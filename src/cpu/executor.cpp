@@ -263,8 +263,8 @@ inline ModRmResult decode_modrm(const u8* code, usize available, GuestAddr next_
         }
 
         const u8 base_reg = (rex_b ? 8 : 0) | base;
-        if (mod == 0 && base == 5) {
-            has_base = false; // [index*scale + disp32]
+        if (mod == 0 && base == 5 && !rex_b) {
+            has_base = false; // [index*scale + disp32] (no base register)
         } else {
             base_addr += get_gpr64(ctx, base_reg);
             has_base = true;
@@ -279,13 +279,20 @@ inline ModRmResult decode_modrm(const u8* code, usize available, GuestAddr next_
     }
 
     if (mod == 0) {
-        if (rm == 5 || (rm == 4 && !has_base)) {
+        if (rm == 5) {
             if (available < offset + 4) return res;
             i32 disp32 = 0;
             std::memcpy(&disp32, code + offset, 4);
             offset += 4;
             // RIP-relative calculation: next_ip_base + offset + extra_imm_bytes + disp32
             res.mem_addr = next_ip_base + offset + extra_imm_bytes + disp32;
+        } else if (rm == 4 && !has_base) {
+            if (available < offset + 4) return res;
+            i32 disp32 = 0;
+            std::memcpy(&disp32, code + offset, 4);
+            offset += 4;
+            // SIB with no base: [index*scale + disp32]
+            res.mem_addr = base_addr + static_cast<i64>(disp32);
         } else {
             res.mem_addr = base_addr;
         }
