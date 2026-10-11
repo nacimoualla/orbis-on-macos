@@ -74,7 +74,14 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
         }
 
         // Return SCE_OK (0) for unimplemented stubs to permit process initialization
-        std::fprintf(stderr, "[HLE UNIMPLEMENTED] NID=0x%llx\n", (unsigned long long)nid);
+        const char* str_arg0 = (sctx.args[0] > 0x1000 && m_memory.is_valid_address(sctx.args[0], 1))
+                                ? m_memory.to_host_ptr<char>(sctx.args[0]) : nullptr;
+        const char* str_arg1 = (sctx.args[1] > 0x1000 && m_memory.is_valid_address(sctx.args[1], 1))
+                                ? m_memory.to_host_ptr<char>(sctx.args[1]) : nullptr;
+        std::fprintf(stderr, "[HLE UNIMPLEMENTED] NID=0x%llx (rdi=0x%llx '%s', rsi=0x%llx '%s', rdx=0x%llx)\n",
+                     (unsigned long long)nid, (unsigned long long)sctx.args[0],
+                     str_arg0 ? str_arg0 : "", (unsigned long long)sctx.args[1],
+                     str_arg1 ? str_arg1 : "", (unsigned long long)sctx.args[2]);
         sctx.rax = 0;
         return 0;
     });

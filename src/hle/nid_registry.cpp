@@ -90,6 +90,19 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = 0;
         });
 
+    // sceKernelLoadStartModule
+    // NID: 0xC33BEA4F852A297FULL
+    register_symbol(0xC33BEA4F852A297FULL, "sceKernelLoadStartModule", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            static u32 s_module_id = 0x2000;
+            const GuestAddr path_addr = ctx.rdi;
+            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                                   ? mem.to_host_ptr<char>(path_addr) : "unknown";
+            const u32 handle = ++s_module_id;
+            std::fprintf(stderr, "[HLE] sceKernelLoadStartModule('%s') -> handle 0x%x\n", path, handle);
+            ctx.rax = handle;
+        });
+
     // sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t length, size_t align, int type, off_t* out_addr)
     register_symbol(0x51EAECE91C9A12B0ULL, "sceKernelAllocateDirectMemory", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
@@ -495,7 +508,6 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x9E990E49EC698A4DULL, "malloc", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestSize size = ctx.rdi;
-            // 16-byte aligned bump allocation
             g_guest_heap_current = (g_guest_heap_current + 15) & ~15ULL;
             const GuestAddr allocated = g_guest_heap_current;
             g_guest_heap_current += size;
@@ -543,7 +555,25 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr buf = ctx.rdi;
             const GuestSize sz  = ctx.rsi;
+            const GuestAddr fmt_addr = ctx.rdx;
+            const char* fmt = (fmt_addr > 0x1000 && mem.is_valid_address(fmt_addr, 1))
+                                ? mem.to_host_ptr<char>(fmt_addr) : nullptr;
             if (sz > 0 && mem.is_valid_address(buf, 1)) {
+                char* dst = mem.to_host_ptr<char>(buf);
+                if (fmt && dst) {
+                    // Try formatting
+                    // For string / int args
+                    const char* s_arg = (ctx.rcx > 0x1000 && mem.is_valid_address(ctx.rcx, 1))
+                                            ? mem.to_host_ptr<char>(ctx.rcx) : nullptr;
+                    if (s_arg && std::strcmp(fmt, "%s") == 0) {
+                        ctx.rax = std::snprintf(dst, sz, "%s", s_arg);
+                    } else if (s_arg) {
+                        ctx.rax = std::snprintf(dst, sz, fmt, s_arg, ctx.r8, ctx.r9);
+                    } else {
+                        ctx.rax = std::snprintf(dst, sz, fmt, ctx.rcx, ctx.r8, ctx.r9);
+                    }
+                    return;
+                }
                 mem.write_value(buf, static_cast<u8>(0));
             }
             ctx.rax = 0;
