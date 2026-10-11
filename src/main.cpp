@@ -90,6 +90,10 @@ int main(int argc, char* argv[]) {
     // 5. Initialize Syscall Dispatch Table & Virtual File System
     std::cout << "[HLE] Initializing Orbis system call table & Virtual File System...\n";
     ps4::VirtualFileSystem vfs;
+    const auto app_dir = std::filesystem::absolute(std::filesystem::path(elf_path).parent_path());
+    vfs.mount("/app0", app_dir, true);
+    std::cout << "[VFS] Mounted /app0 -> " << app_dir << "\n";
+
     ps4::SyscallTable syscalls(memory);
     syscalls.set_vfs(&vfs);
     syscalls.register_default_handlers();
@@ -98,6 +102,7 @@ int main(int argc, char* argv[]) {
     // 6. Initialize NID Registry & Dynamic Linker
     std::cout << "[Linker] Initializing NID Registry and Dynamic Linker...\n";
     ps4::NidRegistry nid_registry;
+    nid_registry.set_vfs(&vfs);
     nid_registry.register_default_libraries();
 
     ps4::DynamicLinker linker(memory, syscalls, nid_registry);

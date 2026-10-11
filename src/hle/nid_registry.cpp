@@ -38,8 +38,12 @@ inline AudioOutManager& get_audio_manager() {
 
 // Global VirtualFileSystem instance
 std::unique_ptr<VirtualFileSystem> g_vfs;
+VirtualFileSystem* g_external_vfs = nullptr;
 
 inline VirtualFileSystem& get_vfs() {
+    if (g_external_vfs) {
+        return *g_external_vfs;
+    }
     if (!g_vfs) {
         g_vfs = std::make_unique<VirtualFileSystem>();
     }
@@ -49,6 +53,10 @@ inline VirtualFileSystem& get_vfs() {
 } // namespace
 
 NidRegistry::NidRegistry() = default;
+
+void NidRegistry::set_vfs(VirtualFileSystem* vfs) {
+    g_external_vfs = vfs;
+}
 
 void NidRegistry::register_symbol(Nid nid, std::string_view name, std::string_view module_name, HleFunction handler) {
     HleSymbol sym;
@@ -601,6 +609,28 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = dest;
         });
 
+    // strncmp(const char* s1, const char* s2, size_t n)
+    // NID: 0x69EB328EB1D55B2EULL ("aesyjrHVWy4")
+    register_symbol(0x69EB328EB1D55B2EULL, "strncmp", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr s1_addr = ctx.rdi;
+            const GuestAddr s2_addr = ctx.rsi;
+            const GuestSize n = ctx.rdx;
+            if (n == 0) {
+                ctx.rax = 0;
+                return;
+            }
+            const char* s1 = (s1_addr > 0x1000 && mem.is_valid_address(s1_addr, 1))
+                                ? mem.to_host_ptr<char>(s1_addr) : nullptr;
+            const char* s2 = (s2_addr > 0x1000 && mem.is_valid_address(s2_addr, 1))
+                                ? mem.to_host_ptr<char>(s2_addr) : nullptr;
+            if (!s1 || !s2) {
+                ctx.rax = (s1 == s2) ? 0 : (s1 ? 1 : -1);
+                return;
+            }
+            ctx.rax = static_cast<u64>(static_cast<i64>(std::strncmp(s1, s2, n)));
+        });
+
     // strlen(const char* s)
     // NID: 0x8F856258D1C4830CULL ("j4ViWNHEgww")
     register_symbol(0x8F856258D1C4830CULL, "strlen", "libc",
@@ -925,6 +955,94 @@ void NidRegistry::register_default_libraries() {
                 return;
             }
             ctx.rax = static_cast<u64>(-14);
+        });
+
+    // ==========================================
+    // libSceFios2 - Fast I/O System 2
+    // ==========================================
+
+    // sceFiosFileExists(int profile, const char* path, ...)
+    // NID: 0x3703873113363E9CULL ("NwOHMRM2Ppw")
+    register_symbol(0x3703873113363E9CULL, "sceFiosFileExists", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path_addr = ctx.rsi;
+            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
+            if (!path) {
+                ctx.rax = 0;
+                return;
+            }
+            auto& vfs = get_vfs();
+            auto resolved = vfs.resolve_path(path);
+            bool exists = false;
+            if (resolved) {
+                std::error_code ec;
+                exists = std::filesystem::is_regular_file(*resolved, ec);
+            }
+            std::fprintf(stderr, "[FIOS2] sceFiosFileExists('%s') -> %d\n", path, exists ? 1 : 0);
+            ctx.rax = exists ? 1 : 0;
+        });
+
+    // sceFiosDirectoryExists(int profile, const char* path, ...)
+    // NID: 0x38EBAF1CA4EEE0E7ULL ("OOuvHKTu4Oc")
+    register_symbol(0x38EBAF1CA4EEE0E7ULL, "sceFiosDirectoryExists", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path_addr = ctx.rsi;
+            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
+            if (!path) {
+                ctx.rax = 0;
+                return;
+            }
+            auto& vfs = get_vfs();
+            auto resolved = vfs.resolve_path(path);
+            bool exists = false;
+            if (resolved) {
+                std::error_code ec;
+                exists = std::filesystem::is_directory(*resolved, ec);
+            }
+            std::fprintf(stderr, "[FIOS2] sceFiosDirectoryExists('%s') -> %d\n", path, exists ? 1 : 0);
+            ctx.rax = exists ? 1 : 0;
+        });
+
+    // sceFiosStat / sceFiosFileGetStatSync(int profile, const char* path, SceFiosStat* stat)
+    // NID: 0x8DACAF634EC2E5D9ULL ("jayvY07C5dk")
+    register_symbol(0x8DACAF634EC2E5D9ULL, "sceFiosStat", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path_addr = ctx.rsi;
+            const GuestAddr stat_ptr  = ctx.rdx;
+            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
+            if (!path || stat_ptr == 0 || !mem.is_valid_address(stat_ptr, 0x40)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            auto& vfs = get_vfs();
+            auto resolved = vfs.resolve_path(path);
+            if (!resolved) {
+                std::fprintf(stderr, "[FIOS2] sceFiosStat('%s') -> not found\n", path);
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            std::error_code ec;
+            const auto st = std::filesystem::status(*resolved, ec);
+            if (!std::filesystem::exists(st)) {
+                std::fprintf(stderr, "[FIOS2] sceFiosStat('%s' -> '%s') -> not found\n", path, resolved->c_str());
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+
+            mem.zero_memory(stat_ptr, 0x40);
+            const bool is_dir = std::filesystem::is_directory(st);
+            const u64 file_sz = is_dir ? 0 : std::filesystem::file_size(*resolved, ec);
+            const u32 stat_flags = is_dir ? 0x1 : 0x0;
+
+            mem.write_value(stat_ptr + 0x00, file_sz);
+            mem.write_value(stat_ptr + 0x20, stat_flags);
+
+            std::fprintf(stderr, "[FIOS2] sceFiosStat('%s') -> size=%llu, flags=0x%x\n",
+                         path, (unsigned long long)file_sz, stat_flags);
+            ctx.rax = SCE_OK;
         });
 }
 

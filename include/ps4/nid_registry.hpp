@@ -40,6 +40,9 @@ public:
     /// Register standard built-in functions for libkernel and libc
     void register_default_libraries();
 
+    /// Attach virtual file system for HLE I/O routines
+    void set_vfs(class VirtualFileSystem* vfs);
+
 private:
     std::unordered_map<Nid, HleSymbol> m_symbols_by_nid;
     std::unordered_map<std::string, Nid> m_nids_by_name;

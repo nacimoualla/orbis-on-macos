@@ -1347,6 +1347,13 @@ StepResult CpuExecutor::step() {
         // 0x0F 0x0B: UD2 (Undefined instruction / abort / trap)
         if (op1 == 0x0B) {
             std::fprintf(stderr, "[CPU] UD2 instruction executed at RIP=0x%llx\n", (unsigned long long)start_rip);
+            std::fprintf(stderr, "[CPU] Recent RIP history before UD2 (last 64 instructions):\n");
+            for (usize i = 0; i < 64; ++i) {
+                const GuestAddr h_rip = s_rip_history[(s_rip_hist_idx + 64 + i) % 128];
+                if (h_rip != 0) {
+                    std::fprintf(stderr, "  [%02zu] RIP=0x%llx\n", i, (unsigned long long)h_rip);
+                }
+            }
             return StepResult::IllegalInstruction;
         }
 
