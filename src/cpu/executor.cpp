@@ -570,7 +570,8 @@ StepResult CpuExecutor::step() {
         auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base, rex_r, rex_x, rex_b, seg_override, m_context);
         if (!m.valid || m.is_reg) return StepResult::IllegalInstruction;
         if (op_bits == 64) set_gpr64(m_context, m.reg_id, m.mem_addr);
-        else set_gpr32(m_context, m.reg_id, static_cast<u32>(m.mem_addr));
+        else if (op_bits == 32) set_gpr32(m_context, m.reg_id, static_cast<u32>(m.mem_addr));
+        else set_gpr16(m_context, m.reg_id, static_cast<u16>(m.mem_addr));
         m_context.rip = start_rip + cursor + m.bytes_consumed;
         return StepResult::Ok;
     }
@@ -613,6 +614,11 @@ StepResult CpuExecutor::step() {
             std::memcpy(&imm64, raw_code + cursor, 8);
             set_gpr64(m_context, reg, imm64);
             m_context.rip = start_rip + cursor + 8;
+        } else if (operand_size_16) {
+            u16 imm16 = 0;
+            std::memcpy(&imm16, raw_code + cursor, 2);
+            set_gpr16(m_context, reg, imm16);
+            m_context.rip = start_rip + cursor + 2;
         } else {
             u32 imm32 = 0;
             std::memcpy(&imm32, raw_code + cursor, 4);
@@ -1256,6 +1262,7 @@ StepResult CpuExecutor::step() {
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 byte_val = static_cast<u8>(read_rm(m, 8));
             if (rex_w) set_gpr64(m_context, m.reg_id, byte_val);
+            else if (operand_size_16) set_gpr16(m_context, m.reg_id, byte_val);
             else set_gpr32(m_context, m.reg_id, byte_val);
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
@@ -1278,6 +1285,7 @@ StepResult CpuExecutor::step() {
             if (!m.valid) return StepResult::IllegalInstruction;
             const i8 byte_val = static_cast<i8>(read_rm(m, 8));
             if (rex_w) set_gpr64(m_context, m.reg_id, static_cast<u64>(static_cast<i64>(byte_val)));
+            else if (operand_size_16) set_gpr16(m_context, m.reg_id, static_cast<u16>(static_cast<i16>(byte_val)));
             else set_gpr32(m_context, m.reg_id, static_cast<u32>(static_cast<i32>(byte_val)));
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
@@ -1992,6 +2000,10 @@ StepResult CpuExecutor::step() {
             imm = (bits == 64) ? static_cast<u64>(static_cast<i64>(imm8)) : static_cast<u32>(static_cast<i32>(imm8));
         } else if (op0 == 0x80) {
             imm = raw_code[cursor + m.bytes_consumed];
+        } else if (op_bits == 16) {
+            u16 imm16 = 0;
+            std::memcpy(&imm16, raw_code + cursor + m.bytes_consumed, 2);
+            imm = imm16;
         } else {
             i32 imm32 = 0;
             std::memcpy(&imm32, raw_code + cursor + m.bytes_consumed, 4);
@@ -2072,7 +2084,7 @@ StepResult CpuExecutor::step() {
         const usize bits = (op0 == 0xF6) ? 8 : op_bits;
         const u8 modrm_peek = raw_code[cursor];
         const u8 sub_op = (modrm_peek >> 3) & 7;
-        const usize extra_imm = (sub_op == 0) ? (bits == 8 ? 1 : 4) : 0;
+        const usize extra_imm = (sub_op == 0) ? (bits == 8 ? 1 : (op_bits == 16 ? 2 : 4)) : 0;
 
         auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base, rex_r, rex_x, rex_b, seg_override, m_context, extra_imm);
         if (!m.valid) return StepResult::IllegalInstruction;
@@ -2080,6 +2092,7 @@ StepResult CpuExecutor::step() {
         if (sub_op == 0) { // TEST r/m, imm
             u64 imm = 0;
             if (bits == 8) imm = raw_code[cursor + m.bytes_consumed];
+            else if (bits == 16) { u16 imm16 = 0; std::memcpy(&imm16, raw_code + cursor + m.bytes_consumed, 2); imm = imm16; }
             else { u32 imm32 = 0; std::memcpy(&imm32, raw_code + cursor + m.bytes_consumed, 4); imm = imm32; }
             const u64 val = read_rm(m, bits);
             update_flags_logic(m_context, val & imm, bits);
