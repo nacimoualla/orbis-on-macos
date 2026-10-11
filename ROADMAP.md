@@ -361,3 +361,125 @@ The goal of this phase is to extend the PM4 GPU command processor to support 3D 
 
 *All phases 1 through 14 successfully implemented and verified with 100% test pass rate!*
 
+---
+
+# 🚧 Next Up — Candidate Phases (15+)
+
+_Phases 1–14 built the runtime and are verified against synthetic `samples/*.elf` fixtures. The phases below are the identified next steps to progress from samples toward running real retail titles, ordered by dependency and impact. Each "Verified starting point" was confirmed against the current tree._
+
+### Verified starting points (current tree)
+- The **ARM64 JIT (`Arm64Emitter`) is not connected** — `cpu.set_jit_compiler(&jit)` is commented out in `src/main.cpp`; the interpreter is executing.
+- **Input does not exist yet** — no `libScePad` HLE, no GameController backend, and no keyboard/mouse capture in `DisplayWindow`, despite ADR 0009.
+- **HLE breadth is thin** — only `libSceFios2` (done) and `libSceCommonDialog` are substantially implemented; `libSceVideoOut`, `libSceUserService`, `libSceSysmodule`, `libSceNgs2` and media decoders are missing. (`libaudioout` symbols are registered.)
+- **Graphics uses a fixed inline MSL mesh shader** — ADR 0007's two-tier GCN→MSL translation and texture/sampler binding are not yet implemented.
+
+## 📌 Phase 15: Connect the ARM64 JIT to the Executor
+
+The goal is to activate the existing `JitCompiler`/`Arm64Emitter` for throughput while keeping the interpreter as a fallback.
+
+- [ ] **Step 15.1: Wire `JitCompiler` into `CpuExecutor`**
+  - Implement/enable `set_jit_compiler(&jit)` and dispatch translated blocks by guest PC.
+
+- [ ] **Step 15.2: Code cache & basic-block boundaries**
+  - Linear-sweep/block scanning to find branch targets; cache translated blocks keyed by guest PC.
+
+- [ ] **Step 15.3: W^X code cache on Apple Silicon**
+  - Guest pages are per-`phdr` RWX; use a separate `MAP_JIT` code cache with `pthread_jit_write_protect()` to satisfy hardened-runtime W^X.
+
+- [ ] **Step 15.4: Exit the JIT for interrupts**
+  - Fall back to the interpreter on syscalls, page faults, and traps; keep guest register state consistent across the boundary.
+
+- [ ] **Step 15.5: Benchmark interpreter vs. JIT**
+  - Measure instructions/sec on `samples/*.elf` (`test_phase15`).
+
+## 📌 Phase 16: Input — GameController Framework (closes ADR 0009)
+
+- [ ] **Step 16.1: `libScePad` HLE**
+  - Implement `scePadOpen/Read/Close/etc.` mapping a controller port to an abstract input state.
+
+- [ ] **Step 16.2: GCController backend**
+  - Adopt DualShock 4 / DualSense / Xbox controllers via `GameController.framework`.
+
+- [ ] **Step 16.3: Keyboard/mouse capture in `DisplayWindow`**
+  - Translate NSEvent key/mouse events into pad/analog state (matches shadPS4's default bindings).
+
+- [ ] **Step 16.4: Analog processing**
+  - Deadzone handling, trigger/L2-R2 analog range, per-game remap.
+
+## 📌 Phase 17: Display & Present — `libSceVideoOut` / flip
+
+- [ ] **Step 17.1: `libSceVideoOut` HLE**
+  - Register/allocate flip chains, set flip rate (30/60), resolution from `param.sfo`.
+
+- [ ] **Step 17.2: Present on flip**
+  - Blit the Metal framebuffer to the `DisplayWindow` presenter on `sceVideoOutSubmitFlip`/`flipRate`.
+
+- [ ] **Step 17.3: Scanout metadata**
+  - Derive initial width/height/tiling from `sce_sys/param.sfo`.
+
+## 📌 Phase 18: Expand HLE Coverage (game-critical `libSce` modules)
+
+- [ ] **Step 18.1: `libSceUserService` + `libSceSysmodule`**
+  - Initial user id / username, and module load/unload bookkeeping.
+
+- [ ] **Step 18.2: `libSceNgs2`**
+  - Route the game audio mixer into the existing CoreAudio backend alongside `libaudioout`.
+
+- [ ] **Step 18.3: Media decoders**
+  - `libSceJpegDec`, `libScePngDec`, `libSceSulpha`/`libSceAvPlayer` stubs as needed.
+
+- [ ] **Step 18.4: Offline network/NP stubs**
+  - `libSceNpManager`, `libSceNet` returning benign offline values.
+
+## 📌 Phase 19: Real GCN → MSL Shader Translation (closes ADR 0007)
+
+- [ ] **Step 19.1: Parse GCN/AMDGPU shader ISA**
+  - Decode vertex/fragment/compute shaders (leveraging SPIRV-Tools/Slang where appropriate).
+
+- [ ] **Step 19.2: Map registers/varyings/descriptors to MSL**
+  - Input semantics, uniform/constant buffers, resource descriptor tables.
+
+- [ ] **Step 19.3: Replace the fixed mesh shader**
+  - Compile translated vertex/fragment `MTLRenderPipelineState` instead of the inline MSL in `pm4_translator.mm`.
+
+- [ ] **Step 19.4: Texture + sampler binding**
+  - `T#`/`S#` descriptors → `MTLTexture`/`MTLSamplerState`.
+
+## 📌 Phase 20: PM4 / GPU Feature Expansion
+
+- [ ] **Step 20.1: Full context-register handling**
+  - Depth/stencil, scissor, multiple render targets, viewport from `IT_SET_CONTEXT_REG`.
+
+- [ ] **Step 20.2: Textures & samplers**
+  - Texture upload path, sampler states, cubemaps.
+
+- [ ] **Step 20.3: Sync & compute**
+  - Occlusion queries, fences/`IT_EVENT_WRITE`, compute dispatch (`IT_DISPATCH_DIRECT`) if feasible.
+
+## 📌 Phase 21: SELF / Retail Loading & `.pkg`
+
+- [ ] **Step 21.1: SELF header + NPDRM/keystone**
+  - Parse `SCE` header and decrypt `eboot.bin` (legally-dumped titles only).
+
+- [ ] **Step 21.2: Integrate `.pkg` unpacking**
+  - Fold `scripts/unpack_self.py` logic into the loader/install flow.
+
+- [ ] **Step 21.3: Parse `sce_sys/param.sfo`**
+  - Title id, version, parental level, display resolution.
+
+## 📌 Phase 22: Concurrency, Save Data & Users
+
+- [ ] **Step 22.1: Real host-thread scheduling**
+  - Run guest threads on host threads; maintain per-thread CPU context + TLS FS/GS bases.
+
+- [ ] **Step 22.2: `libkernel` sync primitives**
+  - Mutex, condvar, semaphore, rwlock (extend the threading HLE).
+
+- [ ] **Step 22.3: Save data & users**
+  - Mount `savedata` to `~/Library/Application Support/<title>`, trophies, per-user profiles.
+
+---
+
+*These phases are candidates; reorder based on which real titles you target first.*
+
+
