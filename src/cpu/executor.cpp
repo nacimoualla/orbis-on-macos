@@ -360,6 +360,24 @@ StepResult CpuExecutor::step() {
         return StepResult::Exited;
     }
 
+    static GuestAddr s_rip_history[128];
+    static usize s_rip_hist_idx = 0;
+
+    if (m_context.rip < 0x20) {
+        u64 ret_addr = 0;
+        m_memory.read_value(m_context.rsp, ret_addr);
+        std::fprintf(stderr, "[CPU FAULT] Invalid execution target RIP=0x%llx! Return address on stack: 0x%llx\n",
+                     (unsigned long long)m_context.rip, (unsigned long long)ret_addr);
+        std::fprintf(stderr, "[CPU FAULT] Recent RIP history (last 64 instructions):\n");
+        for (usize i = 0; i < 64; ++i) {
+            const GuestAddr h_rip = s_rip_history[(s_rip_hist_idx + 64 + i) % 128];
+            if (h_rip != 0) {
+                std::fprintf(stderr, "  [%02zu] RIP=0x%llx\n", i, (unsigned long long)h_rip);
+            }
+        }
+        return StepResult::MemoryFault;
+    }
+
     if (!m_memory.is_valid_address(m_context.rip, 1)) {
         return StepResult::MemoryFault;
     }
@@ -370,10 +388,7 @@ StepResult CpuExecutor::step() {
     }
 
     const GuestAddr start_rip = m_context.rip;
-
-    static GuestAddr s_rip_history[32];
-    static usize s_rip_hist_idx = 0;
-    s_rip_history[s_rip_hist_idx++ % 32] = start_rip;
+    s_rip_history[s_rip_hist_idx++ % 128] = start_rip;
     u8 rex = 0;
     bool has_rex = false;
     bool operand_size_16 = false;
@@ -849,6 +864,79 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
+        // VPUNPCKLBW (0x60), VPUNPCKLWD (0x61), VPUNPCKLDQ (0x62),
+        // VPUNPCKHBW (0x68), VPUNPCKHWD (0x69), VPUNPCKHDQ (0x6A),
+        // VPUNPCKLQDQ (0x6C), VPUNPCKHQDQ (0x6D)
+        if (vex_map == 1 && (vex_op == 0x60 || vex_op == 0x61 || vex_op == 0x62 ||
+                             vex_op == 0x68 || vex_op == 0x69 || vex_op == 0x6A ||
+                             vex_op == 0x6C || vex_op == 0x6D)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2_val{};
+            if (m.is_reg) {
+                src2_val = m_context.ymm[m.rm_id & 15];
+            } else {
+                m_memory.read_bytes(m.mem_addr, &src2_val, vex_l ? 32 : 16);
+            }
+            const auto s1 = m_context.ymm[src1];
+            CpuContext::YmmReg res{};
+
+            const usize lanes = vex_l ? 2 : 1;
+            for (usize l = 0; l < lanes; ++l) {
+                const usize q_base = l * 2;
+                const usize d_base = l * 4;
+                const usize w_base = l * 8;
+                const usize b_base = l * 16;
+
+                if (vex_op == 0x6C) { // VPUNPCKLQDQ: low qwords
+                    res.q[q_base + 0] = s1.q[q_base + 0];
+                    res.q[q_base + 1] = src2_val.q[q_base + 0];
+                } else if (vex_op == 0x6D) { // VPUNPCKHQDQ: high qwords
+                    res.q[q_base + 0] = s1.q[q_base + 1];
+                    res.q[q_base + 1] = src2_val.q[q_base + 1];
+                } else if (vex_op == 0x62) { // VPUNPCKLDQ: low dwords
+                    res.d[d_base + 0] = s1.d[d_base + 0];
+                    res.d[d_base + 1] = src2_val.d[d_base + 0];
+                    res.d[d_base + 2] = s1.d[d_base + 1];
+                    res.d[d_base + 3] = src2_val.d[d_base + 1];
+                } else if (vex_op == 0x6A) { // VPUNPCKHDQ: high dwords
+                    res.d[d_base + 0] = s1.d[d_base + 2];
+                    res.d[d_base + 1] = src2_val.d[d_base + 2];
+                    res.d[d_base + 2] = s1.d[d_base + 3];
+                    res.d[d_base + 3] = src2_val.d[d_base + 3];
+                } else if (vex_op == 0x61) { // VPUNPCKLWD: low words
+                    for (usize i = 0; i < 4; ++i) {
+                        res.w[w_base + 2 * i] = s1.w[w_base + i];
+                        res.w[w_base + 2 * i + 1] = src2_val.w[w_base + i];
+                    }
+                } else if (vex_op == 0x69) { // VPUNPCKHWD: high words
+                    for (usize i = 0; i < 4; ++i) {
+                        res.w[w_base + 2 * i] = s1.w[w_base + 4 + i];
+                        res.w[w_base + 2 * i + 1] = src2_val.w[w_base + 4 + i];
+                    }
+                } else if (vex_op == 0x60) { // VPUNPCKLBW: low bytes
+                    for (usize i = 0; i < 8; ++i) {
+                        res.b[b_base + 2 * i] = s1.b[b_base + i];
+                        res.b[b_base + 2 * i + 1] = src2_val.b[b_base + i];
+                    }
+                } else if (vex_op == 0x68) { // VPUNPCKHBW: high bytes
+                    for (usize i = 0; i < 8; ++i) {
+                        res.b[b_base + 2 * i] = s1.b[b_base + 8 + i];
+                        res.b[b_base + 2 * i + 1] = src2_val.b[b_base + 8 + i];
+                    }
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
         // VPXOR (0xEF) / VPOR (0xEB) / VORPS (0x56) / VPAND (0xDB) / VANDPS (0x54) / VPANDN (0xDF) / VANDNPS (0x55)
         if (vex_op == 0xEF || vex_op == 0xEB || vex_op == 0xDB || vex_op == 0xDF ||
             vex_op == 0x56 || vex_op == 0x54 || vex_op == 0x55) {
@@ -1255,6 +1343,12 @@ StepResult CpuExecutor::step() {
     if (op0 == 0x0F && m_memory.is_valid_address(start_rip + cursor, 1)) {
         const u8 op1 = raw_code[cursor++];
         const GuestAddr next_ip_base_0f = start_rip + cursor;
+
+        // 0x0F 0x0B: UD2 (Undefined instruction / abort / trap)
+        if (op1 == 0x0B) {
+            std::fprintf(stderr, "[CPU] UD2 instruction executed at RIP=0x%llx\n", (unsigned long long)start_rip);
+            return StepResult::IllegalInstruction;
+        }
 
         // 0x0F 0xB6: MOVZX reg, r/m8
         if (op1 == 0xB6) {
