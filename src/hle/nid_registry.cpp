@@ -2,6 +2,7 @@
 #include "ps4/nid_registry.hpp"
 #include "ps4/thread.hpp"
 #include "ps4/vfs.hpp"
+#include <fstream>
 #include <iostream>
 #include <sys/time.h>
 #include <unistd.h>
@@ -49,6 +50,16 @@ inline VirtualFileSystem& get_vfs() {
     }
     return *g_vfs;
 }
+
+// Fios2 file handle tracking
+struct FiosFile {
+    std::unique_ptr<std::ifstream> stream;
+    u64 size{0};
+    u64 offset{0};
+    std::string path;
+};
+static std::unordered_map<i32, FiosFile> s_fios_files;
+static i32 s_next_fios_fd = 200;
 
 } // namespace
 
@@ -587,6 +598,28 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = 0;
         });
 
+    // vsnprintf(char* str, size_t size, const char* format, va_list ap)
+    // NID: 0x43657E8AABE3802DULL ("Q2V+iqvjgC0")
+    register_symbol(0x43657E8AABE3802DULL, "vsnprintf", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dest = ctx.rdi;
+            const GuestSize maxlen = ctx.rsi;
+            const GuestAddr fmt_addr = ctx.rdx;
+            if (dest == 0 || maxlen == 0 || fmt_addr == 0 || !mem.is_valid_address(dest, 1)) {
+                ctx.rax = 0;
+                return;
+            }
+            const char* fmt = (fmt_addr > 0x1000 && mem.is_valid_address(fmt_addr, 1))
+                                ? mem.to_host_ptr<char>(fmt_addr) : nullptr;
+            char* out = mem.to_host_ptr<char>(dest);
+            if (!fmt || !out) {
+                ctx.rax = 0;
+                return;
+            }
+            const int written = std::snprintf(out, maxlen, "%s", fmt);
+            ctx.rax = static_cast<u64>(written >= 0 ? written : 0);
+        });
+
     // strncpy(char* dest, const char* src, size_t n)
     // NID: 0xEAC256896491BAA9ULL ("6sJWiWSRuqk")
     register_symbol(0xEAC256896491BAA9ULL, "strncpy", "libc",
@@ -691,6 +724,20 @@ void NidRegistry::register_default_libraries() {
                 mem.write_value(sema_ptr, sema_id++);
             }
             ctx.rax = SCE_OK;
+        });
+
+    // sceKernelDeleteSema(SceKernelSema sema)
+    // NID: 0x47526F9FC6D2096FULL ("R1Jvn8bSCW8")
+    register_symbol(0x47526F9FC6D2096FULL, "sceKernelDeleteSema", "libkernel",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            ctx.rax = SCE_OK;
+        });
+
+    // sceKernelIsNeoMode()
+    // NID: 0x5AC95C2B51507062ULL ("WslcK1FQcGI")
+    register_symbol(0x5AC95C2B51507062ULL, "sceKernelIsNeoMode", "libkernel",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            ctx.rax = 0; // Standard PS4 Base mode
         });
 
     // scePthreadMutexInit NID: 0x726A3544862F6BDAULL ("cmo1RIYva9o")
@@ -1043,6 +1090,256 @@ void NidRegistry::register_default_libraries() {
             std::fprintf(stderr, "[FIOS2] sceFiosStat('%s') -> size=%llu, flags=0x%x\n",
                          path, (unsigned long long)file_sz, stat_flags);
             ctx.rax = SCE_OK;
+        });
+
+    // sceFiosFHOpen / sceFiosFHOpenSync(int profile, const char* path, ...)
+    // NID: 0xCC5F3F091BD15E73ULL ("zF8-CRvRXnM")
+    register_symbol(0xCC5F3F091BD15E73ULL, "sceFiosFHOpen", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path_addr = ctx.rsi;
+            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
+            if (!path) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            auto& vfs = get_vfs();
+            auto resolved = vfs.resolve_path(path);
+            if (!resolved) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHOpen('%s') -> not found, returning -1\n", path);
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(*resolved, ec)) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHOpen('%s' -> '%s') -> not regular file\n", path, resolved->c_str());
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            auto stream = std::make_unique<std::ifstream>(*resolved, std::ios::binary);
+            if (!stream->is_open()) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHOpen('%s' -> '%s') -> open failed\n", path, resolved->c_str());
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            const u64 sz = std::filesystem::file_size(*resolved, ec);
+            const i32 fd = s_next_fios_fd++;
+            s_fios_files[fd] = FiosFile{
+                .stream = std::move(stream),
+                .size = sz,
+                .offset = 0,
+                .path = path
+            };
+            std::fprintf(stderr, "[FIOS2] sceFiosFHOpen('%s' -> '%s') -> handle %d (size=%llu)\n",
+                         path, resolved->c_str(), fd, (unsigned long long)sz);
+            ctx.rax = static_cast<u64>(fd);
+        });
+
+    // sceFiosFHRead / sceFiosFHReadSync(int profile, int fh, void* buf, size_t size)
+    // NID: 0x2A5FD36EB0D4F583ULL ("Kl-TbrDU9YM")
+    register_symbol(0x2A5FD36EB0D4F583ULL, "sceFiosFHRead", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const i32 fd = static_cast<i32>(ctx.rsi);
+            const GuestSize size = ctx.rdx;
+            const GuestAddr buf_addr = ctx.rcx;
+            auto it = s_fios_files.find(fd);
+            if (it == s_fios_files.end() || !it->second.stream || !it->second.stream->is_open()) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHRead: invalid handle %d\n", fd);
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            if (buf_addr == 0 || !mem.is_valid_address(buf_addr, size)) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHRead: invalid buffer 0x%llx (size=%llu)\n",
+                             (unsigned long long)buf_addr, (unsigned long long)size);
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            u8* dest = mem.to_host_ptr<u8>(buf_addr);
+            it->second.stream->seekg(it->second.offset, std::ios::beg);
+            it->second.stream->read(reinterpret_cast<char*>(dest), size);
+            const std::streamsize bytes_read = it->second.stream->gcount();
+            it->second.offset += static_cast<u64>(bytes_read);
+            std::fprintf(stderr, "[FIOS2] sceFiosFHRead(fd=%d, size=%llu) -> read %lld bytes\n",
+                         fd, (unsigned long long)size, (long long)bytes_read);
+            ctx.rax = static_cast<u64>(bytes_read);
+        });
+
+    // sceFiosFHPread / sceFiosFHPreadSync(int profile, int fh, size_t offset, size_t size, void* buf)
+    // NID: 0x80C71F3AD1D6EB39ULL ("gMcfOtHW6zk")
+    register_symbol(0x80C71F3AD1D6EB39ULL, "sceFiosFHPread", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const i32 fd = static_cast<i32>(ctx.rsi);
+            const u64 offset = ctx.rdx;
+            const GuestSize size = ctx.rcx;
+            const GuestAddr buf_addr = ctx.r8;
+            auto it = s_fios_files.find(fd);
+            if (it == s_fios_files.end() || !it->second.stream || !it->second.stream->is_open()) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHPread: invalid handle %d\n", fd);
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            if (buf_addr == 0 || !mem.is_valid_address(buf_addr, size)) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHPread: invalid buffer 0x%llx (size=%llu)\n",
+                             (unsigned long long)buf_addr, (unsigned long long)size);
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            u8* dest = mem.to_host_ptr<u8>(buf_addr);
+            it->second.stream->seekg(offset, std::ios::beg);
+            it->second.stream->read(reinterpret_cast<char*>(dest), size);
+            const std::streamsize bytes_read = it->second.stream->gcount();
+            std::fprintf(stderr, "[FIOS2] sceFiosFHPread(fd=%d, offset=%llu, size=%llu) -> read %lld bytes\n",
+                         fd, (unsigned long long)offset, (unsigned long long)size, (long long)bytes_read);
+            ctx.rax = static_cast<u64>(bytes_read);
+        });
+
+    // sceFiosFHGetSize / sceFiosFHStat(int fh)
+    // NID: 0x32B445ADD829B31FULL ("MrRFrdgpsx8")
+    register_symbol(0x32B445ADD829B31FULL, "sceFiosFHGetSize", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            const i32 fd = static_cast<i32>(ctx.rdi);
+            auto it = s_fios_files.find(fd);
+            if (it == s_fios_files.end()) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            std::fprintf(stderr, "[FIOS2] sceFiosFHGetSize(fd=%d) -> %llu\n", fd, (unsigned long long)it->second.size);
+            ctx.rax = it->second.size;
+        });
+
+    // sceFiosFHSeek(int fh, int64_t offset, int whence)
+    // NID: 0xC5179279BC0A0290ULL ("xReSebwKApA")
+    register_symbol(0xC5179279BC0A0290ULL, "sceFiosFHSeek", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            const i32 fd = static_cast<i32>(ctx.rdi);
+            const i64 offset = static_cast<i64>(ctx.rsi);
+            const i32 whence = static_cast<i32>(ctx.rdx);
+            auto it = s_fios_files.find(fd);
+            if (it == s_fios_files.end()) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            if (whence == 0) { // SEEK_SET
+                it->second.offset = static_cast<u64>(offset >= 0 ? offset : 0);
+            } else if (whence == 1) { // SEEK_CUR
+                it->second.offset = static_cast<u64>(std::max<i64>(0, static_cast<i64>(it->second.offset) + offset));
+            } else if (whence == 2) { // SEEK_END
+                it->second.offset = static_cast<u64>(std::max<i64>(0, static_cast<i64>(it->second.size) + offset));
+            }
+            std::fprintf(stderr, "[FIOS2] sceFiosFHSeek(fd=%d, offset=%lld, whence=%d) -> pos %llu\n",
+                         fd, (long long)offset, whence, (unsigned long long)it->second.offset);
+            ctx.rax = it->second.offset;
+        });
+
+    // sceFiosFHClose(int profile, int fh)
+    // NID: 0x00EBA3486A94FA6BULL ("AOujSGqU+ms")
+    register_symbol(0x00EBA3486A94FA6BULL, "sceFiosFHClose", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            const i32 fd = static_cast<i32>(ctx.rsi);
+            s_fios_files.erase(fd);
+            std::fprintf(stderr, "[FIOS2] sceFiosFHClose(fd=%d) -> closed\n", fd);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceFiosExists(int profile, const char* path)
+    // NID: 0x9D6BB36B465D7EA0ULL ("nWuza0ZdfqA")
+    register_symbol(0x9D6BB36B465D7EA0ULL, "sceFiosExists", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path_addr = ctx.rsi;
+            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
+            if (!path) {
+                ctx.rax = 0;
+                return;
+            }
+            auto& vfs = get_vfs();
+            auto resolved = vfs.resolve_path(path);
+            bool exists = false;
+            if (resolved) {
+                std::error_code ec;
+                exists = std::filesystem::exists(*resolved, ec);
+            }
+            std::fprintf(stderr, "[FIOS2] sceFiosExists('%s') -> %d\n", path, exists ? 1 : 0);
+            ctx.rax = exists ? 1 : 0;
+        });
+
+    // sceFiosFileDelete(int profile, const char* path)
+    // NID: 0x6C3BA91206D0E859ULL ("bDupEgbQ6Fk")
+    register_symbol(0x6C3BA91206D0E859ULL, "sceFiosFileDelete", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            ctx.rax = SCE_OK;
+        });
+
+    // sceFiosFileGetSize(int profile, const char* path)
+    // NID: 0x514AE2697CBB1BDDULL ("UUriaXy7G90")
+    register_symbol(0x514AE2697CBB1BDDULL, "sceFiosFileGetSize", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path_addr = ctx.rsi;
+            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
+            if (!path) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            auto& vfs = get_vfs();
+            auto resolved = vfs.resolve_path(path);
+            if (!resolved) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            std::error_code ec;
+            const u64 sz = std::filesystem::file_size(*resolved, ec);
+            ctx.rax = ec ? static_cast<u64>(-1) : sz;
+        });
+
+    // sceFiosFileRead(int profile, const char* path, void* buf, size_t size, ...)
+    // NID: 0xC6EB4B6D076AC9BEULL ("xutLbQdqyb4")
+    register_symbol(0xC6EB4B6D076AC9BEULL, "sceFiosFileRead", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path_addr = ctx.rsi;
+            const GuestAddr buf_addr  = ctx.rdx;
+            const GuestSize size      = ctx.rcx;
+            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
+            if (!path || buf_addr == 0 || !mem.is_valid_address(buf_addr, size)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            auto& vfs = get_vfs();
+            auto resolved = vfs.resolve_path(path);
+            if (!resolved) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            std::ifstream file(*resolved, std::ios::binary);
+            if (!file.is_open()) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            file.read(reinterpret_cast<char*>(mem.to_host_ptr<u8>(buf_addr)), size);
+            ctx.rax = static_cast<u64>(file.gcount());
+        });
+
+    // sceFiosInitialize(const void* params)
+    // NID: 0x960213B81B11A36AULL ("lgITuBsRo2o")
+    register_symbol(0x960213B81B11A36AULL, "sceFiosInitialize", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            std::fprintf(stderr, "[FIOS2] sceFiosInitialize() -> SCE_OK\n");
+            ctx.rax = SCE_OK;
+        });
+
+    // Archive Mount stubs (return negative so engine uses loose files on /app0)
+    register_symbol(0xF8546F2A49D48F52ULL, "sceFiosArchiveMountWithOrder", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            ctx.rax = static_cast<u64>(-1);
+        });
+    register_symbol(0x186AAE70BF45F982ULL, "sceFiosArchiveMountWithOrderSync", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            ctx.rax = static_cast<u64>(-1);
+        });
+    register_symbol(0xB8292024EAD850BEULL, "sceFiosArchiveGetMountBufferSize", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            ctx.rax = 0x10000;
         });
 }
 

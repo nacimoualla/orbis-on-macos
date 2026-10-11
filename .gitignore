@@ -1,6 +1,36 @@
+# Build artifacts
 build/
-.DS_Store
+build-*/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+
+# Compiled objects / binaries / debug symbols
 *.o
+*.obj
+*.a
+*.so
+*.dylib
 *.dSYM/
+*.dwarf
+
+# macOS
+.DS_Store
+
+# Proprietary / user-supplied game & console assets (never committed)
 games/*
 !games/.gitkeep
+
+# Defense-in-depth: ignore common PS4/Orbis proprietary artifacts anywhere
+*.pkg
+*.prx
+*.sprx
+*.self
+eboot.bin
+sce_sys/
+sce_module/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp

@@ -473,6 +473,7 @@ StepResult CpuExecutor::step() {
         sctx.rcx     = m_context.rcx;
         sctx.rax     = m_context.rax;
         sctx.rsp     = m_context.rsp;
+        sctx.rbp     = m_context.rbp;
 
         m_syscalls.dispatch(static_cast<u32>(m_context.rax), sctx);
         m_context.rax = sctx.rax;

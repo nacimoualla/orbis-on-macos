@@ -78,10 +78,21 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
                                 ? m_memory.to_host_ptr<char>(sctx.args[0]) : nullptr;
         const char* str_arg1 = (sctx.args[1] > 0x1000 && m_memory.is_valid_address(sctx.args[1], 1))
                                 ? m_memory.to_host_ptr<char>(sctx.args[1]) : nullptr;
-        std::fprintf(stderr, "[HLE UNIMPLEMENTED] NID=0x%llx (rdi=0x%llx '%s', rsi=0x%llx '%s', rdx=0x%llx)\n",
-                     (unsigned long long)nid, (unsigned long long)sctx.args[0],
+        GuestAddr ret_addr = 0;
+        m_memory.read_value(sctx.rsp, ret_addr);
+        std::fprintf(stderr, "[HLE UNIMPLEMENTED] NID=0x%llx (caller RIP=0x%llx, rdi=0x%llx '%s', rsi=0x%llx '%s', rdx=0x%llx)\n",
+                     (unsigned long long)nid, (unsigned long long)ret_addr, (unsigned long long)sctx.args[0],
                      str_arg0 ? str_arg0 : "", (unsigned long long)sctx.args[1],
                      str_arg1 ? str_arg1 : "", (unsigned long long)sctx.args[2]);
+        GuestAddr cur_rbp = sctx.rbp;
+        for (int f = 0; f < 8 && cur_rbp > 0x1000 && m_memory.is_valid_address(cur_rbp, 16); ++f) {
+            GuestAddr saved_rip = 0;
+            GuestAddr saved_rbp = 0;
+            m_memory.read_value(cur_rbp + 8, saved_rip);
+            m_memory.read_value(cur_rbp, saved_rbp);
+            std::fprintf(stderr, "  frame #%d: RIP=0x%llx, RBP=0x%llx\n", f, (unsigned long long)saved_rip, (unsigned long long)saved_rbp);
+            cur_rbp = saved_rbp;
+        }
         sctx.rax = 0;
         return 0;
     });

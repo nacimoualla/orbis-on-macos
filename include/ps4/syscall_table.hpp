@@ -16,6 +16,7 @@ struct SyscallContext {
     u64 rax{0};                   // Return value register
     u64 rcx{0};                   // 4th argument in userspace calling convention (System V)
     u64 rsp{0};                   // Stack pointer register
+    u64 rbp{0};                   // Base pointer register
     MemoryManager* memory{nullptr}; // Pointer to guest memory manager
     VirtualFileSystem* vfs{nullptr}; // Pointer to virtual file system
 
