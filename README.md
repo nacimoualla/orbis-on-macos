@@ -1,13 +1,14 @@
 # orbis-on-macos
 
+**A PlayStation 4 (PS4) emulator & Orbis compatibility layer for Apple Silicon macOS.**
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/nacimoualla/orbis-on-macos?style=social)](https://github.com/nacimoualla/orbis-on-macos/stargazers)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black)](https://github.com/nacimoualla/orbis-on-macos)
 [![C++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](CMakeLists.txt)
 [![Build](https://img.shields.io/badge/build-CMake%203.25%2B-brightgreen)](CMakeLists.txt)
 
-A **userland compatibility layer & runtime** that lets PlayStation 4 (Orbis OS) applications execute natively on **Apple Silicon macOS**.
-
-Instead of emulating the whole console, `orbis-on-macos` is a clean-room, high-level userland runtime: it loads a PS4 `eboot.bin`/ELF or PRX module, maps the guest's 8 GB address space into the Mac's unified memory, dynamically recompiles guest `x86_64` code to native `ARM64`, translates the GNM/Metal GPU command stream and delivers audio through CoreAudio — all on top of Darwin/Mach and Apple frameworks.
+`orbis-on-macos` is an open-source **PlayStation 4 emulator** — a clean-room **userland compatibility layer & runtime** that runs PS4 (Orbis OS) games and apps **natively on Apple Silicon macOS**. Instead of emulating the whole console, it loads a PS4 `eboot.bin`/ELF or PRX module, maps the guest's 8 GB address space into the Mac's unified memory, dynamically recompiles guest `x86_64` code to native `ARM64`, translates the GNM/Metal GPU command stream and delivers audio through CoreAudio — all on top of Darwin/Mach and Apple frameworks.
 
 > **Status:** Phases 1–14 implemented and verified (see [ROADMAP.md](ROADMAP.md)). CPU interpreter + ARM64 JIT, PRX/NID dynamic linker, Orbis syscall HLE, VFS, Metal graphics pipeline, CoreAudio, and threading are all in place.
 
@@ -147,6 +148,13 @@ cd build && ctest --output-on-failure
 - [ROADMAP.md](ROADMAP.md) — interactive, phase-by-phase implementation plan.
 - [GLOSSARY.md](GLOSSARY.md) — canonical terminology (Orbis, GNM, NID, PRX, HLE, …).
 - [docs/adr/](docs/adr/) — architecture decision records.
+
+## 🙏 Related projects
+
+- **[shadPS4](https://github.com/shadps4-emu/shadPS4)** — the leading cross-platform PS4 emulator (Windows / Linux / macOS / FreeBSD), built on Vulkan. If you want an end-user GUI today, start there.
+- **[orbital](https://github.com/cy33hc/orbital)** — an experimental, research-oriented PS4 emulator.
+
+`orbis-on-macos` takes a **Mac-first** angle: an Apple Silicon–native, Metal/CoreAudio userland runtime with an `x86-64 → ARM64` dynamic binary translator, explored as a from-scratch, clean-room build.
 
 ## 📄 License
 
