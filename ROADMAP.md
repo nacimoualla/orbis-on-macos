@@ -359,38 +359,40 @@ The goal of this phase is to extend the PM4 GPU command processor to support 3D 
 
 ---
 
-*All phases 1 through 14 successfully implemented and verified with 100% test pass rate!*
-
----
-
-# 🚧 Next Up — Candidate Phases (15+)
-
-_Phases 1–14 built the runtime and are verified against synthetic `samples/*.elf` fixtures. The phases below are the identified next steps to progress from samples toward running real retail titles, ordered by dependency and impact. Each "Verified starting point" was confirmed against the current tree._
-
-### Verified starting points (current tree)
-- The **ARM64 JIT (`Arm64Emitter`) is not connected** — `cpu.set_jit_compiler(&jit)` is commented out in `src/main.cpp`; the interpreter is executing.
-- **Input does not exist yet** — no `libScePad` HLE, no GameController backend, and no keyboard/mouse capture in `DisplayWindow`, despite ADR 0009.
-- **HLE breadth is thin** — only `libSceFios2` (done) and `libSceCommonDialog` are substantially implemented; `libSceVideoOut`, `libSceUserService`, `libSceSysmodule`, `libSceNgs2` and media decoders are missing. (`libaudioout` symbols are registered.)
-- **Graphics uses a fixed inline MSL mesh shader** — ADR 0007's two-tier GCN→MSL translation and texture/sampler binding are not yet implemented.
-
 ## 📌 Phase 15: Connect the ARM64 JIT to the Executor
 
 The goal is to activate the existing `JitCompiler`/`Arm64Emitter` for throughput while keeping the interpreter as a fallback.
 
-- [ ] **Step 15.1: Wire `JitCompiler` into `CpuExecutor`**
+- [x] **Step 15.1: Wire `JitCompiler` into `CpuExecutor`**
   - Implement/enable `set_jit_compiler(&jit)` and dispatch translated blocks by guest PC.
 
-- [ ] **Step 15.2: Code cache & basic-block boundaries**
+- [x] **Step 15.2: Code cache & basic-block boundaries**
   - Linear-sweep/block scanning to find branch targets; cache translated blocks keyed by guest PC.
 
-- [ ] **Step 15.3: W^X code cache on Apple Silicon**
+- [x] **Step 15.3: W^X code cache on Apple Silicon**
   - Guest pages are per-`phdr` RWX; use a separate `MAP_JIT` code cache with `pthread_jit_write_protect()` to satisfy hardened-runtime W^X.
 
-- [ ] **Step 15.4: Exit the JIT for interrupts**
+- [x] **Step 15.4: Exit the JIT for interrupts**
   - Fall back to the interpreter on syscalls, page faults, and traps; keep guest register state consistent across the boundary.
 
-- [ ] **Step 15.5: Benchmark interpreter vs. JIT**
+- [x] **Step 15.5: Benchmark interpreter vs. JIT**
   - Measure instructions/sec on `samples/*.elf` (`test_phase15`).
+
+---
+
+*All phases 1 through 15 successfully implemented and verified with 100% test pass rate!*
+
+---
+
+# 🚧 Next Up — Candidate Phases (16+)
+
+_Phases 1–15 built the runtime and are verified against synthetic `samples/*.elf` fixtures. The phases below are the identified next steps to progress from samples toward running real retail titles, ordered by dependency and impact._
+
+### Verified starting points (current tree)
+- The **ARM64 JIT (`Arm64Emitter`) is connected** — `cpu.set_jit_compiler(&jit)` active by default with seamless interpreter fallback and W^X support.
+- **Input does not exist yet** — no `libScePad` HLE, no GameController backend, and no keyboard/mouse capture in `DisplayWindow`, despite ADR 0009.
+- **HLE breadth is thin** — only `libSceFios2` (done) and `libSceCommonDialog` are substantially implemented; `libSceVideoOut`, `libSceUserService`, `libSceSysmodule`, `libSceNgs2` and media decoders are missing. (`libaudioout` symbols are registered.)
+- **Graphics uses a fixed inline MSL mesh shader** — ADR 0007's two-tier GCN→MSL translation and texture/sampler binding are not yet implemented.
 
 ## 📌 Phase 16: Input — GameController Framework (closes ADR 0009)
 

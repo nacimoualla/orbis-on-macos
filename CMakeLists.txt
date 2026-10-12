@@ -113,5 +113,9 @@ add_executable(test_phase14 tests/test_phase14.cpp)
 target_link_libraries(test_phase14 PRIVATE ps4_core)
 add_test(NAME Phase14_MeshPipeline COMMAND test_phase14)
 
+add_executable(test_phase15 tests/test_phase15.cpp)
+target_link_libraries(test_phase15 PRIVATE ps4_core)
+add_test(NAME Phase15_JitExecutorIntegration COMMAND test_phase15)
+
 
 

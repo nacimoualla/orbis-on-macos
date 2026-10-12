@@ -21,6 +21,8 @@ int main(int argc, char* argv[]) {
     std::cout << "========================================================\n";
 
     bool enable_window = false;
+    bool enable_jit = true;
+    bool enable_trace = false;
     std::filesystem::path elf_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -29,11 +31,17 @@ int main(int argc, char* argv[]) {
             enable_window = true;
         } else if (arg == "--headless") {
             enable_window = false;
+        } else if (arg == "--no-jit") {
+            enable_jit = false;
+        } else if (arg == "--trace" || arg == "-t") {
+            enable_trace = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: ps4-runner [options] <path-to-eboot.bin-or-elf>\n";
             std::cout << "Options:\n";
             std::cout << "  --window, -w     Open interactive macOS display window (60 FPS)\n";
             std::cout << "  --headless       Run headlessly in console only (default)\n";
+            std::cout << "  --no-jit         Disable ARM64 JIT dynamic recompiler (interpreter only)\n";
+            std::cout << "  --trace, -t      Trace guest instruction execution step-by-step\n";
             return 0;
         } else {
             elf_path = argv[i];
@@ -135,7 +143,12 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[CPU] Initializing execution engine & ARM64 JIT dynamic recompiler...\n";
     ps4::JitCompiler jit;
     ps4::CpuExecutor cpu(memory, syscalls);
-    // cpu.set_jit_compiler(&jit);
+    if (enable_jit) {
+        cpu.set_jit_compiler(&jit);
+        std::cout << "[CPU] ARM64 JIT compiler connected to executor (Tier-2 Dynamic Binary Translation active)\n";
+    } else {
+        std::cout << "[CPU] Running in pure interpreter mode (--no-jit specified)\n";
+    }
     if (!cpu.setup_default_stack()) {
         std::cerr << "[Error] Failed to allocate stack.\n";
         return 1;
@@ -145,27 +158,44 @@ int main(int argc, char* argv[]) {
     std::cout << "[CPU] RSP initialized to:     0x" << std::hex << cpu.context().rsp << std::dec << "\n";
 
     std::cout << "\n================= Guest Execution Output =================\n";
-    for (int i = 0; i < 20; ++i) {
-        ps4::GuestAddr cur_rip = cpu.context().rip;
-        ps4::StepResult sr = cpu.step();
-        std::cout << "Step " << i << ": RIP=0x" << std::hex << cur_rip << " -> 0x" << cpu.context().rip 
-                  << " (" << ps4::step_result_to_string(sr) << ")\n" << std::dec;
-        if (sr != ps4::StepResult::Ok) break;
-    }
     ps4::RunResult run_res{};
     ps4::usize total_instructions = 0;
-    const ps4::usize batch = 1000000;
-    const ps4::usize max_total = 20000000;
-    while (total_instructions < max_total) {
-        run_res = cpu.run(batch);
-        total_instructions += run_res.instructions_executed;
-        if (run_res.status != ps4::StepResult::Ok) break;
-        std::cout << "[CPU Progress] " << total_instructions << " instrs, RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n";
+
+    if (enable_trace) {
+        for (int i = 0; i < 20; ++i) {
+            ps4::GuestAddr cur_rip = cpu.context().rip;
+            ps4::StepResult sr = cpu.step();
+            std::cout << "Step " << i << ": RIP=0x" << std::hex << cur_rip << " -> 0x" << cpu.context().rip 
+                      << " (" << ps4::step_result_to_string(sr) << ")\n" << std::dec;
+            total_instructions++;
+            if (sr != ps4::StepResult::Ok) {
+                run_res.status = sr;
+                if (sr == ps4::StepResult::Exited) {
+                    run_res.exit_code = syscalls.exit_code();
+                }
+                break;
+            }
+        }
+    }
+
+    if (!syscalls.has_exited() && run_res.status == ps4::StepResult::Ok) {
+        const ps4::usize batch = 1000000;
+        const ps4::usize max_total = 20000000;
+        while (total_instructions < max_total) {
+            run_res = cpu.run(batch);
+            total_instructions += run_res.instructions_executed;
+            if (run_res.status != ps4::StepResult::Ok) break;
+            std::cout << "[CPU Progress] " << total_instructions << " instrs, RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n";
+        }
     }
     std::cout << "==========================================================\n";
 
     std::cout << "\n[CPU] Execution Status: " << ps4::step_result_to_string(run_res.status) << "\n";
     std::cout << "[CPU] Instructions Executed: " << total_instructions << "\n";
+    if (enable_jit && jit.cached_block_count() > 0) {
+        std::cout << "[CPU] JIT Blocks Cached: " << jit.cached_block_count()
+                  << " | Total Invocations: " << jit.total_invocations() << "\n";
+    }
     if (run_res.status == ps4::StepResult::Exited) {
         std::cout << "[CPU] Process Exit Code: " << run_res.exit_code << "\n";
     }

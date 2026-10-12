@@ -56,6 +56,16 @@ void Arm64Emitter::ldr_reg(u8 rt, u8 rn, u32 offset_bytes) {
     emit(0xf9400000 | (imm12 << 10) | (static_cast<u32>(rn) << 5) | rt);
 }
 
+void Arm64Emitter::str_w(u8 rt, u8 rn, u32 offset_bytes) {
+    const u32 imm12 = (offset_bytes / 4) & 0xFFF;
+    emit(0xb9000000 | (imm12 << 10) | (static_cast<u32>(rn) << 5) | rt);
+}
+
+void Arm64Emitter::ldr_w(u8 rt, u8 rn, u32 offset_bytes) {
+    const u32 imm12 = (offset_bytes / 4) & 0xFFF;
+    emit(0xb9400000 | (imm12 << 10) | (static_cast<u32>(rn) << 5) | rt);
+}
+
 void Arm64Emitter::str_zero(u8 rn, u32 offset_bytes) {
     str_reg(31, rn, offset_bytes); // xzr = 31
 }
@@ -66,6 +76,22 @@ void Arm64Emitter::add_reg(u8 rd, u8 rn, u8 rm) {
 
 void Arm64Emitter::sub_reg(u8 rd, u8 rn, u8 rm) {
     emit(0xcb000000 | (static_cast<u32>(rm) << 16) | (static_cast<u32>(rn) << 5) | rd);
+}
+
+void Arm64Emitter::adds_reg(u8 rd, u8 rn, u8 rm) {
+    emit(0xab000000 | (static_cast<u32>(rm) << 16) | (static_cast<u32>(rn) << 5) | rd);
+}
+
+void Arm64Emitter::subs_reg(u8 rd, u8 rn, u8 rm) {
+    emit(0xeb000000 | (static_cast<u32>(rm) << 16) | (static_cast<u32>(rn) << 5) | rd);
+}
+
+void Arm64Emitter::b(i32 offset_words) {
+    emit(0x14000000 | (static_cast<u32>(offset_words) & 0x03ffffff));
+}
+
+void Arm64Emitter::b_cond(u8 cond, i32 offset_words) {
+    emit(0x54000000 | ((static_cast<u32>(offset_words) & 0x7ffff) << 5) | (cond & 0xf));
 }
 
 void Arm64Emitter::add_imm(u8 rd, u8 rn, u32 imm12) {
@@ -215,16 +241,34 @@ void JitCompiler::commit_code(void* dest, const u32* src, usize size_bytes) {
 }
 
 bool JitCompiler::is_block_cached(GuestAddr guest_rip) const {
+    std::lock_guard<std::mutex> lock(m_cache_mutex);
     return m_blocks.find(guest_rip) != m_blocks.end();
 }
 
 void JitCompiler::clear_cache() {
+    std::lock_guard<std::mutex> lock(m_cache_mutex);
     m_blocks.clear();
     m_metrics.clear();
     m_code_buffer_offset = 0;
 }
 
+usize JitCompiler::cached_block_count() const noexcept {
+    std::lock_guard<std::mutex> lock(m_cache_mutex);
+    return m_blocks.size();
+}
+
+usize JitCompiler::code_buffer_used() const noexcept {
+    std::lock_guard<std::mutex> lock(m_cache_mutex);
+    return m_code_buffer_offset;
+}
+
+usize JitCompiler::total_invocations() const noexcept {
+    std::lock_guard<std::mutex> lock(m_cache_mutex);
+    return m_total_invocations;
+}
+
 const JitBlockMetrics* JitCompiler::get_block_metrics(GuestAddr guest_rip) const {
+    std::lock_guard<std::mutex> lock(m_cache_mutex);
     auto it = m_metrics.find(guest_rip);
     if (it != m_metrics.end()) {
         return &it->second;
@@ -233,6 +277,11 @@ const JitBlockMetrics* JitCompiler::get_block_metrics(GuestAddr guest_rip) const
 }
 
 JittedBlockFunc JitCompiler::compile_block(GuestAddr guest_rip, const MemoryManager& memory) {
+    std::lock_guard<std::mutex> lock(m_cache_mutex);
+    return compile_block_locked(guest_rip, memory);
+}
+
+JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip, const MemoryManager& memory) {
     if (auto it = m_blocks.find(guest_rip); it != m_blocks.end()) {
         return it->second;
     }
@@ -256,14 +305,51 @@ JittedBlockFunc JitCompiler::compile_block(GuestAddr guest_rip, const MemoryMana
         const u8* code = memory.to_host_ptr<u8>(current_rip);
         if (!code) break;
 
-        const u8 op0 = code[0];
+        usize cursor = 0;
+        bool rex_w = false, rex_r = false, rex_b = false;
+        bool has_rex = false;
+
+        // Decode legacy prefixes and REX prefix
+        while (cursor < 15 && memory.is_valid_address(current_rip + cursor, 1)) {
+            const u8 byte = code[cursor];
+            if (byte >= 0x40 && byte <= 0x4F) {
+                has_rex = true;
+                rex_w = (byte & 0x08) != 0;
+                rex_r = (byte & 0x04) != 0;
+                rex_b = (byte & 0x01) != 0;
+                cursor++;
+            } else {
+                break;
+            }
+        }
+
+        if (!memory.is_valid_address(current_rip + cursor, 1)) {
+            break;
+        }
+
+        const u8 op0 = code[cursor];
 
         // 0x90: NOP
-        if (op0 == 0x90) {
+        if (op0 == 0x90 && !has_rex) {
             m_emitter.nop();
-            current_rip += 1;
+            current_rip += cursor + 1;
             instructions++;
             continue;
+        }
+
+        // Multi-byte NOP: 0x0F 0x1F /0
+        if (op0 == 0x0F && memory.is_valid_address(current_rip + cursor, 3) && code[cursor + 1] == 0x1F) {
+            const u8 modrm = code[cursor + 2];
+            const u8 mod = (modrm >> 6) & 3;
+            usize len = 3;
+            if (mod == 1) len = 4;
+            else if (mod == 2) len = 7;
+            if (memory.is_valid_address(current_rip + cursor, len)) {
+                m_emitter.nop();
+                current_rip += cursor + len;
+                instructions++;
+                continue;
+            }
         }
 
         // 0xF4: HLT (end block without advancing RIP so interpreter steps into it)
@@ -273,142 +359,278 @@ JittedBlockFunc JitCompiler::compile_block(GuestAddr guest_rip, const MemoryMana
         }
 
         // 0x0F 0x05: SYSCALL (end block without advancing RIP so interpreter steps into it)
-        if (op0 == 0x0F && memory.is_valid_address(current_rip, 2) && code[1] == 0x05) {
+        if (op0 == 0x0F && memory.is_valid_address(current_rip + cursor, 2) && code[cursor + 1] == 0x05) {
             block_ended = true;
             break;
         }
 
-        // 0x31: XOR reg, reg
-        if (op0 == 0x31 && memory.is_valid_address(current_rip, 2)) {
-            const u8 modrm = code[1];
-            if (modrm == 0xC0) { // xor eax, eax
-                m_emitter.str_zero(19, offsetof(CpuContext, rax));
-                current_rip += 2; instructions++; continue;
-            }
-            if (modrm == 0xFF) { // xor edi, edi
-                m_emitter.str_zero(19, offsetof(CpuContext, rdi));
-                current_rip += 2; instructions++; continue;
-            }
-            if (modrm == 0xF6) { // xor esi, esi
-                m_emitter.str_zero(19, offsetof(CpuContext, rsi));
-                current_rip += 2; instructions++; continue;
-            }
-            if (modrm == 0xD2) { // xor edx, edx
-                m_emitter.str_zero(19, offsetof(CpuContext, rdx));
-                current_rip += 2; instructions++; continue;
-            }
+        // 0x0F 0x0B: UD2 (end block without advancing RIP so interpreter steps into it)
+        if (op0 == 0x0F && memory.is_valid_address(current_rip + cursor, 2) && code[cursor + 1] == 0x0B) {
+            block_ended = true;
+            break;
         }
 
-        // 0xB8 - 0xBF: MOV reg32, imm32 (5 bytes)
-        if (op0 >= 0xB8 && op0 <= 0xBF && memory.is_valid_address(current_rip, 5)) {
-            u32 imm32 = 0;
-            std::memcpy(&imm32, code + 1, sizeof(imm32));
-            u32 off = offsetof(CpuContext, rax);
-            switch (op0) {
-                case 0xB8: off = offsetof(CpuContext, rax); break;
-                case 0xB9: off = offsetof(CpuContext, rcx); break;
-                case 0xBA: off = offsetof(CpuContext, rdx); break;
-                case 0xBB: off = offsetof(CpuContext, rbx); break;
-                case 0xBE: off = offsetof(CpuContext, rsi); break;
-                case 0xBF: off = offsetof(CpuContext, rdi); break;
-                default: break;
-            }
-            m_emitter.mov_imm64(0, imm32);
-            m_emitter.str_reg(0, 19, off);
-            current_rip += 5;
-            instructions++;
-            continue;
+        // 0xCC: INT3 (end block without advancing RIP so interpreter steps into it)
+        if (op0 == 0xCC) {
+            block_ended = true;
+            break;
         }
 
-        // REX.W prefix (0x48) instructions
-        if (op0 == 0x48 && memory.is_valid_address(current_rip, 2)) {
-            const u8 op1 = code[1];
-
-            // 0x48 0xC7: MOV r/m64, imm32 (sign-extended, 7 bytes)
-            if (op1 == 0xC7 && memory.is_valid_address(current_rip, 7)) {
-                const u8 modrm = code[2];
-                i32 imm32 = 0;
-                std::memcpy(&imm32, code + 3, sizeof(imm32));
-                const u64 imm64 = static_cast<u64>(static_cast<i64>(imm32));
-
-                u32 off = offsetof(CpuContext, rax);
-                if (modrm == 0xC0) off = offsetof(CpuContext, rax);
-                else if (modrm == 0xC1) off = offsetof(CpuContext, rcx);
-                else if (modrm == 0xC2) off = offsetof(CpuContext, rdx);
-                else if (modrm == 0xC3) off = offsetof(CpuContext, rbx);
-                else if (modrm == 0xC6) off = offsetof(CpuContext, rsi);
-                else if (modrm == 0xC7) off = offsetof(CpuContext, rdi);
-                else break;
-
-                m_emitter.mov_imm64(0, imm64);
-                m_emitter.str_reg(0, 19, off);
-                current_rip += 7;
-                instructions++;
-                continue;
-            }
-
-            // 0x48 0xB8 - 0xBF: MOVABS reg64, imm64 (10 bytes)
-            if (op1 >= 0xB8 && op1 <= 0xBF && memory.is_valid_address(current_rip, 10)) {
-                u64 imm64 = 0;
-                std::memcpy(&imm64, code + 2, sizeof(imm64));
-                u32 off = offsetof(CpuContext, rax);
-                switch (op1) {
-                    case 0xB8: off = offsetof(CpuContext, rax); break;
-                    case 0xB9: off = offsetof(CpuContext, rcx); break;
-                    case 0xBA: off = offsetof(CpuContext, rdx); break;
-                    case 0xBB: off = offsetof(CpuContext, rbx); break;
-                    case 0xBE: off = offsetof(CpuContext, rsi); break;
-                    case 0xBF: off = offsetof(CpuContext, rdi); break;
-                    default: break;
-                }
-                m_emitter.mov_imm64(0, imm64);
-                m_emitter.str_reg(0, 19, off);
-                current_rip += 10;
-                instructions++;
-                continue;
-            }
-
-            // 0x48 0x01: ADD r/m64, r64 (3 bytes)
-            if (op1 == 0x01 && memory.is_valid_address(current_rip, 3)) {
-                const u8 modrm = code[2];
-                const u8 rm_idx = (modrm >> 3) & 0x7;
-                const u8 rn_idx = modrm & 0x7;
-                const u32 off_rm = get_gpr_offset(rm_idx);
-                const u32 off_rn = get_gpr_offset(rn_idx);
-
-                m_emitter.ldr_reg(0, 19, off_rn); // x0 = dest
-                m_emitter.ldr_reg(1, 19, off_rm); // x1 = src
-                m_emitter.add_reg(0, 0, 1);
-                m_emitter.str_reg(0, 19, off_rn);
-
-                current_rip += 3;
-                instructions++;
-                continue;
-            }
-
-            // 0x48 0x29: SUB r/m64, r64 (3 bytes)
-            if (op1 == 0x29 && memory.is_valid_address(current_rip, 3)) {
-                const u8 modrm = code[2];
-                const u8 rm_idx = (modrm >> 3) & 0x7;
-                const u8 rn_idx = modrm & 0x7;
-                const u32 off_rm = get_gpr_offset(rm_idx);
-                const u32 off_rn = get_gpr_offset(rn_idx);
-
-                m_emitter.ldr_reg(0, 19, off_rn); // x0 = dest
-                m_emitter.ldr_reg(1, 19, off_rm); // x1 = src
-                m_emitter.sub_reg(0, 0, 1);
-                m_emitter.str_reg(0, 19, off_rn);
-
-                current_rip += 3;
-                instructions++;
-                continue;
-            }
-        }
-
-        // 0xC3: RET (end block without advancing RIP so interpreter step handles the stack pop)
+        // 0xC3: RET (end block without advancing RIP so interpreter steps into it)
         if (op0 == 0xC3) {
             block_ended = true;
             break;
+        }
+
+        // 0xE8: CALL rel32 (end block without advancing RIP so interpreter steps into it)
+        if (op0 == 0xE8) {
+            block_ended = true;
+            break;
+        }
+
+        // Conditional jumps: 0x70 .. 0x7F and 0x0F 0x80 .. 0x8F (end block so interpreter steps)
+        if ((op0 >= 0x70 && op0 <= 0x7F) ||
+            (op0 == 0x0F && memory.is_valid_address(current_rip + cursor, 2) &&
+             code[cursor + 1] >= 0x80 && code[cursor + 1] <= 0x8F)) {
+            block_ended = true;
+            break;
+        }
+
+        // 0xEB: JMP rel8
+        if (op0 == 0xEB && memory.is_valid_address(current_rip + cursor, 2)) {
+            const i8 rel = static_cast<i8>(code[cursor + 1]);
+            const GuestAddr target = current_rip + cursor + 2 + rel;
+            current_rip = target;
+            instructions++;
+            block_ended = true;
+            break;
+        }
+
+        // 0xE9: JMP rel32
+        if (op0 == 0xE9 && memory.is_valid_address(current_rip + cursor, 5)) {
+            i32 rel = 0;
+            std::memcpy(&rel, code + cursor + 1, 4);
+            const GuestAddr target = current_rip + cursor + 5 + rel;
+            current_rip = target;
+            instructions++;
+            block_ended = true;
+            break;
+        }
+
+        // 0xB8 - 0xBF: MOV reg32, imm32 OR (with REX.W) MOVABS reg64, imm64
+        if (op0 >= 0xB8 && op0 <= 0xBF) {
+            const u8 reg_idx = (op0 - 0xB8) | (rex_b ? 8 : 0);
+            const u32 off = get_gpr_offset(reg_idx);
+
+            if (rex_w) {
+                // 64-bit immediate (9 bytes after cursor)
+                if (memory.is_valid_address(current_rip + cursor, 9)) {
+                    u64 imm64 = 0;
+                    std::memcpy(&imm64, code + cursor + 1, sizeof(imm64));
+                    m_emitter.mov_imm64(0, imm64);
+                    m_emitter.str_reg(0, 19, off);
+                    current_rip += cursor + 9;
+                    instructions++;
+                    continue;
+                }
+            } else {
+                // 32-bit immediate (5 bytes after cursor)
+                if (memory.is_valid_address(current_rip + cursor, 5)) {
+                    u32 imm32 = 0;
+                    std::memcpy(&imm32, code + cursor + 1, sizeof(imm32));
+                    m_emitter.mov_imm64(0, imm32); // zero-extends to 64-bit
+                    m_emitter.str_reg(0, 19, off);
+                    current_rip += cursor + 5;
+                    instructions++;
+                    continue;
+                }
+            }
+        }
+
+        // 0xC7 /0: MOV r/m, imm32
+        if (op0 == 0xC7 && memory.is_valid_address(current_rip + cursor, 6)) {
+            const u8 modrm = code[cursor + 1];
+            if ((modrm >> 6) == 3 && ((modrm >> 3) & 7) == 0) { // mod == 3, reg == 0
+                const u8 reg_idx = (modrm & 7) | (rex_b ? 8 : 0);
+                const u32 off = get_gpr_offset(reg_idx);
+                i32 imm32 = 0;
+                std::memcpy(&imm32, code + cursor + 2, sizeof(imm32));
+                const u64 imm_val = rex_w ? static_cast<u64>(static_cast<i64>(imm32))
+                                          : static_cast<u64>(static_cast<u32>(imm32));
+                m_emitter.mov_imm64(0, imm_val);
+                m_emitter.str_reg(0, 19, off);
+                current_rip += cursor + 6;
+                instructions++;
+                continue;
+            }
+        }
+
+        // 0x89: MOV r/m, reg (reg to reg)
+        if (op0 == 0x89 && memory.is_valid_address(current_rip + cursor, 2)) {
+            const u8 modrm = code[cursor + 1];
+            if ((modrm >> 6) == 3) {
+                const u8 dst_idx = (modrm & 7) | (rex_b ? 8 : 0);
+                const u8 src_idx = ((modrm >> 3) & 7) | (rex_r ? 8 : 0);
+                const u32 off_dst = get_gpr_offset(dst_idx);
+                const u32 off_src = get_gpr_offset(src_idx);
+
+                m_emitter.ldr_reg(0, 19, off_src);
+                m_emitter.str_reg(0, 19, off_dst);
+                current_rip += cursor + 2;
+                instructions++;
+                continue;
+            }
+        }
+
+        // 0x8B: MOV reg, r/m (reg to reg)
+        if (op0 == 0x8B && memory.is_valid_address(current_rip + cursor, 2)) {
+            const u8 modrm = code[cursor + 1];
+            if ((modrm >> 6) == 3) {
+                const u8 dst_idx = ((modrm >> 3) & 7) | (rex_r ? 8 : 0);
+                const u8 src_idx = (modrm & 7) | (rex_b ? 8 : 0);
+                const u32 off_dst = get_gpr_offset(dst_idx);
+                const u32 off_src = get_gpr_offset(src_idx);
+
+                m_emitter.ldr_reg(0, 19, off_src);
+                m_emitter.str_reg(0, 19, off_dst);
+                current_rip += cursor + 2;
+                instructions++;
+                continue;
+            }
+        }
+
+        // 0x31 / 0x33: XOR
+        if ((op0 == 0x31 || op0 == 0x33) && memory.is_valid_address(current_rip + cursor, 2)) {
+            const u8 modrm = code[cursor + 1];
+            if ((modrm >> 6) == 3) {
+                const u8 dst_idx = (op0 == 0x31) ? ((modrm & 7) | (rex_b ? 8 : 0))
+                                                 : (((modrm >> 3) & 7) | (rex_r ? 8 : 0));
+                const u8 src_idx = (op0 == 0x31) ? (((modrm >> 3) & 7) | (rex_r ? 8 : 0))
+                                                 : ((modrm & 7) | (rex_b ? 8 : 0));
+                const u32 off_dst = get_gpr_offset(dst_idx);
+                const u32 off_src = get_gpr_offset(src_idx);
+
+                if (dst_idx == src_idx) {
+                    m_emitter.str_zero(19, off_dst);
+                } else {
+                    m_emitter.ldr_reg(0, 19, off_dst);
+                    m_emitter.ldr_reg(1, 19, off_src);
+                    m_emitter.eor_reg(0, 0, 1);
+                    m_emitter.str_reg(0, 19, off_dst);
+                }
+                current_rip += cursor + 2;
+                instructions++;
+                continue;
+            }
+        }
+
+        // 0x01 / 0x03: ADD
+        if ((op0 == 0x01 || op0 == 0x03) && memory.is_valid_address(current_rip + cursor, 2)) {
+            const u8 modrm = code[cursor + 1];
+            if ((modrm >> 6) == 3) {
+                const u8 dst_idx = (op0 == 0x01) ? ((modrm & 7) | (rex_b ? 8 : 0))
+                                                 : (((modrm >> 3) & 7) | (rex_r ? 8 : 0));
+                const u8 src_idx = (op0 == 0x01) ? (((modrm >> 3) & 7) | (rex_r ? 8 : 0))
+                                                 : ((modrm & 7) | (rex_b ? 8 : 0));
+                const u32 off_dst = get_gpr_offset(dst_idx);
+                const u32 off_src = get_gpr_offset(src_idx);
+
+                m_emitter.ldr_reg(0, 19, off_dst);
+                m_emitter.ldr_reg(1, 19, off_src);
+                m_emitter.add_reg(0, 0, 1);
+                m_emitter.str_reg(0, 19, off_dst);
+                current_rip += cursor + 2;
+                instructions++;
+                continue;
+            }
+        }
+
+        // 0x29 / 0x2B: SUB
+        if ((op0 == 0x29 || op0 == 0x2B) && memory.is_valid_address(current_rip + cursor, 2)) {
+            const u8 modrm = code[cursor + 1];
+            if ((modrm >> 6) == 3) {
+                const u8 dst_idx = (op0 == 0x29) ? ((modrm & 7) | (rex_b ? 8 : 0))
+                                                 : (((modrm >> 3) & 7) | (rex_r ? 8 : 0));
+                const u8 src_idx = (op0 == 0x29) ? (((modrm >> 3) & 7) | (rex_r ? 8 : 0))
+                                                 : ((modrm & 7) | (rex_b ? 8 : 0));
+                const u32 off_dst = get_gpr_offset(dst_idx);
+                const u32 off_src = get_gpr_offset(src_idx);
+
+                m_emitter.ldr_reg(0, 19, off_dst);
+                m_emitter.ldr_reg(1, 19, off_src);
+                m_emitter.sub_reg(0, 0, 1);
+                m_emitter.str_reg(0, 19, off_dst);
+                current_rip += cursor + 2;
+                instructions++;
+                continue;
+            }
+        }
+
+        // 0x21 / 0x23: AND
+        if ((op0 == 0x21 || op0 == 0x23) && memory.is_valid_address(current_rip + cursor, 2)) {
+            const u8 modrm = code[cursor + 1];
+            if ((modrm >> 6) == 3) {
+                const u8 dst_idx = (op0 == 0x21) ? ((modrm & 7) | (rex_b ? 8 : 0))
+                                                 : (((modrm >> 3) & 7) | (rex_r ? 8 : 0));
+                const u8 src_idx = (op0 == 0x21) ? (((modrm >> 3) & 7) | (rex_r ? 8 : 0))
+                                                 : ((modrm & 7) | (rex_b ? 8 : 0));
+                const u32 off_dst = get_gpr_offset(dst_idx);
+                const u32 off_src = get_gpr_offset(src_idx);
+
+                m_emitter.ldr_reg(0, 19, off_dst);
+                m_emitter.ldr_reg(1, 19, off_src);
+                m_emitter.and_reg(0, 0, 1);
+                m_emitter.str_reg(0, 19, off_dst);
+                current_rip += cursor + 2;
+                instructions++;
+                continue;
+            }
+        }
+
+        // 0x09 / 0x0B: OR
+        if ((op0 == 0x09 || op0 == 0x0B) && memory.is_valid_address(current_rip + cursor, 2)) {
+            const u8 modrm = code[cursor + 1];
+            if ((modrm >> 6) == 3) {
+                const u8 dst_idx = (op0 == 0x09) ? ((modrm & 7) | (rex_b ? 8 : 0))
+                                                 : (((modrm >> 3) & 7) | (rex_r ? 8 : 0));
+                const u8 src_idx = (op0 == 0x09) ? (((modrm >> 3) & 7) | (rex_r ? 8 : 0))
+                                                 : ((modrm & 7) | (rex_b ? 8 : 0));
+                const u32 off_dst = get_gpr_offset(dst_idx);
+                const u32 off_src = get_gpr_offset(src_idx);
+
+                m_emitter.ldr_reg(0, 19, off_dst);
+                m_emitter.ldr_reg(1, 19, off_src);
+                m_emitter.orr_reg(0, 0, 1);
+                m_emitter.str_reg(0, 19, off_dst);
+                current_rip += cursor + 2;
+                instructions++;
+                continue;
+            }
+        }
+
+        // 0x83: ALU r/m with imm8
+        if (op0 == 0x83 && memory.is_valid_address(current_rip + cursor, 3)) {
+            const u8 modrm = code[cursor + 1];
+            if ((modrm >> 6) == 3) {
+                const u8 reg_idx = (modrm & 7) | (rex_b ? 8 : 0);
+                const u8 subop = (modrm >> 3) & 7;
+                const i8 imm8 = static_cast<i8>(code[cursor + 2]);
+                const u32 off = get_gpr_offset(reg_idx);
+
+                if (subop == 0) { // ADD
+                    m_emitter.ldr_reg(0, 19, off);
+                    if (imm8 >= 0) m_emitter.add_imm(0, 0, static_cast<u32>(imm8));
+                    else m_emitter.sub_imm(0, 0, static_cast<u32>(-imm8));
+                    m_emitter.str_reg(0, 19, off);
+                    current_rip += cursor + 3; instructions++; continue;
+                } else if (subop == 5) { // SUB
+                    m_emitter.ldr_reg(0, 19, off);
+                    if (imm8 >= 0) m_emitter.sub_imm(0, 0, static_cast<u32>(imm8));
+                    else m_emitter.add_imm(0, 0, static_cast<u32>(-imm8));
+                    m_emitter.str_reg(0, 19, off);
+                    current_rip += cursor + 3; instructions++; continue;
+                }
+            }
         }
 
         // Unknown / unsupported instruction: stop compiling block
@@ -445,13 +667,20 @@ JittedBlockFunc JitCompiler::compile_block(GuestAddr guest_rip, const MemoryMana
 }
 
 bool JitCompiler::execute_block(CpuContext& ctx, const MemoryManager& memory) {
-    auto fn = compile_block(ctx.rip, memory);
-    if (!fn) {
-        return false;
+    JittedBlockFunc fn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_cache_mutex);
+        fn = compile_block_locked(ctx.rip, memory);
+        if (!fn) {
+            return false;
+        }
+
+        m_metrics[ctx.rip].execution_count++;
+        m_total_invocations++;
     }
 
-    m_metrics[ctx.rip].execution_count++;
-    m_total_invocations++;
+    // Enforce execute mode for MAP_JIT on Apple Silicon
+    pthread_jit_write_protect_np(1);
 
     fn(&ctx);
     return true;

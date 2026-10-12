@@ -15,20 +15,20 @@
 
 ## 🗺️ Progress & Roadmap
 
-[![Progress](https://img.shields.io/badge/Roadmap-64%25%20complete-blue)](ROADMAP.md) [![Phases](https://img.shields.io/badge/Phases-14%2F22-8250df)](ROADMAP.md) [![Steps](https://img.shields.io/badge/Steps-59%2F88-success)](ROADMAP.md)
+[![Progress](https://img.shields.io/badge/Roadmap-68%25%20complete-blue)](ROADMAP.md) [![Phases](https://img.shields.io/badge/Phases-15%2F22-8250df)](ROADMAP.md) [![Steps](https://img.shields.io/badge/Steps-64%2F88-success)](ROADMAP.md)
 
 ```
-Phases   1–14 (foundation)   ████████████████████  100%  ✅ built & tested
-Phases   1–22 (full roadmap) █████████████░░░░░░░   64%  14/22 phases · 59/88 steps
+Phases   1–15 (runtime + JIT) ████████████████████  100%  ✅ built & tested
+Phases   1–22 (full roadmap)  ██████████████░░░░░░   68%  15/22 phases · 64/88 steps
 ```
 
-The **runtime foundation is complete and tested** — ELF/PRX loader, 8 GB memory, x86_64 interpreter, syscall HLE, NID linker, VFS, Metal pipeline, CoreAudio, and threading (Phases 1–14).
+The **runtime foundation and ARM64 JIT are complete and tested** — ELF/PRX loader, 8 GB memory, x86_64 interpreter + ARM64 JIT dynamic binary translator, syscall HLE, NID linker, VFS, Metal pipeline, CoreAudio, and threading (Phases 1–15).
 
-The remaining **Phases 15–22** are what move it from *synthetic `samples/*.elf`* to *real retail titles* — and it's the harder half: wiring the currently-disabled ARM64 JIT, input, broader HLE, real GCN→MSL shaders, and retail loading. Tracked on the [Next-Up board (#1)](https://github.com/nacimoualla/orbis-on-macos/issues/1):
+The remaining **Phases 16–22** are what move it from *synthetic `samples/*.elf`* to *real retail titles* — input, broader HLE, real GCN→MSL shaders, and retail loading. Tracked on the [Next-Up board (#1)](https://github.com/nacimoualla/orbis-on-macos/issues/1):
 
-- **✅ Foundation (Phases 1–14):** done
-- [ ] [#2](https://github.com/nacimoualla/orbis-on-macos/issues/2) · **P15** — Connect the ARM64 JIT — `ready-for-agent` ← *start here*
-- [ ] [#3](https://github.com/nacimoualla/orbis-on-macos/issues/3) · **P16** — Input (`libScePad` + GameController) — `ready-for-agent`
+- **✅ Foundation + JIT (Phases 1–15):** done
+- [x] [#2](https://github.com/nacimoualla/orbis-on-macos/issues/2) · **P15** — Connect the ARM64 JIT — `done`
+- [ ] [#3](https://github.com/nacimoualla/orbis-on-macos/issues/3) · **P16** — Input (`libScePad` + GameController) — `ready-for-agent` ← *start here*
 - [ ] [#4](https://github.com/nacimoualla/orbis-on-macos/issues/4) · **P17** — Display & present (`libSceVideoOut`) — `ready-for-human`
 - [ ] [#5](https://github.com/nacimoualla/orbis-on-macos/issues/5) · **P18** — Expand HLE coverage — `needs-triage`
 - [ ] [#6](https://github.com/nacimoualla/orbis-on-macos/issues/6) · **P19** — Real GCN→MSL shaders — `ready-for-human`
@@ -100,7 +100,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-This builds the `ps4_core` library, the `ps4-runner` CLI, and the 14 `test_phase*` binaries.
+This builds the `ps4_core` library, the `ps4-runner` CLI, and the 15 `test_phase*` binaries.
 
 ## ▶️ Running
 
@@ -112,6 +112,8 @@ This builds the `ps4_core` library, the `ps4-runner` CLI, and the 14 `test_phase
 |---|---|
 | `--window`, `-w` | Open an interactive macOS Metal window (60 FPS presentation loop). |
 | `--headless` | Run console-only (default). |
+| `--no-jit` | Disable ARM64 JIT dynamic recompiler (interpreter only). |
+| `--trace`, `-t` | Trace guest instruction execution step-by-step. |
 | `--help`, `-h` | Show usage. |
 
 Example with the bundled synthetic sample ELF:
@@ -120,7 +122,7 @@ Example with the bundled synthetic sample ELF:
 ./build/ps4-runner --window samples/triangle_orbis.elf
 ```
 
-The runner loads the binary, maps segments into guest memory, initializes the VFS (mounting the binary's parent directory as `/app0`), resolves NID symbols, initializes the Metal GPU, then executes guest code and reports progress.
+The runner loads the binary, maps segments into guest memory, initializes the VFS (mounting the binary's parent directory as `/app0`), resolves NID symbols, initializes the Metal GPU, then executes guest code via the ARM64 JIT recompiler and reports progress.
 
 **Bring your own titles.** Drop legally obtained game files under `games/<Title>/` (that directory is git-ignored) and point `ps4-runner` at an `eboot.bin`/`.elf`. No game data is included in this repository.
 
@@ -131,7 +133,7 @@ The suite is headless — it exercises CPU translation, memory mapping, the link
 ```bash
 cd build && ctest --output-on-failure
 # or run an individual phase:
-./build/test_phase14
+./build/test_phase15
 ```
 
 | Phase | Focus |
@@ -141,13 +143,13 @@ cd build && ctest --output-on-failure
 | 6, 8 | Offscreen Metal framebuffer, display window |
 | 7 | Dynamic linker & NID resolution |
 | 9–11 | Threading (libkernel), PM4 GPU processor, audio (CoreAudio) |
-| 12–14 | Virtual File System, ARM64 JIT, 3D mesh pipeline |
+| 12–15 | Virtual File System, ARM64 JIT recompiler, 3D mesh pipeline, JIT-executor integration |
 
 ## 📁 Project structure
 
 ```
 .
-├── CMakeLists.txt          # Build: ps4_core lib, ps4-runner, test_phase1..14
+├── CMakeLists.txt          # Build: ps4_core lib, ps4-runner, test_phase1..15
 ├── include/ps4/            # Public headers (per subsystem)
 ├── src/
 │   ├── core/               # ELF loader, memory, syscall table, linker, VFS
@@ -156,13 +158,13 @@ cd build && ctest --output-on-failure
 │   ├── audio/              # Audio manager + CoreAudio backend
 │   └── hle/                # NID registry, threading
 ├── samples/                # Synthetic test ELF fixtures (hello/sample/dynamic/triangle)
-├── tests/                  # test_phase1..14 (CTest)
+├── tests/                  # test_phase1..15 (CTest)
 ├── scripts/                # Utilities (e.g. unpack_self.py)
 ├── vfs_root/               # Default VFS mount points (/app0, /data, /savedata)
 ├── docs/
 │   ├── adr/                # Architecture Decision Records (0001–0009)
 │   └── agents/             # Domain/issue-tracker docs for engineering agents
-├── ROADMAP.md              # Phase-by-phase checklist (1–14)
+├── ROADMAP.md              # Phase-by-phase checklist (1–15)
 ├── GLOSSARY.md             # Orbis/macOS terminology
 └── LICENSE
 ```

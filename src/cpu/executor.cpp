@@ -392,7 +392,7 @@ StepResult CpuExecutor::step() {
     u8 rex = 0;
     bool has_rex = false;
     bool operand_size_16 = false;
-    bool lock_prefix = false;
+    [[maybe_unused]] bool lock_prefix = false;
     u8 rep_prefix = 0;
     u8 seg_override = 0;
 
@@ -2543,9 +2543,7 @@ RunResult CpuExecutor::run(usize max_instructions) {
                     result.exit_code = m_syscalls.exit_code();
                     break;
                 }
-                if (m_context.rip != prev_rip) {
-                    continue;
-                }
+                continue;
             }
         }
 
