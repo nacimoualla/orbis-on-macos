@@ -7,10 +7,34 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black)](https://github.com/nacimoualla/orbis-on-macos)
 [![C++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](CMakeLists.txt)
 [![Build](https://img.shields.io/badge/build-CMake%203.25%2B-brightgreen)](CMakeLists.txt)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ouallanacim)
 
 `orbis-on-macos` is an open-source **PlayStation 4 emulator** — a clean-room **userland compatibility layer & runtime** that runs PS4 (Orbis OS) games and apps **natively on Apple Silicon macOS**. Instead of emulating the whole console, it loads a PS4 `eboot.bin`/ELF or PRX module, maps the guest's 8 GB address space into the Mac's unified memory, dynamically recompiles guest `x86_64` code to native `ARM64`, translates the GNM/Metal GPU command stream and delivers audio through CoreAudio — all on top of Darwin/Mach and Apple frameworks.
 
 > **Status:** Phases 1–14 implemented and verified (see [ROADMAP.md](ROADMAP.md)). CPU interpreter + ARM64 JIT, PRX/NID dynamic linker, Orbis syscall HLE, VFS, Metal graphics pipeline, CoreAudio, and threading are all in place.
+
+## 🗺️ Progress & Roadmap
+
+[![Progress](https://img.shields.io/badge/Roadmap-64%25%20complete-blue)](ROADMAP.md) [![Phases](https://img.shields.io/badge/Phases-14%2F22-8250df)](ROADMAP.md) [![Steps](https://img.shields.io/badge/Steps-59%2F88-success)](ROADMAP.md)
+
+```
+Phases   1–14 (foundation)   ████████████████████  100%  ✅ built & tested
+Phases   1–22 (full roadmap) █████████████░░░░░░░   64%  14/22 phases · 59/88 steps
+```
+
+The **runtime foundation is complete and tested** — ELF/PRX loader, 8 GB memory, x86_64 interpreter, syscall HLE, NID linker, VFS, Metal pipeline, CoreAudio, and threading (Phases 1–14).
+
+The remaining **Phases 15–22** are what move it from *synthetic `samples/*.elf`* to *real retail titles* — and it's the harder half: wiring the currently-disabled ARM64 JIT, input, broader HLE, real GCN→MSL shaders, and retail loading. Tracked on the [Next-Up board (#1)](https://github.com/nacimoualla/orbis-on-macos/issues/1):
+
+- **✅ Foundation (Phases 1–14):** done
+- [ ] [#2](https://github.com/nacimoualla/orbis-on-macos/issues/2) · **P15** — Connect the ARM64 JIT — `ready-for-agent` ← *start here*
+- [ ] [#3](https://github.com/nacimoualla/orbis-on-macos/issues/3) · **P16** — Input (`libScePad` + GameController) — `ready-for-agent`
+- [ ] [#4](https://github.com/nacimoualla/orbis-on-macos/issues/4) · **P17** — Display & present (`libSceVideoOut`) — `ready-for-human`
+- [ ] [#5](https://github.com/nacimoualla/orbis-on-macos/issues/5) · **P18** — Expand HLE coverage — `needs-triage`
+- [ ] [#6](https://github.com/nacimoualla/orbis-on-macos/issues/6) · **P19** — Real GCN→MSL shaders — `ready-for-human`
+- [ ] [#7](https://github.com/nacimoualla/orbis-on-macos/issues/7) · **P20** — PM4/GPU expansion — `ready-for-human` *(blocked by #6)*
+- [ ] [#8](https://github.com/nacimoualla/orbis-on-macos/issues/8) · **P21** — SELF/`.pkg` retail loading — `ready-for-human`
+- [ ] [#9](https://github.com/nacimoualla/orbis-on-macos/issues/9) · **P22** — Concurrency + save data — `ready-for-human`
 
 ---
 
@@ -155,6 +179,12 @@ cd build && ctest --output-on-failure
 - **[orbital](https://github.com/cy33hc/orbital)** — an experimental, research-oriented PS4 emulator.
 
 `orbis-on-macos` takes a **Mac-first** angle: an Apple Silicon–native, Metal/CoreAudio userland runtime with an `x86-64 → ARM64` dynamic binary translator, explored as a from-scratch, clean-room build.
+
+## ☕ Support
+
+If this project helps you, consider [buying me a coffee](https://buymeacoffee.com/ouallanacim) — it funds the late-night emulator debugging. Every cup is genuinely appreciated. 🙏
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ouallanacim)
 
 ## 📄 License
 
