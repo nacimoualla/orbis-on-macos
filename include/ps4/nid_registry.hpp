@@ -43,6 +43,22 @@ public:
     /// Attach virtual file system for HLE I/O routines
     void set_vfs(class VirtualFileSystem* vfs);
 
+    /// Attach MetalBackend for video out display presentation
+    void set_metal_backend(class MetalBackend* metal);
+
+    /// Attach SyscallTable for guest thread execution
+    void set_syscall_table(class SyscallTable* syscalls);
+
+    /// Attach JIT compiler for guest thread execution
+    void set_jit_compiler(class JitCompiler* jit);
+
+    /// Access active ThreadManager
+    class ThreadManager& thread_manager(MemoryManager& mem);
+    [[nodiscard]] class ThreadManager* thread_manager() const noexcept;
+
+    /// Set pad digital buttons bitmask (e.g. from keyboard/mouse input)
+    void set_pad_buttons(u32 buttons);
+
 private:
     std::unordered_map<Nid, HleSymbol> m_symbols_by_nid;
     std::unordered_map<std::string, Nid> m_nids_by_name;

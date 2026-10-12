@@ -20,6 +20,7 @@ bool DynamicLinker::initialize(GuestAddr trampoline_base) {
     }
 
     m_memory.zero_memory(m_trampoline_base, TRAMPOLINE_POOL_SIZE);
+    m_registry.set_syscall_table(&m_syscalls);
     return true;
 }
 
@@ -50,20 +51,43 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
     m_syscalls.register_handler(pseudo_syscall, [this, nid](SyscallContext& sctx) -> OrbisResult {
         const HleSymbol* sym = m_registry.find_by_nid(nid);
         if (sym && sym->handler) {
-            std::fprintf(stderr, "[HLE CALL] %s (NID=0x%llx, rdi=0x%llx, rsi=0x%llx)\n",
-                         sym->name.c_str(), (unsigned long long)nid, (unsigned long long)sctx.args[0], (unsigned long long)sctx.args[1]);
+            GuestAddr ret_addr = 0;
+            m_memory.read_value(sctx.rsp, ret_addr);
+            if (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" && 
+                sym->name != "strlen" && sym->name != "memcpy" && sym->name != "memmove" &&
+                sym->name != "strcmp" && sym->name != "strncmp" && sym->name != "strncpy" &&
+                sym->name != "malloc" && sym->name != "free" && sym->name != "memalign" &&
+                sym->name != "sceKernelSyncStub") {
+                std::fprintf(stderr, "[HLE CALL] %s (NID=0x%llx, caller RIP=0x%llx, rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx)\n",
+                             sym->name.c_str(), (unsigned long long)nid, (unsigned long long)ret_addr,
+                             (unsigned long long)sctx.args[0], (unsigned long long)sctx.args[1],
+                             (unsigned long long)sctx.args[2], (unsigned long long)(sctx.rcx ? sctx.rcx : sctx.args[3]),
+                             (unsigned long long)sctx.args[4], (unsigned long long)sctx.args[5]);
+            }
+            CpuContext* cur_cpu = sctx.cpu;
             CpuContext mock_cpu{};
-            mock_cpu.rdi = sctx.args[0];
-            mock_cpu.rsi = sctx.args[1];
-            mock_cpu.rdx = sctx.args[2];
-            mock_cpu.rcx = sctx.rcx ? sctx.rcx : sctx.args[3]; // Function call ABI uses RCX
-            mock_cpu.r8  = sctx.args[4];
-            mock_cpu.r9  = sctx.args[5];
-            mock_cpu.rax = sctx.rax;
-            mock_cpu.rsp = sctx.rsp;
+            if (!cur_cpu) {
+                mock_cpu.rdi = sctx.args[0];
+                mock_cpu.rsi = sctx.args[1];
+                mock_cpu.rdx = sctx.args[2];
+                mock_cpu.rcx = sctx.rcx ? sctx.rcx : sctx.args[3]; // Function call ABI uses RCX
+                mock_cpu.r8  = sctx.args[4];
+                mock_cpu.r9  = sctx.args[5];
+                mock_cpu.rax = sctx.rax;
+                mock_cpu.rsp = sctx.rsp;
+                mock_cpu.rbp = sctx.rbp;
+                cur_cpu = &mock_cpu;
+            }
 
-            sym->handler(mock_cpu, m_memory);
-            sctx.rax = mock_cpu.rax;
+            const GuestAddr initial_rip = cur_cpu->rip;
+            sym->handler(*cur_cpu, m_memory);
+            sctx.rax = cur_cpu->rax;
+            sctx.rsp = cur_cpu->rsp;
+            sctx.rbp = cur_cpu->rbp;
+
+            if (cur_cpu->rip != initial_rip) {
+                sctx.cpu_rip_modified = true;
+            }
 
             // Trigger clean exit on sceKernelExitProcess
             constexpr Nid NID_EXIT_PROCESS = 0x6424D00705E3BEBEULL;
@@ -249,8 +273,30 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                     Elf64_Sym sym{};
                     const GuestAddr sym_entry_addr = symtab_addr + (sym_idx * sizeof(Elf64_Sym));
                     if (read_data(sym_entry_addr, &sym, sizeof(sym))) {
-                        const GuestAddr value = sym.st_value + rela.r_addend;
-                        m_memory.write_value(patch_location, value);
+                        if (sym.st_value != 0) {
+                            const GuestAddr value = base_load_addr + sym.st_value + rela.r_addend;
+                            m_memory.write_value(patch_location, value);
+                        } else {
+                            char sym_str[128]{0};
+                            if (strtab_addr != 0 && sym.st_name != 0) {
+                                read_data(strtab_addr + sym.st_name, sym_str, sizeof(sym_str) - 1);
+                            }
+                            Nid nid = decode_nid_from_string(sym_str);
+                            if (nid == 0) {
+                                nid = 0x8000000000000000ULL | static_cast<u64>(sym_idx);
+                            }
+
+                            if (std::string_view(sym_str).find("f7uOxY9mM1U") != std::string_view::npos ||
+                                nid == 0x7fbb8ec58f663355ULL || nid == 0x5533668fc58ebb7fULL) {
+                                constexpr GuestAddr STACK_CANARY_ADDR = 0x3FF0000ULL;
+                                constexpr u64 CANARY_VALUE = 0x595E9FBD94FDA766ULL;
+                                m_memory.write_value(STACK_CANARY_ADDR, CANARY_VALUE);
+                                m_memory.write_value(patch_location, STACK_CANARY_ADDR);
+                            } else {
+                                const GuestAddr tramp = get_or_create_trampoline(nid);
+                                m_memory.write_value(patch_location, tramp + rela.r_addend);
+                            }
+                        }
                     }
                 }
             } else if (type == R_X86_64_JUMP_SLOT || type == R_X86_64_GLOB_DAT) {
@@ -259,16 +305,25 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                     const GuestAddr sym_entry_addr = symtab_addr + (sym_idx * sizeof(Elf64_Sym));
                     if (read_data(sym_entry_addr, &sym, sizeof(sym))) {
                         Nid nid = sym.st_value;
-                        if (nid == 0 && strtab_addr != 0 && sym.st_name != 0) {
-                            char sym_str[128]{0};
-                            if (read_data(strtab_addr + sym.st_name, sym_str, sizeof(sym_str) - 1)) {
-                                nid = decode_nid_from_string(sym_str);
-                            }
+                        char sym_str[128]{0};
+                        if (strtab_addr != 0 && sym.st_name != 0) {
+                            read_data(strtab_addr + sym.st_name, sym_str, sizeof(sym_str) - 1);
+                        }
+                        if (nid == 0 && sym_str[0] != '\0') {
+                            nid = decode_nid_from_string(sym_str);
                         }
                         if (nid == 0) {
                             nid = 0x8000000000000000ULL | static_cast<u64>(sym_idx);
                         }
-                        patch_jump_slot(patch_location, nid);
+                        if (std::string_view(sym_str).find("f7uOxY9mM1U") != std::string_view::npos ||
+                            nid == 0x7fbb8ec58f663355ULL || nid == 0x5533668fc58ebb7fULL) {
+                            constexpr GuestAddr STACK_CANARY_ADDR = 0x3FF0000ULL;
+                            constexpr u64 CANARY_VALUE = 0x595E9FBD94FDA766ULL;
+                            m_memory.write_value(STACK_CANARY_ADDR, CANARY_VALUE);
+                            m_memory.write_value(patch_location, STACK_CANARY_ADDR);
+                        } else {
+                            patch_jump_slot(patch_location, nid);
+                        }
                     }
                 }
             }

@@ -13,6 +13,7 @@
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
 #include "ps4/syscall_table.hpp"
+#include "ps4/thread.hpp"
 #include "ps4/vfs.hpp"
 
 int main(int argc, char* argv[]) {
@@ -111,6 +112,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[Linker] Initializing NID Registry and Dynamic Linker...\n";
     ps4::NidRegistry nid_registry;
     nid_registry.set_vfs(&vfs);
+    nid_registry.set_syscall_table(&syscalls);
     nid_registry.register_default_libraries();
 
     ps4::DynamicLinker linker(memory, syscalls, nid_registry);
@@ -123,9 +125,10 @@ int main(int argc, char* argv[]) {
     std::cout << "[Linker] Resolved symbols via NID registry (Active trampolines: "
               << linker.trampoline_count() << ")\n";
 
-    // 7. Initialize Apple Silicon Metal GPU Subsystem
+    // 7. Initialize Apple Silicon Metal GPU Subsystem & Window
     std::cout << "[Metal] Initializing GPU backend...\n";
     ps4::MetalBackend metal;
+    std::unique_ptr<ps4::DisplayWindow> window;
     if (metal.initialize()) {
         std::cout << "[Metal] GPU Device: " << metal.device_name() << "\n";
         if (metal.create_framebuffer(1920, 1080)) {
@@ -133,6 +136,24 @@ int main(int argc, char* argv[]) {
             // PlayStation Deep Blue clear: R=0.0f, G=0.15f, B=0.45f
             if (metal.clear_screen({0.0f, 0.15f, 0.45f, 1.0f})) {
                 std::cout << "[Metal] GPU command buffer executed clear pass.\n";
+            }
+            nid_registry.set_metal_backend(&metal);
+        }
+
+        if (enable_window) {
+            std::cout << "\n[Display] Opening interactive macOS Metal window...\n";
+            std::cout << "[Display] Running presentation loop at 60 FPS (Press ESC or close window to exit)\n";
+            window = std::make_unique<ps4::DisplayWindow>();
+            ps4::WindowConfig win_cfg{
+                .title = "ps4-to-macos: " + elf_path.filename().string() + " (Metal 3 - Interactive)",
+                .width = 1280,
+                .height = 720,
+                .resizable = true,
+                .headless = false
+            };
+            if (!window->initialize(metal, win_cfg)) {
+                std::cerr << "[Display] Warning: Failed to open interactive window, falling back to console mode.\n";
+                window.reset();
             }
         }
     } else {
@@ -145,6 +166,7 @@ int main(int argc, char* argv[]) {
     ps4::CpuExecutor cpu(memory, syscalls);
     if (enable_jit) {
         cpu.set_jit_compiler(&jit);
+        nid_registry.set_jit_compiler(&jit);
         std::cout << "[CPU] ARM64 JIT compiler connected to executor (Tier-2 Dynamic Binary Translation active)\n";
     } else {
         std::cout << "[CPU] Running in pure interpreter mode (--no-jit specified)\n";
@@ -179,13 +201,31 @@ int main(int argc, char* argv[]) {
     }
 
     if (!syscalls.has_exited() && run_res.status == ps4::StepResult::Ok) {
-        const ps4::usize batch = 1000000;
-        const ps4::usize max_total = 20000000;
-        while (total_instructions < max_total) {
-            run_res = cpu.run(batch);
-            total_instructions += run_res.instructions_executed;
-            if (run_res.status != ps4::StepResult::Ok) break;
-            std::cout << "[CPU Progress] " << total_instructions << " instrs, RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n";
+        if (window && window->is_open()) {
+            // Interactive 60 FPS Presentation Loop:
+            // Run guest execution batches each frame, pump user input events, and present via Metal
+            const ps4::usize frame_slice = 2000000;
+            while (window->is_open() && !syscalls.has_exited()) {
+                window->poll_events();
+                nid_registry.set_pad_buttons(window->input_buttons());
+
+                run_res = cpu.run(frame_slice);
+                total_instructions += run_res.instructions_executed;
+                if (run_res.status != ps4::StepResult::Ok) break;
+
+                window->present_frame();
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            }
+        } else {
+            // Console / Headless Execution Loop
+            const ps4::usize batch = 1000000;
+            const ps4::usize max_total = 100000000;
+            while (total_instructions < max_total && !syscalls.has_exited()) {
+                run_res = cpu.run(batch);
+                total_instructions += run_res.instructions_executed;
+                if (run_res.status != ps4::StepResult::Ok) break;
+                std::cout << "[CPU Progress] " << total_instructions << " instrs, RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n";
+            }
         }
     }
     std::cout << "==========================================================\n";
@@ -196,33 +236,19 @@ int main(int argc, char* argv[]) {
         std::cout << "[CPU] JIT Blocks Cached: " << jit.cached_block_count()
                   << " | Total Invocations: " << jit.total_invocations() << "\n";
     }
+    if (auto* tm = nid_registry.thread_manager()) {
+        std::cout << "[Threads] Created: " << tm->threads_created()
+                  << " | Started: " << tm->threads_started()
+                  << " | Executed Instructions: " << tm->threads_executed_instructions() << "\n";
+    }
     if (run_res.status == ps4::StepResult::Exited) {
         std::cout << "[CPU] Process Exit Code: " << run_res.exit_code << "\n";
     }
 
     cpu.context().dump();
 
-    // 9. Interactive Metal Display Window Presentation
-    if (enable_window && metal.is_initialized()) {
-        std::cout << "\n[Display] Opening interactive macOS Metal window...\n";
-        std::cout << "[Display] Running presentation loop at 60 FPS (Press ESC or close window to exit)\n";
-        ps4::DisplayWindow window;
-        ps4::WindowConfig win_cfg{
-            .title = "ps4-to-macos: " + elf_path.filename().string() + " (Metal 3)",
-            .width = 1280,
-            .height = 720,
-            .resizable = true,
-            .headless = false
-        };
-
-        if (window.initialize(metal, win_cfg)) {
-            while (window.is_open()) {
-                window.poll_events();
-                window.present_frame();
-                std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS
-            }
-            std::cout << "[Display] Window closed cleanly.\n";
-        }
+    if (window && window->is_open()) {
+        window->close();
     }
 
     return 0;
