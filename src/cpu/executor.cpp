@@ -1,5 +1,6 @@
 #include "ps4/executor.hpp"
 #include "ps4/jit_compiler.hpp"
+#include <chrono>
 #include <cstring>
 #include <cmath>
 #include <iostream>
@@ -1824,10 +1825,10 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // 0x0F 0x31: RDTSC
+        // 0x0F 0x31: RDTSC — wall-clock nanoseconds so guest TSC-delta timeout
+        // loops expire in real time. (Was: +100 per execution, i.e. frozen.)
         if (op1 == 0x31) {
-            static u64 tsc = 1000;
-            tsc += 100;
+            const u64 tsc = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
             m_context.rax = static_cast<u32>(tsc);
             m_context.rdx = static_cast<u32>(tsc >> 32);
             m_context.rip = start_rip + cursor;
