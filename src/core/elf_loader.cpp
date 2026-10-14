@@ -136,7 +136,7 @@ bool ElfLoader::parse_internal(std::span<const u8> buffer) {
 std::vector<Elf64ProgramHeader> ElfLoader::load_segments() const {
     std::vector<Elf64ProgramHeader> loads;
     for (const auto& phdr : m_program_headers) {
-        if (phdr.p_type == PT_LOAD) {
+        if (phdr.p_type == PT_LOAD || phdr.p_type == PT_SCE_RELRO) {
             loads.push_back(phdr);
         }
     }

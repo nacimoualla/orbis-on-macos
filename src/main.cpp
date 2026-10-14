@@ -133,13 +133,6 @@ int main(int argc, char* argv[]) {
     std::cout << "[Linker] Resolved symbols via NID registry (Active trampolines: "
               << linker.trampoline_count() << ")\n";
 
-    // Apply segment protections now that relocations and GOT patching are complete
-    for (const auto& seg : loader.load_segments()) {
-        if (seg.p_memsz > 0) {
-            memory.protect(seg.p_vaddr, seg.p_memsz, seg.p_flags);
-        }
-    }
-
     // 7. Initialize Apple Silicon Metal GPU Subsystem & Window
     std::cout << "[Metal] Initializing GPU backend...\n";
     ps4::MetalBackend metal;
