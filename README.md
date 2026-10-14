@@ -124,6 +124,12 @@ Example with the bundled synthetic sample ELF:
 
 The runner loads the binary, maps segments into guest memory, initializes the VFS (mounting the binary's parent directory as `/app0`), resolves NID symbols, initializes the Metal GPU, then executes guest code via the ARM64 JIT recompiler and reports progress.
 
+Tip: overlay Apple's Metal performance HUD (FPS, frame time, GPU load) on the emulator window with:
+
+```bash
+MTL_HUD_ENABLED=1 ./build/ps4-runner --window <path-to-eboot>
+```
+
 **Bring your own titles.** Drop legally obtained game files under `games/<Title>/` (that directory is git-ignored) and point `ps4-runner` at an `eboot.bin`/`.elf`. No game data is included in this repository.
 
 ## 🧪 Testing
@@ -145,6 +151,21 @@ cd build && ctest --output-on-failure
 | 9–11 | Threading (libkernel), PM4 GPU processor, audio (CoreAudio) |
 | 12–15 | Virtual File System, ARM64 JIT recompiler, 3D mesh pipeline, JIT-executor integration |
 
+A standalone Python suite audits the HLE NID registry (hash vectors, tag round-trips, malformed inputs, registry + eboot cross-reference) without the CTest harness:
+
+```bash
+python3 tests/test_verify_nids_adversarial.py
+```
+
+### Debugging HLE coverage
+
+Two stdlib-only scripts support NID work:
+
+- `python3 scripts/verify_nids.py [--eboot <eboot.bin|elf>] [--registry <nid_registry.cpp>]` — validates the Sony NID hash against test vectors, audits every `register_symbol` name/NID pair in the registry, and cross-references a game's imports (resolved vs. unresolved).
+- `python3 scripts/check_log_nids.py <run-log> [names.txt]` — flags every `[HLE CALL] label (NID=…)` line whose label doesn't hash to its NID, and optionally resolves the real name from a candidate list. Run it on any `ps4-runner` log to catch misregistered handlers.
+
+At runtime, a stall watchdog in the thread manager dumps per-thread RIP/GPRs after ~2 s of per-thread HLE silence — look for `[WATCHDOG stall-a/b]` blocks in run logs when the game stops progressing.
+
 ## 📁 Project structure
 
 ```
@@ -159,7 +180,7 @@ cd build && ctest --output-on-failure
 │   └── hle/                # NID registry, threading
 ├── samples/                # Synthetic test ELF fixtures (hello/sample/dynamic/triangle)
 ├── tests/                  # test_phase1..15 (CTest)
-├── scripts/                # Utilities (e.g. unpack_self.py)
+├── scripts/                # NID verification + log checker, SELF unpacker
 ├── vfs_root/               # Default VFS mount points (/app0, /data, /savedata)
 ├── docs/
 │   ├── adr/                # Architecture Decision Records (0001–0009)
