@@ -163,6 +163,7 @@ Two stdlib-only scripts support NID work:
 
 - `python3 scripts/verify_nids.py [--eboot <eboot.bin|elf>] [--registry <nid_registry.cpp>]` — validates the Sony NID hash against test vectors, audits every `register_symbol` name/NID pair in the registry, and cross-references a game's imports (resolved vs. unresolved).
 - `python3 scripts/check_log_nids.py <run-log> [names.txt]` — flags every `[HLE CALL] label (NID=…)` line whose label doesn't hash to its NID, and optionally resolves the real name from a candidate list. Run it on any `ps4-runner` log to catch misregistered handlers.
+- `python3 scripts/crack_nids.py` — hashes every string in the game's `eboot.bin` and Mono PRXs against target NIDs to resolve unknown imports (extend `TARGETS` for new ones).
 
 At runtime, a stall watchdog in the thread manager dumps per-thread RIP/GPRs after ~2 s of per-thread HLE silence — look for `[WATCHDOG stall-a/b]` blocks in run logs when the game stops progressing.
 
