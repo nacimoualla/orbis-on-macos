@@ -39,6 +39,11 @@ public:
     /// Find an HLE symbol by name
     [[nodiscard]] const HleSymbol* find_by_name(std::string_view name) const;
 
+    /// HLE dispatch accounting for the stall watchdog. Const: touches only
+    /// globals and thread entries, never the registry itself.
+    void note_hle_dispatch(Nid nid) const;
+    void note_hle_return() const;
+
     /// Total count of registered symbols
     [[nodiscard]] usize size() const noexcept { return m_symbols_by_nid.size(); }
 

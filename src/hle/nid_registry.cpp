@@ -1,11 +1,18 @@
 #include "ps4/audio_manager.hpp"
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
+#include "ps4/syscall_table.hpp"
 #include "ps4/thread.hpp"
 #include "ps4/vfs.hpp"
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -13,11 +20,14 @@ namespace ps4 {
 
 namespace {
 
-// Guest heap pointer for simple HLE malloc allocations
-std::atomic<GuestAddr> g_guest_heap_current{0x80000000ULL}; // 2GB virtual mark
-
-// Direct physical memory offset counter
-std::atomic<GuestAddr> g_direct_phys_current{0x100000000ULL}; // 4GB mark
+// Compact 8GB PS4 Memory Map for 16GB MacBook Air M4:
+// 0x000000000 - 0x004000000 (0 - 64 MB)    : ELF segments + trampolines
+// 0x004000000 - 0x020000000 (64 - 512 MB)  : Main stack (0x1ffffff00)
+// 0x020000000 - 0x040000000 (512 MB - 1 GB): Guest libc heap (malloc/memalign)
+// 0x040000000 - 0x1C0000000 (1 GB - 7 GB)  : Direct Memory (ALLOC_GFX / ONION / GARLIC)
+// 0x1C0000000 - 0x200000000 (7 GB - 8 GB)  : Worker thread stacks (downward from 0x1d0000000)
+std::atomic<GuestAddr> g_guest_heap_current{0x20000000ULL};   // 512 MB mark
+std::atomic<GuestAddr> g_direct_phys_current{0x40000000ULL};  // 1 GB mark
 
 // Global ThreadManager and execution dependencies
 std::unique_ptr<ThreadManager> g_thread_manager;
@@ -74,6 +84,19 @@ struct FiosFile {
 };
 static std::unordered_map<i32, FiosFile> s_fios_files;
 static i32 s_next_fios_fd = 200;
+
+// Real Orbis semaphore table for Unity worker threads (file scope so the
+// watchdog dump and synthetic wake can inspect it).
+struct GuestSema {
+    std::mutex mtx;
+    std::condition_variable cv;
+    i32 count{0};
+    i32 max_count{0x7fffffff};
+    bool deleted{false};
+};
+static std::mutex s_sema_table_mtx;
+static std::unordered_map<u32, std::shared_ptr<GuestSema>> s_semas;
+static u32 s_next_sema_id = 1;
 
 } // namespace
 
@@ -135,6 +158,25 @@ ThreadManager* NidRegistry::thread_manager() const noexcept {
     return g_thread_manager.get();
 }
 
+void NidRegistry::note_hle_dispatch(Nid nid) const {
+    if (g_thread_manager) {
+        const ScePthreadId tid = g_thread_manager->current_thread_id();
+        if (GuestThread* th = g_thread_manager->get_thread(tid)) {
+            th->last_nid.store(nid, std::memory_order_relaxed);
+            th->hle_calls.fetch_add(1, std::memory_order_relaxed);
+            th->in_hle.store(true, std::memory_order_relaxed);
+        }
+    }
+}
+
+void NidRegistry::note_hle_return() const {
+    if (g_thread_manager) {
+        if (GuestThread* th = g_thread_manager->get_thread(g_thread_manager->current_thread_id())) {
+            th->in_hle.store(false, std::memory_order_relaxed);
+        }
+    }
+}
+
 void NidRegistry::set_pad_buttons(u32 buttons) {
     g_pad_buttons.store(buttons, std::memory_order_relaxed);
 }
@@ -166,6 +208,109 @@ const HleSymbol* NidRegistry::find_by_name(std::string_view name) const {
     return nullptr;
 }
 
+// Helper: safely format a guest format string using up to 4 guest GP arguments
+static std::string format_guest_string(const MemoryManager& mem, const char* fmt,
+                                       u64 a0, u64 a1, u64 a2, u64 a3) {
+    if (!fmt) return "";
+    const u64 args[4] = {a0, a1, a2, a3};
+    usize arg_idx = 0;
+    std::string out;
+    out.reserve(256);
+
+    for (usize i = 0; fmt[i] != '\0'; ++i) {
+        if (fmt[i] != '%') {
+            out.push_back(fmt[i]);
+            continue;
+        }
+        ++i;
+        if (fmt[i] == '\0') break;
+        if (fmt[i] == '%') {
+            out.push_back('%');
+            continue;
+        }
+
+        // Skip flags, width, precision, and length modifiers
+        while (fmt[i] == '-' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#' || fmt[i] == '0' ||
+               (fmt[i] >= '1' && fmt[i] <= '9') || fmt[i] == '.') {
+            ++i;
+        }
+        while (fmt[i] == 'l' || fmt[i] == 'h' || fmt[i] == 'z' || fmt[i] == 't') {
+            ++i;
+        }
+        const char spec = fmt[i];
+        if (spec == '\0') break;
+
+        const u64 val = (arg_idx < 4) ? args[arg_idx++] : 0;
+        char buf[64]{0};
+        if (spec == 's') {
+            if (val > 0x1000 && mem.is_valid_address(val, 1)) {
+                const char* s = mem.to_host_ptr<char>(val);
+                if (s) out.append(s);
+            }
+        } else if (spec == 'd' || spec == 'i') {
+            std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(static_cast<i64>(val)));
+            out.append(buf);
+        } else if (spec == 'u') {
+            std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(val));
+            out.append(buf);
+        } else if (spec == 'x' || spec == 'X' || spec == 'p') {
+            std::snprintf(buf, sizeof(buf), "%llx", static_cast<unsigned long long>(val));
+            out.append(buf);
+        } else if (spec == 'c') {
+            out.push_back(static_cast<char>(val & 0xFF));
+        }
+    }
+    return out;
+}
+
+// Simulated GPU fence + legacy label slot for libSceGnmDriver. The slot address
+// below was once handed to the guest; keep it fresh on every fence advance so a
+// guest polling it never spins on a stale value. (It sits in the heap zone, so a
+// proper reservation is still TBD.)
+static std::atomic<u32> g_gnm_completed_label{1};
+static constexpr GuestAddr kGnmLabelSlotAddr = 0x20003000ULL;
+
+static void sync_gnm_label_slot(MemoryManager& mem) {
+    if (mem.is_valid_address(kGnmLabelSlotAddr, sizeof(u32))) {
+        mem.write_value(kGnmLabelSlotAddr, g_gnm_completed_label.load());
+    }
+}
+
+// Sema-table snapshot for the stall watchdog (id, count/max per semaphore).
+void dump_sema_states() {
+    std::lock_guard<std::mutex> lock(s_sema_table_mtx);
+    std::fprintf(stderr, "=== [SEMA] table snapshot (%zu entries) ===\n", s_semas.size());
+    for (const auto& [id, sema] : s_semas) {
+        if (!sema) continue;
+        std::lock_guard<std::mutex> slock(sema->mtx);
+        std::fprintf(stderr, "  [Sema %u] count=%d max=%d%s\n",
+                     id, sema->count, sema->max_count,
+                     sema->deleted ? " DELETED" : "");
+    }
+}
+
+// One-shot synthetic wake for the stall experiment: nudge the two semaphores
+// the gfx handshake is parked on. Fires once ever (see s_synthetic_wake_done).
+void debug_wake_stall_semas() {
+    for (u32 id : {0x33u, 0x38u}) {
+        std::shared_ptr<GuestSema> sema;
+        {
+            std::lock_guard<std::mutex> lock(s_sema_table_mtx);
+            auto it = s_semas.find(id);
+            if (it != s_semas.end()) sema = it->second;
+        }
+        if (sema) {
+            std::lock_guard<std::mutex> lock(sema->mtx);
+            sema->count = std::min(sema->max_count, sema->count + 1);
+            sema->cv.notify_all();
+            std::fprintf(stderr, "[WATCHDOG] synthetic wake: SignalSema(0x%x) count now %d\n",
+                         id, sema->count);
+        } else {
+            std::fprintf(stderr, "[WATCHDOG] synthetic wake: sema 0x%x not present\n", id);
+        }
+    }
+}
+
 void NidRegistry::register_default_libraries() {
     // =========================================================================
     // libkernel: Core Orbis OS runtime services
@@ -195,17 +340,29 @@ void NidRegistry::register_default_libraries() {
     // sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t length, size_t align, int type, off_t* out_addr)
     // Canonical NID: 0xAD35F0EB9C662C80ULL ("rTXw65xmLIA"), Legacy test alias: 0x51EAECE91C9A12B0ULL
     auto alloc_direct_handler = [](CpuContext& ctx, MemoryManager& mem) {
-        const GuestSize length = ctx.rdx;
+        const GuestSize requested_len = ctx.rdx;
         const GuestSize align  = ctx.rcx > 0 ? ctx.rcx : GUEST_PAGE_SIZE;
         const GuestAddr out_ptr = ctx.r9;
 
-        // Align physical address
-        g_direct_phys_current = (g_direct_phys_current + align - 1) & ~(align - 1);
-        const GuestAddr allocated_phys = g_direct_phys_current;
-        g_direct_phys_current += length;
+        GuestAddr cur = g_direct_phys_current.load();
+        cur = (cur + align - 1) & ~(align - 1);
+
+        // Keep all direct memory allocations strictly below the 7GB thread-stack boundary (0x1C0000000)
+        constexpr GuestAddr kDirectMemCeiling = 0x1C0000000ULL;
+        GuestSize effective_advance = requested_len;
+        if (cur + effective_advance > kDirectMemCeiling) {
+            // Reserve virtual sub-range without overflowing into the 7GB..8GB stack region
+            effective_advance = (cur < kDirectMemCeiling) ? std::min<GuestSize>(requested_len, 0x40000000ULL) : 0;
+        }
+        g_direct_phys_current.store(cur + effective_advance);
+
+        std::fprintf(stderr, "[DirectMem] Allocated 0x%llx bytes at phys 0x%llx (next=0x%llx)\n",
+                     (unsigned long long)requested_len,
+                     (unsigned long long)cur,
+                     (unsigned long long)g_direct_phys_current.load());
 
         if (mem.is_valid_address(out_ptr, sizeof(GuestAddr))) {
-            mem.write_value(out_ptr, allocated_phys);
+            mem.write_value(out_ptr, cur);
             ctx.rax = SCE_OK;
         } else {
             ctx.rax = static_cast<u64>(-14); // -EFAULT
@@ -237,7 +394,12 @@ void NidRegistry::register_default_libraries() {
         const u32 usec = static_cast<u32>(ctx.rdi);
         auto& tm = get_thread_manager(mem);
         GuestThread* cur_th = tm.current_thread();
-        if (cur_th) cur_th->state.store(ThreadState::WaitingSleep);
+        if (cur_th) {
+            cur_th->state.store(ThreadState::WaitingSleep);
+            const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            cur_th->sleep_until_us.store(now_us + usec);
+        }
 
         // Unblock job queue flush loops if caller is 0x85ccbc / 0x85ccc6
         // JobQueue object is in %r15 at 0x8082f570; clearing pending counter [r15 + 0x98] completes flush
@@ -251,7 +413,10 @@ void NidRegistry::register_default_libraries() {
             std::this_thread::yield();
         }
 
-        if (cur_th) cur_th->state.store(ThreadState::Running);
+        if (cur_th) {
+            cur_th->sleep_until_us.store(0);
+            cur_th->state.store(ThreadState::Running);
+        }
         ctx.rax = SCE_OK;
     };
     register_symbol(0x3230BAEFBC36C18BULL, "sceKernelUsleep", "libkernel", usleep_handler);
@@ -313,55 +478,110 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
+    // Host-side full attr store keyed by guest attr slot. The guest slot holds a
+    // single u64 (stack size); detach state and priority live here instead.
+    static std::mutex s_pthread_attr_mtx;
+    static std::unordered_map<GuestAddr, ScePthreadAttr> s_pthread_attrs;
+
     // scePthreadCreate(ScePthread* thread, const ScePthreadAttr* attr, void* (*entry)(void*), void* arg, const char* name)
-    register_symbol(0x7FD4FA3050DCDE51ULL, "scePthreadCreate", "libkernel",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr out_thread_ptr = ctx.rdi;
-            const GuestAddr attr_ptr = ctx.rsi;
-            const GuestAddr entry = ctx.rdx;
-            const GuestAddr arg = ctx.rcx;
-            auto& tm = get_thread_manager(mem);
+    auto pthread_create_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr out_thread_ptr = ctx.rdi;
+        const GuestAddr attr_ptr = ctx.rsi;
+        const GuestAddr entry = ctx.rdx;
+        const GuestAddr arg = ctx.rcx;
+        const GuestAddr name_ptr = ctx.r8;
+        const char* name = (name_ptr > 0x1000 && mem.is_valid_address(name_ptr, 1))
+                               ? mem.to_host_ptr<char>(name_ptr)
+                               : "ps4_thread";
 
-            ScePthreadAttr attr{};
-            if (attr_ptr != 0 && mem.is_valid_address(attr_ptr, sizeof(attr))) {
-                mem.read_bytes(attr_ptr, &attr, sizeof(attr));
+        auto& tm = get_thread_manager(mem);
+        ScePthreadAttr attr{};
+        bool have_full_attr = false;
+        {
+            std::lock_guard<std::mutex> lock(s_pthread_attr_mtx);
+            auto it = s_pthread_attrs.find(attr_ptr);
+            if (it != s_pthread_attrs.end()) {
+                attr = it->second;
+                have_full_attr = true;
             }
-            const ScePthreadId tid = tm.create_thread(entry, arg, attr_ptr ? &attr : nullptr);
-            if (out_thread_ptr != 0 && mem.is_valid_address(out_thread_ptr, sizeof(u64))) {
-                mem.write_value(out_thread_ptr, static_cast<u64>(tid));
+        }
+        if (!have_full_attr && attr_ptr != 0 && mem.is_valid_address(attr_ptr, sizeof(u64))) {
+            u64 stored_stack_sz = 0;
+            mem.read_value(attr_ptr, stored_stack_sz);
+            if (stored_stack_sz >= 65536 && stored_stack_sz <= 16 * 1024 * 1024) {
+                attr.stack_size = stored_stack_sz;
             }
-            ctx.rax = SCE_OK;
-        });
-
-    // scePthreadCreate NID alias: 0xE9482DC15FB4CDBEULL ("6UgtwV+0zb4")
-    register_symbol(0xE9482DC15FB4CDBEULL, "scePthreadCreate", "libkernel",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr out_thread_ptr = ctx.rdi;
-            const GuestAddr attr_ptr = ctx.rsi;
-            const GuestAddr entry = ctx.rdx;
-            const GuestAddr arg = ctx.rcx;
-            auto& tm = get_thread_manager(mem);
-
-            ScePthreadAttr attr{};
-            if (attr_ptr != 0 && mem.is_valid_address(attr_ptr, sizeof(attr))) {
-                mem.read_bytes(attr_ptr, &attr, sizeof(attr));
-            }
-            const ScePthreadId tid = tm.create_thread(entry, arg, attr_ptr ? &attr : nullptr);
-            if (out_thread_ptr != 0 && mem.is_valid_address(out_thread_ptr, sizeof(u64))) {
-                mem.write_value(out_thread_ptr, static_cast<u64>(tid));
-            }
-            ctx.rax = SCE_OK;
-        });
+        }
+        const ScePthreadId tid = tm.create_thread(entry, arg, &attr, name ? name : "ps4_thread");
+        if (out_thread_ptr != 0 && mem.is_valid_address(out_thread_ptr, sizeof(u64))) {
+            mem.write_value(out_thread_ptr, static_cast<u64>(tid));
+        }
+        ctx.rax = SCE_OK;
+    };
+    register_symbol(0x7FD4FA3050DCDE51ULL, "scePthreadCreate", "libkernel", pthread_create_handler);
+    register_symbol(0xE9482DC15FB4CDBEULL, "scePthreadCreate", "libkernel", pthread_create_handler);
 
     // scePthreadAttrInit NID: 0x9EC628351CB0C0D8ULL ("nsYoNRywwNg")
+    // Orbis pthread_attr_t is an 8-byte opaque handle on the stack! Writing >8 bytes clobbers saved RBP!
     register_symbol(0x9EC628351CB0C0D8ULL, "scePthreadAttrInit", "libkernel",
-        [](CpuContext& ctx, MemoryManager&) {
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr attr_ptr = ctx.rdi;
+            if (attr_ptr != 0 && mem.is_valid_address(attr_ptr, sizeof(u64))) {
+                mem.write_value(attr_ptr, static_cast<u64>(2 * 1024 * 1024));
+                std::lock_guard<std::mutex> lock(s_pthread_attr_mtx);
+                s_pthread_attrs[attr_ptr] = ScePthreadAttr{};
+            }
             ctx.rax = SCE_OK;
         });
 
     // scePthreadAttrSetstacksize NID: 0x5135F325B5A18531ULL ("UTXzJbWhhTE")
     register_symbol(0x5135F325B5A18531ULL, "scePthreadAttrSetstacksize", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr attr_ptr = ctx.rdi;
+            const u64 stack_sz = ctx.rsi;
+            if (attr_ptr != 0 && mem.is_valid_address(attr_ptr, sizeof(u64))) {
+                mem.write_value(attr_ptr, stack_sz);
+                std::lock_guard<std::mutex> lock(s_pthread_attr_mtx);
+                s_pthread_attrs[attr_ptr].stack_size = stack_sz;
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // scePthreadAttrGetschedparam NID: 0x1573D61CD93C39FDULL
+    register_symbol(0x1573D61CD93C39FDULL, "scePthreadAttrGetschedparam", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr param_ptr = ctx.rsi;
+            if (param_ptr != 0 && mem.is_valid_address(param_ptr, sizeof(i32))) {
+                mem.write_value(param_ptr, static_cast<i32>(0));
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // scePthreadAttrSetdetachstate NID: 0xFD6ADEA6BB6ED10BULL
+    register_symbol(0xFD6ADEA6BB6ED10BULL, "scePthreadAttrSetdetachstate", "libkernel",
         [](CpuContext& ctx, MemoryManager&) {
+            const GuestAddr attr_ptr = ctx.rdi;
+            const i32 state = static_cast<i32>(ctx.rsi);
+            if (attr_ptr != 0) {
+                std::lock_guard<std::mutex> lock(s_pthread_attr_mtx);
+                s_pthread_attrs[attr_ptr].detachstate = state;
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // scePthreadAttrSetschedparam NID: 0x0F3112F61405E1FEULL
+    register_symbol(0x0F3112F61405E1FEULL, "scePthreadAttrSetschedparam", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr attr_ptr = ctx.rdi;
+            const GuestAddr param_ptr = ctx.rsi;
+            i32 prio = 256;
+            if (param_ptr > 0x1000 && mem.is_valid_address(param_ptr, sizeof(i32))) {
+                mem.read_value(param_ptr, prio);
+            }
+            if (attr_ptr != 0) {
+                std::lock_guard<std::mutex> lock(s_pthread_attr_mtx);
+                s_pthread_attrs[attr_ptr].priority = prio;
+            }
             ctx.rax = SCE_OK;
         });
 
@@ -777,14 +997,13 @@ void NidRegistry::register_default_libraries() {
         });
 
     // malloc(size_t size)
-    auto malloc_handler = [](CpuContext& ctx, MemoryManager& mem) {
+    // Note: no zeroing — the bump allocator only hands out fresh OS-zero pages
+    // (free is a no-op), so untouched pages stay purely virtual until written.
+    auto malloc_handler = [](CpuContext& ctx, MemoryManager&) {
         const GuestSize size = ctx.rdi;
         g_guest_heap_current = (g_guest_heap_current + 15) & ~15ULL;
         const GuestAddr allocated = g_guest_heap_current;
         g_guest_heap_current += size;
-        if (size > 0 && mem.is_valid_address(allocated, size)) {
-            mem.zero_memory(allocated, size);
-        }
         ctx.rax = allocated;
     };
     register_symbol(0x9E990E49EC698A4DULL, "malloc", "libc", malloc_handler);
@@ -799,17 +1018,15 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x63B689D6EC9D3CCAULL, "free", "libc", free_handler);
 
     // calloc(size_t num, size_t size)
+    // Note: no explicit zeroing — see malloc above; fresh bump pages are OS-zero.
     register_symbol(0xB50228F8620F925AULL, "calloc", "libc",
-        [](CpuContext& ctx, MemoryManager& mem) {
+        [](CpuContext& ctx, MemoryManager&) {
             const GuestSize num = ctx.rdi;
             const GuestSize size = ctx.rsi;
             const GuestSize total = num * size;
             g_guest_heap_current = (g_guest_heap_current + 15) & ~15ULL;
             const GuestAddr allocated = g_guest_heap_current;
             g_guest_heap_current += total;
-            if (total > 0 && mem.is_valid_address(allocated, total)) {
-                mem.zero_memory(allocated, total);
-            }
             ctx.rax = allocated;
         });
 
@@ -960,25 +1177,21 @@ void NidRegistry::register_default_libraries() {
             const GuestAddr fmt_addr = ctx.rdx;
             const char* fmt = (fmt_addr > 0x1000 && mem.is_valid_address(fmt_addr, 1))
                                 ? mem.to_host_ptr<char>(fmt_addr) : nullptr;
-            if (sz > 0 && mem.is_valid_address(buf, 1)) {
-                char* dst = mem.to_host_ptr<char>(buf);
-                if (fmt && dst) {
-                    // Try formatting
-                    // For string / int args
-                    const char* s_arg = (ctx.rcx > 0x1000 && mem.is_valid_address(ctx.rcx, 1))
-                                            ? mem.to_host_ptr<char>(ctx.rcx) : nullptr;
-                    if (s_arg && std::strcmp(fmt, "%s") == 0) {
-                        ctx.rax = std::snprintf(dst, sz, "%s", s_arg);
-                    } else if (s_arg) {
-                        ctx.rax = std::snprintf(dst, sz, fmt, s_arg, ctx.r8, ctx.r9);
-                    } else {
-                        ctx.rax = std::snprintf(dst, sz, fmt, ctx.rcx, ctx.r8, ctx.r9);
-                    }
-                    return;
-                }
-                mem.write_value(buf, static_cast<u8>(0));
+            if (!fmt) {
+                ctx.rax = 0;
+                return;
             }
-            ctx.rax = 0;
+
+            const std::string formatted = format_guest_string(mem, fmt, ctx.rcx, ctx.r8, ctx.r9, 0);
+            if (buf != 0 && sz > 0 && mem.is_valid_address(buf, sz)) {
+                char* dst = mem.to_host_ptr<char>(buf);
+                if (dst) {
+                    const usize copy_len = std::min<usize>(formatted.size(), sz - 1);
+                    std::memcpy(dst, formatted.data(), copy_len);
+                    dst[copy_len] = '\0';
+                }
+            }
+            ctx.rax = formatted.size();
         });
 
     // fopen(const char* path, const char* mode)
@@ -1003,6 +1216,67 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = reinterpret_cast<u64>(fp);
         });
 
+    // fseek(FILE* stream, long offset, int whence)
+    // NID: 0xAD0155057A7F0B18ULL
+    register_symbol(0xAD0155057A7F0B18ULL, "fseek", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            const long offset = static_cast<long>(ctx.rsi);
+            const int whence = static_cast<int>(ctx.rdx);
+            if (!fp) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            ctx.rax = static_cast<u64>(static_cast<i64>(std::fseek(fp, offset, whence)));
+        });
+
+    // ftell(FILE* stream)
+    // NID: 0x41ACF2F0B9974EFCULL
+    register_symbol(0x41ACF2F0B9974EFCULL, "ftell", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            if (!fp) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            const long pos = std::ftell(fp);
+            std::fprintf(stderr, "[LIBC ftell] ftell(%p) -> %ld\n", static_cast<void*>(fp), pos);
+            ctx.rax = static_cast<u64>(pos);
+        });
+
+    // fread(void* ptr, size_t size, size_t nmemb, FILE* stream)
+    // NID: 0x95B07E52566A546DULL
+    register_symbol(0x95B07E52566A546DULL, "fread", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dst_addr = ctx.rdi;
+            const usize size = ctx.rsi;
+            const usize nmemb = ctx.rdx;
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rcx);
+            const usize total_bytes = size * nmemb;
+            if (!fp || dst_addr == 0 || total_bytes == 0 || !mem.is_valid_address(dst_addr, total_bytes)) {
+                ctx.rax = 0;
+                return;
+            }
+            void* dst = mem.to_host_ptr<void>(dst_addr);
+            const usize items_read = std::fread(dst, size, nmemb, fp);
+            std::fprintf(stderr, "[LIBC fread] fread(dst=0x%llx, size=%zu, nmemb=%zu, fp=%p) -> %zu\n",
+                         (unsigned long long)dst_addr, size, nmemb, static_cast<void*>(fp), items_read);
+            ctx.rax = items_read;
+        });
+
+    // fclose(FILE* stream)
+    // NID: 0xBA874B632522A76DULL
+    register_symbol(0xBA874B632522A76DULL, "fclose", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            if (!fp) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            std::fprintf(stderr, "[LIBC fclose] fclose(%p)\n", static_cast<void*>(fp));
+            ctx.rax = static_cast<u64>(std::fclose(fp));
+        });
+
     // vsnprintf(char* str, size_t size, const char* format, va_list ap)
     // NID: 0x43657E8AABE3802DULL ("Q2V+iqvjgC0")
     register_symbol(0x43657E8AABE3802DULL, "vsnprintf", "libc",
@@ -1010,42 +1284,52 @@ void NidRegistry::register_default_libraries() {
             const GuestAddr dest = ctx.rdi;
             const GuestSize maxlen = ctx.rsi;
             const GuestAddr fmt_addr = ctx.rdx;
-            if (dest == 0 || maxlen == 0 || fmt_addr == 0 || !mem.is_valid_address(dest, 1)) {
-                ctx.rax = 0;
-                return;
-            }
+            const GuestAddr ap = ctx.rcx;
+
             const char* fmt = (fmt_addr > 0x1000 && mem.is_valid_address(fmt_addr, 1))
                                 ? mem.to_host_ptr<char>(fmt_addr) : nullptr;
-            char* out = mem.to_host_ptr<char>(dest);
-            if (!fmt || !out) {
+            if (!fmt) {
                 ctx.rax = 0;
                 return;
             }
-            const int written = std::snprintf(out, maxlen, "%s", fmt);
-            ctx.rax = static_cast<u64>(written >= 0 ? written : 0);
-            
-            // Debug print va_list arguments
-            const GuestAddr ap = ctx.rcx;
-            if (mem.is_valid_address(ap, 24)) {
-                u32 gp_offset = 0, fp_offset = 0;
+
+            // Extract up to 4 GP arguments from x86_64 System V va_list
+            u64 args[4] = {0, 0, 0, 0};
+            if (ap != 0 && mem.is_valid_address(ap, 24)) {
+                u32 gp_offset = 0;
                 GuestAddr overflow_area = 0, reg_save = 0;
                 mem.read_value(ap + 0, gp_offset);
-                mem.read_value(ap + 4, fp_offset);
                 mem.read_value(ap + 8, overflow_area);
                 mem.read_value(ap + 16, reg_save);
-                GuestAddr arg0 = 0, arg1 = 0;
-                if (gp_offset < 48 && mem.is_valid_address(reg_save + gp_offset, 16)) {
-                    mem.read_value(reg_save + gp_offset, arg0);
-                    mem.read_value(reg_save + gp_offset + 8, arg1);
-                } else if (mem.is_valid_address(overflow_area, 16)) {
-                    mem.read_value(overflow_area, arg0);
-                    mem.read_value(overflow_area + 8, arg1);
+
+                for (int i = 0; i < 4; ++i) {
+                    if (gp_offset < 48 && mem.is_valid_address(reg_save + gp_offset, 8)) {
+                        mem.read_value(reg_save + gp_offset, args[i]);
+                        gp_offset += 8;
+                    } else if ( overflow_area > 0x1000 && mem.is_valid_address(overflow_area, 8)) {
+                        mem.read_value(overflow_area, args[i]);
+                        overflow_area += 8;
+                    }
                 }
-                const char* str0 = (arg0 > 0x1000 && mem.is_valid_address(arg0, 1)) ? mem.to_host_ptr<char>(arg0) : nullptr;
-                std::fprintf(stderr, "[VSNPRINTF] fmt='%s' gp=%u ov=0x%llx rs=0x%llx arg0=0x%llx ('%s') arg1=%lld\n",
-                             fmt, gp_offset, (unsigned long long)overflow_area, (unsigned long long)reg_save,
-                             (unsigned long long)arg0, str0 ? str0 : "", (long long)arg1);
             }
+
+            const std::string formatted = format_guest_string(mem, fmt, args[0], args[1], args[2], args[3]);
+
+            if (dest != 0 && maxlen > 0 && mem.is_valid_address(dest, maxlen)) {
+                char* out = mem.to_host_ptr<char>(dest);
+                if (out) {
+                    const usize copy_len = std::min<usize>(formatted.size(), maxlen - 1);
+                    std::memcpy(out, formatted.data(), copy_len);
+                    out[copy_len] = '\0';
+                }
+            }
+
+            if (formatted.size() > 1 && formatted != "/app0/media/boot.config") {
+                std::fprintf(stderr, "[Unity Log] %s", formatted.c_str());
+                if (formatted.back() != '\n') std::fprintf(stderr, "\n");
+            }
+
+            ctx.rax = formatted.size();
         });
 
     // strncpy(char* dest, const char* src, size_t n)
@@ -1142,22 +1426,161 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = 0;
         });
 
+    // Real Orbis Semaphore synchronization for Unity worker threads
+    // (table lives in the anonymous namespace so diagnostics can reach it)
+
     // sceKernelCreateSema(SceKernelSema* sema, const char* name, uint32_t attr, int initCount, int maxCount, void* opt)
     // NID: 0xD7CF31E7B258A748ULL ("188x57JYp0g")
     register_symbol(0xD7CF31E7B258A748ULL, "sceKernelCreateSema", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr sema_ptr = ctx.rdi;
-            if (sema_ptr != 0 && mem.is_valid_address(sema_ptr, sizeof(u32))) {
-                static u32 sema_id = 1;
-                mem.write_value(sema_ptr, sema_id++);
+            const GuestAddr name_ptr = ctx.rsi;
+            const u32 attr = static_cast<u32>(ctx.rdx);
+            const i32 init_count = static_cast<i32>(ctx.rcx);
+            const i32 max_count  = static_cast<i32>(ctx.r8) > 0 ? static_cast<i32>(ctx.r8) : 0x7fffffff;
+            const char* name = (name_ptr > 0x1000 && mem.is_valid_address(name_ptr, 1))
+                                   ? mem.to_host_ptr<char>(name_ptr) : nullptr;
+
+            auto sema = std::make_shared<GuestSema>();
+            sema->count = (init_count >= 0 && init_count <= 1024) ? init_count : 0;
+            sema->max_count = max_count;
+
+            u32 id = 0;
+            {
+                std::lock_guard<std::mutex> lock(s_sema_table_mtx);
+                id = s_next_sema_id++;
+                s_semas[id] = sema;
             }
+            if (sema_ptr != 0 && mem.is_valid_address(sema_ptr, sizeof(u32))) {
+                mem.write_value(sema_ptr, id);
+            }
+            std::fprintf(stderr, "[Sema] CreateSema -> id=%u name='%s' attr=0x%x init=%d max=%d\n",
+                         id, name ? name : "?", attr, init_count, max_count);
             ctx.rax = SCE_OK;
+        });
+
+    // sceKernelWaitSema(SceKernelSema sema, int needCount, SceKernelUseconds* pTimeout)
+    // NID: 0x6716B45614154EC9ULL ("Zxa0VhQVTsk")
+    register_symbol(0x6716B45614154EC9ULL, "sceKernelWaitSema", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const u32 id = static_cast<u32>(ctx.rdi);
+            const i32 need = static_cast<i32>(ctx.rsi) > 0 ? static_cast<i32>(ctx.rsi) : 1;
+            const GuestAddr timo_ptr = ctx.rdx;
+
+            auto& tm = get_thread_manager(mem);
+            GuestThread* cur_th = tm.current_thread();
+            if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
+
+            std::shared_ptr<GuestSema> sema;
+            {
+                std::lock_guard<std::mutex> lock(s_sema_table_mtx);
+                auto it = s_semas.find(id);
+                if (it != s_semas.end()) sema = it->second;
+            }
+            if (!sema) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (cur_th) cur_th->state.store(ThreadState::Running);
+                ctx.rax = SCE_OK;
+                return;
+            }
+
+            std::unique_lock<std::mutex> lock(sema->mtx);
+            auto pred = [&]() {
+                return sema->count >= need || sema->deleted || (g_syscalls && g_syscalls->has_exited());
+            };
+
+            if (timo_ptr != 0 && mem.is_valid_address(timo_ptr, sizeof(u32))) {
+                u32 usec = 0;
+                mem.read_value(timo_ptr, usec);
+                std::fprintf(stderr, "[Sema] WaitSema(%u, need=%d, timeout=%uus)\n", id, need, usec);
+                if (!sema->cv.wait_for(lock, std::chrono::microseconds(usec), pred)) {
+                    if (cur_th) cur_th->state.store(ThreadState::Running);
+                    ctx.rax = 0x8002003CULL; // SCE_KERNEL_ERROR_ETIMEDOUT
+                    return;
+                }
+            } else {
+                std::fprintf(stderr, "[Sema] WaitSema(%u, need=%d, timeout=infinite)\n", id, need);
+                while (!pred()) {
+                    sema->cv.wait_for(lock, std::chrono::milliseconds(50), pred);
+                }
+            }
+
+            if (sema->count >= need) {
+                sema->count -= need;
+            }
+            if (cur_th) cur_th->state.store(ThreadState::Running);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceKernelSignalSema(SceKernelSema sema, int signalCount)
+    // NIDs: 0x443BB032833D9F45ULL ("RDuwMoM9n0U") and 0x3C4AC6259839E5EBULL
+    auto signal_sema_handler = [](CpuContext& ctx, MemoryManager&) {
+        const u32 id = static_cast<u32>(ctx.rdi);
+        const i32 sig = static_cast<i32>(ctx.rsi) > 0 ? static_cast<i32>(ctx.rsi) : 1;
+        std::shared_ptr<GuestSema> sema;
+        {
+            std::lock_guard<std::mutex> lock(s_sema_table_mtx);
+            auto it = s_semas.find(id);
+            if (it != s_semas.end()) sema = it->second;
+        }
+        if (sema) {
+            std::lock_guard<std::mutex> lock(sema->mtx);
+            sema->count = std::min(sema->max_count, sema->count + sig);
+            sema->cv.notify_all();
+            std::fprintf(stderr, "[Sema] SignalSema(%u, %d) -> count=%d\n", id, sig, sema->count);
+        } else {
+            std::fprintf(stderr, "[Sema] SignalSema(%u, %d) -> unknown id\n", id, sig);
+        }
+        ctx.rax = SCE_OK;
+    };
+    register_symbol(0x443BB032833D9F45ULL, "sceKernelSignalSema", "libkernel", signal_sema_handler);
+    register_symbol(0x3C4AC6259839E5EBULL, "sceKernelSignalSema", "libkernel", signal_sema_handler);
+
+    // sceKernelPollSema(SceKernelSema sema, int needCount)
+    // NID: 0x0528B1D7D1C6C155ULL ("BSix19HGwVU")
+    register_symbol(0x0528B1D7D1C6C155ULL, "sceKernelPollSema", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) {
+            const u32 id = static_cast<u32>(ctx.rdi);
+            const i32 need = static_cast<i32>(ctx.rsi) > 0 ? static_cast<i32>(ctx.rsi) : 1;
+            std::shared_ptr<GuestSema> sema;
+            {
+                std::lock_guard<std::mutex> lock(s_sema_table_mtx);
+                auto it = s_semas.find(id);
+                if (it != s_semas.end()) sema = it->second;
+            }
+            if (sema) {
+                std::lock_guard<std::mutex> lock(sema->mtx);
+                if (sema->count >= need) {
+                    sema->count -= need;
+                    ctx.rax = SCE_OK;
+                    return;
+                }
+                std::fprintf(stderr, "[Sema] PollSema(%u, need=%d) -> BUSY (count=%d)\n", id, need, sema->count);
+            } else {
+                std::fprintf(stderr, "[Sema] PollSema(%u, need=%d) -> unknown id\n", id, need);
+            }
+            ctx.rax = 0x80020010ULL; // SCE_KERNEL_ERROR_EBUSY
         });
 
     // sceKernelDeleteSema(SceKernelSema sema)
     // NID: 0x47526F9FC6D2096FULL ("R1Jvn8bSCW8")
     register_symbol(0x47526F9FC6D2096FULL, "sceKernelDeleteSema", "libkernel",
-        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+        [](CpuContext& ctx, MemoryManager&) {
+            const u32 id = static_cast<u32>(ctx.rdi);
+            std::shared_ptr<GuestSema> sema;
+            {
+                std::lock_guard<std::mutex> lock(s_sema_table_mtx);
+                auto it = s_semas.find(id);
+                if (it != s_semas.end()) {
+                    sema = it->second;
+                    s_semas.erase(it);
+                }
+            }
+            if (sema) {
+                std::lock_guard<std::mutex> lock(sema->mtx);
+                sema->deleted = true;
+                sema->cv.notify_all();
+            }
             ctx.rax = SCE_OK;
         });
 
@@ -1208,30 +1631,24 @@ void NidRegistry::register_default_libraries() {
     // memalign(size_t alignment, size_t size)
     // NID: 0x5237F72B332F4662ULL ("Ujf3KzMvRmI")
     register_symbol(0x5237F72B332F4662ULL, "memalign", "libc",
-        [](CpuContext& ctx, MemoryManager& mem) {
+        [](CpuContext& ctx, MemoryManager&) {
             const GuestSize alignment = ctx.rdi > 0 ? ctx.rdi : 16;
             const GuestSize size = ctx.rsi;
             g_guest_heap_current = (g_guest_heap_current + alignment - 1) & ~(alignment - 1);
             const GuestAddr allocated = g_guest_heap_current;
             g_guest_heap_current += size;
-            if (size > 0 && mem.is_valid_address(allocated, size)) {
-                mem.zero_memory(allocated, size);
-            }
             ctx.rax = allocated;
         });
 
     // mspace_memalign(mspace msp, size_t alignment, size_t size)
     // NID: 0x885D62407CF10495ULL ("iF1iQHzxBJU")
     register_symbol(0x885D62407CF10495ULL, "mspace_memalign", "libc",
-        [](CpuContext& ctx, MemoryManager& mem) {
+        [](CpuContext& ctx, MemoryManager&) {
             const GuestSize alignment = ctx.rsi > 0 ? ctx.rsi : 16;
             const GuestSize size = ctx.rdx;
             g_guest_heap_current = (g_guest_heap_current + alignment - 1) & ~(alignment - 1);
             const GuestAddr allocated = g_guest_heap_current;
             g_guest_heap_current += size;
-            if (size > 0 && mem.is_valid_address(allocated, size)) {
-                mem.zero_memory(allocated, size);
-            }
             ctx.rax = allocated;
         });
 
@@ -1646,8 +2063,11 @@ void NidRegistry::register_default_libraries() {
         });
 
     // sceFiosFHRead / sceFiosFHReadSync(int profile, int fh, void* buf, size_t size)
+    // NID 0x2A5FD36EB0D4F583ULL hashes to sceFiosFHWriteSync. Body below is the
+    // legacy read-shaped impl (fail-safes to -1 via address gates; never called
+    // in traces so far). Real write path TBD.
     // NID: 0x2A5FD36EB0D4F583ULL ("Kl-TbrDU9YM")
-    register_symbol(0x2A5FD36EB0D4F583ULL, "sceFiosFHRead", "libSceFios2",
+    register_symbol(0x2A5FD36EB0D4F583ULL, "sceFiosFHWriteSync", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& mem) {
             const i32 fd = static_cast<i32>(ctx.rsi);
             const GuestSize size = ctx.rdx;
@@ -1675,8 +2095,10 @@ void NidRegistry::register_default_libraries() {
         });
 
     // sceFiosFHPread(int profile, int fh, void* buf, size_t size, size_t offset)
+    // NID 0x80C71F3AD1D6EB39ULL hashes to sceFiosFHPwriteSync. Body below is the
+    // legacy pread-shaped impl (fail-safes to -1; never called). Real pwrite TBD.
     // NID: 0x80C71F3AD1D6EB39ULL ("gMcfOtHW6zk")
-    register_symbol(0x80C71F3AD1D6EB39ULL, "sceFiosFHPread", "libSceFios2",
+    register_symbol(0x80C71F3AD1D6EB39ULL, "sceFiosFHPwriteSync", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& mem) {
             const i32 fd = static_cast<i32>(ctx.rsi);
             const GuestAddr buf_addr = ctx.rdx;
@@ -1732,9 +2154,39 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = static_cast<u64>(bytes_read);
         });
 
-    // sceFiosFHGetSize / sceFiosFHStat(int fh)
+    // sceFiosFHReadSync(int profile, int fh, void* buf, size_t size)
+    // NID: 0x067D991786637AE4ULL — the real blocking read; consumes the live offset.
+    // Arg positions mirror FHPreadSync (fd=rsi, buf=rdx, size=rcx).
+    register_symbol(0x067D991786637AE4ULL, "sceFiosFHReadSync", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const i32 fd = static_cast<i32>(ctx.rsi);
+            const GuestAddr buf_addr = ctx.rdx;
+            const GuestSize size = ctx.rcx;
+            auto it = s_fios_files.find(fd);
+            if (it == s_fios_files.end() || !it->second.stream || !it->second.stream->is_open()) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHReadSync: invalid handle %d\n", fd);
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            if (buf_addr == 0 || !mem.is_valid_address(buf_addr, size)) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHReadSync: invalid buffer 0x%llx (size=%llu)\n",
+                             (unsigned long long)buf_addr, (unsigned long long)size);
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            u8* dest = mem.to_host_ptr<u8>(buf_addr);
+            it->second.stream->seekg(static_cast<std::streamoff>(it->second.offset), std::ios::beg);
+            it->second.stream->read(reinterpret_cast<char*>(dest), static_cast<std::streamsize>(size));
+            const std::streamsize bytes_read = it->second.stream->gcount();
+            it->second.offset += static_cast<u64>(bytes_read);
+            std::fprintf(stderr, "[FIOS2] sceFiosFHReadSync(fd=%d, size=%llu) -> read %lld bytes\n",
+                         fd, (unsigned long long)size, (long long)bytes_read);
+            ctx.rax = static_cast<u64>(bytes_read);
+        });
+
+    // sceFiosFHTell(int fh) -> current file offset
     // NID: 0x32B445ADD829B31FULL ("MrRFrdgpsx8")
-    register_symbol(0x32B445ADD829B31FULL, "sceFiosFHGetSize", "libSceFios2",
+    register_symbol(0x32B445ADD829B31FULL, "sceFiosFHTell", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& /*mem*/) {
             const i32 fd = static_cast<i32>(ctx.rdi);
             auto it = s_fios_files.find(fd);
@@ -1742,8 +2194,8 @@ void NidRegistry::register_default_libraries() {
                 ctx.rax = static_cast<u64>(-1);
                 return;
             }
-            std::fprintf(stderr, "[FIOS2] sceFiosFHGetSize(fd=%d) -> %llu\n", fd, (unsigned long long)it->second.size);
-            ctx.rax = it->second.size;
+            std::fprintf(stderr, "[FIOS2] sceFiosFHTell(fd=%d) -> %llu\n", fd, (unsigned long long)it->second.offset);
+            ctx.rax = it->second.offset;
         });
 
     // sceFiosFHSeek(int fh, int64_t offset, int whence)
@@ -1781,26 +2233,27 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0xE6C60D04D2BE5B78ULL, "sceFiosFHClose", "libSceFios2", fios_fh_close_handler);
     register_symbol(0x00EBA3486A94FA6BULL, "sceFiosFHCloseSync", "libSceFios2", fios_fh_close_handler);
 
-    // sceFiosExists(int profile, const char* path)
+    // sceFiosDirectoryCreateSync(int profile, const char* path)
     // NID: 0x9D6BB36B465D7EA0ULL ("nWuza0ZdfqA")
-    register_symbol(0x9D6BB36B465D7EA0ULL, "sceFiosExists", "libSceFios2",
+    register_symbol(0x9D6BB36B465D7EA0ULL, "sceFiosDirectoryCreateSync", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr path_addr = ctx.rsi;
             const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
                                    ? mem.to_host_ptr<char>(path_addr) : nullptr;
             if (!path) {
-                ctx.rax = 0;
+                ctx.rax = static_cast<u64>(-1);
                 return;
             }
             auto& vfs = get_vfs();
             auto resolved = vfs.resolve_path(path);
-            bool exists = false;
-            if (resolved) {
-                std::error_code ec;
-                exists = std::filesystem::exists(*resolved, ec);
+            if (!resolved) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
             }
-            std::fprintf(stderr, "[FIOS2] sceFiosExists('%s') -> %d\n", path, exists ? 1 : 0);
-            ctx.rax = exists ? 1 : 0;
+            std::error_code ec;
+            std::filesystem::create_directories(*resolved, ec);
+            std::fprintf(stderr, "[FIOS2] sceFiosDirectoryCreateSync('%s') -> %d\n", path, ec ? -1 : 0);
+            ctx.rax = ec ? static_cast<u64>(-1) : 0;
         });
 
     // sceFiosFileDeleteSync / sceFiosFileDelete(int profile, const char* path)
@@ -1811,9 +2264,10 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x550F1EE6DF2FB588ULL, "sceFiosFileDelete", "libSceFios2", fios_file_delete_handler);
     register_symbol(0x6C3BA91206D0E859ULL, "sceFiosFileDeleteSync", "libSceFios2", fios_file_delete_handler);
 
-    // sceFiosFileGetSize(int profile, const char* path)
+    // sceFiosArchiveGetMountBufferSizeSync(int profile, const char* path)
     // NID: 0x514AE2697CBB1BDDULL ("UUriaXy7G90")
-    register_symbol(0x514AE2697CBB1BDDULL, "sceFiosFileGetSize", "libSceFios2",
+    // Body returns the resolved file size, which has satisfied both observed calls.
+    register_symbol(0x514AE2697CBB1BDDULL, "sceFiosArchiveGetMountBufferSizeSync", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr path_addr = ctx.rsi;
             const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
@@ -1916,8 +2370,23 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0xC37058FAD0048906ULL, "sceVideoOutRegisterBuffers", "libSceVideoOut", reg_buffers_handler);
 
     // sceVideoOutConfigureOutputMode_ / N1bEoJ4SRw4
+    // Dumps the mode struct (rdx) so the layout filled by sceVideoOutModeSetAny_
+    // can be decoded from the log.
     register_symbol(0x3756C4A09E12470EULL, "sceVideoOutConfigureOutputMode_", "libSceVideoOut",
-        [](CpuContext& ctx, MemoryManager&) {
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr mode_ptr = ctx.rdx;
+            if (mode_ptr > 0x1000 && mem.is_valid_address(mode_ptr, 64)) {
+                const u8* p = mem.to_host_ptr<u8>(mode_ptr);
+                if (p) {
+                    std::fprintf(stderr, "[VideoOut] ConfigureOutputMode_ mode struct at 0x%llx:\n",
+                                 (unsigned long long)mode_ptr);
+                    for (usize i = 0; i < 64; i += 16) {
+                        std::fprintf(stderr, "  +%02zx: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                     i, p[i], p[i+1], p[i+2], p[i+3], p[i+4], p[i+5], p[i+6], p[i+7],
+                                     p[i+8], p[i+9], p[i+10], p[i+11], p[i+12], p[i+13], p[i+14], p[i+15]);
+                    }
+                }
+            }
             ctx.rax = SCE_OK;
         });
 
@@ -1957,8 +2426,23 @@ void NidRegistry::register_default_libraries() {
 
     // sceVideoOutSetBufferAttribute
     // NID: 0x8BAFEC47DD56B7FEULL ("i6-sR91Wt-4")
+    // Logs all regs plus a guarded dump of the rsi struct so format/tiling/pitch
+    // layout can be decoded from the log.
     register_symbol(0x8BAFEC47DD56B7FEULL, "sceVideoOutSetBufferAttribute", "libSceVideoOut",
-        [](CpuContext& ctx, MemoryManager&) {
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::fprintf(stderr, "[VideoOut] SetBufferAttribute(rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx)\n",
+                         (unsigned long long)ctx.rdi, (unsigned long long)ctx.rsi,
+                         (unsigned long long)ctx.rdx, (unsigned long long)ctx.rcx,
+                         (unsigned long long)ctx.r8, (unsigned long long)ctx.r9);
+            const GuestAddr p_addr = ctx.rsi;
+            if (p_addr > 0x1000 && mem.is_valid_address(p_addr, 32)) {
+                const u8* p = mem.to_host_ptr<u8>(p_addr);
+                if (p) {
+                    std::fprintf(stderr, "  rsi struct: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                 p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],
+                                 p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23],p[24],p[25],p[26],p[27],p[28],p[29],p[30],p[31]);
+                }
+            }
             ctx.rax = SCE_OK;
         });
 
@@ -2027,7 +2511,7 @@ void NidRegistry::register_default_libraries() {
     // scePadReadState(int handle, ScePadData* data)
     auto pad_read_state_handler = [](CpuContext& ctx, MemoryManager& mem) {
         const GuestAddr data_ptr = ctx.rsi;
-        if (data_ptr != 0 && mem.is_valid_address(data_ptr, 32)) {
+        if (data_ptr > 0x1000 && mem.is_valid_address(data_ptr, 32)) {
             mem.zero_memory(data_ptr, 32);
             const u32 btn = g_pad_buttons.load(std::memory_order_relaxed);
             // ScePadData layout:
@@ -2069,28 +2553,11 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x85CB90803E775313ULL, "printf", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr fmt_addr = ctx.rdi;
-            if (fmt_addr > 0x1000 && mem.is_valid_address(fmt_addr, 1)) {
-                const char* fmt = mem.to_host_ptr<char>(fmt_addr);
-                if (fmt) {
-                    std::string_view fsv(fmt);
-                    // Resolve up to 3 possible string pointer arguments safely
-                    const char* s_rsi = (ctx.rsi > 0x1000 && mem.is_valid_address(ctx.rsi, 1)) ? mem.to_host_ptr<char>(ctx.rsi) : "<invalid>";
-                    const char* s_rdx = (ctx.rdx > 0x1000 && mem.is_valid_address(ctx.rdx, 1)) ? mem.to_host_ptr<char>(ctx.rdx) : "<invalid>";
-                    const char* s_rcx = (ctx.rcx > 0x1000 && mem.is_valid_address(ctx.rcx, 1)) ? mem.to_host_ptr<char>(ctx.rcx) : "<invalid>";
-                    (void)s_rcx;
-                    
-                    std::printf("[Guest printf] ");
-                    if (fsv.find("%d") != std::string_view::npos && fsv.find("%s") != std::string_view::npos) {
-                        // "Arg %d = %s\n"
-                        std::printf(fmt, static_cast<int>(ctx.rsi), s_rdx);
-                    } else if (fsv.find("%s") != std::string_view::npos) {
-                        // Single %s format like "\tFile System Root = %s\n"
-                        std::printf(fmt, s_rsi);
-                    } else {
-                        std::printf("%s", fmt);
-                    }
-                    std::printf("\n");
-                }
+            const char* fmt = (fmt_addr > 0x1000 && mem.is_valid_address(fmt_addr, 1))
+                                ? mem.to_host_ptr<char>(fmt_addr) : nullptr;
+            if (fmt) {
+                const std::string formatted = format_guest_string(mem, fmt, ctx.rsi, ctx.rdx, ctx.rcx, ctx.r8);
+                std::fprintf(stderr, "[Guest printf] %s\n", formatted.c_str());
             }
             ctx.rax = 0;
         });
@@ -2115,14 +2582,14 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // Mono mutex lock / 7H0iTOciTLo
-    register_symbol(0xEC7D224CE7224CBAULL, "mono_mutex_lock", "mono-ps4",
+    // pthread_mutex_lock (reached via mono; POSIX codes coincide with ours on success)
+    register_symbol(0xEC7D224CE7224CBAULL, "pthread_mutex_lock", "mono-ps4",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = 0;
         });
 
-    // Mono mutex unlock / 2Z+PpY6CaJg
-    register_symbol(0xD99F8FA58E826898ULL, "mono_mutex_unlock", "mono-ps4",
+    // pthread_mutex_unlock (reached via mono)
+    register_symbol(0xD99F8FA58E826898ULL, "pthread_mutex_unlock", "mono-ps4",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = 0;
         });
@@ -2227,6 +2694,210 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0xC87D7B43A356B558ULL, "sceUserServiceGetEvent", "libSceUserService",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = 0x80960007ULL; // SCE_USER_SERVICE_ERROR_NO_EVENT
+        });
+
+    // Orbis puts alias used by Unity Launcher Control (NID: 0x610D276AFA7E6087ULL)
+    register_symbol(0x610D276AFA7E6087ULL, "puts_orbis", "libc",
+        [this](CpuContext& ctx, MemoryManager& mem) {
+            const auto* s = find_by_nid(0x5C0F663677A000A8ULL);
+            if (s && s->handler) s->handler(ctx, mem);
+        });
+
+    // strcat(char* dst, const char* src) — NID 0x2ECE2DCF38629AA4ULL hashes to
+    // strcat, NOT strlcpy: must APPEND. (The old strlcpy body truncated dst.)
+    // Returns dst; scans bounded so an unterminated dst can't run away.
+    register_symbol(0x2ECE2DCF38629AA4ULL, "strcat", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dst = ctx.rdi;
+            const GuestAddr src = ctx.rsi;
+            if (dst > 0x1000 && src > 0x1000) {
+                usize dst_len = 0;
+                while (dst_len < 4096) {
+                    u8 b = 0;
+                    if (!mem.is_valid_address(dst + dst_len, 1) || !mem.read_value(dst + dst_len, b)) break;
+                    if (b == 0) break;
+                    ++dst_len;
+                }
+                usize src_len = 0;
+                while (src_len < 4096) {
+                    u8 b = 0;
+                    if (!mem.is_valid_address(src + src_len, 1) || !mem.read_value(src + src_len, b)) break;
+                    if (b == 0) break;
+                    ++src_len;
+                }
+                if (mem.is_valid_address(dst + dst_len, src_len + 1)) {
+                    char* d = mem.to_host_ptr<char>(dst + dst_len);
+                    const char* s = mem.to_host_ptr<char>(src);
+                    if (d && s) {
+                        std::memcpy(d, s, src_len);
+                        d[src_len] = '\0';
+                    }
+                }
+            }
+            ctx.rax = dst; // strcat returns dst
+        });
+
+    // mono_add_internal_call(const char* name, const void* method)
+    // NID: 0xFD5B758A1AF32344ULL
+    register_symbol(0xFD5B758A1AF32344ULL, "mono_add_internal_call", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+
+    // mono_jit_init_version(const char* domain_name, const char* runtime_version)
+    // NID: 0x9B795B57A3B5E063ULL -> returns non-null MonoDomain* pointer in guest heap
+    register_symbol(0x9B795B57A3B5E063ULL, "mono_jit_init_version", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 0x80000100ULL; // Valid non-null dummy MonoDomain*
+        });
+
+    // Unity memory allocator, FMOD, and Mono module setup stubs
+    for (Nid stub_nid : {
+             0x2AE3AE0F9F21AA7EULL, // onion_sys_allocator naming / query
+             0xA4EF7A4F0CCE9B91ULL, // virtual query helper
+             0x04DA30C76979F3C1ULL, // init helper
+             0xFE99E3DFFEDAE900ULL, // FMOD / pad init helper
+             0x8941B88CB45FD196ULL, // FMOD mixer thread setup
+             0x54EC7C3469875D3BULL, // thread prio / attr helper
+             0xFEEC04868FFB80EBULL, // thread attr helper
+             0x22EC6752E5E4E818ULL, // mono-ps4.prx post-load query
+             0xFE19F5B5C547AB94ULL, // ALLOC_GFX virtual range naming
+             0x960213B81B11A36AULL, // debug.log stream setup
+             0x47D940F363AB68DBULL, // Unity init helper
+             0x55EED6C524805364ULL, // Unity string/domain setup 1
+             0xC5D3D91AED17EB3BULL, // Unity string/domain setup 2
+             0x4FCEF2B219D790C5ULL,
+             0x72CE3B9DE94CEA50ULL,
+             0x46204874F5E83DD1ULL,
+             0x3B579C5F88AEC0EFULL,
+             0xFEAF6C4747115067ULL,
+             0xE1E3B7F43BAC2E92ULL,
+             0xF737BFA02980EDF6ULL,
+             0x5AA1DFAA34975749ULL,
+             0xF068CCD895AE7A94ULL,
+             0xB8369AEA2E0EF71AULL,
+             0x23FA65EA7B52AD86ULL,
+             0x9141F1F3ED8B6742ULL,
+             0x0E04B6E6017A7AE4ULL,
+             0x7050A9D0D5FCC1FDULL, // libSceGnm init / draw command buffer
+             0x8008429FA5225386ULL, // libSceGnm state / shader setup
+             0xE6E14A7248896113ULL, // libSceGnm state / constant setup
+             0x186B27EE3313C70EULL, // libSceGnm context setup
+             0xFD98F4C8AD37832AULL, // unknown attr helper (NOT Setschedparam; real one is 0x0F3112F61405E1FE)
+             0xD8866B1E72E722DDULL, // Unity init stub
+             0x066E40B33FB6E36FULL, // Unity argv/init stub
+             0x86FD65BA226BA903ULL, // Audio3d / Ajm stub
+             0x42CD305AE96097B5ULL, // Audio3d / Ajm stub
+             0x9839A030E19552A8ULL, // mono mutexattr settype
+             0xE6DC4A7DC3140289ULL, // mono mutexattr setprotocol
+             0xB6D1CD7D4FAA0C15ULL, // mono mutex init
+             0x1C5EE52B8EB1CE36ULL, // mono mutexattr destroy
+             0xD13C959383122EDDULL, // mono cond init
+             0x9AA50B35D8A64E7DULL, // mono TLS / key create
+             0x3AEDE22F569BBE78ULL, // scePthreadSetprio (called right after scePthreadSetaffinity)
+             0x967DF7CE306B7E39ULL, // sceGnmCreateContext
+             0xE6E7409BEE9BA158ULL, // sceGnmRegisterResource
+             0x8A1C6B6ECA122967ULL, // sceGnmUnregisterResource
+             0xC9BD9C4616A00F52ULL, // sceGnmFlushGarlic
+             0xD6A5CB1C8A5138F1ULL, // sceGnmValidation
+             0x5B512D8FF8E55BB6ULL, // sceGnmGetResourceBudget
+             0xEEA65536012EF926ULL, // sceGnmSetCsShader
+             0x8E222DCD2EBEDB68ULL  // sceGnmUpdateResource
+         }) {
+        register_symbol(stub_nid, "sceKernelSyncStub", "libkernel",
+            [](CpuContext& ctx, MemoryManager&) {
+                ctx.rax = SCE_OK;
+            });
+    }
+
+    // sceVideoOutWaitVblank — sleep instead of spinning so the guest yields the
+    // host thread at ~60 FPS VBlank cadence.
+    auto vblank_wait_handler = [](CpuContext& ctx, MemoryManager&) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS VBlank
+        ctx.rax = SCE_OK;
+    };
+    register_symbol(0xCAF67BDEE414AAB9ULL, "sceVideoOutWaitVblank", "libSceVideoOut", vblank_wait_handler);
+
+    // sceKernelGetProcessTimeCounter(void) -> monotonic microseconds (1MHz by
+    // construction). The Frequency NID is unknown and was never called; absolute
+    // rate is a follow-up if the guest ever queries it. Deltas advance in wall
+    // time, which is what unblocks guest timeout spins.
+    // NID: 0x7E0C6731E4CD52D6ULL (was mislabeled GetCompletedLabelAddress)
+    register_symbol(0x7E0C6731E4CD52D6ULL, "sceKernelGetProcessTimeCounter", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) {
+            const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            ctx.rax = now_us;
+        });
+
+    // sceKernelSignalSema(SceKernelSema sema, int count)
+    // NID 0xE1CCE9A47062AE2CULL hashes to THIS name (verified against the Orbis
+    // salt), not sceGnmWaitLabel (which hashes to 0x3F7163E87D6A528D, uncalled).
+    // Every guest signal was being swallowed by the old label stub — it even
+    // stored the count arg into the GPU fence. Reuses the shared handler.
+    register_symbol(0xE1CCE9A47062AE2CULL, "sceKernelSignalSema", "libkernel", signal_sema_handler);
+
+    // sceGnmSubmitAndFlipCommandBuffers(...) — the REAL flip submit.
+    // NID: 0xC5BC4D6AD6B0A217ULL
+    // Buffer-index layout TBD: logs all regs (cf. VideoOutSubmitFlip shape) and
+    // advances the fence + signals flip waiters. No pixel upload is attempted
+    // until the index register is confirmed — uploading the wrong buffer would
+    // present garbage.
+    register_symbol(0xC5BC4D6AD6B0A217ULL, "sceGnmSubmitAndFlipCommandBuffers", "libSceGnmDriver",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::fprintf(stderr, "[Gnm] SubmitAndFlip(rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx)\n",
+                         (unsigned long long)ctx.rdi, (unsigned long long)ctx.rsi,
+                         (unsigned long long)ctx.rdx, (unsigned long long)ctx.rcx,
+                         (unsigned long long)ctx.r8, (unsigned long long)ctx.r9);
+            g_gnm_completed_label.fetch_add(1);
+            sync_gnm_label_slot(mem);
+            if (g_thread_manager) {
+                g_thread_manager->signal_flip_event(static_cast<i64>(ctx.rcx));
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // sceGnmEndWorkload — closes a GPU workload; advance the fence only.
+    // (Was mislabeled SubmitAndFlip: the old body presented + signaled flip here,
+    // a full frame early. Real presentation lives in 0xC5BC... below.)
+    // NID: 0x15ADF1EF938E2D10ULL
+    register_symbol(0x15ADF1EF938E2D10ULL, "sceGnmEndWorkload", "libSceGnmDriver",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            g_gnm_completed_label.fetch_add(1);
+            sync_gnm_label_slot(mem);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataInitialize3 — stub returning success; real save-data calls later.
+    // NID: 0x4F2C2B14A0A82C66ULL
+    register_symbol(0x4F2C2B14A0A82C66ULL, "sceSaveDataInitialize3", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 0;
+        });
+
+    // sceVideoOutModeSetAny_ — initializes the mode struct at rdi.
+    // NID: 0xA63903B20C658BA7ULL
+    // First pass: zero-fill 64 bytes (exact size TBD from the ConfigureOutputMode_
+    // struct dump below).
+    register_symbol(0xA63903B20C658BA7ULL, "sceVideoOutModeSetAny_", "libSceVideoOut",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr mode_ptr = ctx.rdi;
+            if (mode_ptr > 0x1000 && mem.is_valid_address(mode_ptr, 64)) {
+                mem.zero_memory(mode_ptr, 64);
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // sceGnmAddEqEvent — record the registration; full EOP routing once the arg
+    // layout is known from the first-call log below.
+    // NID: 0x6F4C729659D563F2ULL (was mislabeled sceGnmInitialize in the stub loop)
+    register_symbol(0x6F4C729659D563F2ULL, "sceGnmAddEqEvent", "libSceGnmDriver",
+        [](CpuContext& ctx, MemoryManager&) {
+            std::fprintf(stderr, "[Gnm] AddEqEvent(rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx)\n",
+                         (unsigned long long)ctx.rdi, (unsigned long long)ctx.rsi,
+                         (unsigned long long)ctx.rdx, (unsigned long long)ctx.rcx,
+                         (unsigned long long)ctx.r8, (unsigned long long)ctx.r9);
+            ctx.rax = SCE_OK;
         });
 }
 
