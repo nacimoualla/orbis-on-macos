@@ -199,7 +199,6 @@ At runtime, a stall watchdog in the thread manager dumps per-thread RIP/GPRs aft
 ## 🙏 Related projects
 
 - **[shadPS4](https://github.com/shadps4-emu/shadPS4)** — the leading cross-platform PS4 emulator (Windows / Linux / macOS / FreeBSD), built on Vulkan. If you want an end-user GUI today, start there.
-- **[orbital](https://github.com/cy33hc/orbital)** — an experimental, research-oriented PS4 emulator.
 
 `orbis-on-macos` takes a **Mac-first** angle: an Apple Silicon–native, Metal/CoreAudio userland runtime with an `x86-64 → ARM64` dynamic binary translator, explored as a from-scratch, clean-room build.
 
