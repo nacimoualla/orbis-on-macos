@@ -3052,3 +3052,34 @@ void NidRegistry::register_default_libraries() {
 
 } // namespace ps4
 
+    // mono_class_is_subclass_of(MonoClass* klass, MonoClass* parent, gboolean check_interfaces)
+    // NID: 0x1147722929EB0A4CULL — reflexive identity only; distinct cookies
+    // stay 0 so unrelated types are never misclassified.
+    register_symbol(0x1147722929EB0A4CULL, "mono_class_is_subclass_of", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager&) {
+            const GuestAddr klass = ctx.rdi;
+            const GuestAddr parent = ctx.rsi;
+            ctx.rax = (klass != 0 && klass == parent) ? 1 : 0;
+        });
+
+    // mono_runtime_invoke(MonoMethod* method, void* obj, void** params, MonoObject** exc)
+    // NID: 0xA6B7BD0639320E1BULL — no IL execution; clears *exc so the caller
+    // never reads uninitialized stack garbage as a managed exception.
+    register_symbol(0xA6B7BD0639320E1BULL, "mono_runtime_invoke", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr exc_ptr = ctx.rcx;
+            if (exc_ptr > 0x1000 && mem.is_valid_address(exc_ptr, sizeof(u64))) {
+                mem.write_value(exc_ptr, static_cast<u64>(0));
+            }
+            ctx.rax = 0;
+        });
+
+    // mono_class_get_parent(MonoClass* klass) — iterator family: NULL ends the
+    // hierarchy walk at 0x99aeef (do/while klass != NULL). Explicit handler pins
+    // the behavior independently of the global unimplemented fallback.
+    // NID: 0x4CCB2C2760985FAAULL
+    register_symbol(0x4CCB2C2760985FAAULL, "mono_class_get_parent", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 0;
+        });
+
