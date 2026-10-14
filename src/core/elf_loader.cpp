@@ -65,6 +65,11 @@ bool ElfLoader::load_from_memory(std::span<const u8> buffer) {
 }
 
 bool ElfLoader::parse_internal(std::span<const u8> buffer) {
+    const usize ph_table_size = static_cast<usize>(m_header.e_phnum) * static_cast<usize>(m_header.e_phentsize);
+    if (m_header.e_phoff > buffer.size() || ph_table_size > buffer.size() - m_header.e_phoff) {
+        m_error = ElfError::InvalidProgramHeadersOffset;
+        return false;
+    }
     if (buffer.size() < sizeof(Elf64Header)) {
         m_error = ElfError::FileTooSmall;
         return false;
@@ -131,7 +136,7 @@ bool ElfLoader::parse_internal(std::span<const u8> buffer) {
 std::vector<Elf64ProgramHeader> ElfLoader::load_segments() const {
     std::vector<Elf64ProgramHeader> loads;
     for (const auto& phdr : m_program_headers) {
-        if (phdr.p_type == PT_LOAD || phdr.p_type == PT_SCE_RELRO) {
+        if (phdr.p_type == PT_LOAD) {
             loads.push_back(phdr);
         }
     }
