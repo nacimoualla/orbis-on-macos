@@ -132,10 +132,12 @@ struct MonoArena {
     std::unordered_map<ClassKey, GuestAddr, ClassKeyHash> classes;
 };
 static MonoArena s_mono_arena;
-static constexpr GuestSize kMonoArenaSize = 64 * 1024; // 256 slots
+static constexpr GuestSize kMonoArenaSize = 1024 * 1024; // 1 MB = 4096 slots
 static constexpr GuestSize kMonoSlotSize = 256;
 
-// Caller holds s_mono_arena.mtx. Returns a zeroed slot, or 0 when exhausted.
+// Caller holds s_mono_arena.mtx. Carves the arena once from the heap bump
+// pointer (virtual reservation only) and hands out slots zeroed on first use,
+// so untouched pages stay unbacked. Returns 0 when exhausted.
 static GuestAddr mono_arena_alloc(MemoryManager& mem) {
     if (s_mono_arena.base == 0) {
         GuestAddr cur = (g_guest_heap_current.load() + 15) & ~15ULL;
@@ -147,14 +149,14 @@ static GuestAddr mono_arena_alloc(MemoryManager& mem) {
         s_mono_arena.next = cur;
         s_mono_arena.end = cur + kMonoArenaSize;
         g_guest_heap_current.store(cur + kMonoArenaSize);
-        mem.zero_memory(cur, kMonoArenaSize);
     }
     if (s_mono_arena.next + kMonoSlotSize > s_mono_arena.end) {
-        std::fprintf(stderr, "[Mono] arena exhausted (256 slots)\n");
+        std::fprintf(stderr, "[Mono] arena exhausted (4096 slots)\n");
         return 0;
     }
     const GuestAddr slot = s_mono_arena.next;
     s_mono_arena.next += kMonoSlotSize;
+    mem.zero_memory(slot, kMonoSlotSize);
     return slot;
 }
 
