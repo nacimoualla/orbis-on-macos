@@ -69,18 +69,27 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
                                           std::function<void(GuestThread&)> host_task) {
     std::lock_guard<std::mutex> lock(m_threads_mutex);
 
+    constexpr GuestSize kTlsReserveSize = 0x10000; // 64 KB reserved for TLS/TCB below stack
     GuestSize stack_size = (attr && attr->stack_size >= 65536) ? attr->stack_size : 2 * 1024 * 1024;
     GuestAddr stack_base = 0;
+    GuestAddr tls_base = 0;
+
     if (attr && attr->stack_addr != 0 && attr->stack_size >= 65536 &&
         m_memory.is_valid_address(attr->stack_addr, stack_size)) {
         stack_base = attr->stack_addr;
+        // Allocate TLS separately so we never overwrite a small user-supplied stack
+        m_next_stack_top -= kTlsReserveSize;
+        tls_base = (m_next_stack_top + 0x8000) & ~0xFFFULL;
+        m_memory.zero_memory(m_next_stack_top, kTlsReserveSize);
     } else {
-        stack_size = 2 * 1024 * 1024;
-        m_next_stack_top -= stack_size;
-        stack_base = m_next_stack_top;
-        m_memory.zero_memory(stack_base, stack_size);
+        m_next_stack_top -= (stack_size + kTlsReserveSize);
+        tls_base = (m_next_stack_top + 0x8000) & ~0xFFFULL;
+        stack_base = m_next_stack_top + kTlsReserveSize;
+        m_memory.zero_memory(m_next_stack_top, stack_size + kTlsReserveSize);
     }
-    const GuestAddr initial_rsp = (stack_base + stack_size - 16) & ~15ULL;
+
+    // System V x86_64 ABI: RSP must be (16n - 8) at function entry where [RSP] holds return address
+    const GuestAddr initial_rsp = ((stack_base + stack_size - 16) & ~15ULL) - 8;
 
     // Write return address 0 to the top of stack (standard System V entry convention)
     m_memory.write_value(initial_rsp, static_cast<u64>(0));
@@ -102,7 +111,6 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
     thread_ptr->context.rdi = arg;
     thread_ptr->context.rip = entry_point;
 
-    const GuestAddr tls_base = (stack_base + 0x10000) & ~0xFFFULL;
     thread_ptr->context.fs_base = tls_base;
     m_memory.write_value(tls_base, tls_base);
 
@@ -244,7 +252,16 @@ usize ThreadManager::active_thread_count() const {
 
 void ThreadManager::dump_thread_states() const {
     std::lock_guard<std::mutex> lock(m_threads_mutex);
-    std::fprintf(stderr, "=== Thread States Dump (Total active: %zu) ===\n", active_thread_count());
+    usize active_count = 0;
+    for (const auto& [id, th] : m_threads) {
+        if (th) {
+            const auto st = th->state.load();
+            if (st != ThreadState::Terminated && st != ThreadState::Uninitialized) {
+                active_count++;
+            }
+        }
+    }
+    std::fprintf(stderr, "=== Thread States Dump (Total active: %zu) ===\n", active_count);
     for (const auto& [id, th] : m_threads) {
         if (!th) continue;
         const char* st = "Unknown";
