@@ -60,6 +60,7 @@ struct DisplayWindow::Impl {
     NSWindow* window{nil};
     CAMetalLayer* metal_layer{nil};
     PS4WindowDelegate* delegate{nil};
+    u32 buttons{0};
 };
 
 DisplayWindow::DisplayWindow() : m_impl(std::make_unique<Impl>()) {}
@@ -187,10 +188,32 @@ void DisplayWindow::poll_events() {
                 break;
             }
 
+            // Map Space bar (keyCode 49), Enter (keyCode 36), or Left Click / Touch to PS4 Cross (0x4000)
+            constexpr u32 PS4_BUTTON_CROSS = 0x4000;
+            if ([event type] == NSEventTypeKeyDown) {
+                const unsigned short code = [event keyCode];
+                if (code == 49 || code == 36 || code == 126 /* Up */ || code == 124 /* Right */) {
+                    m_impl->buttons |= PS4_BUTTON_CROSS;
+                }
+            } else if ([event type] == NSEventTypeKeyUp) {
+                const unsigned short code = [event keyCode];
+                if (code == 49 || code == 36 || code == 126 || code == 124) {
+                    m_impl->buttons &= ~PS4_BUTTON_CROSS;
+                }
+            } else if ([event type] == NSEventTypeLeftMouseDown) {
+                m_impl->buttons |= PS4_BUTTON_CROSS;
+            } else if ([event type] == NSEventTypeLeftMouseUp) {
+                m_impl->buttons &= ~PS4_BUTTON_CROSS;
+            }
+
             [NSApp sendEvent:event];
         }
         [NSApp updateWindows];
     }
+}
+
+u32 DisplayWindow::input_buttons() const noexcept {
+    return m_impl ? m_impl->buttons : 0;
 }
 
 bool DisplayWindow::present_frame() {

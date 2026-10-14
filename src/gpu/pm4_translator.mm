@@ -32,51 +32,53 @@ void Pm4Translator::Impl::init_mesh_pipeline() {
     if (!metal || !metal->is_initialized()) return;
     if (mesh_pipeline_state) return;
 
-    id<MTLDevice> device = (__bridge id<MTLDevice>)metal->raw_device();
-    if (!device) return;
+    @autoreleasepool {
+        id<MTLDevice> device = (__bridge id<MTLDevice>)metal->raw_device();
+        if (!device) return;
 
-    NSString* shader_source = @""
-        "#include <metal_stdlib>\n"
-        "using namespace metal;\n"
-        "struct Vertex3D {\n"
-        "    packed_float3 position;\n"
-        "    packed_float4 color;\n"
-        "};\n"
-        "struct RasterizerData {\n"
-        "    float4 position [[position]];\n"
-        "    float4 color;\n"
-        "};\n"
-        "vertex RasterizerData vs_mesh(uint vid [[vertex_id]],\n"
-        "                              constant Vertex3D* vertices [[buffer(0)]]) {\n"
-        "    RasterizerData out;\n"
-        "    out.position = float4(float3(vertices[vid].position), 1.0);\n"
-        "    out.color = float4(vertices[vid].color);\n"
-        "    return out;\n"
-        "}\n"
-        "fragment float4 fs_mesh(RasterizerData in [[stage_in]]) {\n"
-        "    return in.color;\n"
-        "}\n";
+        NSString* shader_source = @""
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "struct Vertex3D {\n"
+            "    packed_float3 position;\n"
+            "    packed_float4 color;\n"
+            "};\n"
+            "struct RasterizerData {\n"
+            "    float4 position [[position]];\n"
+            "    float4 color;\n"
+            "};\n"
+            "vertex RasterizerData vs_mesh(uint vid [[vertex_id]],\n"
+            "                              constant Vertex3D* vertices [[buffer(0)]]) {\n"
+            "    RasterizerData out;\n"
+            "    out.position = float4(float3(vertices[vid].position), 1.0);\n"
+            "    out.color = float4(vertices[vid].color);\n"
+            "    return out;\n"
+            "}\n"
+            "fragment float4 fs_mesh(RasterizerData in [[stage_in]]) {\n"
+            "    return in.color;\n"
+            "}\n";
 
-    NSError* error = nil;
-    id<MTLLibrary> library = [device newLibraryWithSource:shader_source options:nil error:&error];
-    if (!library) {
-        std::cerr << "[PM4] Failed to compile MSL 3D mesh shader: "
-                  << (error ? [[error localizedDescription] UTF8String] : "unknown error") << "\n";
-        return;
-    }
+        NSError* error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:shader_source options:nil error:&error];
+        if (!library) {
+            std::cerr << "[PM4] Failed to compile MSL 3D mesh shader: "
+                      << (error ? [[error localizedDescription] UTF8String] : "unknown error") << "\n";
+            return;
+        }
 
-    id<MTLFunction> vs = [library newFunctionWithName:@"vs_mesh"];
-    id<MTLFunction> fs = [library newFunctionWithName:@"fs_mesh"];
+        id<MTLFunction> vs = [library newFunctionWithName:@"vs_mesh"];
+        id<MTLFunction> fs = [library newFunctionWithName:@"fs_mesh"];
 
-    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
-    desc.vertexFunction = vs;
-    desc.fragmentFunction = fs;
-    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+        desc.vertexFunction = vs;
+        desc.fragmentFunction = fs;
+        desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 
-    mesh_pipeline_state = [device newRenderPipelineStateWithDescriptor:desc error:&error];
-    if (!mesh_pipeline_state) {
-        std::cerr << "[PM4] Failed to create 3D mesh render pipeline state: "
-                  << (error ? [[error localizedDescription] UTF8String] : "unknown error") << "\n";
+        mesh_pipeline_state = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+        if (!mesh_pipeline_state) {
+            std::cerr << "[PM4] Failed to create 3D mesh render pipeline state: "
+                      << (error ? [[error localizedDescription] UTF8String] : "unknown error") << "\n";
+        }
     }
 }
 
@@ -89,104 +91,109 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         return true;
     }
 
-    init_mesh_pipeline();
-    if (!mesh_pipeline_state) return false;
+    @autoreleasepool {
+        init_mesh_pipeline();
+        if (!mesh_pipeline_state) return false;
 
-    id<MTLDevice> device = (__bridge id<MTLDevice>)metal->raw_device();
-    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metal->raw_command_queue();
-    id<MTLTexture> framebuffer = (__bridge id<MTLTexture>)metal->raw_framebuffer();
-    if (!device || !queue || !framebuffer) return false;
+        id<MTLDevice> device = (__bridge id<MTLDevice>)metal->raw_device();
+        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metal->raw_command_queue();
+        id<MTLTexture> framebuffer = (__bridge id<MTLTexture>)metal->raw_framebuffer();
+        if (!device || !queue || !framebuffer) return false;
 
-    const void* vtx_ptr = nullptr;
-    const void* idx_ptr = nullptr;
-
-    const usize required_vtx_size = vertex_buffer_size > 0 ? vertex_buffer_size : (idx_count * sizeof(Vertex3D));
-    const usize required_idx_size = idx_count * sizeof(u16);
-
-    if (memory) {
-        if (!memory->is_valid_address(vertex_buffer_addr, required_vtx_size) ||
-            !memory->is_valid_address(idx_addr, required_idx_size)) {
+        const usize required_idx_size = idx_count * sizeof(u16);
+        if (!memory || !memory->is_valid_address(idx_addr, required_idx_size)) {
             return false;
         }
-        vtx_ptr = memory->to_host_ptr<void>(vertex_buffer_addr);
-        idx_ptr = memory->to_host_ptr<void>(idx_addr);
+        const u16* idx_ptr = memory->to_host_ptr<u16>(idx_addr);
+        if (!idx_ptr) return false;
+
+        // Determine actual vertex count from max index if vertex_buffer_size was not explicitly set
+        usize required_vtx_size = vertex_buffer_size;
+        if (required_vtx_size == 0) {
+            u16 max_idx = 0;
+            for (u32 i = 0; i < idx_count; ++i) {
+                if (idx_ptr[i] > max_idx) max_idx = idx_ptr[i];
+            }
+            const usize stride = vertex_stride > 0 ? vertex_stride : sizeof(Vertex3D);
+            required_vtx_size = static_cast<usize>(max_idx + 1) * stride;
+        }
+
+        if (!memory->is_valid_address(vertex_buffer_addr, required_vtx_size)) {
+            return false;
+        }
+        const void* vtx_ptr = memory->to_host_ptr<void>(vertex_buffer_addr);
+        if (!vtx_ptr) return false;
+
+        id<MTLBuffer> vtx_buf = [device newBufferWithBytes:vtx_ptr length:required_vtx_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> idx_buf = [device newBufferWithBytes:idx_ptr length:required_idx_size options:MTLResourceStorageModeShared];
+
+        MTLRenderPassDescriptor* pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass_desc.colorAttachments[0].texture = framebuffer;
+        pass_desc.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass_desc.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+        id<MTLCommandBuffer> cmd = [queue commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass_desc];
+
+        [enc setRenderPipelineState:mesh_pipeline_state];
+        [enc setCullMode:MTLCullModeNone];
+
+        const u32 fb_w = metal->width() > 0 ? metal->width() : 1920;
+        const u32 fb_h = metal->height() > 0 ? metal->height() : 1080;
+
+        f32 origin_x = (viewport.width > 0.0f && viewport.x >= (viewport.width / 2.0f))
+                           ? (viewport.x - (viewport.width / 2.0f))
+                           : viewport.x;
+        f32 origin_y = (viewport.height > 0.0f && viewport.y >= (viewport.height / 2.0f))
+                           ? (viewport.y - (viewport.height / 2.0f))
+                           : viewport.y;
+
+        [enc setViewport:MTLViewport{
+            .originX = origin_x,
+            .originY = origin_y,
+            .width = viewport.width > 0.0f ? std::min<f32>(viewport.width, static_cast<f32>(fb_w)) : static_cast<f32>(fb_w),
+            .height = viewport.height > 0.0f ? std::min<f32>(viewport.height, static_cast<f32>(fb_h)) : static_cast<f32>(fb_h),
+            .znear = viewport.min_depth,
+            .zfar = viewport.max_depth
+        }];
+
+        const u32 sc_x = std::min<u32>(scissor.x, fb_w - 1);
+        const u32 sc_y = std::min<u32>(scissor.y, fb_h - 1);
+        const u32 sc_w = (scissor.width > 0 && sc_x + scissor.width <= fb_w) ? scissor.width : (fb_w - sc_x);
+        const u32 sc_h = (scissor.height > 0 && sc_y + scissor.height <= fb_h) ? scissor.height : (fb_h - sc_y);
+
+        [enc setScissorRect:MTLScissorRect{
+            .x = sc_x,
+            .y = sc_y,
+            .width = sc_w,
+            .height = sc_h
+        }];
+
+        [enc setVertexBuffer:vtx_buf offset:0 atIndex:0];
+
+        MTLPrimitiveType mtl_prim = MTLPrimitiveTypeTriangle;
+        if (prim_type == PrimitiveType::TriangleStrip) {
+            mtl_prim = MTLPrimitiveTypeTriangleStrip;
+        } else if (prim_type == PrimitiveType::LineList) {
+            mtl_prim = MTLPrimitiveTypeLine;
+        } else if (prim_type == PrimitiveType::PointList) {
+            mtl_prim = MTLPrimitiveTypePoint;
+        }
+
+        [enc drawIndexedPrimitives:mtl_prim
+                        indexCount:idx_count
+                         indexType:MTLIndexTypeUInt16
+                       indexBuffer:idx_buf
+                 indexBufferOffset:0];
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        draw_count++;
+        indexed_draw_count++;
+        return true;
     }
-
-    if (!vtx_ptr || !idx_ptr) return false;
-
-    id<MTLBuffer> vtx_buf = [device newBufferWithBytes:vtx_ptr length:required_vtx_size options:MTLResourceStorageModeShared];
-    id<MTLBuffer> idx_buf = [device newBufferWithBytes:idx_ptr length:required_idx_size options:MTLResourceStorageModeShared];
-
-    MTLRenderPassDescriptor* pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass_desc.colorAttachments[0].texture = framebuffer;
-    pass_desc.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    pass_desc.colorAttachments[0].storeAction = MTLStoreActionStore;
-
-    id<MTLCommandBuffer> cmd = [queue commandBuffer];
-    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass_desc];
-
-    [enc setRenderPipelineState:mesh_pipeline_state];
-    [enc setCullMode:MTLCullModeNone];
-
-    f32 origin_x = 0.0f;
-    if (viewport.width > 0.0f && viewport.x >= (viewport.width / 2.0f)) {
-        origin_x = viewport.x - (viewport.width / 2.0f);
-    } else {
-        origin_x = viewport.x;
-    }
-
-    f32 origin_y = 0.0f;
-    if (viewport.height > 0.0f && viewport.y >= (viewport.height / 2.0f)) {
-        origin_y = viewport.y - (viewport.height / 2.0f);
-    } else {
-        origin_y = viewport.y;
-    }
-
-    [enc setViewport:MTLViewport{
-        .originX = origin_x,
-        .originY = origin_y,
-        .width = viewport.width > 0.0f ? viewport.width : 1920.0f,
-        .height = viewport.height > 0.0f ? viewport.height : 1080.0f,
-        .znear = viewport.min_depth,
-        .zfar = viewport.max_depth
-    }];
-
-    const u32 sc_x = std::min<u32>(scissor.x, 1919);
-    const u32 sc_y = std::min<u32>(scissor.y, 1079);
-    const u32 sc_w = (scissor.width > 0 && sc_x + scissor.width <= 1920) ? scissor.width : (1920 - sc_x);
-    const u32 sc_h = (scissor.height > 0 && sc_y + scissor.height <= 1080) ? scissor.height : (1080 - sc_y);
-
-    [enc setScissorRect:MTLScissorRect{
-        .x = sc_x,
-        .y = sc_y,
-        .width = sc_w,
-        .height = sc_h
-    }];
-
-    [enc setVertexBuffer:vtx_buf offset:0 atIndex:0];
-
-    MTLPrimitiveType mtl_prim = MTLPrimitiveTypeTriangle;
-    if (prim_type == PrimitiveType::TriangleStrip) {
-        mtl_prim = MTLPrimitiveTypeTriangleStrip;
-    } else if (prim_type == PrimitiveType::LineList) {
-        mtl_prim = MTLPrimitiveTypeLine;
-    } else if (prim_type == PrimitiveType::PointList) {
-        mtl_prim = MTLPrimitiveTypePoint;
-    }
-
-    [enc drawIndexedPrimitives:mtl_prim
-                    indexCount:idx_count
-                     indexType:MTLIndexTypeUInt16
-                   indexBuffer:idx_buf
-             indexBufferOffset:0];
-
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
-
-    draw_count++;
-    indexed_draw_count++;
-    return true;
 }
 
 Pm4Translator::Pm4Translator(MetalBackend* metal)

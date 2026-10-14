@@ -43,6 +43,9 @@ public:
     /// Request closing the window
     void close();
 
+    /// Get current controller/keyboard buttons bitmask (Bit 14 = Cross/Space/Click)
+    [[nodiscard]] u32 input_buttons() const noexcept;
+
     /// Window content width
     [[nodiscard]] u32 width() const noexcept;
 

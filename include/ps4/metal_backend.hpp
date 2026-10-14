@@ -48,6 +48,9 @@ public:
     /// Read back pixel value at (x, y) into 8-bit RGBA channels
     bool read_pixel(u32 x, u32 y, u8& out_r, u8& out_g, u8& out_b, u8& out_a) const;
 
+    /// Upload CPU/guest pixel buffer (BGRA or RGBA) directly into Metal framebuffer texture
+    bool upload_pixels(const void* pixel_data, usize bytes_per_row);
+
     /// Raw Metal pointers for window presentation and GPU subsystems
     [[nodiscard]] void* raw_device() const noexcept;
     [[nodiscard]] void* raw_command_queue() const noexcept;
