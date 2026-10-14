@@ -208,9 +208,15 @@ void SyscallTable::register_default_handlers() {
     register_handler(SYS_mprotect, [](SyscallContext& ctx) -> OrbisResult {
         const GuestAddr addr = ctx.args[0];
         const GuestSize len = ctx.args[1];
-        const u32 prot = static_cast<u32>(ctx.args[2]);
+        const u32 bsd_prot = static_cast<u32>(ctx.args[2]);
 
-        if (!ctx.memory || !ctx.memory->protect(addr, len, prot)) {
+        // Translate BSD PROT_* (R=1, W=2, X=4) to ELF PF_* (X=1, W=2, R=4)
+        u32 elf_flags = 0;
+        if (bsd_prot & 0x1) elf_flags |= PF_R; // PROT_READ  -> PF_R
+        if (bsd_prot & 0x2) elf_flags |= PF_W; // PROT_WRITE -> PF_W
+        if (bsd_prot & 0x4) elf_flags |= PF_X; // PROT_EXEC  -> PF_X
+
+        if (!ctx.memory || !ctx.memory->protect(addr, len, elf_flags)) {
             ctx.rax = static_cast<u64>(-12); // -ENOMEM
             return -12;
         }
@@ -218,6 +224,7 @@ void SyscallTable::register_default_handlers() {
         ctx.rax = 0;
         return 0;
     });
+
 }
 
 } // namespace ps4

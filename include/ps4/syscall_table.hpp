@@ -7,6 +7,8 @@
 #include <iostream>
 #include <unordered_map>
 
+#include "ps4/cpu_context.hpp"
+
 namespace ps4 {
  
 class VirtualFileSystem;
@@ -19,10 +21,12 @@ struct SyscallContext {
     u64 rbp{0};                   // Base pointer register
     MemoryManager* memory{nullptr}; // Pointer to guest memory manager
     VirtualFileSystem* vfs{nullptr}; // Pointer to virtual file system
+    CpuContext* cpu{nullptr};        // Pointer to CPU context
+    bool cpu_rip_modified{false};    // Flag set if HLE (e.g. longjmp) modified RIP/RSP
 
     SyscallContext() = default;
-    explicit SyscallContext(MemoryManager& mem, VirtualFileSystem* vfs_ptr = nullptr)
-        : memory(&mem), vfs(vfs_ptr) {}
+    explicit SyscallContext(MemoryManager& mem, VirtualFileSystem* vfs_ptr = nullptr, CpuContext* cpu_ptr = nullptr)
+        : memory(&mem), vfs(vfs_ptr), cpu(cpu_ptr) {}
 };
 
 using SyscallHandler = std::function<OrbisResult(SyscallContext&)>;
