@@ -265,6 +265,7 @@ int main(int argc, char* argv[]) {
         tm->dump_thread_states();
     }
     ps4::dump_sema_states();
+    ps4::dump_hle_warning_stats();
 
     if (window && window->is_open()) {
         window->close();

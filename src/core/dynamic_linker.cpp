@@ -1,8 +1,12 @@
 #include "ps4/dynamic_linker.hpp"
 #include "ps4/thread.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 namespace ps4 {
 
@@ -46,6 +50,45 @@ bool DynamicLinker::initialize(GuestAddr trampoline_base) {
     m_memory.zero_memory(m_trampoline_base, TRAMPOLINE_POOL_SIZE);
     m_registry.set_syscall_table(&m_syscalls);
     return true;
+}
+
+namespace {
+
+// Unimplemented-NID warning throttle state. Poll loops can hit one stub
+// millions of times; the dispatch gate below caps warning+backtrace output per
+// (NID, caller) so a single hot loop can never balloon the log again.
+// Mutex-guarded: dispatches run on many host threads concurrently.
+struct UnimplWarnEntry { Nid nid{0}; GuestAddr caller{0}; unsigned printed{0}; };
+std::mutex s_unimpl_warn_mtx;
+std::unordered_map<u64, UnimplWarnEntry> s_unimpl_warned;
+unsigned long long s_unimpl_suppressed_total{0};
+
+u64 unimpl_warn_key(Nid nid, GuestAddr caller) {
+    return nid ^ (caller * 0x9e3779b97f4a7c15ULL);
+}
+
+} // namespace
+
+void dump_hle_warning_stats() {
+    struct Row { Nid nid; GuestAddr caller; unsigned printed; };
+    std::vector<Row> rows;
+    unsigned long long suppressed = 0;
+    {
+        std::lock_guard<std::mutex> lock(s_unimpl_warn_mtx);
+        suppressed = s_unimpl_suppressed_total;
+        for (const auto& [key, e] : s_unimpl_warned) {
+            (void)key;
+            rows.push_back({e.nid, e.caller, e.printed});
+        }
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const Row& a, const Row& b) { return a.printed > b.printed; });
+    std::fprintf(stderr, "=== [HLE WARNING] suppression stats: %llu silenced after cap ===\n", suppressed);
+    for (usize i = 0; i < rows.size() && i < 10; ++i) {
+        std::fprintf(stderr, "  NID=0x%016llx caller=0x%llx printed=%u\n",
+                     (unsigned long long)rows[i].nid,
+                     (unsigned long long)rows[i].caller, rows[i].printed);
+    }
 }
 
 GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
@@ -179,14 +222,35 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             std::abort();
         }
 
-        // 3. Normal mode (non-strict): warn and return SCE_KERNEL_ERROR_EINVAL (0x80020016ULL)
+        // 3. Normal mode (non-strict): warn and return 0 (null-bail fallback).
+        // 0 is SCE_OK for Sony calls and NULL for pointer/iterator APIs: mono_*
+        // walks bail cleanly on null, while EINVAL was stored as a handle and
+        // chased as a pointer (see the 0x99ad0a poll loop).
         const char* str_arg0 = (sctx.args[0] > 0x1000 && m_memory.is_valid_address(sctx.args[0], 1))
                                 ? m_memory.to_host_ptr<char>(sctx.args[0]) : nullptr;
         const char* str_arg1 = (sctx.args[1] > 0x1000 && m_memory.is_valid_address(sctx.args[1], 1))
                                 ? m_memory.to_host_ptr<char>(sctx.args[1]) : nullptr;
         GuestAddr ret_addr = 0;
         m_memory.read_value(sctx.rsp, ret_addr);
-        std::fprintf(stderr, "[HLE WARNING] Unimplemented stub called: NID=0x%016llx (caller RIP=0x%llx, rdi=0x%llx '%s', rsi=0x%llx '%s', rdx=0x%llx) returning SCE_KERNEL_ERROR_EINVAL (0x80020016)\n",
+        // Throttle: first 5 prints per (NID, caller); the rest only bump the
+        // suppressed counter reported by dump_hle_warning_stats().
+        bool print_warning = false;
+        {
+            std::lock_guard<std::mutex> lock(s_unimpl_warn_mtx);
+            UnimplWarnEntry& e = s_unimpl_warned[unimpl_warn_key(nid, ret_addr)];
+            if (e.printed == 0) {
+                e.nid = nid;
+                e.caller = ret_addr;
+            }
+            if (e.printed < 5) {
+                ++e.printed;
+                print_warning = true;
+            } else {
+                ++s_unimpl_suppressed_total;
+            }
+        }
+        if (print_warning) {
+        std::fprintf(stderr, "[HLE WARNING] Unimplemented stub called: NID=0x%016llx (caller RIP=0x%llx, rdi=0x%llx '%s', rsi=0x%llx '%s', rdx=0x%llx) returning 0 (0x0)\n",
                      (unsigned long long)nid, (unsigned long long)ret_addr, (unsigned long long)sctx.args[0],
                      str_arg0 ? str_arg0 : "", (unsigned long long)sctx.args[1],
                      str_arg1 ? str_arg1 : "", (unsigned long long)sctx.args[2]);
@@ -199,9 +263,10 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             std::fprintf(stderr, "  frame #%d: RIP=0x%llx, RBP=0x%llx\n", f, (unsigned long long)saved_rip, (unsigned long long)saved_rbp);
             cur_rbp = saved_rbp;
         }
-        sctx.rax = SCE_KERNEL_ERROR_EINVAL;
+        } // if (print_warning)
+        sctx.rax = 0;
         if (sctx.cpu) {
-            sctx.cpu->rax = SCE_KERNEL_ERROR_EINVAL;
+            sctx.cpu->rax = 0;
         }
         return 0;
     });

@@ -45,9 +45,7 @@ public:
 
     /// Benign stubs whitelist
     void add_to_whitelist(Nid nid);
-    [[nodiscard]] bool is_whitelisted(Nid nid) const noexcept;
-
-private:
+    [[nodiscard]] bool is_whitelisted(Nid nid) const noexcept;private:
     MemoryManager& m_memory;
     SyscallTable& m_syscalls;
     NidRegistry& m_registry;
@@ -60,5 +58,9 @@ private:
     std::unordered_map<Nid, GuestAddr> m_nid_to_trampoline;
     std::unordered_map<u32, Nid> m_id_to_nid;
 };
+
+/// Unimplemented-stub warning stats (suppressed-after-cap totals). Defined in
+/// dynamic_linker.cpp; called from the run exit path.
+void dump_hle_warning_stats();
 
 } // namespace ps4
