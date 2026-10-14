@@ -172,6 +172,9 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[CPU] Initializing execution engine & ARM64 JIT dynamic recompiler...\n";
     ps4::JitCompiler jit;
     ps4::CpuExecutor cpu(memory, syscalls);
+    // Creating overload: the manager may not exist yet (first HLE dispatch
+    // creates it lazily), and the no-arg accessor would return null here.
+    nid_registry.thread_manager(memory).set_main_context(&cpu.context());
     if (enable_jit) {
         cpu.set_jit_compiler(&jit);
         nid_registry.set_jit_compiler(&jit);
@@ -255,6 +258,13 @@ int main(int argc, char* argv[]) {
     }
 
     cpu.context().dump();
+
+    // End-of-run per-thread snapshot: state, wake deadline, last RIP, instrs.
+    // Answers "what is each thread blocked in" without a live debugger.
+    if (auto* tm = nid_registry.thread_manager()) {
+        tm->dump_thread_states();
+    }
+    ps4::dump_sema_states();
 
     if (window && window->is_open()) {
         window->close();
