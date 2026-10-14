@@ -24,6 +24,7 @@ int main(int argc, char* argv[]) {
     bool enable_window = false;
     bool enable_jit = true;
     bool enable_trace = false;
+    bool enable_strict_hle = false;
     std::filesystem::path elf_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -36,6 +37,8 @@ int main(int argc, char* argv[]) {
             enable_jit = false;
         } else if (arg == "--trace" || arg == "-t") {
             enable_trace = true;
+        } else if (arg == "--strict-hle") {
+            enable_strict_hle = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: ps4-runner [options] <path-to-eboot.bin-or-elf>\n";
             std::cout << "Options:\n";
@@ -43,6 +46,7 @@ int main(int argc, char* argv[]) {
             std::cout << "  --headless       Run headlessly in console only (default)\n";
             std::cout << "  --no-jit         Disable ARM64 JIT dynamic recompiler (interpreter only)\n";
             std::cout << "  --trace, -t      Trace guest instruction execution step-by-step\n";
+            std::cout << "  --strict-hle     Fail-loud strict HLE development mode (crash on missing NIDs)\n";
             return 0;
         } else {
             elf_path = argv[i];
@@ -116,6 +120,10 @@ int main(int argc, char* argv[]) {
     nid_registry.register_default_libraries();
 
     ps4::DynamicLinker linker(memory, syscalls, nid_registry);
+    if (enable_strict_hle) {
+        linker.set_strict_hle(true);
+        std::cout << "[Linker] Strict HLE mode ENABLED (fail-loud diagnostic crash on missing NIDs)\n";
+    }
     if (!linker.initialize()) {
         std::cerr << "[Error] Failed to initialize dynamic linker trampoline pool.\n";
         return 1;
@@ -124,6 +132,13 @@ int main(int argc, char* argv[]) {
     linker.resolve_relocations(file_data, loader);
     std::cout << "[Linker] Resolved symbols via NID registry (Active trampolines: "
               << linker.trampoline_count() << ")\n";
+
+    // Apply segment protections now that relocations and GOT patching are complete
+    for (const auto& seg : loader.load_segments()) {
+        if (seg.p_memsz > 0) {
+            memory.protect(seg.p_vaddr, seg.p_memsz, seg.p_flags);
+        }
+    }
 
     // 7. Initialize Apple Silicon Metal GPU Subsystem & Window
     std::cout << "[Metal] Initializing GPU backend...\n";
@@ -190,7 +205,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Step " << i << ": RIP=0x" << std::hex << cur_rip << " -> 0x" << cpu.context().rip 
                       << " (" << ps4::step_result_to_string(sr) << ")\n" << std::dec;
             total_instructions++;
-            if (sr != ps4::StepResult::Ok) {
+            if (sr != ps4::StepResult::Ok && sr != ps4::StepResult::Syscall) {
                 run_res.status = sr;
                 if (sr == ps4::StepResult::Exited) {
                     run_res.exit_code = syscalls.exit_code();
@@ -200,7 +215,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (!syscalls.has_exited() && run_res.status == ps4::StepResult::Ok) {
+    if (!syscalls.has_exited() &&
+        (run_res.status == ps4::StepResult::Ok || run_res.status == ps4::StepResult::Syscall)) {
         if (window && window->is_open()) {
             // Interactive 60 FPS Presentation Loop:
             // Run guest execution batches each frame, pump user input events, and present via Metal
@@ -250,6 +266,9 @@ int main(int argc, char* argv[]) {
     if (window && window->is_open()) {
         window->close();
     }
+
+    // Join all guest pthreads before local MemoryManager, SyscallTable, and JitCompiler go out of scope
+    nid_registry.shutdown();
 
     return 0;
 }
