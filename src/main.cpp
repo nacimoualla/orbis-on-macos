@@ -13,6 +13,7 @@
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
 #include "ps4/syscall_table.hpp"
+#include "ps4/thread.hpp"
 #include "ps4/vfs.hpp"
 
 int main(int argc, char* argv[]) {
@@ -23,6 +24,7 @@ int main(int argc, char* argv[]) {
     bool enable_window = false;
     bool enable_jit = true;
     bool enable_trace = false;
+    bool enable_strict_hle = false;
     std::filesystem::path elf_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -35,6 +37,8 @@ int main(int argc, char* argv[]) {
             enable_jit = false;
         } else if (arg == "--trace" || arg == "-t") {
             enable_trace = true;
+        } else if (arg == "--strict-hle") {
+            enable_strict_hle = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: ps4-runner [options] <path-to-eboot.bin-or-elf>\n";
             std::cout << "Options:\n";
@@ -42,6 +46,7 @@ int main(int argc, char* argv[]) {
             std::cout << "  --headless       Run headlessly in console only (default)\n";
             std::cout << "  --no-jit         Disable ARM64 JIT dynamic recompiler (interpreter only)\n";
             std::cout << "  --trace, -t      Trace guest instruction execution step-by-step\n";
+            std::cout << "  --strict-hle     Fail-loud strict HLE development mode (crash on missing NIDs)\n";
             return 0;
         } else {
             elf_path = argv[i];
@@ -111,9 +116,14 @@ int main(int argc, char* argv[]) {
     std::cout << "[Linker] Initializing NID Registry and Dynamic Linker...\n";
     ps4::NidRegistry nid_registry;
     nid_registry.set_vfs(&vfs);
+    nid_registry.set_syscall_table(&syscalls);
     nid_registry.register_default_libraries();
 
     ps4::DynamicLinker linker(memory, syscalls, nid_registry);
+    if (enable_strict_hle) {
+        linker.set_strict_hle(true);
+        std::cout << "[Linker] Strict HLE mode ENABLED (fail-loud diagnostic crash on missing NIDs)\n";
+    }
     if (!linker.initialize()) {
         std::cerr << "[Error] Failed to initialize dynamic linker trampoline pool.\n";
         return 1;
@@ -123,9 +133,10 @@ int main(int argc, char* argv[]) {
     std::cout << "[Linker] Resolved symbols via NID registry (Active trampolines: "
               << linker.trampoline_count() << ")\n";
 
-    // 7. Initialize Apple Silicon Metal GPU Subsystem
+    // 7. Initialize Apple Silicon Metal GPU Subsystem & Window
     std::cout << "[Metal] Initializing GPU backend...\n";
     ps4::MetalBackend metal;
+    std::unique_ptr<ps4::DisplayWindow> window;
     if (metal.initialize()) {
         std::cout << "[Metal] GPU Device: " << metal.device_name() << "\n";
         if (metal.create_framebuffer(1920, 1080)) {
@@ -133,6 +144,24 @@ int main(int argc, char* argv[]) {
             // PlayStation Deep Blue clear: R=0.0f, G=0.15f, B=0.45f
             if (metal.clear_screen({0.0f, 0.15f, 0.45f, 1.0f})) {
                 std::cout << "[Metal] GPU command buffer executed clear pass.\n";
+            }
+            nid_registry.set_metal_backend(&metal);
+        }
+
+        if (enable_window) {
+            std::cout << "\n[Display] Opening interactive macOS Metal window...\n";
+            std::cout << "[Display] Running presentation loop at 60 FPS (Press ESC or close window to exit)\n";
+            window = std::make_unique<ps4::DisplayWindow>();
+            ps4::WindowConfig win_cfg{
+                .title = "ps4-to-macos: " + elf_path.filename().string() + " (Metal 3 - Interactive)",
+                .width = 1280,
+                .height = 720,
+                .resizable = true,
+                .headless = false
+            };
+            if (!window->initialize(metal, win_cfg)) {
+                std::cerr << "[Display] Warning: Failed to open interactive window, falling back to console mode.\n";
+                window.reset();
             }
         }
     } else {
@@ -143,8 +172,12 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[CPU] Initializing execution engine & ARM64 JIT dynamic recompiler...\n";
     ps4::JitCompiler jit;
     ps4::CpuExecutor cpu(memory, syscalls);
+    // Creating overload: the manager may not exist yet (first HLE dispatch
+    // creates it lazily), and the no-arg accessor would return null here.
+    nid_registry.thread_manager(memory).set_main_context(&cpu.context());
     if (enable_jit) {
         cpu.set_jit_compiler(&jit);
+        nid_registry.set_jit_compiler(&jit);
         std::cout << "[CPU] ARM64 JIT compiler connected to executor (Tier-2 Dynamic Binary Translation active)\n";
     } else {
         std::cout << "[CPU] Running in pure interpreter mode (--no-jit specified)\n";
@@ -168,7 +201,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Step " << i << ": RIP=0x" << std::hex << cur_rip << " -> 0x" << cpu.context().rip 
                       << " (" << ps4::step_result_to_string(sr) << ")\n" << std::dec;
             total_instructions++;
-            if (sr != ps4::StepResult::Ok) {
+            if (sr != ps4::StepResult::Ok && sr != ps4::StepResult::Syscall) {
                 run_res.status = sr;
                 if (sr == ps4::StepResult::Exited) {
                     run_res.exit_code = syscalls.exit_code();
@@ -178,14 +211,33 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (!syscalls.has_exited() && run_res.status == ps4::StepResult::Ok) {
-        const ps4::usize batch = 1000000;
-        const ps4::usize max_total = 20000000;
-        while (total_instructions < max_total) {
-            run_res = cpu.run(batch);
-            total_instructions += run_res.instructions_executed;
-            if (run_res.status != ps4::StepResult::Ok) break;
-            std::cout << "[CPU Progress] " << total_instructions << " instrs, RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n";
+    if (!syscalls.has_exited() &&
+        (run_res.status == ps4::StepResult::Ok || run_res.status == ps4::StepResult::Syscall)) {
+        if (window && window->is_open()) {
+            // Interactive 60 FPS Presentation Loop:
+            // Run guest execution batches each frame, pump user input events, and present via Metal
+            const ps4::usize frame_slice = 2000000;
+            while (window->is_open() && !syscalls.has_exited()) {
+                window->poll_events();
+                nid_registry.set_pad_buttons(window->input_buttons());
+
+                run_res = cpu.run(frame_slice);
+                total_instructions += run_res.instructions_executed;
+                if (run_res.status != ps4::StepResult::Ok) break;
+
+                window->present_frame();
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            }
+        } else {
+            // Console / Headless Execution Loop
+            const ps4::usize batch = 1000000;
+            const ps4::usize max_total = 100000000;
+            while (total_instructions < max_total && !syscalls.has_exited()) {
+                run_res = cpu.run(batch);
+                total_instructions += run_res.instructions_executed;
+                if (run_res.status != ps4::StepResult::Ok) break;
+                std::cout << "[CPU Progress] " << total_instructions << " instrs, RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n";
+            }
         }
     }
     std::cout << "==========================================================\n";
@@ -196,34 +248,31 @@ int main(int argc, char* argv[]) {
         std::cout << "[CPU] JIT Blocks Cached: " << jit.cached_block_count()
                   << " | Total Invocations: " << jit.total_invocations() << "\n";
     }
+    if (auto* tm = nid_registry.thread_manager()) {
+        std::cout << "[Threads] Created: " << tm->threads_created()
+                  << " | Started: " << tm->threads_started()
+                  << " | Executed Instructions: " << tm->threads_executed_instructions() << "\n";
+    }
     if (run_res.status == ps4::StepResult::Exited) {
         std::cout << "[CPU] Process Exit Code: " << run_res.exit_code << "\n";
     }
 
     cpu.context().dump();
 
-    // 9. Interactive Metal Display Window Presentation
-    if (enable_window && metal.is_initialized()) {
-        std::cout << "\n[Display] Opening interactive macOS Metal window...\n";
-        std::cout << "[Display] Running presentation loop at 60 FPS (Press ESC or close window to exit)\n";
-        ps4::DisplayWindow window;
-        ps4::WindowConfig win_cfg{
-            .title = "ps4-to-macos: " + elf_path.filename().string() + " (Metal 3)",
-            .width = 1280,
-            .height = 720,
-            .resizable = true,
-            .headless = false
-        };
-
-        if (window.initialize(metal, win_cfg)) {
-            while (window.is_open()) {
-                window.poll_events();
-                window.present_frame();
-                std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS
-            }
-            std::cout << "[Display] Window closed cleanly.\n";
-        }
+    // End-of-run per-thread snapshot: state, wake deadline, last RIP, instrs.
+    // Answers "what is each thread blocked in" without a live debugger.
+    if (auto* tm = nid_registry.thread_manager()) {
+        tm->dump_thread_states();
     }
+    ps4::dump_sema_states();
+    ps4::dump_hle_warning_stats();
+
+    if (window && window->is_open()) {
+        window->close();
+    }
+
+    // Join all guest pthreads before local MemoryManager, SyscallTable, and JitCompiler go out of scope
+    nid_registry.shutdown();
 
     return 0;
 }

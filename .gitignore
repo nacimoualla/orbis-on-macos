@@ -34,3 +34,14 @@ sce_module/
 .idea/
 .vscode/
 *.swp
+
+# Emulator run logs (can reach GBs; regenerated every run, never published)
+flappy_*.txt
+log.txt
+
+# Python bytecode caches
+__pycache__/
+
+# Agent working-memory directories (machine-local session notes)
+.agents/
+.superpowers/

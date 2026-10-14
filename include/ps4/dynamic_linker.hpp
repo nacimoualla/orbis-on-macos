@@ -8,12 +8,17 @@
 #include "ps4/reloc.hpp"
 #include "ps4/syscall_table.hpp"
 #include <unordered_map>
+#include <unordered_set>
 #include <span>
 
 namespace ps4 {
 
 inline constexpr GuestAddr HLE_TRAMPOLINE_BASE = 0x00100000ULL;
 inline constexpr u32 HLE_SYSCALL_DISPATCH_BASE = 0x80000000;
+
+// Orbis OS return codes
+inline constexpr u64 SCE_KERNEL_ERROR_EINVAL = 0x80020016ULL;
+inline constexpr u64 SCE_USER_SERVICE_ERROR_NO_EVENT = 0x80960007ULL;
 
 class DynamicLinker {
 public:
@@ -34,15 +39,28 @@ public:
     /// Total number of generated trampolines
     [[nodiscard]] usize trampoline_count() const noexcept { return m_nid_to_trampoline.size(); }
 
-private:
+    /// Strict HLE fail-loud development mode
+    void set_strict_hle(bool enabled) noexcept;
+    [[nodiscard]] bool is_strict_hle() const noexcept;
+
+    /// Benign stubs whitelist
+    void add_to_whitelist(Nid nid);
+    [[nodiscard]] bool is_whitelisted(Nid nid) const noexcept;private:
     MemoryManager& m_memory;
     SyscallTable& m_syscalls;
     NidRegistry& m_registry;
     GuestAddr m_trampoline_base{HLE_TRAMPOLINE_BASE};
     u32 m_next_trampoline_id{0};
 
+    bool m_strict_hle{false};
+    std::unordered_set<Nid> m_whitelist;
+
     std::unordered_map<Nid, GuestAddr> m_nid_to_trampoline;
     std::unordered_map<u32, Nid> m_id_to_nid;
 };
+
+/// Unimplemented-stub warning stats (suppressed-after-cap totals). Defined in
+/// dynamic_linker.cpp; called from the run exit path.
+void dump_hle_warning_stats();
 
 } // namespace ps4

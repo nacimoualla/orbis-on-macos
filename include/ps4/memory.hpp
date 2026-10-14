@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <span>
 #include <string_view>
+#include <type_traits>
+#include <unordered_map>
 
 namespace ps4 {
 
@@ -60,25 +62,33 @@ public:
     }
 
     /// Translate a guest virtual address to a host pointer
-    [[nodiscard]] void* to_host_ptr(GuestAddr addr) noexcept {
-        if (!is_valid_address(addr)) return nullptr;
+    [[nodiscard]] void* to_host_ptr(GuestAddr addr, GuestSize size = 1) noexcept {
+        if (!is_valid_address(addr, size)) return nullptr;
         return static_cast<void*>(m_base + addr);
     }
 
-    [[nodiscard]] const void* to_host_ptr(GuestAddr addr) const noexcept {
-        if (!is_valid_address(addr)) return nullptr;
+    [[nodiscard]] const void* to_host_ptr(GuestAddr addr, GuestSize size = 1) const noexcept {
+        if (!is_valid_address(addr, size)) return nullptr;
         return static_cast<const void*>(m_base + addr);
     }
 
     /// Typed translation helper
     template <typename T>
     [[nodiscard]] T* to_host_ptr(GuestAddr addr) noexcept {
-        return static_cast<T*>(to_host_ptr(addr));
+        if constexpr (std::is_void_v<T>) {
+            return static_cast<T*>(to_host_ptr(addr, 1));
+        } else {
+            return static_cast<T*>(to_host_ptr(addr, sizeof(T)));
+        }
     }
 
     template <typename T>
     [[nodiscard]] const T* to_host_ptr(GuestAddr addr) const noexcept {
-        return static_cast<const T*>(to_host_ptr(addr));
+        if constexpr (std::is_void_v<T>) {
+            return static_cast<const T*>(to_host_ptr(addr, 1));
+        } else {
+            return static_cast<const T*>(to_host_ptr(addr, sizeof(T)));
+        }
     }
 
     /// Translate a host pointer back to a guest address
@@ -127,6 +137,7 @@ private:
     u8* m_base{nullptr};
     GuestSize m_total_size{GUEST_MEMORY_SIZE};
     MemoryError m_last_error{MemoryError::None};
+    std::unordered_map<u64, u32> m_page_flags;
 };
 
 } // namespace ps4

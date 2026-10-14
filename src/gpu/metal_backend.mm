@@ -134,6 +134,21 @@ bool MetalBackend::read_pixel(u32 x, u32 y, u8& out_r, u8& out_g, u8& out_b, u8&
     }
 }
 
+bool MetalBackend::upload_pixels(const void* pixel_data, usize bytes_per_row) {
+    if (!is_initialized() || !m_impl->framebuffer || !pixel_data) {
+        return false;
+    }
+
+    @autoreleasepool {
+        MTLRegion region = MTLRegionMake2D(0, 0, m_impl->width, m_impl->height);
+        [m_impl->framebuffer replaceRegion:region
+                              mipmapLevel:0
+                                withBytes:pixel_data
+                              bytesPerRow:bytes_per_row];
+        return true;
+    }
+}
+
 void* MetalBackend::raw_device() const noexcept {
     return m_impl ? (__bridge void*)m_impl->device : nullptr;
 }

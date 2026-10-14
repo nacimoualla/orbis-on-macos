@@ -76,6 +76,7 @@ void MemoryManager::release() {
     if (m_base != nullptr) {
         ::munmap(m_base, m_total_size);
         m_base = nullptr;
+        m_page_flags.clear();
     }
 }
 
@@ -84,17 +85,39 @@ bool MemoryManager::protect(GuestAddr addr, GuestSize size, u32 elf_flags) {
         m_last_error = MemoryError::OutOfBounds;
         return false;
     }
-
-    int prot = PROT_NONE;
-    if (elf_flags & PF_R) prot |= PROT_READ;
-    if (elf_flags & PF_W) prot |= PROT_WRITE;
-    if (elf_flags & PF_X) prot |= PROT_EXEC;
-
-    if (::mprotect(m_base + addr, size, prot) != 0) {
-        m_last_error = MemoryError::ProtectionFailed;
-        return false;
+    if (size == 0) {
+        m_last_error = MemoryError::None;
+        return true;
     }
-
+    constexpr GuestSize kGuestPageSize = 0x1000;//4kb orbis OS page
+    constexpr GuestSize kHostPageSize = 0x4000;//16kb apple silicon page
+    const GuestAddr start_4k = addr & ~(kGuestPageSize - 1);
+    const GuestAddr end_4k = (addr + size + kGuestPageSize - 1) & ~(kGuestPageSize - 1);
+    for (GuestAddr page = start_4k; page < end_4k; page += kGuestPageSize){
+        m_page_flags[page >> 12] = elf_flags;
+    }
+    //align outer range into 16kb macOS pages
+    const GuestAddr start_16k = start_4k & ~(kHostPageSize - 1);
+    const GuestAddr end_16k = (end_4k + kHostPageSize - 1) & ~(kHostPageSize - 1);
+    //union all of 4kb pages into one 16kb page
+    for(GuestAddr host_page = start_16k; host_page < end_16k; host_page += kHostPageSize){
+        u32 combined_elf_flags = 0;
+        for(GuestSize sub = 0; sub < kHostPageSize; sub += kGuestPageSize) {
+            auto it = m_page_flags.find((host_page + sub) >> 12);
+            if (it != m_page_flags.end()) {
+                combined_elf_flags |= it->second;
+            } else {
+                combined_elf_flags |= (PF_R | PF_W);
+            }
+        }
+        int host_prot = PROT_NONE;
+        if (combined_elf_flags & (PF_R | PF_X)) host_prot |= PROT_READ;
+        if (combined_elf_flags & PF_W) host_prot |=PROT_WRITE;
+        if(::mprotect(m_base + host_page, kHostPageSize, host_prot) != 0) {
+            m_last_error = MemoryError::ProtectionFailed;
+            return false;
+        }
+    }
     m_last_error = MemoryError::None;
     return true;
 }
@@ -137,7 +160,7 @@ bool MemoryManager::load_elf_segments(const ElfLoader& loader, std::span<const u
     }
 
     for (const auto& seg : loader.load_segments()) {
-        if (seg.p_offset + seg.p_filesz > file_data.size()) {
+        if (seg.p_offset > file_data.size() || seg.p_filesz > file_data.size() - seg.p_offset || seg.p_memsz < seg.p_filesz) {
             m_last_error = MemoryError::InvalidSegment;
             return false;
         }
