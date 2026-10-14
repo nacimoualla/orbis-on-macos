@@ -1,11 +1,34 @@
 #include "ps4/dynamic_linker.hpp"
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 
 namespace ps4 {
 
 DynamicLinker::DynamicLinker(MemoryManager& memory, SyscallTable& syscalls, NidRegistry& registry)
-    : m_memory(memory), m_syscalls(syscalls), m_registry(registry) {}
+    : m_memory(memory), m_syscalls(syscalls), m_registry(registry) {
+    // Initialize default benign whitelist with CRT bootstrap stubs:
+    // 0x6F3404C72D7CF592ULL (_init_env / bzQExy189ZI)
+    // 0xF06D8B07E037AF38ULL (atexit / 8G2LB+A3rzg)
+    m_whitelist.insert(0x6F3404C72D7CF592ULL);
+    m_whitelist.insert(0xF06D8B07E037AF38ULL);
+}
+
+void DynamicLinker::set_strict_hle(bool enabled) noexcept {
+    m_strict_hle = enabled;
+}
+
+bool DynamicLinker::is_strict_hle() const noexcept {
+    return m_strict_hle;
+}
+
+void DynamicLinker::add_to_whitelist(Nid nid) {
+    m_whitelist.insert(nid);
+}
+
+bool DynamicLinker::is_whitelisted(Nid nid) const noexcept {
+    return m_whitelist.contains(nid);
+}
 
 bool DynamicLinker::initialize(GuestAddr trampoline_base) {
     m_trampoline_base = trampoline_base;
@@ -97,14 +120,64 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             return 0;
         }
 
-        // Return SCE_OK (0) for unimplemented stubs to permit process initialization
+        // 1. If NID is in m_whitelist: benign stub execution
+        if (is_whitelisted(nid)) {
+            GuestAddr ret_addr = 0;
+            m_memory.read_value(sctx.rsp, ret_addr);
+            std::fprintf(stderr, "[HLE WHITELIST] Benign stub executed: NID=0x%016llx (caller RIP=0x%llx)\n",
+                         (unsigned long long)nid, (unsigned long long)ret_addr);
+            sctx.rax = SCE_OK;
+            if (sctx.cpu) {
+                sctx.cpu->rax = SCE_OK;
+            }
+            return 0;
+        }
+
+        // 2. If NID is NOT in m_whitelist and strict HLE is enabled: crash diagnostically
+        if (m_strict_hle) {
+            GuestAddr ret_addr = 0;
+            m_memory.read_value(sctx.rsp, ret_addr);
+            std::fprintf(stderr, "\n======================================================================\n");
+            std::fprintf(stderr, "[HLE CRASH] Strict HLE violation: Unregistered/unimplemented NID=0x%016llx\n",
+                         (unsigned long long)nid);
+            std::fprintf(stderr, "Caller RIP=0x%llx, RSP=0x%llx, RBP=0x%llx\n",
+                         (unsigned long long)ret_addr, (unsigned long long)sctx.rsp, (unsigned long long)sctx.rbp);
+            std::fprintf(stderr, "======================================================================\n");
+            std::fprintf(stderr, "[HLE CRASH] Register State:\n");
+            if (sctx.cpu != nullptr) {
+                sctx.cpu->dump();
+            } else {
+                std::fprintf(stderr, "  RAX: 0x%016llx  RBX: 0x%016llx  RCX: 0x%016llx  RDX: 0x%016llx\n",
+                             (unsigned long long)sctx.rax, 0ULL, (unsigned long long)sctx.rcx, (unsigned long long)sctx.args[2]);
+                std::fprintf(stderr, "  RSI: 0x%016llx  RDI: 0x%016llx  RBP: 0x%016llx  RSP: 0x%016llx\n",
+                             (unsigned long long)sctx.args[1], (unsigned long long)sctx.args[0], (unsigned long long)sctx.rbp, (unsigned long long)sctx.rsp);
+                std::fprintf(stderr, "  R8 : 0x%016llx  R9 : 0x%016llx\n",
+                             (unsigned long long)sctx.args[4], (unsigned long long)sctx.args[5]);
+            }
+            std::fprintf(stderr, "[HLE CRASH] Call Stack:\n");
+            GuestAddr cur_rbp = sctx.rbp;
+            for (int f = 0; f < 16 && cur_rbp > 0x1000 && m_memory.is_valid_address(cur_rbp, 16); ++f) {
+                GuestAddr saved_rip = 0;
+                GuestAddr saved_rbp = 0;
+                m_memory.read_value(cur_rbp + 8, saved_rip);
+                m_memory.read_value(cur_rbp, saved_rbp);
+                std::fprintf(stderr, "  #%d: RIP=0x%llx, RBP=0x%llx\n", f, (unsigned long long)saved_rip, (unsigned long long)saved_rbp);
+                cur_rbp = saved_rbp;
+            }
+            std::fprintf(stderr, "======================================================================\n");
+            std::fprintf(stderr, "Aborting execution due to --strict-hle policy.\n");
+            std::fflush(stderr);
+            std::abort();
+        }
+
+        // 3. Normal mode (non-strict): warn and return SCE_KERNEL_ERROR_EINVAL (0x80020016ULL)
         const char* str_arg0 = (sctx.args[0] > 0x1000 && m_memory.is_valid_address(sctx.args[0], 1))
                                 ? m_memory.to_host_ptr<char>(sctx.args[0]) : nullptr;
         const char* str_arg1 = (sctx.args[1] > 0x1000 && m_memory.is_valid_address(sctx.args[1], 1))
                                 ? m_memory.to_host_ptr<char>(sctx.args[1]) : nullptr;
         GuestAddr ret_addr = 0;
         m_memory.read_value(sctx.rsp, ret_addr);
-        std::fprintf(stderr, "[HLE UNIMPLEMENTED] NID=0x%llx (caller RIP=0x%llx, rdi=0x%llx '%s', rsi=0x%llx '%s', rdx=0x%llx)\n",
+        std::fprintf(stderr, "[HLE WARNING] Unimplemented stub called: NID=0x%016llx (caller RIP=0x%llx, rdi=0x%llx '%s', rsi=0x%llx '%s', rdx=0x%llx) returning SCE_KERNEL_ERROR_EINVAL (0x80020016)\n",
                      (unsigned long long)nid, (unsigned long long)ret_addr, (unsigned long long)sctx.args[0],
                      str_arg0 ? str_arg0 : "", (unsigned long long)sctx.args[1],
                      str_arg1 ? str_arg1 : "", (unsigned long long)sctx.args[2]);
@@ -117,7 +190,10 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             std::fprintf(stderr, "  frame #%d: RIP=0x%llx, RBP=0x%llx\n", f, (unsigned long long)saved_rip, (unsigned long long)saved_rbp);
             cur_rbp = saved_rbp;
         }
-        sctx.rax = 0;
+        sctx.rax = SCE_KERNEL_ERROR_EINVAL;
+        if (sctx.cpu) {
+            sctx.cpu->rax = SCE_KERNEL_ERROR_EINVAL;
+        }
         return 0;
     });
 
