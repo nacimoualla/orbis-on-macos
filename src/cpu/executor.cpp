@@ -112,39 +112,47 @@ inline void set_gpr64(CpuContext& ctx, u8 reg_idx, u64 val) {
 }
 
 inline void update_flags_logic(CpuContext& ctx, u64 result, usize bits) {
+    const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+    const u64 masked = result & mask;
     ctx.set_flag(CpuContext::FLAG_CF, false);
     ctx.set_flag(CpuContext::FLAG_OF, false);
-    ctx.set_flag(CpuContext::FLAG_ZF, (result == 0));
+    ctx.set_flag(CpuContext::FLAG_ZF, (masked == 0));
+    ctx.set_flag(CpuContext::FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
     const u64 sign_bit = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
-    ctx.set_flag(CpuContext::FLAG_SF, (result & sign_bit) != 0);
+    ctx.set_flag(CpuContext::FLAG_SF, (masked & sign_bit) != 0);
 }
 
 inline void update_flags_add(CpuContext& ctx, u64 a, u64 b, u64 result, usize bits) {
     const u64 sign_mask = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
     const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
-    ctx.set_flag(CpuContext::FLAG_ZF, ((result & mask) == 0));
-    ctx.set_flag(CpuContext::FLAG_SF, ((result & sign_mask) != 0));
-    ctx.set_flag(CpuContext::FLAG_CF, (result & mask) < (a & mask));
+    const u64 masked = result & mask;
+    ctx.set_flag(CpuContext::FLAG_ZF, (masked == 0));
+    ctx.set_flag(CpuContext::FLAG_SF, (masked & sign_mask) != 0);
+    ctx.set_flag(CpuContext::FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
+    ctx.set_flag(CpuContext::FLAG_CF, masked < (a & mask));
     const bool a_sign = (a & sign_mask) != 0;
     const bool b_sign = (b & sign_mask) != 0;
-    const bool res_sign = (result & sign_mask) != 0;
+    const bool res_sign = (masked & sign_mask) != 0;
     ctx.set_flag(CpuContext::FLAG_OF, (a_sign == b_sign) && (a_sign != res_sign));
 }
 
 inline void update_flags_sub(CpuContext& ctx, u64 a, u64 b, u64 result, usize bits) {
     const u64 sign_mask = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
     const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
-    ctx.set_flag(CpuContext::FLAG_ZF, ((result & mask) == 0));
-    ctx.set_flag(CpuContext::FLAG_SF, ((result & sign_mask) != 0));
+    const u64 masked = result & mask;
+    ctx.set_flag(CpuContext::FLAG_ZF, (masked == 0));
+    ctx.set_flag(CpuContext::FLAG_SF, (masked & sign_mask) != 0);
+    ctx.set_flag(CpuContext::FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
     ctx.set_flag(CpuContext::FLAG_CF, (a & mask) < (b & mask));
     const bool a_sign = (a & sign_mask) != 0;
     const bool b_sign = (b & sign_mask) != 0;
-    const bool res_sign = (result & sign_mask) != 0;
+    const bool res_sign = (masked & sign_mask) != 0;
     ctx.set_flag(CpuContext::FLAG_OF, (a_sign != b_sign) && (a_sign != res_sign));
 }
 
 inline bool check_condition(const CpuContext& ctx, u8 cc) {
     const bool cf = ctx.flag_cf();
+    const bool pf = ctx.flag_pf();
     const bool zf = ctx.flag_zf();
     const bool sf = ctx.flag_sf();
     const bool of = ctx.flag_of();
@@ -155,7 +163,7 @@ inline bool check_condition(const CpuContext& ctx, u8 cc) {
         case 2: cond = zf; break;                 // E/Z
         case 3: cond = cf || zf; break;           // BE/NA
         case 4: cond = sf; break;                 // S
-        case 5: cond = false; break;              // P/PE
+        case 5: cond = pf; break;                 // P/PE (Fixed!)
         case 6: cond = (sf != of); break;         // L/NGE
         case 7: cond = zf || (sf != of); break;   // LE/NG
         default: break;
@@ -2041,6 +2049,86 @@ StepResult CpuExecutor::step() {
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
         }
+                // 0x0F 0x6F (MOVDQA/MOVDQU load), 0x0F 0x7F (MOVDQA/MOVDQU store)
+        if (op1 == 0x6F) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            if (m.is_reg) std::memcpy(&m_context.ymm[dest], &m_context.ymm[m.rm_id & 15], 16);
+            else m_memory.read_bytes(m.mem_addr, &m_context.ymm[dest], 16);
+            m_context.ymm[dest].q[2] = 0; m_context.ymm[dest].q[3] = 0;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+        if (op1 == 0x7F) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 src = m.reg_id & 15;
+            if (m.is_reg) std::memcpy(&m_context.ymm[m.rm_id & 15], &m_context.ymm[src], 16);
+            else m_memory.write_bytes(m.mem_addr, &m_context.ymm[src], 16);
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // 0x0F 0x6E (MOVD/MOVQ GPR -> XMM), 0x0F 0x7E (MOVD/MOVQ XMM -> GPR / XMM load), 0x0F 0xD6 (MOVQ store)
+        if (op1 == 0x6E) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            m_context.ymm[dest] = CpuContext::YmmReg{};
+            if (rex_w) m_context.ymm[dest].q[0] = read_rm(m, 64);
+            else m_context.ymm[dest].d[0] = static_cast<u32>(read_rm(m, 32));
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+        if (op1 == 0x7E) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            if (rep_prefix == 0xF3) { // MOVQ xmm1, xmm2/m64
+                const u8 dest = m.reg_id & 15;
+                u64 val = 0;
+                if (m.is_reg) val = m_context.ymm[m.rm_id & 15].q[0];
+                else m_memory.read_value(m.mem_addr, val);
+                m_context.ymm[dest] = CpuContext::YmmReg{};
+                m_context.ymm[dest].q[0] = val;
+            } else { // MOVD/MOVQ r/m32/64, xmm
+                const u8 src = m.reg_id & 15;
+                if (rex_w) write_rm(m, m_context.ymm[src].q[0], 64);
+                else write_rm(m, m_context.ymm[src].d[0], 32);
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+        if (op1 == 0xD6) { // MOVQ xmm2/m64, xmm1
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 src = m.reg_id & 15;
+            if (m.is_reg) {
+                m_context.ymm[m.rm_id & 15] = CpuContext::YmmReg{};
+                m_context.ymm[m.rm_id & 15].q[0] = m_context.ymm[src].q[0];
+            } else {
+                m_memory.write_value(m.mem_addr, m_context.ymm[src].q[0]);
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+        if (op1 == 0xEF || op1 == 0xEB || op1 == 0xDB || op1 == 0xDF) { // PXOR / POR / PAND / PANDN
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, 16);
+            for (usize q = 0; q < 2; ++q) {
+                if (op1 == 0xEF) m_context.ymm[dest].q[q] ^= src2.q[q];
+                else if (op1 == 0xEB) m_context.ymm[dest].q[q] |= src2.q[q];
+                else if (op1 == 0xDB) m_context.ymm[dest].q[q] &= src2.q[q];
+                else m_context.ymm[dest].q[q] = (~m_context.ymm[dest].q[q]) & src2.q[q];
+            }
+            m_context.ymm[dest].q[2] = 0; m_context.ymm[dest].q[3] = 0;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
 
         // 0x0F 0x2A: CVTSI2SS (rep=0xF3) / CVTSI2SD (rep=0xF2)
         if (op1 == 0x2A) {
@@ -2625,7 +2713,6 @@ StepResult CpuExecutor::step() {
 
         auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base, rex_r, rex_x, rex_b, seg_override, m_context, extra_imm);
         if (!m.valid) return StepResult::IllegalInstruction;
-
         if (sub_op == 0) { // TEST r/m, imm
             u64 imm = 0;
             if (bits == 8) imm = raw_code[cursor + m.bytes_consumed];

@@ -42,8 +42,10 @@ struct CpuContext {
     static constexpr u64 FLAG_OF = 1ULL << 11;
 
     [[nodiscard]] bool flag_cf() const noexcept { return (rflags & FLAG_CF) != 0; }
+    [[nodiscard]] bool flag_pf() const noexcept { return (rflags & FLAG_PF) != 0; }
     [[nodiscard]] bool flag_zf() const noexcept { return (rflags & FLAG_ZF) != 0; }
     [[nodiscard]] bool flag_sf() const noexcept { return (rflags & FLAG_SF) != 0; }
+    [[nodiscard]] bool flag_df() const noexcept { return (rflags & FLAG_DF) != 0; }
     [[nodiscard]] bool flag_of() const noexcept { return (rflags & FLAG_OF) != 0; }
 
     void set_flag(u64 flag, bool val) noexcept {
