@@ -1,4 +1,5 @@
 #include "ps4/dynamic_linker.hpp"
+#include "ps4/thread.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -72,15 +73,21 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
 
     // Hook pseudo-syscall in SyscallTable
     m_syscalls.register_handler(pseudo_syscall, [this, nid](SyscallContext& sctx) -> OrbisResult {
+        note_hle_activity_for(current_hle_thread_id());
         const HleSymbol* sym = m_registry.find_by_nid(nid);
         if (sym && sym->handler) {
             GuestAddr ret_addr = 0;
             m_memory.read_value(sctx.rsp, ret_addr);
-            if (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" && 
+            // Post-stall verbose: after the first stall dump, log everything
+            // except keepalive TID 5's loop (4th worker spawned; stable order
+            // in every run observed). Costs nothing pre-stall (flag off).
+            const bool verbose = post_stall_verbose() && current_hle_thread_id() != 5;
+            if (verbose || (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" && 
                 sym->name != "strlen" && sym->name != "memcpy" && sym->name != "memmove" &&
                 sym->name != "strcmp" && sym->name != "strncmp" && sym->name != "strncpy" &&
                 sym->name != "malloc" && sym->name != "free" && sym->name != "memalign" &&
-                sym->name != "sceKernelSyncStub") {
+                sym->name != "mono_add_internal_call" &&
+                sym->name != "sceKernelSyncStub")) {
                 std::fprintf(stderr, "[HLE CALL] %s (NID=0x%llx, caller RIP=0x%llx, rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx)\n",
                              sym->name.c_str(), (unsigned long long)nid, (unsigned long long)ret_addr,
                              (unsigned long long)sctx.args[0], (unsigned long long)sctx.args[1],
@@ -103,7 +110,9 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             }
 
             const GuestAddr initial_rip = cur_cpu->rip;
+            m_registry.note_hle_dispatch(nid);
             sym->handler(*cur_cpu, m_memory);
+            m_registry.note_hle_return();
             sctx.rax = cur_cpu->rax;
             sctx.rsp = cur_cpu->rsp;
             sctx.rbp = cur_cpu->rbp;
