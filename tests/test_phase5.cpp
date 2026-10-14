@@ -354,6 +354,28 @@ int main() {
 
         std::cout << "  ✓ Test 10: Extended registers (R8-R15) and REX prefix verified\n";
     }
+    // Test 10: 4KB Orbis sub-page protections inside a single 16KB Apple Silicon host page
+    {
+        ps4::MemoryManager mem;
+        assert(mem.initialize());
+
+        // 0x400000 is 16KB-aligned (.rodata -> PF_R)
+        assert(mem.protect(0x400000, 0x1000, ps4::PF_R));
+
+        // 0x401000 is 4KB-aligned, NOT 16KB-aligned (.data -> PF_R | PF_W)
+        // Old code fails here on Apple Silicon with EINVAL!
+        assert(mem.protect(0x401000, 0x1000, ps4::PF_R | ps4::PF_W));
+
+        // Verify we can still write to 0x401000 without a SIGBUS/SIGSEGV because
+        // the 16KB host page (0x400000..0x403FFF) unioned PF_R and PF_R|PF_W -> PROT_READ|PROT_WRITE
+        uint64_t test_val = 0xCAFEBABE12345678ULL;
+        assert(mem.write_value(0x401000, test_val));
+
+        uint64_t read_back = 0;
+        assert(mem.read_value(0x401000, read_back));
+        assert(read_back == test_val);
+    }
+
 
     std::cout << "[PHASE 5] PASS: All CPU Execution and Instruction Dispatch tests passed!\n";
     return 0;
