@@ -33,6 +33,7 @@ struct ScePthreadAttr {
     i32 priority{256};
     u64 affinity{0};
     char name[32]{0};
+    i32 detachstate{0}; // 0 = joinable, 1 = detached (appended: never serialized to guest)
 };
 
 struct SceKernelEvent {
@@ -62,6 +63,18 @@ struct GuestThread {
     GuestAddr stack_base{0};
     GuestSize stack_size{0};
     u64 return_value{0};
+    bool detached{false}; // created detached: join not required (still joined at shutdown)
+    i32 priority{256};
+    std::atomic<u64> sleep_until_us{0}; // host steady-clock wake deadline while WaitingSleep
+    // Stall-watchdog telemetry (all atomics; lock-free for the dispatch hot path)
+    std::atomic<u64> run_returns{0};   // executor.run() completions
+    std::atomic<u64> hle_calls{0};     // HLE dispatches on this thread
+    std::atomic<bool> in_hle{false};   // inside a handler right now
+    std::atomic<u64> last_nid{0};      // most recent HLE NID
+    // Worker's live executor context, set after each quantum copy-in and
+    // cleared on thread exit. Read by the watchdog without locking; atomicity
+    // only (tearing documented) — never dereference past thread exit.
+    std::atomic<const CpuContext*> live_context{nullptr};
     std::thread host_thread;
     CpuContext context{};
     std::atomic<u64> instructions_executed{0};
@@ -69,6 +82,26 @@ struct GuestThread {
 
 class SyscallTable;
 class JitCompiler;
+
+/// Stall-watchdog activity stamp. Called on every HLE dispatch; the watchdog
+/// (owned by ThreadManager) dumps per-thread state after ~2 s without any.
+void note_hle_activity();
+
+/// Calling thread's guest TID (thread-local; 1 on the main host thread).
+[[nodiscard]] ScePthreadId current_hle_thread_id();
+
+/// Per-thread activity stamp for the watchdog trigger (also refreshes the
+/// global stamp). Cheap: thread-local read + one guarded map update.
+void note_hle_activity_for(ScePthreadId tid);
+
+/// Post-stall verbose logging: set once after the first stall-b dump; makes
+/// the HLE dispatch bypass its quiet/whitelist filter (except keepalive TID 5).
+void set_post_stall_verbose();
+[[nodiscard]] bool post_stall_verbose();
+
+/// Sema-table snapshot + synthetic stall wake (implemented in nid_registry.cpp).
+void dump_sema_states();
+void debug_wake_stall_semas();
 
 class ThreadManager {
 public:
@@ -117,6 +150,15 @@ public:
     /// Diagnostics: dump all thread states and RIPs
     void dump_thread_states() const;
 
+    /// Stall watchdog: wall-clock thread taking register-level snapshots after
+    /// ~2 s of HLE silence. Started/stopped automatically with this object.
+    void start_watchdog();
+    void stop_watchdog();
+
+    /// Point the watchdog at main's live CpuContext (stepped by the runner loop,
+    /// not stored in the main GuestThread entry). Must outlive this manager.
+    void set_main_context(const CpuContext* ctx);
+
     // Telemetry getters
     [[nodiscard]] u64 threads_created() const noexcept { return m_threads_created.load(); }
     [[nodiscard]] u64 threads_started() const noexcept { return m_threads_started.load(); }
@@ -147,6 +189,9 @@ public:
     void signal_flip_event(i64 flip_arg = 0);
 
 private:
+    void dump_stall_snapshot(const char* tag) const;
+    void watchdog_loop();
+
     MemoryManager& m_memory;
     SyscallTable* m_syscalls{nullptr};
     JitCompiler* m_jit{nullptr};
@@ -173,6 +218,11 @@ private:
     std::atomic<u64> m_threads_created{0};
     std::atomic<u64> m_threads_started{0};
     std::atomic<u64> m_threads_executed_instructions{0};
+
+    // Stall watchdog (see start_watchdog)
+    std::thread m_watchdog_thread;
+    std::atomic<bool> m_watchdog_stop{false};
+    std::atomic<const CpuContext*> m_main_context{nullptr};
 };
 
 } // namespace ps4
