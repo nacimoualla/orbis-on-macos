@@ -98,6 +98,65 @@ static std::mutex s_sema_table_mtx;
 static std::unordered_map<u32, std::shared_ptr<GuestSema>> s_semas;
 static u32 s_next_sema_id = 1;
 
+// Mono dummy-cookie arena: distinct zeroed 256-byte guest slots for Mono
+// object lookups. The guest dereferences fields inside these pointers, so they
+// must be real mapped memory — carved once from the libc heap bump pointer
+// (never the old 0x80000100 dummy range inside DirectMemory). Iterators keep
+// returning NULL. Slots are never freed (Mono objects live forever here);
+// on exhaustion the handlers return NULL.
+struct MonoArena {
+    std::mutex mtx;
+    GuestAddr base{0};
+    GuestAddr next{0};
+    GuestAddr end{0};
+    GuestAddr domain{0}; // singleton MonoDomain*
+    std::unordered_map<std::string, GuestAddr> assemblies; // by name
+    std::unordered_map<GuestAddr, GuestAddr> images;       // by assembly ptr
+    struct ClassKey {
+        GuestAddr image{0};
+        std::string ns;
+        std::string name;
+        bool operator==(const ClassKey& o) const {
+            return image == o.image && ns == o.ns && name == o.name;
+        }
+    };
+    struct ClassKeyHash {
+        usize operator()(const ClassKey& k) const noexcept {
+            usize h = std::hash<GuestAddr>{}(k.image);
+            h ^= std::hash<std::string>{}(k.ns) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h ^= std::hash<std::string>{}(k.name) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    std::unordered_map<ClassKey, GuestAddr, ClassKeyHash> classes;
+};
+static MonoArena s_mono_arena;
+static constexpr GuestSize kMonoArenaSize = 64 * 1024; // 256 slots
+static constexpr GuestSize kMonoSlotSize = 256;
+
+// Caller holds s_mono_arena.mtx. Returns a zeroed slot, or 0 when exhausted.
+static GuestAddr mono_arena_alloc(MemoryManager& mem) {
+    if (s_mono_arena.base == 0) {
+        GuestAddr cur = (g_guest_heap_current.load() + 15) & ~15ULL;
+        if (!mem.is_valid_address(cur, kMonoArenaSize)) {
+            std::fprintf(stderr, "[Mono] arena carve failed: heap exhausted\n");
+            return 0;
+        }
+        s_mono_arena.base = cur;
+        s_mono_arena.next = cur;
+        s_mono_arena.end = cur + kMonoArenaSize;
+        g_guest_heap_current.store(cur + kMonoArenaSize);
+        mem.zero_memory(cur, kMonoArenaSize);
+    }
+    if (s_mono_arena.next + kMonoSlotSize > s_mono_arena.end) {
+        std::fprintf(stderr, "[Mono] arena exhausted (256 slots)\n");
+        return 0;
+    }
+    const GuestAddr slot = s_mono_arena.next;
+    s_mono_arena.next += kMonoSlotSize;
+    return slot;
+}
+
 } // namespace
 
 NidRegistry::NidRegistry() = default;
@@ -2745,10 +2804,100 @@ void NidRegistry::register_default_libraries() {
         });
 
     // mono_jit_init_version(const char* domain_name, const char* runtime_version)
-    // NID: 0x9B795B57A3B5E063ULL -> returns non-null MonoDomain* pointer in guest heap
+    // NID: 0x9B795B57A3B5E063ULL -> returns the arena domain singleton so all
+    // domain handles in the process compare equal.
     register_symbol(0x9B795B57A3B5E063ULL, "mono_jit_init_version", "mono-ps4",
-        [](CpuContext& ctx, MemoryManager&) {
-            ctx.rax = 0x80000100ULL; // Valid non-null dummy MonoDomain*
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
+            if (s_mono_arena.domain == 0) {
+                s_mono_arena.domain = mono_arena_alloc(mem);
+            }
+            ctx.rax = s_mono_arena.domain;
+        });
+
+    // mono_domain_get(void) -> singleton dummy MonoDomain*
+    // NID: 0x88095379DC1FF3D9ULL
+    register_symbol(0x88095379DC1FF3D9ULL, "mono_domain_get", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
+            if (s_mono_arena.domain == 0) {
+                s_mono_arena.domain = mono_arena_alloc(mem);
+                std::fprintf(stderr, "[Mono] domain_get -> 0x%llx\n",
+                             (unsigned long long)s_mono_arena.domain);
+            }
+            ctx.rax = s_mono_arena.domain;
+        });
+
+    // mono_domain_assembly_open(MonoDomain* domain, const char* name)
+    // NID: 0x7427A284FB5A7423ULL
+    register_symbol(0x7427A284FB5A7423ULL, "mono_domain_assembly_open", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr name_addr = ctx.rsi;
+            const char* name = (name_addr > 0x1000 && mem.is_valid_address(name_addr, 1))
+                                   ? mem.to_host_ptr<char>(name_addr) : nullptr;
+            GuestAddr slot = 0;
+            if (name) {
+                std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
+                auto it = s_mono_arena.assemblies.find(name);
+                if (it == s_mono_arena.assemblies.end()) {
+                    slot = mono_arena_alloc(mem);
+                    if (slot) s_mono_arena.assemblies[name] = slot;
+                } else {
+                    slot = it->second;
+                }
+                std::fprintf(stderr, "[Mono] domain_assembly_open('%.128s') -> 0x%llx\n",
+                             name, (unsigned long long)slot);
+            }
+            ctx.rax = slot;
+        });
+
+    // mono_assembly_get_image(MonoAssembly* assembly)
+    // NID: 0xC4FE040B84A9F462ULL
+    register_symbol(0xC4FE040B84A9F462ULL, "mono_assembly_get_image", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr assembly = ctx.rdi;
+            GuestAddr slot = 0;
+            if (assembly != 0) {
+                std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
+                auto it = s_mono_arena.images.find(assembly);
+                if (it == s_mono_arena.images.end()) {
+                    slot = mono_arena_alloc(mem);
+                    if (slot) s_mono_arena.images[assembly] = slot;
+                } else {
+                    slot = it->second;
+                }
+                std::fprintf(stderr, "[Mono] assembly_get_image(0x%llx) -> 0x%llx\n",
+                             (unsigned long long)assembly, (unsigned long long)slot);
+            }
+            ctx.rax = slot;
+        });
+
+    // mono_class_from_name(MonoImage* image, const char* name_space, const char* name)
+    // NID: 0x6F3C536529E7077FULL
+    register_symbol(0x6F3C536529E7077FULL, "mono_class_from_name", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr image = ctx.rdi;
+            const GuestAddr ns_addr = ctx.rsi;
+            const GuestAddr name_addr = ctx.rdx;
+            const char* ns = (ns_addr > 0x1000 && mem.is_valid_address(ns_addr, 1))
+                                 ? mem.to_host_ptr<char>(ns_addr) : nullptr;
+            const char* name = (name_addr > 0x1000 && mem.is_valid_address(name_addr, 1))
+                                   ? mem.to_host_ptr<char>(name_addr) : nullptr;
+            GuestAddr slot = 0;
+            if (image != 0 && ns && name) {
+                MonoArena::ClassKey key{image, ns, name};
+                std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
+                auto it = s_mono_arena.classes.find(key);
+                if (it == s_mono_arena.classes.end()) {
+                    slot = mono_arena_alloc(mem);
+                    if (slot) s_mono_arena.classes.emplace(std::move(key), slot);
+                } else {
+                    slot = it->second;
+                }
+                std::fprintf(stderr, "[Mono] class_from_name('%.128s', '%.128s') -> 0x%llx\n",
+                             ns, name, (unsigned long long)slot);
+            }
+            ctx.rax = slot;
         });
 
     // Unity memory allocator, FMOD, and Mono module setup stubs
