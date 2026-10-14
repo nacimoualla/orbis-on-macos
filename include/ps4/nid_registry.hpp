@@ -24,6 +24,11 @@ struct HleSymbol {
 class NidRegistry {
 public:
     NidRegistry();
+    ~NidRegistry();
+
+    /// Join guest worker threads and clear subsystem pointers before
+    /// MemoryManager, SyscallTable, and JitCompiler are destroyed in main().
+    void shutdown();
 
     /// Register an HLE symbol handler
     void register_symbol(Nid nid, std::string_view name, std::string_view module_name, HleFunction handler);

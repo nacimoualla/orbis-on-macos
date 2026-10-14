@@ -14,19 +14,21 @@ namespace ps4 {
 namespace {
 
 // Guest heap pointer for simple HLE malloc allocations
-GuestAddr g_guest_heap_current = 0x80000000ULL; // 2GB virtual mark
+std::atomic<GuestAddr> g_guest_heap_current{0x80000000ULL}; // 2GB virtual mark
 
 // Direct physical memory offset counter
-GuestAddr g_direct_phys_current = 0x100000000ULL; // 4GB mark
+std::atomic<GuestAddr> g_direct_phys_current{0x100000000ULL}; // 4GB mark
 
 // Global ThreadManager and execution dependencies
 std::unique_ptr<ThreadManager> g_thread_manager;
+MemoryManager* g_thread_manager_mem = nullptr;
 SyscallTable* g_syscalls = nullptr;
 JitCompiler* g_jit = nullptr;
 
 inline ThreadManager& get_thread_manager(MemoryManager& mem) {
-    if (!g_thread_manager) {
+    if (!g_thread_manager || g_thread_manager_mem != &mem) {
         g_thread_manager = std::make_unique<ThreadManager>(mem, g_syscalls);
+        g_thread_manager_mem = &mem;
         if (g_jit) g_thread_manager->set_jit_compiler(g_jit);
     } else {
         if (g_syscalls && !g_thread_manager->syscall_table()) {
@@ -102,6 +104,29 @@ void NidRegistry::set_jit_compiler(JitCompiler* jit) {
     }
 }
 
+NidRegistry::~NidRegistry() {
+    shutdown();
+}
+
+void NidRegistry::shutdown() {
+    // 1. Join and destroy all guest threads while MemoryManager, SyscallTable, and JitCompiler are still alive
+    if (g_thread_manager) {
+        g_thread_manager.reset();
+        g_thread_manager_mem = nullptr;
+    }
+    // 2. Close audio backend and FIOS handles
+    if (g_audio_manager) {
+        g_audio_manager.reset();
+    }
+    s_fios_files.clear();
+
+    // 3. Clear pointers to stack-allocated subsystems in main()
+    g_syscalls = nullptr;
+    g_jit = nullptr;
+    g_external_vfs = nullptr;
+    g_metal_backend = nullptr;
+}
+
 ThreadManager& NidRegistry::thread_manager(MemoryManager& mem) {
     return get_thread_manager(mem);
 }
@@ -168,39 +193,43 @@ void NidRegistry::register_default_libraries() {
         });
 
     // sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t length, size_t align, int type, off_t* out_addr)
-    register_symbol(0x51EAECE91C9A12B0ULL, "sceKernelAllocateDirectMemory", "libkernel",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestSize length = ctx.rdx;
-            const GuestSize align  = ctx.rcx > 0 ? ctx.rcx : GUEST_PAGE_SIZE;
-            const GuestAddr out_ptr = ctx.r9;
+    // Canonical NID: 0xAD35F0EB9C662C80ULL ("rTXw65xmLIA"), Legacy test alias: 0x51EAECE91C9A12B0ULL
+    auto alloc_direct_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestSize length = ctx.rdx;
+        const GuestSize align  = ctx.rcx > 0 ? ctx.rcx : GUEST_PAGE_SIZE;
+        const GuestAddr out_ptr = ctx.r9;
 
-            // Align physical address
-            g_direct_phys_current = (g_direct_phys_current + align - 1) & ~(align - 1);
-            const GuestAddr allocated_phys = g_direct_phys_current;
-            g_direct_phys_current += length;
+        // Align physical address
+        g_direct_phys_current = (g_direct_phys_current + align - 1) & ~(align - 1);
+        const GuestAddr allocated_phys = g_direct_phys_current;
+        g_direct_phys_current += length;
 
-            if (mem.is_valid_address(out_ptr, sizeof(GuestAddr))) {
-                mem.write_value(out_ptr, allocated_phys);
-                ctx.rax = SCE_OK;
-            } else {
-                ctx.rax = static_cast<u64>(-14); // -EFAULT
-            }
-        });
+        if (mem.is_valid_address(out_ptr, sizeof(GuestAddr))) {
+            mem.write_value(out_ptr, allocated_phys);
+            ctx.rax = SCE_OK;
+        } else {
+            ctx.rax = static_cast<u64>(-14); // -EFAULT
+        }
+    };
+    register_symbol(0x51EAECE91C9A12B0ULL, "sceKernelAllocateDirectMemory", "libkernel", alloc_direct_handler);
+    register_symbol(0xAD35F0EB9C662C80ULL, "sceKernelAllocateDirectMemory", "libkernel", alloc_direct_handler);
 
     // sceKernelMapDirectMemory(void** out_addr, size_t length, int protection, int flags, off_t phys_addr, size_t align)
-    register_symbol(0x6002A3859BC62DFBULL, "sceKernelMapDirectMemory", "libkernel",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr out_ptr  = ctx.rdi;
-            const GuestAddr phys_addr = ctx.r8;
+    // Canonical NID: 0x2FF4372C48C86E00ULL ("L-Q3LEjIbgA"), Legacy test alias: 0x6002A3859BC62DFBULL
+    auto map_direct_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr out_ptr  = ctx.rdi;
+        const GuestAddr phys_addr = ctx.r8;
 
-            // In our unified memory architecture, virtual address maps 1:1 to direct memory
-            if (mem.is_valid_address(out_ptr, sizeof(GuestAddr))) {
-                mem.write_value(out_ptr, phys_addr);
-                ctx.rax = SCE_OK;
-            } else {
-                ctx.rax = static_cast<u64>(-14);
-            }
-        });
+        // In our unified memory architecture, virtual address maps 1:1 to direct memory
+        if (mem.is_valid_address(out_ptr, sizeof(GuestAddr))) {
+            mem.write_value(out_ptr, phys_addr);
+            ctx.rax = SCE_OK;
+        } else {
+            ctx.rax = static_cast<u64>(-14);
+        }
+    };
+    register_symbol(0x6002A3859BC62DFBULL, "sceKernelMapDirectMemory", "libkernel", map_direct_handler);
+    register_symbol(0x2FF4372C48C86E00ULL, "sceKernelMapDirectMemory", "libkernel", map_direct_handler);
 
     // sceKernelUsleep(unsigned int useconds)
     // NID: 0x3230BAEFBC36C18BULL and 0xD637D72D15738AC7ULL ("1jfXLRVzisc")
@@ -348,8 +377,8 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // scePthreadAttrSetaffinity NID: 0x1573D61CD93C39FDULL ("FXPWHNk8Of0")
-    register_symbol(0x1573D61CD93C39FDULL, "scePthreadAttrSetaffinity", "libkernel",
+    // scePthreadAttrSetaffinity NID: 0xDEAC603387B31130ULL ("3qxgM4ezETA")
+    register_symbol(0xDEAC603387B31130ULL, "scePthreadAttrSetaffinity", "libkernel",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
@@ -367,7 +396,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // scePthreadJoin(ScePthread thread, void** value_ptr)
-    register_symbol(0xC4F0E23991209B0FULL, "scePthreadJoin", "libkernel",
+    // NID: 0xA27358F41CA7FD6FULL ("onNY9Byn-W8")
+    register_symbol(0xA27358F41CA7FD6FULL, "scePthreadJoin", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const ScePthreadId tid = static_cast<ScePthreadId>(ctx.rdi);
             const GuestAddr val_ptr = ctx.rsi;
@@ -384,7 +414,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // scePthreadSelf()
-    register_symbol(0xC052F1176214A36BULL, "scePthreadSelf", "libkernel",
+    // NID: 0x688F8E782CFCC6B4ULL ("aI+OeCz8xrQ")
+    register_symbol(0x688F8E782CFCC6B4ULL, "scePthreadSelf", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             auto& tm = get_thread_manager(mem);
             ctx.rax = static_cast<u64>(tm.current_thread_id());
@@ -422,7 +453,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // scePthreadMutexTrylock(ScePthreadMutex* mutex)
-    register_symbol(0x98150D89A0831626ULL, "scePthreadMutexTrylock", "libkernel",
+    // NID: 0xBA9A15AF330715E1ULL ("upoVrzMHFeE")
+    register_symbol(0xBA9A15AF330715E1ULL, "scePthreadMutexTrylock", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr mtx_ptr = ctx.rdi;
             auto& tm = get_thread_manager(mem);
@@ -473,7 +505,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // scePthreadMutexDestroy(ScePthreadMutex* mutex)
-    register_symbol(0x6F1BCDF3BDC5D06AULL, "scePthreadMutexDestroy", "libkernel",
+    // NID: 0xD8E7F47FEDE68611ULL ("2Of0f+3mhhE")
+    register_symbol(0xD8E7F47FEDE68611ULL, "scePthreadMutexDestroy", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr mtx_ptr = ctx.rdi;
             auto& tm = get_thread_manager(mem);
@@ -486,7 +519,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // scePthreadCondInit(ScePthreadCond* cond, const ScePthreadCondattr* attr, const char* name)
-    register_symbol(0x8CD7808E58BAF551ULL, "scePthreadCondInit", "libkernel",
+    // NID: 0xD936FDDAABA9AE5DULL ("2Tb92quprl0")
+    register_symbol(0xD936FDDAABA9AE5DULL, "scePthreadCondInit", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr cond_ptr = ctx.rdi;
             auto& tm = get_thread_manager(mem);
@@ -500,7 +534,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // scePthreadCondWait(ScePthreadCond* cond, ScePthreadMutex* mutex)
-    register_symbol(0x296D8E4AE9BFFDF0ULL, "scePthreadCondWait", "libkernel",
+    // NID: 0x58A0172785C13D0EULL ("WKAXJ4XBPQ4")
+    register_symbol(0x58A0172785C13D0EULL, "scePthreadCondWait", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr cond_ptr = ctx.rdi;
             const GuestAddr mtx_ptr = ctx.rsi;
@@ -514,7 +549,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // scePthreadCondSignal(ScePthreadCond* cond)
-    register_symbol(0x3231F2A7EF228E10ULL, "scePthreadCondSignal", "libkernel",
+    // NID: 0x90387F35FC6032D1ULL ("kDh-NfxgMtE")
+    register_symbol(0x90387F35FC6032D1ULL, "scePthreadCondSignal", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr cond_ptr = ctx.rdi;
             auto& tm = get_thread_manager(mem);
@@ -527,7 +563,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // scePthreadCondBroadcast(ScePthreadCond* cond)
-    register_symbol(0x1B8682F5CF60505FULL, "scePthreadCondBroadcast", "libkernel",
+    // NID: 0x246823ED4BEB97E0ULL ("JGgj7Uvrl+A")
+    register_symbol(0x246823ED4BEB97E0ULL, "scePthreadCondBroadcast", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr cond_ptr = ctx.rdi;
             auto& tm = get_thread_manager(mem);
@@ -540,7 +577,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // scePthreadCondDestroy(ScePthreadCond* cond)
-    register_symbol(0x6C46F0C0F39695EFULL, "scePthreadCondDestroy", "libkernel",
+    // NID: 0x83E3D977686269C8ULL ("g+PZd2hiacg")
+    register_symbol(0x83E3D977686269C8ULL, "scePthreadCondDestroy", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr cond_ptr = ctx.rdi;
             auto& tm = get_thread_manager(mem);
@@ -1166,11 +1204,6 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // libkernel synchronization helper NID: 0x688F8E782CFCC6B4ULL ("aI+OeCz8xrQ")
-    register_symbol(0x688F8E782CFCC6B4ULL, "sceKernelSyncStub", "libkernel",
-        [](CpuContext& ctx, MemoryManager&) {
-            ctx.rax = SCE_OK;
-        });
 
     // memalign(size_t alignment, size_t size)
     // NID: 0x5237F72B332F4662ULL ("Ujf3KzMvRmI")
@@ -1440,89 +1473,96 @@ void NidRegistry::register_default_libraries() {
     // libSceFios2 - Fast I/O System 2
     // ==========================================
 
-    // sceFiosFileExists(int profile, const char* path, ...)
-    // NID: 0x3703873113363E9CULL ("NwOHMRM2Ppw")
-    register_symbol(0x3703873113363E9CULL, "sceFiosFileExists", "libSceFios2",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr path_addr = ctx.rsi;
-            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
-                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
-            if (!path) {
-                ctx.rax = 0;
-                return;
-            }
-            auto& vfs = get_vfs();
-            auto resolved = vfs.resolve_path(path);
-            bool exists = false;
-            if (resolved) {
-                std::error_code ec;
-                exists = std::filesystem::is_regular_file(*resolved, ec);
-            }
-            std::fprintf(stderr, "[FIOS2] sceFiosFileExists('%s') -> %d\n", path, exists ? 1 : 0);
-            ctx.rax = exists ? 1 : 0;
-        });
-
-    // sceFiosDirectoryExists(int profile, const char* path, ...)
-    // NID: 0x38EBAF1CA4EEE0E7ULL ("OOuvHKTu4Oc")
-    register_symbol(0x38EBAF1CA4EEE0E7ULL, "sceFiosDirectoryExists", "libSceFios2",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr path_addr = ctx.rsi;
-            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
-                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
-            if (!path) {
-                ctx.rax = 0;
-                return;
-            }
-            auto& vfs = get_vfs();
-            auto resolved = vfs.resolve_path(path);
-            bool exists = false;
-            if (resolved) {
-                std::error_code ec;
-                exists = std::filesystem::is_directory(*resolved, ec);
-            }
-            std::fprintf(stderr, "[FIOS2] sceFiosDirectoryExists('%s') -> %d\n", path, exists ? 1 : 0);
-            ctx.rax = exists ? 1 : 0;
-        });
-
-    // sceFiosStat / sceFiosFileGetStatSync(int profile, const char* path, SceFiosStat* stat)
-    // NID: 0x8DACAF634EC2E5D9ULL ("jayvY07C5dk")
-    register_symbol(0x8DACAF634EC2E5D9ULL, "sceFiosStat", "libSceFios2",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr path_addr = ctx.rsi;
-            const GuestAddr stat_ptr  = ctx.rdx;
-            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
-                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
-            if (!path || stat_ptr == 0 || !mem.is_valid_address(stat_ptr, 0x40)) {
-                ctx.rax = static_cast<u64>(-1);
-                return;
-            }
-            auto& vfs = get_vfs();
-            auto resolved = vfs.resolve_path(path);
-            if (!resolved) {
-                std::fprintf(stderr, "[FIOS2] sceFiosStat('%s') -> not found\n", path);
-                ctx.rax = static_cast<u64>(-1);
-                return;
-            }
+    // sceFiosFileExistsSync / sceFiosFileExists(int profile, const char* path, ...)
+    // Canonical Sync NID: 0x3703873113363E9CULL ("NwOHMRM2Ppw"), Non-sync alias NID: 0x398F2FF160F39F7BULL ("OY8v8WDzn3s")
+    auto fios_file_exists_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr path_addr = ctx.rsi;
+        const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                               ? mem.to_host_ptr<char>(path_addr) : nullptr;
+        if (!path) {
+            ctx.rax = 0;
+            return;
+        }
+        auto& vfs = get_vfs();
+        auto resolved = vfs.resolve_path(path);
+        bool exists = false;
+        if (resolved) {
             std::error_code ec;
-            const auto st = std::filesystem::status(*resolved, ec);
-            if (!std::filesystem::exists(st)) {
-                std::fprintf(stderr, "[FIOS2] sceFiosStat('%s' -> '%s') -> not found\n", path, resolved->c_str());
-                ctx.rax = static_cast<u64>(-1);
-                return;
-            }
+            exists = std::filesystem::is_regular_file(*resolved, ec);
+        }
+        std::fprintf(stderr, "[FIOS2] sceFiosFileExists('%s') -> %d\n", path, exists ? 1 : 0);
+        ctx.rax = exists ? 1 : 0;
+    };
+    register_symbol(0x398F2FF160F39F7BULL, "sceFiosFileExists", "libSceFios2", fios_file_exists_handler);
+    register_symbol(0x3703873113363E9CULL, "sceFiosFileExistsSync", "libSceFios2", fios_file_exists_handler);
 
-            mem.zero_memory(stat_ptr, 0x40);
-            const bool is_dir = std::filesystem::is_directory(st);
-            const u64 file_sz = is_dir ? 0 : std::filesystem::file_size(*resolved, ec);
-            const u32 stat_flags = is_dir ? 0x1 : 0x0;
+    // sceFiosFHRead / sceFiosFHReadSync(int profile, int fh, void* buf, size_t size)
+    // NID: 0x2A5FD36EB0D4F583ULL ("Kl-TbrDU9YM")
+    // Registered below, after sceFiosFHOpenSync, using the handle-based
+    // s_fios_files read implementation (see the sceFiosFHOpenSync handler above it).
+    // sceFiosDirectoryExistsSync / sceFiosDirectoryExists(int profile, const char* path, ...)
+    // Canonical Sync NID: 0x38EBAF1CA4EEE0E7ULL ("OOuvHKTu4Oc"), Non-sync alias NID: 0xBED1DDD347F43B9DULL ("vtHd00f0O50")
+    auto fios_dir_exists_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr path_addr = ctx.rsi;
+        const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                               ? mem.to_host_ptr<char>(path_addr) : nullptr;
+        if (!path) {
+            ctx.rax = 0;
+            return;
+        }
+        auto& vfs = get_vfs();
+        auto resolved = vfs.resolve_path(path);
+        bool exists = false;
+        if (resolved) {
+            std::error_code ec;
+            exists = std::filesystem::is_directory(*resolved, ec);
+        }
+        std::fprintf(stderr, "[FIOS2] sceFiosDirectoryExists('%s') -> %d\n", path, exists ? 1 : 0);
+        ctx.rax = exists ? 1 : 0;
+    };
+    register_symbol(0xBED1DDD347F43B9DULL, "sceFiosDirectoryExists", "libSceFios2", fios_dir_exists_handler);
+    register_symbol(0x38EBAF1CA4EEE0E7ULL, "sceFiosDirectoryExistsSync", "libSceFios2", fios_dir_exists_handler);
 
-            mem.write_value(stat_ptr + 0x00, file_sz);
-            mem.write_value(stat_ptr + 0x20, stat_flags);
+    // sceFiosStatSync / sceFiosStat(int profile, const char* path, SceFiosStat* stat)
+    // Canonical Sync NID: 0x8DACAF634EC2E5D9ULL ("jayvY07C5dk"), Non-sync alias NID: 0x40AB08F4DECAD731ULL ("QKsI9N7K1zE")
+    auto fios_stat_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr path_addr = ctx.rsi;
+        const GuestAddr stat_ptr  = ctx.rdx;
+        const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                               ? mem.to_host_ptr<char>(path_addr) : nullptr;
+        if (!path || stat_ptr == 0 || !mem.is_valid_address(stat_ptr, 0x40)) {
+            ctx.rax = static_cast<u64>(-1);
+            return;
+        }
+        auto& vfs = get_vfs();
+        auto resolved = vfs.resolve_path(path);
+        if (!resolved) {
+            std::fprintf(stderr, "[FIOS2] sceFiosStat('%s') -> not found\n", path);
+            ctx.rax = static_cast<u64>(-1);
+            return;
+        }
+        std::error_code ec;
+        const auto st = std::filesystem::status(*resolved, ec);
+        if (!std::filesystem::exists(st)) {
+            std::fprintf(stderr, "[FIOS2] sceFiosStat('%s' -> '%s') -> not found\n", path, resolved->c_str());
+            ctx.rax = static_cast<u64>(-1);
+            return;
+        }
 
-            std::fprintf(stderr, "[FIOS2] sceFiosStat('%s') -> size=%llu, flags=0x%x\n",
-                         path, (unsigned long long)file_sz, stat_flags);
-            ctx.rax = SCE_OK;
-        });
+        mem.zero_memory(stat_ptr, 0x40);
+        const bool is_dir = std::filesystem::is_directory(st);
+        const u64 file_sz = is_dir ? 0 : std::filesystem::file_size(*resolved, ec);
+        const u32 stat_flags = is_dir ? 0x1 : 0x0;
+
+        mem.write_value(stat_ptr + 0x00, file_sz);
+        mem.write_value(stat_ptr + 0x20, stat_flags);
+
+        std::fprintf(stderr, "[FIOS2] sceFiosStat('%s') -> size=%llu, flags=0x%x\n",
+                     path, (unsigned long long)file_sz, stat_flags);
+        ctx.rax = SCE_OK;
+    };
+    register_symbol(0x40AB08F4DECAD731ULL, "sceFiosStat", "libSceFios2", fios_stat_handler);
+    register_symbol(0x8DACAF634EC2E5D9ULL, "sceFiosStatSync", "libSceFios2", fios_stat_handler);
 
     // sceFiosFileGetSizeSync / sceFiosGetSize(int profile, const char* path, ...)
     // NID: 0xCC5F3F091BD15E73ULL ("zF8-CRvRXnM")
@@ -1730,15 +1770,16 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = it->second.offset;
         });
 
-    // sceFiosFHClose(int profile, int fh)
-    // NID: 0x00EBA3486A94FA6BULL ("AOujSGqU+ms")
-    register_symbol(0x00EBA3486A94FA6BULL, "sceFiosFHClose", "libSceFios2",
-        [](CpuContext& ctx, MemoryManager& /*mem*/) {
-            const i32 fd = static_cast<i32>(ctx.rsi);
-            s_fios_files.erase(fd);
-            std::fprintf(stderr, "[FIOS2] sceFiosFHClose(fd=%d) -> closed\n", fd);
-            ctx.rax = SCE_OK;
-        });
+    // sceFiosFHCloseSync / sceFiosFHClose(int profile, int fh)
+    // Canonical Sync NID: 0x00EBA3486A94FA6BULL ("AOujSGqU+ms"), Non-sync alias NID: 0xE6C60D04D2BE5B78ULL ("5sYNBNK+W3g")
+    auto fios_fh_close_handler = [](CpuContext& ctx, MemoryManager& /*mem*/) {
+        const i32 fd = static_cast<i32>(ctx.rsi);
+        s_fios_files.erase(fd);
+        std::fprintf(stderr, "[FIOS2] sceFiosFHClose(fd=%d) -> closed\n", fd);
+        ctx.rax = SCE_OK;
+    };
+    register_symbol(0xE6C60D04D2BE5B78ULL, "sceFiosFHClose", "libSceFios2", fios_fh_close_handler);
+    register_symbol(0x00EBA3486A94FA6BULL, "sceFiosFHCloseSync", "libSceFios2", fios_fh_close_handler);
 
     // sceFiosExists(int profile, const char* path)
     // NID: 0x9D6BB36B465D7EA0ULL ("nWuza0ZdfqA")
@@ -1762,12 +1803,13 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = exists ? 1 : 0;
         });
 
-    // sceFiosFileDelete(int profile, const char* path)
-    // NID: 0x6C3BA91206D0E859ULL ("bDupEgbQ6Fk")
-    register_symbol(0x6C3BA91206D0E859ULL, "sceFiosFileDelete", "libSceFios2",
-        [](CpuContext& ctx, MemoryManager& /*mem*/) {
-            ctx.rax = SCE_OK;
-        });
+    // sceFiosFileDeleteSync / sceFiosFileDelete(int profile, const char* path)
+    // Canonical Sync NID: 0x6C3BA91206D0E859ULL ("bDupEgbQ6Fk"), Non-sync alias NID: 0x550F1EE6DF2FB588ULL ("VQ8e5t8vtYg")
+    auto fios_file_delete_handler = [](CpuContext& ctx, MemoryManager& /*mem*/) {
+        ctx.rax = SCE_OK;
+    };
+    register_symbol(0x550F1EE6DF2FB588ULL, "sceFiosFileDelete", "libSceFios2", fios_file_delete_handler);
+    register_symbol(0x6C3BA91206D0E859ULL, "sceFiosFileDeleteSync", "libSceFios2", fios_file_delete_handler);
 
     // sceFiosFileGetSize(int profile, const char* path)
     // NID: 0x514AE2697CBB1BDDULL ("UUriaXy7G90")
@@ -1791,9 +1833,16 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = ec ? static_cast<u64>(-1) : sz;
         });
 
-    // sceFiosFileRead(int profile, const char* path, void* buf, size_t size, ...)
+    // sceFiosArchiveMountSync(int profile, const char* path, ...)
     // NID: 0xC6EB4B6D076AC9BEULL ("xutLbQdqyb4")
-    register_symbol(0xC6EB4B6D076AC9BEULL, "sceFiosFileRead", "libSceFios2",
+    register_symbol(0xC6EB4B6D076AC9BEULL, "sceFiosArchiveMountSync", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& /*mem*/) {
+            ctx.rax = static_cast<u64>(-1);
+        });
+
+    // sceFiosFileRead(int profile, const char* path, void* buf, size_t size, ...)
+    // NID: 0x62528291F24BF98FULL ("YlKCkfJL+Y8")
+    register_symbol(0x62528291F24BF98FULL, "sceFiosFileRead", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr path_addr = ctx.rsi;
             const GuestAddr buf_addr  = ctx.rdx;
@@ -1820,8 +1869,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // sceFiosInitialize(const void* params)
-    // NID: 0x960213B81B11A36AULL ("lgITuBsRo2o")
-    register_symbol(0x960213B81B11A36AULL, "sceFiosInitialize", "libSceFios2",
+    // NID: 0xC00299FDD7ADFB2AULL ("wAKZ-det+yo")
+    register_symbol(0xC00299FDD7ADFB2AULL, "sceFiosInitialize", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& /*mem*/) {
             std::fprintf(stderr, "[FIOS2] sceFiosInitialize() -> SCE_OK\n");
             ctx.rax = SCE_OK;
@@ -1846,11 +1895,6 @@ void NidRegistry::register_default_libraries() {
     // =========================================================================
     static std::vector<GuestAddr> s_registered_buffers;
 
-    // sceVideoOutOpen(int userId, int type, int index, const void* param)
-    register_symbol(0x854378A6F00249F5ULL, "sceVideoOutOpen", "libSceVideoOut",
-        [](CpuContext& ctx, MemoryManager&) {
-            ctx.rax = 0x100; // valid video out handle
-        });
 
     // sceVideoOutRegisterBuffers(int handle, int startIndex, void* const* addresses, int bufferCount, ...)
     auto reg_buffers_handler = [](CpuContext& ctx, MemoryManager& mem) {
@@ -1884,12 +1928,11 @@ void NidRegistry::register_default_libraries() {
         });
 
     // sceVideoOutOpen
+    // NID: 0x529DFA3D393AF3B1ULL ("Up36PTk687E")
     auto video_open_handler = [](CpuContext& ctx, MemoryManager&) {
         ctx.rax = 0x100; // valid video out handle
         std::fprintf(stderr, "[VideoOut] sceVideoOutOpen -> handle 0x100\n");
     };
-    register_symbol(0x854378A6F00249F5ULL, "sceVideoOutOpen", "libSceVideoOut", video_open_handler);
-    // NID: 0x529DFA3D393AF3B1ULL ("Up36PTk687E")
     register_symbol(0x529DFA3D393AF3B1ULL, "sceVideoOutOpen", "libSceVideoOut", video_open_handler);
 
     // sceVideoOutGetResolutionStatus
@@ -1913,8 +1956,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // sceVideoOutSetBufferAttribute
-    // NID: 0xA63903B20C658BA7ULL ("pjkDsgxli6c")
-    register_symbol(0xA63903B20C658BA7ULL, "sceVideoOutSetBufferAttribute", "libSceVideoOut",
+    // NID: 0x8BAFEC47DD56B7FEULL ("i6-sR91Wt-4")
+    register_symbol(0x8BAFEC47DD56B7FEULL, "sceVideoOutSetBufferAttribute", "libSceVideoOut",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
@@ -1940,14 +1983,15 @@ void NidRegistry::register_default_libraries() {
         });
 
     // sceVideoOutSetFlipRate(int handle, int rate)
-    register_symbol(0x4DA30C76979F3C1ULL, "sceVideoOutSetFlipRate", "libSceVideoOut",
+    // NID: 0x0818AEE26084D430ULL ("CBiu4mCE1DA")
+    register_symbol(0x0818AEE26084D430ULL, "sceVideoOutSetFlipRate", "libSceVideoOut",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
 
-    // sceSystemServiceParamInitialize / wAKZ-det+yo
-    // NID: 0xC00299FDD7ADFB2AULL ("wAKZ-det+yo#N#O" in libSceSystemService)
-    register_symbol(0xC00299FDD7ADFB2AULL, "sceSystemServiceParamInitialize", "libSceSystemService",
+    // sceSystemServiceParamInitialize / HcurEgsfF80
+    // NID: 0x1DCBAB120B1F17CDULL ("HcurEgsfF80")
+    register_symbol(0x1DCBAB120B1F17CDULL, "sceSystemServiceParamInitialize", "libSceSystemService",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr param_ptr = ctx.rdi;
             if (param_ptr != 0 && mem.is_valid_address(param_ptr, 0x100)) {
@@ -2083,12 +2127,25 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = 0;
         });
 
-    // FMOD / Audio3D / GnmDriver stubs
-    register_symbol(0x4018BB1C22B4DE1CULL, "QBi7HCK03hw", "libkernel",
-        [](CpuContext& ctx, MemoryManager&) {
-            ctx.rax = SCE_OK;
+    // sceKernelClockGettime(clockid_t clock_id, struct timespec *tp)
+    // NID: 0x4018BB1C22B4DE1CULL ("QBi7HCK03hw")
+    register_symbol(0x4018BB1C22B4DE1CULL, "sceKernelClockGettime", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr tp_ptr = ctx.rsi;
+            if (tp_ptr != 0 && mem.is_valid_address(tp_ptr, 16)) {
+                struct timespec ts{};
+                ::clock_gettime(CLOCK_MONOTONIC, &ts);
+                mem.write_value(tp_ptr, static_cast<i64>(ts.tv_sec));
+                mem.write_value(tp_ptr + 8, static_cast<i64>(ts.tv_nsec));
+                ctx.rax = SCE_OK;
+            } else {
+                ctx.rax = static_cast<u64>(-14);
+            }
         });
-    register_symbol(0x43777216EC069FAEULL, "Q3dyFuwGn64", "libSceGnmDriver",
+
+    // sceAjmModuleRegister / Q3dyFuwGn64 (module #X#Y libSceAjm)
+    // NID: 0x43777216EC069FAEULL ("Q3dyFuwGn64")
+    register_symbol(0x43777216EC069FAEULL, "sceAjmModuleRegister", "libSceAjm",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
@@ -2100,7 +2157,10 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
-    register_symbol(0xCE05E27C74FD12B6ULL, "zgXifHT9ErY", "libSceVideoOut",
+
+    // sceVideoOutIsFlipPending / zgXifHT9ErY
+    // NID: 0xCE05E27C74FD12B6ULL ("zgXifHT9ErY")
+    register_symbol(0xCE05E27C74FD12B6ULL, "sceVideoOutIsFlipPending", "libSceVideoOut",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
@@ -2162,11 +2222,11 @@ void NidRegistry::register_default_libraries() {
         });
 
     // sceUserServiceGetEvent / yH17Q6NWtVg
-    // Returns SCE_USER_SERVICE_ERROR_NO_EVENT (0x80960002) when no event is queued,
+    // Returns SCE_USER_SERVICE_ERROR_NO_EVENT (0x80960007) when no event is queued,
     // which unblocks Unity's event loop to proceed with frame rendering!
     register_symbol(0xC87D7B43A356B558ULL, "sceUserServiceGetEvent", "libSceUserService",
         [](CpuContext& ctx, MemoryManager&) {
-            ctx.rax = 0x80960002ULL; // SCE_USER_SERVICE_ERROR_NO_EVENT
+            ctx.rax = 0x80960007ULL; // SCE_USER_SERVICE_ERROR_NO_EVENT
         });
 }
 
