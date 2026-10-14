@@ -112,6 +112,7 @@ struct MonoArena {
     GuestAddr domain{0}; // singleton MonoDomain*
     std::unordered_map<std::string, GuestAddr> assemblies; // by name
     std::unordered_map<GuestAddr, GuestAddr> images;       // by assembly ptr
+    GuestAddr first_image{0}; // default when image==0 (see class_from_name)
     struct ClassKey {
         GuestAddr image{0};
         std::string ns;
@@ -2862,7 +2863,10 @@ void NidRegistry::register_default_libraries() {
                 auto it = s_mono_arena.images.find(assembly);
                 if (it == s_mono_arena.images.end()) {
                     slot = mono_arena_alloc(mem);
-                    if (slot) s_mono_arena.images[assembly] = slot;
+                    if (slot) {
+                        s_mono_arena.images[assembly] = slot;
+                        if (s_mono_arena.first_image == 0) s_mono_arena.first_image = slot;
+                    }
                 } else {
                     slot = it->second;
                 }
@@ -2884,20 +2888,67 @@ void NidRegistry::register_default_libraries() {
             const char* name = (name_addr > 0x1000 && mem.is_valid_address(name_addr, 1))
                                    ? mem.to_host_ptr<char>(name_addr) : nullptr;
             GuestAddr slot = 0;
-            if (image != 0 && ns && name) {
-                MonoArena::ClassKey key{image, ns, name};
+            if (ns && name) {
                 std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
-                auto it = s_mono_arena.classes.find(key);
-                if (it == s_mono_arena.classes.end()) {
-                    slot = mono_arena_alloc(mem);
-                    if (slot) s_mono_arena.classes.emplace(std::move(key), slot);
-                } else {
-                    slot = it->second;
+                // Fall back to the first image when none is supplied: the
+                // cookies are interchangeable zeros, and a NULL image here
+                // otherwise retries forever upstream.
+                GuestAddr eff_image = (image != 0) ? image : s_mono_arena.first_image;
+                if (eff_image != 0) {
+                    MonoArena::ClassKey key{eff_image, ns, name};
+                    auto it = s_mono_arena.classes.find(key);
+                    if (it == s_mono_arena.classes.end()) {
+                        slot = mono_arena_alloc(mem);
+                        if (slot) s_mono_arena.classes.emplace(std::move(key), slot);
+                    } else {
+                        slot = it->second;
+                    }
+                    std::fprintf(stderr, "[Mono] class_from_name('%.128s', '%.128s') -> 0x%llx\n",
+                                 ns, name, (unsigned long long)slot);
                 }
-                std::fprintf(stderr, "[Mono] class_from_name('%.128s', '%.128s') -> 0x%llx\n",
-                             ns, name, (unsigned long long)slot);
+            }
+            if (slot == 0) {
+                // Log raw pointers (capped) to identify which input fails.
+                static std::atomic<unsigned> s_fail_logged{0};
+                if (s_fail_logged.fetch_add(1) < 20) {
+                    std::fprintf(stderr,
+                        "[Mono] class_from_name FAIL image=0x%llx ns=0x%llx name=0x%llx\n",
+                        (unsigned long long)image, (unsigned long long)ns_addr,
+                        (unsigned long long)name_addr);
+                }
             }
             ctx.rax = slot;
+        });
+
+    // mono_class_is_subclass_of(MonoClass* klass, MonoClass* parent, gboolean check_interfaces)
+    // NID: 0x1147722929EB0A4CULL — reflexive identity only; distinct cookies
+    // stay 0 so unrelated types are never misclassified.
+    register_symbol(0x1147722929EB0A4CULL, "mono_class_is_subclass_of", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager&) {
+            const GuestAddr klass = ctx.rdi;
+            const GuestAddr parent = ctx.rsi;
+            ctx.rax = (klass != 0 && klass == parent) ? 1 : 0;
+        });
+
+    // mono_runtime_invoke(MonoMethod* method, void* obj, void** params, MonoObject** exc)
+    // NID: 0xA6B7BD0639320E1BULL — no IL execution; clears *exc so the caller
+    // never reads uninitialized stack garbage as a managed exception.
+    register_symbol(0xA6B7BD0639320E1BULL, "mono_runtime_invoke", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr exc_ptr = ctx.rcx;
+            if (exc_ptr > 0x1000 && mem.is_valid_address(exc_ptr, sizeof(u64))) {
+                mem.write_value(exc_ptr, static_cast<u64>(0));
+            }
+            ctx.rax = 0;
+        });
+
+    // mono_class_get_parent(MonoClass* klass) — iterator family: NULL ends the
+    // hierarchy walk at 0x99aeef (do/while klass != NULL). Explicit handler pins
+    // the behavior independently of the global unimplemented fallback.
+    // NID: 0x4CCB2C2760985FAAULL
+    register_symbol(0x4CCB2C2760985FAAULL, "mono_class_get_parent", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 0;
         });
 
     // Unity memory allocator, FMOD, and Mono module setup stubs
@@ -3051,35 +3102,4 @@ void NidRegistry::register_default_libraries() {
 }
 
 } // namespace ps4
-
-    // mono_class_is_subclass_of(MonoClass* klass, MonoClass* parent, gboolean check_interfaces)
-    // NID: 0x1147722929EB0A4CULL — reflexive identity only; distinct cookies
-    // stay 0 so unrelated types are never misclassified.
-    register_symbol(0x1147722929EB0A4CULL, "mono_class_is_subclass_of", "mono-ps4",
-        [](CpuContext& ctx, MemoryManager&) {
-            const GuestAddr klass = ctx.rdi;
-            const GuestAddr parent = ctx.rsi;
-            ctx.rax = (klass != 0 && klass == parent) ? 1 : 0;
-        });
-
-    // mono_runtime_invoke(MonoMethod* method, void* obj, void** params, MonoObject** exc)
-    // NID: 0xA6B7BD0639320E1BULL — no IL execution; clears *exc so the caller
-    // never reads uninitialized stack garbage as a managed exception.
-    register_symbol(0xA6B7BD0639320E1BULL, "mono_runtime_invoke", "mono-ps4",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr exc_ptr = ctx.rcx;
-            if (exc_ptr > 0x1000 && mem.is_valid_address(exc_ptr, sizeof(u64))) {
-                mem.write_value(exc_ptr, static_cast<u64>(0));
-            }
-            ctx.rax = 0;
-        });
-
-    // mono_class_get_parent(MonoClass* klass) — iterator family: NULL ends the
-    // hierarchy walk at 0x99aeef (do/while klass != NULL). Explicit handler pins
-    // the behavior independently of the global unimplemented fallback.
-    // NID: 0x4CCB2C2760985FAAULL
-    register_symbol(0x4CCB2C2760985FAAULL, "mono_class_get_parent", "mono-ps4",
-        [](CpuContext& ctx, MemoryManager&) {
-            ctx.rax = 0;
-        });
 
