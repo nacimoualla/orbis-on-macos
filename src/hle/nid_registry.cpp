@@ -1805,9 +1805,19 @@ void NidRegistry::register_default_libraries() {
                 if (it != s_semas.end()) sema = it->second;
             }
             if (!sema) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                // Returning success here is a use-after-return generator. The
+                // caller treats the job as complete and lets its frame die; a
+                // worker that is still running the job then stores its result
+                // through an out-pointer that lived in that dead frame, which
+                // has by then been reused by another activation. Observed
+                // exactly that: main's stack canary slot 0x1ffffac40 was
+                // clobbered from TID 6 at guest RIP 0x105961c via a stale
+                // `*obj->out = result` store.
+                std::fprintf(stderr,
+                             "[HLE WARNING TID=%d rip=0x%llx] sceKernelWaitSema(%u): unknown sema id; "
+                             "returning ESRCH instead of pretending success\n", (int)t_guest_tid, (unsigned long long)t_guest_rip, id);
                 if (cur_th) cur_th->state.store(ThreadState::Running);
-                ctx.rax = SCE_OK;
+                ctx.rax = 0x80020003ULL; // SCE_KERNEL_ERROR_ESRCH
                 return;
             }
 
@@ -1867,7 +1877,11 @@ void NidRegistry::register_default_libraries() {
             sema->cv.notify_all();
             std::fprintf(stderr, "[Sema] SignalSema(%u, %d) -> count=%d\n", id, sig, sema->count);
         } else {
-            std::fprintf(stderr, "[Sema] SignalSema(%u, %d) -> unknown id\n", id, sig);
+            std::fprintf(stderr,
+                         "[HLE WARNING TID=%d rip=0x%llx] sceKernelSignalSema(%u): unknown sema id "
+                         "(never created, or already deleted)\n", (int)t_guest_tid, (unsigned long long)t_guest_rip, id);
+            ctx.rax = 0x80020003ULL; // SCE_KERNEL_ERROR_ESRCH -- never success
+            return;
         }
         ctx.rax = SCE_OK;
     };
@@ -1897,7 +1911,9 @@ void NidRegistry::register_default_libraries() {
             std::fprintf(stderr, "[Sema] %s(%u, need=%d) -> BUSY (count=%d)\n", tag, id, need,
                          sema->count);
         } else {
-            std::fprintf(stderr, "[Sema] %s(%u, need=%d) -> unknown id\n", tag, id, need);
+            std::fprintf(stderr,
+                         "[HLE WARNING TID=%d rip=0x%llx] %s(%u): unknown sema id\n", (int)t_guest_tid, (unsigned long long)t_guest_rip, tag, id);
+            ctx.rax = 0x80020003ULL; // SCE_KERNEL_ERROR_ESRCH -- never success
         }
         ctx.rax = 0x80020010ULL; // SCE_KERNEL_ERROR_EBUSY
     };
@@ -2166,7 +2182,18 @@ void NidRegistry::register_default_libraries() {
                            (g_syscalls && g_syscalls->has_exited());
                 };
                 evf->waiters++;
-                ok = evf->cv.wait_for(lock, std::chrono::microseconds(usec), pred);
+                // An untimed wait must actually block. Capping it at 1 ms and
+                // returning ETIMEDOUT lets a requester proceed while the
+                // producer it is waiting on has not run -- the same
+                // use-after-return shape as an unknown-id WaitSema returning
+                // success. The 2 s shutdown watchdog in NidRegistry::shutdown()
+                // now makes parking safe, so the cap is only a shutdown poll.
+                if (guest_timeout) {
+                    ok = evf->cv.wait_for(lock, std::chrono::microseconds(usec), pred);
+                } else {
+                    evf->cv.wait(lock, pred);
+                    ok = true;
+                }
                 evf->waiters--;
                 if (ok) {
                     matched = evf->bits & want;
