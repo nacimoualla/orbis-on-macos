@@ -113,6 +113,8 @@ struct MonoArena {
     std::unordered_map<std::string, GuestAddr> assemblies; // by name
     std::unordered_map<GuestAddr, GuestAddr> images;       // by assembly ptr
     GuestAddr first_image{0}; // default when image==0 (see class_from_name)
+    GuestAddr corlib_image{0}; // singleton MonoImage* for mscorlib (mono_get_corlib)
+    std::unordered_map<GuestAddr, GuestAddr> derived; // unknown-derived objects, by input ptr (retained)
     struct ClassKey {
         GuestAddr image{0};
         std::string ns;
@@ -2974,6 +2976,23 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x4CCB2C2760985FAAULL, "mono_class_get_parent", "mono-ps4",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = 0;
+        });
+
+    // mono_get_corlib(void) -> singleton MonoImage* for mscorlib.
+    // NID: 0x47F74CE8E2982CC4ULL (hash-verified against Orbis salt).
+    // Takes no args; the guest leaves garbage in rdi/rsi/rdx. Returns a stable
+    // non-null cookie that feeds class_from_name(image, ns, name) — all
+    // System.* lookups share one image, which is the correct corlib discipline
+    // (previously a per-input derived map handed out a fresh image per call).
+    register_symbol(0x47F74CE8E2982CC4ULL, "mono_get_corlib", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
+            if (s_mono_arena.corlib_image == 0) {
+                s_mono_arena.corlib_image = mono_arena_alloc(mem);
+                std::fprintf(stderr, "[Mono] get_corlib -> 0x%llx\n",
+                             (unsigned long long)s_mono_arena.corlib_image);
+            }
+            ctx.rax = s_mono_arena.corlib_image;
         });
 
     // Unity memory allocator, FMOD, and Mono module setup stubs
