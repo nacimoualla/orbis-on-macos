@@ -124,18 +124,31 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             // Post-stall verbose: after the first stall dump, log everything
             // except keepalive TID 5's loop (4th worker spawned; stable order
             // in every run observed). Costs nothing pre-stall (flag off).
-            const bool verbose = post_stall_verbose() && current_hle_thread_id() != 5;
-            if (verbose || (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" && 
+            const ScePthreadId hle_tid = current_hle_thread_id();
+            const bool verbose = post_stall_verbose() && hle_tid != 5;
+            // Suppressed high-frequency names still count toward hles=, so the
+            // two totals differ by design; report the suppressed tally alongside
+            // the line so the gap is auditable instead of looking like a
+            // cross-run counter mismatch.
+            static std::atomic<u64> s_suppressed{0};
+            static std::atomic<u64> s_logged{0};
+            if (verbose || (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" &&
                 sym->name != "strlen" && sym->name != "memcpy" && sym->name != "memmove" &&
                 sym->name != "strcmp" && sym->name != "strncmp" && sym->name != "strncpy" &&
                 sym->name != "malloc" && sym->name != "free" && sym->name != "memalign" &&
                 sym->name != "mono_add_internal_call" &&
                 sym->name != "sceKernelSyncStub")) {
-                std::fprintf(stderr, "[HLE CALL] %s (NID=0x%llx, caller RIP=0x%llx, rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx)\n",
+                const u64 n = s_logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                std::fprintf(stderr, "[HLE CALL] T%-3u %s (NID=0x%llx, caller RIP=0x%llx, rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx) [logged=%llu suppressed=%llu]\n",
+                             (unsigned)hle_tid,
                              sym->name.c_str(), (unsigned long long)nid, (unsigned long long)ret_addr,
                              (unsigned long long)sctx.args[0], (unsigned long long)sctx.args[1],
                              (unsigned long long)sctx.args[2], (unsigned long long)(sctx.rcx ? sctx.rcx : sctx.args[3]),
-                             (unsigned long long)sctx.args[4], (unsigned long long)sctx.args[5]);
+                             (unsigned long long)sctx.args[4], (unsigned long long)sctx.args[5],
+                             (unsigned long long)n,
+                             (unsigned long long)s_suppressed.load(std::memory_order_relaxed));
+            } else {
+                s_suppressed.fetch_add(1, std::memory_order_relaxed);
             }
             CpuContext* cur_cpu = sctx.cpu;
             CpuContext mock_cpu{};
@@ -153,8 +166,10 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             }
 
             const GuestAddr initial_rip = cur_cpu->rip;
-            m_registry.note_hle_dispatch(nid);
+            m_registry.note_hle_dispatch(nid, ret_addr);
+            t_guest_in_hle = true;
             sym->handler(*cur_cpu, m_memory);
+            t_guest_in_hle = false;
             m_registry.note_hle_return();
             sctx.rax = cur_cpu->rax;
             sctx.rsp = cur_cpu->rsp;
