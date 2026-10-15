@@ -371,7 +371,66 @@ bool CpuExecutor::setup_default_stack(GuestAddr stack_base, GuestSize stack_size
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Guest LOCK-prefixed read-modify-write.
+//
+// Every guest thread runs on its own host thread over ONE shared mmap of guest
+// memory. The LOCK prefix was decoded into `lock_prefix` and then never read, so
+// `lock` instructions fell through to read_rm()/write_rm() -- a plain
+// load-then-store that loses updates whenever two guests touch the same word.
+//
+// That is not hypothetical here. Unity drives both of its job systems from
+// exactly these instructions:
+//     0x975ba  lock incq (%rax)               job-done counter
+//     0x975c2  lock decq (%rax)               outstanding--
+//     0x975eb  lock decq (%r13)               queue pending--
+//     0x98d30a7 lock cmpxchgl %r15d, (%rcx)   ThreadedStreamBuffer producer CAS
+//     0x975b0  xchgq %rax, (%r15)             queue slot swap
+// so the pool's task queue and the render ringbuffer were being corrupted by
+// lost updates. That is consistent with every symptom seen so far: stack canary
+// failures whose faulting frame moves between runs, job queues that never drain,
+// and wild indirect jumps through a corrupted pointer.
+//
+// These helpers issue a single host atomic instead. They return -1 when the
+// operand cannot be handled this way (register destination, or an address with
+// no host mapping) so the caller can fall back to its existing path.
+// ---------------------------------------------------------------------------
+template <typename T>
+static int guest_atomic_cas(MemoryManager& mem, GuestAddr addr, T desired, T* out_actual) {
+    T* p = mem.to_host_ptr<T>(addr);
+    if (!p) return -1;
+    T expected = __atomic_load_n(p, __ATOMIC_SEQ_CST);
+    if (__atomic_compare_exchange_n(p, &expected, desired, /*weak=*/false,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        *out_actual = expected;
+        return 1;
+    }
+    *out_actual = expected; // compare_exchange_n already refreshed it
+    return 0;
+}
+
+template <typename T>
+static int guest_atomic_xadd(MemoryManager& mem, GuestAddr addr, T operand, T* out_old) {
+    T* p = mem.to_host_ptr<T>(addr);
+    if (!p) return -1;
+    *out_old = __atomic_fetch_add(p, operand, __ATOMIC_SEQ_CST);
+    return 1;
+}
+
+template <typename T>
+static int guest_atomic_xchg(MemoryManager& mem, GuestAddr addr, T operand, T* out_old) {
+    T* p = mem.to_host_ptr<T>(addr);
+    if (!p) return -1;
+    *out_old = __atomic_exchange_n(p, operand, __ATOMIC_SEQ_CST);
+    return 1;
+}
+
 StepResult CpuExecutor::step() {
+    // Publish the executing RIP so a MemoryManager write-watch can name the
+    // instruction responsible for a clobbered address.
+    t_guest_rip = m_context.rip;
+    t_guest_rsp = m_context.rsp;
+    t_guest_rbp = m_context.rbp;
     if (m_syscalls.has_exited()) {
         return StepResult::Exited;
     }
@@ -1869,9 +1928,33 @@ StepResult CpuExecutor::step() {
             if (!m.valid) return StepResult::IllegalInstruction;
             const usize bits = (op1 == 0xB0) ? 8 : op_bits;
             const u64 acc = (bits == 8) ? get_gpr8(m_context, 0, has_rex) : (bits == 64) ? m_context.rax : static_cast<u32>(m_context.rax);
+            const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+            if (!m.is_reg) {
+                // Atomic single-step compare-exchange; see guest_atomic_cas.
+                const u64 reg_val = (bits == 8) ? get_gpr8(m_context, m.reg_id, has_rex)
+                                   : (bits == 64) ? get_gpr64(m_context, m.reg_id)
+                                   : static_cast<u32>(get_gpr64(m_context, m.reg_id));
+                int handled = -1;
+                u64 actual = 0;
+                if (bits == 64) handled = guest_atomic_cas<u64>(m_memory, m.mem_addr, static_cast<u64>(reg_val), reinterpret_cast<u64*>(&actual));
+                else if (bits == 32) handled = guest_atomic_cas<u32>(m_memory, m.mem_addr, static_cast<u32>(reg_val), reinterpret_cast<u32*>(&actual));
+                else if (bits == 16) handled = guest_atomic_cas<u16>(m_memory, m.mem_addr, static_cast<u16>(reg_val), reinterpret_cast<u16*>(&actual));
+                else handled = guest_atomic_cas<u8>(m_memory, m.mem_addr, static_cast<u8>(reg_val), reinterpret_cast<u8*>(&actual));
+                if (handled >= 0) {
+                    const u64 rm_val = actual & mask;
+                    update_flags_sub(m_context, acc, rm_val, acc - rm_val, bits);
+                    m_context.set_flag(CpuContext::FLAG_ZF, handled == 1);
+                    if (handled == 0) {
+                        if (bits == 8) set_gpr8(m_context, 0, has_rex, static_cast<u8>(rm_val));
+                        else if (bits == 64) m_context.rax = rm_val;
+                        else m_context.rax = static_cast<u32>(rm_val);
+                    }
+                    m_context.rip = start_rip + cursor + m.bytes_consumed;
+                    return StepResult::Ok;
+                }
+            }
             const u64 rm_val = read_rm(m, bits);
             update_flags_sub(m_context, acc, rm_val, acc - rm_val, bits);
-            const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
             if ((acc & mask) == (rm_val & mask)) {
                 m_context.set_flag(CpuContext::FLAG_ZF, true);
                 const u64 reg_val = (bits == 8) ? get_gpr8(m_context, m.reg_id, has_rex) : (bits == 64) ? get_gpr64(m_context, m.reg_id) : static_cast<u32>(get_gpr64(m_context, m.reg_id));
@@ -1892,6 +1975,26 @@ StepResult CpuExecutor::step() {
             if (!m.valid) return StepResult::IllegalInstruction;
             const usize bits = (op1 == 0xC0) ? 8 : op_bits;
             const u64 reg_val = (bits == 8) ? get_gpr8(m_context, m.reg_id, has_rex) : (bits == 64) ? get_gpr64(m_context, m.reg_id) : static_cast<u32>(get_gpr64(m_context, m.reg_id));
+            if (!m.is_reg) {
+                // Atomic fetch-add; see guest_atomic_xadd.
+                int handled = -1;
+                u64 old_raw = 0;
+                if (bits == 64) handled = guest_atomic_xadd<u64>(m_memory, m.mem_addr, static_cast<u64>(reg_val), reinterpret_cast<u64*>(&old_raw));
+                else if (bits == 32) handled = guest_atomic_xadd<u32>(m_memory, m.mem_addr, static_cast<u32>(reg_val), reinterpret_cast<u32*>(&old_raw));
+                else if (bits == 16) handled = guest_atomic_xadd<u16>(m_memory, m.mem_addr, static_cast<u16>(reg_val), reinterpret_cast<u16*>(&old_raw));
+                else handled = guest_atomic_xadd<u8>(m_memory, m.mem_addr, static_cast<u8>(reg_val), reinterpret_cast<u8*>(&old_raw));
+                if (handled >= 0) {
+                    const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+                    const u64 rm_val = old_raw & mask;
+                    const u64 sum = (rm_val + reg_val) & mask;
+                    update_flags_add(m_context, rm_val, reg_val, sum, bits);
+                    if (bits == 8) set_gpr8(m_context, m.reg_id, has_rex, static_cast<u8>(rm_val));
+                    else if (bits == 64) set_gpr64(m_context, m.reg_id, rm_val);
+                    else set_gpr32(m_context, m.reg_id, static_cast<u32>(rm_val));
+                    m_context.rip = start_rip + cursor + m.bytes_consumed;
+                    return StepResult::Ok;
+                }
+            }
             const u64 rm_val = read_rm(m, bits);
             const u64 sum = (rm_val + reg_val);
             update_flags_add(m_context, rm_val, reg_val, sum, bits);
@@ -2571,8 +2674,22 @@ StepResult CpuExecutor::step() {
         const u64 reg_val = (bits == 8) ? get_gpr8(m_context, m.reg_id, has_rex) :
                             (bits == 64) ? get_gpr64(m_context, m.reg_id) :
                             static_cast<u32>(get_gpr64(m_context, m.reg_id));
-        const u64 rm_val = read_rm(m, bits);
-        write_rm(m, reg_val, bits);
+        u64 rm_val = 0;
+        int handled = -1;
+        if (!m.is_reg) {
+            // Atomic exchange; see guest_atomic_xchg. XCHG is implicitly locked
+            // on x86 even without a 0xF0 prefix.
+            u64 old_raw = 0;
+            if (bits == 64) handled = guest_atomic_xchg<u64>(m_memory, m.mem_addr, static_cast<u64>(reg_val), reinterpret_cast<u64*>(&old_raw));
+            else if (bits == 32) handled = guest_atomic_xchg<u32>(m_memory, m.mem_addr, static_cast<u32>(reg_val), reinterpret_cast<u32*>(&old_raw));
+            else if (bits == 16) handled = guest_atomic_xchg<u16>(m_memory, m.mem_addr, static_cast<u16>(reg_val), reinterpret_cast<u16*>(&old_raw));
+            else handled = guest_atomic_xchg<u8>(m_memory, m.mem_addr, static_cast<u8>(reg_val), reinterpret_cast<u8*>(&old_raw));
+            if (handled >= 0) rm_val = old_raw;
+        }
+        if (handled < 0) {
+            rm_val = read_rm(m, bits);
+            write_rm(m, reg_val, bits);
+        }
         if (bits == 8) set_gpr8(m_context, m.reg_id, has_rex, static_cast<u8>(rm_val));
         else if (bits == 64) set_gpr64(m_context, m.reg_id, rm_val);
         else if (bits == 32) set_gpr32(m_context, m.reg_id, static_cast<u32>(rm_val));

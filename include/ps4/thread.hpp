@@ -71,6 +71,12 @@ struct GuestThread {
     std::atomic<u64> hle_calls{0};     // HLE dispatches on this thread
     std::atomic<bool> in_hle{false};   // inside a handler right now
     std::atomic<u64> last_nid{0};      // most recent HLE NID
+    // Return address of the call currently being serviced. live_context is only
+    // published at quantum boundaries, so a thread blocked inside a handler has
+    // live_context == nullptr and the dump would otherwise print the entry
+    // context -- making a thread that ran 1,400 instructions look like it never
+    // left its entry point. This pair disambiguates "blocked in HLE" from that.
+    std::atomic<GuestAddr> hle_caller_rip{0};
     // Worker's live executor context, set after each quantum copy-in and
     // cleared on thread exit. Read by the watchdog without locking; atomicity
     // only (tearing documented) — never dereference past thread exit.
@@ -166,6 +172,7 @@ public:
 
     // Mutex management
     u32 mutex_create(std::string_view name = "mutex");
+    bool mutex_exists(u32 mutex_id);
     bool mutex_lock(u32 mutex_id);
     bool mutex_trylock(u32 mutex_id);
     bool mutex_unlock(u32 mutex_id);

@@ -227,6 +227,7 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
             }
             executor.context() = raw_thread->context;
             raw_thread->live_context.store(&executor.context(), std::memory_order_relaxed);
+        t_guest_tid = static_cast<int>(raw_thread->id);
 
             constexpr usize QUANTUM = 20000;
             while (raw_thread->state.load() != ThreadState::Terminated && !m_syscalls->has_exited()) {
@@ -479,6 +480,25 @@ void ThreadManager::dump_stall_snapshot(const char* tag) const {
         const CpuContext* live = th->live_context.load(std::memory_order_relaxed);
         const CpuContext* mc = (!live && id == 1) ? m_main_context.load(std::memory_order_relaxed) : nullptr;
         const CpuContext& c = live ? *live : (mc ? *mc : th->context);
+        // live_context is only published at quantum boundaries, so a thread
+        // blocked inside a handler has live_context == nullptr and `c` falls
+        // back to th->context -- the entry snapshot, whose rip is still the
+        // entry point. That made a thread which ran ~1,400 instructions and then
+        // parked in sem_wait look identical to one that never ran at all. Report
+        // the HLE it is actually parked in so the two are distinguishable.
+        const bool blocked_in_hle = th->in_hle.load(std::memory_order_relaxed);
+        if (blocked_in_hle && !live) {
+            std::fprintf(stderr,
+                         "  [Thread %u] '%s' state=%s BLOCKED-IN-HLE nid=0x%llx caller=0x%llx"
+                         " instrs=%llu runs=%llu hles=%llu\n",
+                         th->id, th->name.c_str(), thread_state_name(th->state.load()),
+                         (unsigned long long)th->last_nid.load(std::memory_order_relaxed),
+                         (unsigned long long)th->hle_caller_rip.load(std::memory_order_relaxed),
+                         (unsigned long long)th->instructions_executed.load(),
+                         (unsigned long long)th->run_returns.load(),
+                         (unsigned long long)th->hle_calls.load());
+            continue;
+        }
         std::fprintf(stderr,
                      "  [Thread %u] '%s' state=%s RIP=0x%llx instrs=%llu runs=%llu hles=%llu inhle=%d lastnid=0x%llx\n"
                      "    rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx\n"
@@ -535,6 +555,11 @@ u32 ThreadManager::mutex_create(std::string_view) {
     const u32 id = m_next_mutex_id++;
     m_mutexes[id] = std::make_unique<std::recursive_mutex>();
     return id;
+}
+
+bool ThreadManager::mutex_exists(u32 mutex_id) {
+    std::lock_guard<std::mutex> lock(m_sync_mutex);
+    return m_mutexes.find(mutex_id) != m_mutexes.end();
 }
 
 bool ThreadManager::mutex_lock(u32 mutex_id) {
