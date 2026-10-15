@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <thread>
@@ -25,6 +26,10 @@ int main(int argc, char* argv[]) {
     bool enable_jit = true;
     bool enable_trace = false;
     bool enable_strict_hle = false;
+    // Headless instruction budget. The default (100M) stops inside the guest's
+    // static-initializer phase, well before Unity's Mono bootstrap, so soak and
+    // smoke runs that need the Mono call census must raise it.
+    ps4::usize instruction_budget = 100000000;
     std::filesystem::path elf_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -39,11 +44,14 @@ int main(int argc, char* argv[]) {
             enable_trace = true;
         } else if (arg == "--strict-hle") {
             enable_strict_hle = true;
+        } else if (arg == "--budget" && i + 1 < argc) {
+            instruction_budget = std::strtoull(argv[++i], nullptr, 10);
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: ps4-runner [options] <path-to-eboot.bin-or-elf>\n";
             std::cout << "Options:\n";
             std::cout << "  --window, -w     Open interactive macOS display window (60 FPS)\n";
             std::cout << "  --headless       Run headlessly in console only (default)\n";
+            std::cout << "  --budget N       Headless instruction budget (default 100000000)\n";
             std::cout << "  --no-jit         Disable ARM64 JIT dynamic recompiler (interpreter only)\n";
             std::cout << "  --trace, -t      Trace guest instruction execution step-by-step\n";
             std::cout << "  --strict-hle     Fail-loud strict HLE development mode (crash on missing NIDs)\n";
@@ -175,6 +183,12 @@ int main(int argc, char* argv[]) {
     // Creating overload: the manager may not exist yet (first HLE dispatch
     // creates it lazily), and the no-arg accessor would return null here.
     nid_registry.thread_manager(memory).set_main_context(&cpu.context());
+    // Optional single-address write-watch, for chasing a specific clobber:
+    // PS4_WATCH_ADDR=0x1ffffac40 ./ps4-runner ... reports the first store to that
+    // guest address together with the RIP and TID that made it.
+    if (const char* w = std::getenv("PS4_WATCH_ADDR")) {
+        ps4::set_write_watch(std::strtoull(w, nullptr, 0));
+    }
     if (enable_jit) {
         cpu.set_jit_compiler(&jit);
         nid_registry.set_jit_compiler(&jit);
@@ -231,12 +245,16 @@ int main(int argc, char* argv[]) {
         } else {
             // Console / Headless Execution Loop
             const ps4::usize batch = 1000000;
-            const ps4::usize max_total = 100000000;
+            const ps4::usize max_total = instruction_budget;
             while (total_instructions < max_total && !syscalls.has_exited()) {
                 run_res = cpu.run(batch);
                 total_instructions += run_res.instructions_executed;
                 if (run_res.status != ps4::StepResult::Ok) break;
-                std::cout << "[CPU Progress] " << total_instructions << " instrs, RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n";
+                // Flush per tick: stdout is block-buffered when redirected to a file, so on
+                // SIGTERM the buffered ticks are lost and a 60 s run can report
+                // only the first couple of ticks -- which reads exactly like a
+                // throughput regression when it is pure measurement loss.
+                std::cout << "[CPU Progress] " << total_instructions << " instrs, RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n" << std::flush;
             }
         }
     }

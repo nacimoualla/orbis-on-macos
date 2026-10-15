@@ -5,6 +5,29 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Default to an optimized build. Without this a bare `cmake -B build ..` leaves
+# CMAKE_BUILD_TYPE empty, and CMake's empty-config fallback adds no -O flag at
+# all -- every translation unit compiles at -O0 with asserts live. That is what
+# this tree was configured with (`CXX_FLAGS = -g -std=c++20 -arch arm64 ...`),
+# and it cost roughly 2 us per guest instruction: the interpreter measured
+# ~467 K guest instr/s, so main covered only 28 M instructions in a 60 s run and
+# never reached first frame. Release resolves to -O3 -DNDEBUG here.
+# Investigate build type: -O2 -g but *without* NDEBUG.
+# The stock types are all wrong for this tree right now: Debug has no -O flag
+# at all, and RelWithDebInfo/Release both define NDEBUG. That matters because
+# tests/test_phase7.cpp has a failing malloc assertion at HEAD -- an allocator
+# invariant violation that -DNDEBUG silently compiles away, in the very same
+# change that made guest memory corruption appear. An allocator bug can corrupt
+# a stack canary indirectly (a bad length field driving an oversized memcpy), so
+# the assert is the best-supported lead and must stay live while we chase it.
+set(CMAKE_CXX_FLAGS_INVESTIGATE "-O2 -g" CACHE STRING "" FORCE)
+set(CMAKE_EXE_LINKER_FLAGS_INVESTIGATE "-O2 -g" CACHE STRING "" FORCE)
+
+# Only sets a default, so -DCMAKE_BUILD_TYPE=Debug/Release still work.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Investigate CACHE STRING "Build type" FORCE)
+endif()
+
 # Enable compiler warnings
 add_compile_options(-Wall -Wextra -Wpedantic)
 
