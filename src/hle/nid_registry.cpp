@@ -4,6 +4,7 @@
 #include "ps4/syscall_table.hpp"
 #include "ps4/thread.hpp"
 #include "ps4/vfs.hpp"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -28,6 +29,64 @@ namespace {
 // 0x1C0000000 - 0x200000000 (7 GB - 8 GB)  : Worker thread stacks (downward from 0x1d0000000)
 std::atomic<GuestAddr> g_guest_heap_current{0x20000000ULL};   // 512 MB mark
 std::atomic<GuestAddr> g_direct_phys_current{0x40000000ULL};  // 1 GB mark
+
+// The libc heap is a bare bump pointer with no block headers, which leaves
+// realloc with no way to know how much of the old block to copy. Record each
+// block's size here rather than changing malloc's block layout.
+static std::mutex s_heap_sizes_mtx;
+static std::unordered_map<GuestAddr, GuestSize> s_heap_sizes;
+
+// Hard ceiling for the CPU heap. The memory map reserves 0x20000000-0x40000000
+// for the guest libc heap and 0x40000000-0x1C0000000 for direct (Garlic/ONION)
+// memory; an unbounded bump allocator walks straight through that boundary and
+// silently overwrites GPU buffers with heap contents. See mspace_alloc below.
+static constexpr GuestAddr kCpuHeapEnd = 0x40000000ULL;
+
+inline GuestAddr bump_alloc(GuestSize size, GuestSize align = 16) {
+    if (size == 0) size = 1;
+    const GuestAddr cur = g_guest_heap_current.load();
+    const GuestAddr p = (cur + align - 1) & ~(align - 1);
+    if (p + size > kCpuHeapEnd) {
+        std::fprintf(stderr, "[heap] CPU heap exhausted: need %llu at 0x%llx, ceiling 0x%llx\n",
+                     (unsigned long long)size, (unsigned long long)p,
+                     (unsigned long long)kCpuHeapEnd);
+        return 0;
+    }
+    g_guest_heap_current.store(p + size);
+    std::lock_guard<std::mutex> lock(s_heap_sizes_mtx);
+    s_heap_sizes[p] = size;
+    return p;
+}
+
+inline GuestSize bump_size_of(GuestAddr ptr) {
+    std::lock_guard<std::mutex> lock(s_heap_sizes_mtx);
+    auto it = s_heap_sizes.find(ptr);
+    return it == s_heap_sizes.end() ? 0 : it->second;
+}
+
+// Unity's PS4 resource allocator (sceLibcMspaceMemalign) asks for hundreds of
+// megabytes of Garlic/ONION memory and treats the result as a GPU buffer: it
+// copies shader binaries there and parses their headers. Served from the shared
+// CPU bump pointer it walked from 0x20100000 to 0x5A7A8C20 -- straight through
+// 0x40000000 -- so ~1.6 GB of heap landed on top of the direct-memory window,
+// first block inside it at 0x40770000. Unity then parsed a header full of heap
+// pointers ("shaderBinarySize %u is not equal to Program size %ld", sizes that
+// were really 0x5E020D58 and a sum of 16-byte entry counts read from pointers),
+// fell into a table walk with a 1.5-billion trip count and never presented a
+// frame. Give these allocations their own arena above the direct-memory region
+// so CPU heap and GPU memory can never alias.
+// Direct memory runs 0x40000000..0x15B800000 in a 60 s run (one 4.5 GB
+// allocation plus a 128 KB one), so the arena starts just above it and has the
+// 0x160000000..0x200000000 remainder of the 8 GB space to itself.
+static std::atomic<GuestAddr> g_mspace_current{0x160000000ULL};
+
+inline GuestAddr mspace_alloc(GuestSize size, GuestSize align) {
+    if (size == 0) size = 1;
+    if (align == 0) align = 16;
+    const GuestAddr p = (g_mspace_current.load() + align - 1) & ~(align - 1);
+    g_mspace_current.store(p + size);
+    return p;
+}
 
 // Global ThreadManager and execution dependencies
 std::unique_ptr<ThreadManager> g_thread_manager;
@@ -100,6 +159,21 @@ static std::mutex s_sema_table_mtx;
 static std::unordered_map<u32, std::shared_ptr<GuestSema>> s_semas;
 static u32 s_next_sema_id = 1;
 
+// Event flags: same shape as the semaphore table. WaitEventFlag blocks on the
+// condition variable until the requested bits appear (or the timeout expires),
+// and SetEventFlag is the only thing that can post bits, so the two must be
+// registered together or a wait can never be satisfied.
+struct GuestEventFlag {
+    std::mutex mtx;
+    std::condition_variable cv;
+    u32 bits{0};
+    u32 waiters{0};
+    bool deleted{false};
+};
+static std::mutex s_eflag_table_mtx;
+static std::unordered_map<u32, std::shared_ptr<GuestEventFlag>> s_eflags;
+static u32 s_next_eflag_id = 1;
+
 // Mono dummy-cookie arena: distinct zeroed 256-byte guest slots for Mono
 // object lookups. The guest dereferences fields inside these pointers, so they
 // must be real mapped memory — carved once from the libc heap bump pointer
@@ -116,6 +190,7 @@ struct MonoArena {
     std::unordered_map<GuestAddr, GuestAddr> images;       // by assembly ptr
     GuestAddr first_image{0}; // default when image==0 (see class_from_name)
     GuestAddr corlib_image{0}; // singleton MonoImage* for mscorlib (mono_get_corlib)
+    std::unordered_map<std::string, GuestAddr> cookies; // stable handle -> slot
     std::unordered_map<GuestAddr, GuestAddr> derived; // unknown-derived objects, by input ptr (retained)
     struct ClassKey {
         GuestAddr image{0};
@@ -164,6 +239,29 @@ static GuestAddr mono_arena_alloc(MemoryManager& mem) {
     return slot;
 }
 
+// Stable handle for a (function, argument-tuple) pair. Two lookups of the same
+// field from the same class must return the same pointer, or every guest
+// identity comparison fails and the caller retries forever. Keyed on the
+// arguments, so distinct lookups get distinct zeroed slots.
+// Caller must hold s_mono_arena.mtx.
+static GuestAddr mono_cookie(MemoryManager& mem, const char* what, std::string_view args) {
+    const std::string key = std::string(what) + "|" + std::string(args);
+    auto it = s_mono_arena.cookies.find(key);
+    if (it != s_mono_arena.cookies.end()) return it->second;
+    const GuestAddr slot = mono_arena_alloc(mem);
+    if (slot) s_mono_arena.cookies.emplace(key, slot);
+    return slot;
+}
+
+static std::string mono_args(const CpuContext& ctx) {
+    char buf[80];
+    std::snprintf(buf, sizeof(buf), "%llx:%llx:%llx",
+                  static_cast<unsigned long long>(ctx.rdi),
+                  static_cast<unsigned long long>(ctx.rsi),
+                  static_cast<unsigned long long>(ctx.rdx));
+    return buf;
+}
+
 } // namespace
 
 NidRegistry::NidRegistry() = default;
@@ -197,7 +295,46 @@ NidRegistry::~NidRegistry() {
     shutdown();
 }
 
+// Defined next to the semaphore condition variable in
+// register_default_libraries(); declared here because shutdown() appears earlier
+// in the translation unit.
+void request_semaphore_shutdown();
+
+static std::mutex s_sem_cv_mtx;
+static std::condition_variable s_sem_cv;
+static std::atomic<bool> s_sem_shutdown{false};
+
+// Unpark every untimed POSIX waiter so thread teardown can complete. has_exited()
+// alone does not cover the HLT, instruction-budget, or fault exits.
+void request_semaphore_shutdown() {
+    s_sem_shutdown.store(true, std::memory_order_relaxed);
+    s_sem_cv.notify_all();
+}
+
 void NidRegistry::shutdown() {
+    // Teardown watchdog. Guest threads park indefinitely in untimed waits
+    // (WaitSema with timeout=infinite, mutex_lock, sceKernelWaitEventFlag) and
+    // none of them observe has_exited(), so ThreadManager's join() never
+    // returns and a single run can wedge for the whole session. Guest threads do
+    // not need orderly teardown -- once main has stopped, nothing depends on
+    // their state -- so arm a detached timer that hard-exits shortly after.
+    // If the joins happen to finish first, the normal exit wins and the timer
+    // thread dies with the process.
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::fflush(nullptr);
+        std::fprintf(stderr, "[shutdown] watchdog: threads still parked after 2s, hard-exiting\n");
+        std::fflush(stderr);
+        std::_Exit(0);
+    }).detach();
+    // Release every thread parked in an untimed POSIX wait before joining.
+    // sem_wait blocks on a condition variable until it is posted or until the
+    // emulator is shutting down; has_exited() is NOT enough, because it is only
+    // set by an exit syscall. A guest that ends any other way -- HLT
+    // (StepResult::Halted), the headless instruction budget, or a fault -- leaves
+    // has_exited() false, so idle pool workers stayed parked and join() hung
+    // forever. That is what turned a 46 s run into an unkillable one.
+    request_semaphore_shutdown();
     // 1. Join and destroy all guest threads while MemoryManager, SyscallTable, and JitCompiler are still alive
     if (g_thread_manager) {
         g_thread_manager.reset();
@@ -224,11 +361,12 @@ ThreadManager* NidRegistry::thread_manager() const noexcept {
     return g_thread_manager.get();
 }
 
-void NidRegistry::note_hle_dispatch(Nid nid) const {
+void NidRegistry::note_hle_dispatch(Nid nid, GuestAddr caller_rip) const {
     if (g_thread_manager) {
         const ScePthreadId tid = g_thread_manager->current_thread_id();
         if (GuestThread* th = g_thread_manager->get_thread(tid)) {
             th->last_nid.store(nid, std::memory_order_relaxed);
+            th->hle_caller_rip.store(caller_rip, std::memory_order_relaxed);
             th->hle_calls.fetch_add(1, std::memory_order_relaxed);
             th->in_hle.store(true, std::memory_order_relaxed);
         }
@@ -386,8 +524,67 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x6424D00705E3BEBEULL, "sceKernelExitProcess", "libkernel",
         [](CpuContext& ctx, MemoryManager&) {
             const i32 status = static_cast<i32>(ctx.rdi);
-            std::cout << "[HLE] sceKernelExitProcess(" << status << ")\n";
+            std::cout << "[HLE] sceKernelExitProcess(" << status << ")\n" << std::flush;
             ctx.rax = 0;
+        });
+
+    // __stack_chk_fail(void)
+    // NID: 0x3AEDE22F569BBE78ULL -- imported by eboot.bin, and ps4libdoc lists
+    // it as the __stack_chk_fail of the stack-protector runtime.
+    //
+    // This MUST NOT RETURN. The guest calls it when the canary at [rbp-0x30]
+    // no longer matches the guard at *0x14fd360. It was registered in the
+    // unimplemented-stub table, whose body returns 0, so the guest fell
+    // through into the nop sled at 0x58d595 and kept executing until it
+    // branched to a garbage pointer: RIP=0x3b480151ed5a1d8d, reported only as
+    // "Memory fault / invalid instruction pointer" with the canary failure
+    // invisible. Real __stack_chk_fail calls __fortify_fail and aborts, so
+    // terminating is the faithful behaviour -- and it turns an unactionable
+    // wild jump into a report that names the actual failure.
+    register_symbol(0x3AEDE22F569BBE78ULL, "__stack_chk_fail", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            // The return address of the call site is [rsp]; ctx.rip is wherever
+            // the trampoline landed and is NOT the call site. Reporting ctx.rip
+            // here pointed 4.6 MB away from the real fault and briefly looked
+            // like a second, moving failure.
+            GuestAddr ret = 0;
+            mem.read_value(ctx.rsp, ret);
+            // Canaries: the frame's copy lives at [rbp-0x30], the guard is the
+            // pointer at 0x14fd360. Print both plus the 64 bytes around the
+            // frame canary -- ASCII points at a string copy overrun, a run of
+            // zeros at a store-width bug, a pointer-shaped word at a stray write.
+            GuestAddr guard_ptr = 0, guard_val = 0, frame_canary = 0;
+            mem.read_value(static_cast<GuestAddr>(0x14FD360), guard_ptr);
+            if (guard_ptr) mem.read_value(guard_ptr, guard_val);
+            mem.read_value(ctx.rbp - 0x30, frame_canary);
+            std::fprintf(stderr,
+                         "[Guest abort] __stack_chk_fail: canary mismatch\n"
+                         "  call site (return addr) = 0x%llx\n"
+                         "  rbp                      = 0x%llx  (canary slot = 0x%llx)\n"
+                         "  guard ptr  *0x14fd360   = 0x%llx\n"
+                         "  guard value             = 0x%016llx\n"
+                         "  frame canary            = 0x%016llx\n",
+                         (unsigned long long)ret, (unsigned long long)ctx.rbp,
+                         (unsigned long long)(ctx.rbp - 0x30),
+                         (unsigned long long)guard_ptr,
+                         (unsigned long long)guard_val,
+                         (unsigned long long)frame_canary);
+            // Full frame as qwords, [rbp-0x80 .. rbp+0x10). The canary slot
+            // is [rbp-0x30]; reading the whole window settles whether the frame
+            // holds an array of heap pointers (overflowed) or a struct.
+            std::fprintf(stderr, "  frame [rbp-0x80 .. rbp+0x10) as qwords:\n");
+            for (GuestAddr a = ctx.rbp - 0x80; a < ctx.rbp + 0x10; a += 8) {
+                u64 v = 0;
+                const bool ok = mem.read_value(a, v);
+                std::fprintf(stderr, "   %s 0x%016llx : 0x%016llx%s\n",
+                             (a == ctx.rbp - 0x30) ? "->" : "  ",
+                             (unsigned long long)a, (unsigned long long)v,
+                             ok ? "" : "  (unreadable)");
+            }
+            dump_write_watch_ring();
+            std::fprintf(stderr, "[Guest abort] terminating emulator\n");
+            std::fflush(stderr);
+            std::exit(134); // 128 + SIGABRT, the conventional abort() status
         });
 
     // sceKernelLoadStartModule
@@ -721,52 +918,53 @@ void NidRegistry::register_default_libraries() {
             }
         });
 
+    // Resolve the guest's mutex handle to one of ours.
+    //
+    // Unity's PlatformMutex (PlatformMutex.cpp) keeps a *guest-owned* struct:
+    // copies of it carry whatever the game stored, not a handle we issued. A
+    // handle we do not recognise is indistinguishable from an uninitialised
+    // mutex, so adopt it: mint a real mutex and write the handle back. Before
+    // this, the gfx worker spun on EINVAL forever:
+    //
+    //   [SCE] scePthreadMutexLock(&m_Mutex) returned 0xffffffea in
+    //         .\PlatformDependent\PS4\Source\Threads\PlatformMutex.cpp(38)
+    //   [SCE] sceKernelUsleep(0xf4240)          ; 1 ms, repeat
+    auto resolve_mutex_id = [](CpuContext& ctx, MemoryManager& mem) -> u32 {
+        const GuestAddr mtx_ptr = ctx.rdi;
+        auto& tm = get_thread_manager(mem);
+        u32 mid = 0;
+        if (mtx_ptr != 0 && mem.read_value(mtx_ptr, mid) && mid != 0 && tm.mutex_exists(mid)) {
+            return mid;
+        }
+        const u32 fresh = tm.mutex_create();
+        if (mtx_ptr != 0 && mem.is_valid_address(mtx_ptr, sizeof(u32))) {
+            mem.write_value(mtx_ptr, fresh);
+        }
+        return fresh;
+    };
+
     // scePthreadMutexLock(ScePthreadMutex* mutex)
     register_symbol(0xE86895318FDC64A0ULL, "scePthreadMutexLock", "libkernel",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr mtx_ptr = ctx.rdi;
-            auto& tm = get_thread_manager(mem);
-            u32 mid = 0;
-            if (mem.read_value(mtx_ptr, mid)) {
-                if (mid == 0) { // Auto-init on zeroed memory
-                    mid = tm.mutex_create();
-                    mem.write_value(mtx_ptr, mid);
-                }
-                ctx.rax = tm.mutex_lock(mid) ? SCE_OK : static_cast<u64>(-22);
-            } else {
-                ctx.rax = static_cast<u64>(-14);
-            }
+        [resolve_mutex_id](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = get_thread_manager(mem).mutex_lock(resolve_mutex_id(ctx, mem)) ? SCE_OK
+                                                                                      : static_cast<u64>(-22);
         });
 
     // scePthreadMutexTrylock(ScePthreadMutex* mutex)
     // NID: 0xBA9A15AF330715E1ULL ("upoVrzMHFeE")
     register_symbol(0xBA9A15AF330715E1ULL, "scePthreadMutexTrylock", "libkernel",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr mtx_ptr = ctx.rdi;
-            auto& tm = get_thread_manager(mem);
-            u32 mid = 0;
-            if (mem.read_value(mtx_ptr, mid)) {
-                if (mid == 0) {
-                    mid = tm.mutex_create();
-                    mem.write_value(mtx_ptr, mid);
-                }
-                ctx.rax = tm.mutex_trylock(mid) ? SCE_OK : static_cast<u64>(-16); // EBUSY
-            } else {
-                ctx.rax = static_cast<u64>(-14);
-            }
+        [resolve_mutex_id](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = get_thread_manager(mem).mutex_trylock(resolve_mutex_id(ctx, mem))
+                          ? SCE_OK
+                          : static_cast<u64>(-16); // EBUSY
         });
 
     // scePthreadMutexUnlock(ScePthreadMutex* mutex)
     register_symbol(0xEFB2023594895C85ULL, "scePthreadMutexUnlock", "libkernel",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr mtx_ptr = ctx.rdi;
-            auto& tm = get_thread_manager(mem);
-            u32 mid = 0;
-            if (mem.read_value(mtx_ptr, mid)) {
-                ctx.rax = tm.mutex_unlock(mid) ? SCE_OK : static_cast<u64>(-22);
-            } else {
-                ctx.rax = static_cast<u64>(-14);
-            }
+        [resolve_mutex_id](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = get_thread_manager(mem).mutex_unlock(resolve_mutex_id(ctx, mem))
+                          ? SCE_OK
+                          : static_cast<u64>(-22);
         });
 
     // scePthreadMutexLock (alternate NID: 0xF542B5BCB6507EDEULL / "9UK1vLZQft4")
@@ -1047,14 +1245,20 @@ void NidRegistry::register_default_libraries() {
     // libc: Standard C library services
     // =========================================================================
 
-    // puts(const char* s)
-    register_symbol(0x5C0F663677A000A8ULL, "puts", "libc",
+    // puts(const char* s) body. ps4libdoc puts this NID under a different name
+    // (0x610D276AFA7E6087 below is the real "puts"), so this registration keeps
+    // an honest unknown_* label while serving as the shared implementation.
+    register_symbol(0x5C0F663677A000A8ULL, "unknown_5c0f6636", "libSceLibcInternal",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr str_addr = ctx.rdi;
             if (mem.is_valid_address(str_addr)) {
                 const char* str = mem.to_host_ptr<char>(str_addr);
                 if (str) {
-                    std::cout << str << "\n";
+                    // Flush immediately: std::cout is block-buffered when stdout is
+                    // not a TTY, so guest output was being dropped when the run is
+                    // killed and ended up reordered against the unbuffered stderr
+                    // [HLE CALL] trace. See also the printf handler below.
+                    std::cout << str << "\n" << std::flush;
                     ctx.rax = 0;
                     return;
                 }
@@ -1067,10 +1271,7 @@ void NidRegistry::register_default_libraries() {
     // (free is a no-op), so untouched pages stay purely virtual until written.
     auto malloc_handler = [](CpuContext& ctx, MemoryManager&) {
         const GuestSize size = ctx.rdi;
-        g_guest_heap_current = (g_guest_heap_current + 15) & ~15ULL;
-        const GuestAddr allocated = g_guest_heap_current;
-        g_guest_heap_current += size;
-        ctx.rax = allocated;
+        ctx.rax = bump_alloc(size, 16);
     };
     register_symbol(0x9E990E49EC698A4DULL, "malloc", "libc", malloc_handler);
     register_symbol(0x8105FEE060D08E93ULL, "malloc", "libc", malloc_handler);
@@ -1081,19 +1282,40 @@ void NidRegistry::register_default_libraries() {
     };
     register_symbol(0x7E16B7B8361BD5BBULL, "free", "libc", free_handler);
     register_symbol(0xB4886CAA3D2AB051ULL, "free", "libc", free_handler);
-    register_symbol(0x63B689D6EC9D3CCAULL, "free", "libc", free_handler);
 
-    // calloc(size_t num, size_t size)
-    // Note: no explicit zeroing — see malloc above; fresh bump pages are OS-zero.
-    register_symbol(0xB50228F8620F925AULL, "calloc", "libc",
+    // realloc(void* ptr, size_t size) -- NID: 0x63B689D6EC9D3CCAULL per
+    // ps4libdoc. This NID is imported by eboot.bin and mono-ps4.prx but was
+    // registered as a third "free", so every realloc silently returned NULL.
+    // The bump allocator never reuses blocks, so the copy is all we owe the
+    // caller; bump_alloc() knows the old size without a block header.
+    register_symbol(0x63B689D6EC9D3CCAULL, "realloc", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr old_ptr = ctx.rdi;
+            const GuestSize size = ctx.rsi;
+            if (size == 0) {
+                ctx.rax = 0;
+                return;
+            }
+            const GuestAddr allocated = bump_alloc(size, 16);
+            const GuestSize old_size = bump_size_of(old_ptr);
+            if (old_ptr != 0 && old_size > 0 && mem.is_valid_address(old_ptr, old_size)) {
+                std::memcpy(mem.to_host_ptr<void>(allocated), mem.to_host_ptr<void>(old_ptr),
+                            old_size < size ? old_size : size);
+            }
+            ctx.rax = allocated;
+        });
+
+    // 0xB50228F8620F925AULL is _ZSt14_Xlength_errorPKc per ps4libdoc, i.e. the
+    // C++ std::length_error thrower -- it was registered here as "calloc".
+    // eboot.bin and libSceSmart.prx import this NID, but only reach it when an
+    // allocation failed in real firmware. Body: hand back a fresh block
+    // instead of throwing, so a guest error path can never unwind through our
+    // un-emulated C++ runtime.
+    register_symbol(0xB50228F8620F925AULL, "_ZSt14_Xlength_errorPKc", "libstdc++",
         [](CpuContext& ctx, MemoryManager&) {
             const GuestSize num = ctx.rdi;
             const GuestSize size = ctx.rsi;
-            const GuestSize total = num * size;
-            g_guest_heap_current = (g_guest_heap_current + 15) & ~15ULL;
-            const GuestAddr allocated = g_guest_heap_current;
-            g_guest_heap_current += total;
-            ctx.rax = allocated;
+            ctx.rax = bump_alloc(num * size, 16);
         });
 
     // setjmp(jmp_buf env)
@@ -1398,6 +1620,45 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = formatted.size();
         });
 
+    // strchr(const char* s, int c) -> char*   (returns the pointer, not an offset)
+    // NID: 0xA1BE71016E259FFDULL (libSceLibcInternal per ps4libdoc).
+    // Unity's parser calls this on every token; the generic stub returned 0,
+    // which is indistinguishable from "character not found" and silently
+    // truncated parsing at the first token.
+    register_symbol(0xA1BE71016E259FFDULL, "strchr", "libSceLibcInternal",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr str_addr = ctx.rdi;
+            const GuestAddr needle = ctx.rsi; // truncated to unsigned char
+            if (str_addr == 0 || !mem.is_valid_address(str_addr, 1)) {
+                ctx.rax = 0;
+                return;
+            }
+            const char* s = mem.to_host_ptr<char>(str_addr);
+            if (!s) {
+                ctx.rax = 0;
+                return;
+            }
+            const char* hit = std::strchr(s, static_cast<int>(needle & 0xFF));
+            ctx.rax = hit ? (str_addr + (hit - s)) : 0;
+        });
+
+    // gettimeofday(struct timeval* tv, struct timezone* tz) -- ps4libdoc:
+    // libScePosix/libkernel. Also answers the sceKernelGettimeofday NID, which
+    // shares this body.
+    auto gettimeofday_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr tv_ptr = ctx.rdi;
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
+        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(now);
+        const auto usecs = std::chrono::duration_cast<std::chrono::microseconds>(now - secs);
+        if (tv_ptr != 0 && mem.is_valid_address(tv_ptr, 16)) {
+            mem.write_value(tv_ptr, static_cast<u64>(secs.count()));            // tv_sec
+            mem.write_value(tv_ptr + 8, static_cast<u64>(usecs.count()));       // tv_usec
+        }
+        ctx.rax = SCE_OK;
+    };
+    register_symbol(0x9FCF2FC770B99D6FULL, "gettimeofday", "libScePosix", gettimeofday_handler);
+    register_symbol(0x7A37A471A35036ADULL, "sceKernelGettimeofday", "libkernel", gettimeofday_handler);
+
     // strncpy(char* dest, const char* src, size_t n)
     // NID: 0xEAC256896491BAA9ULL ("6sJWiWSRuqk")
     register_symbol(0xEAC256896491BAA9ULL, "strncpy", "libc",
@@ -1651,7 +1912,8 @@ void NidRegistry::register_default_libraries() {
         [poll_sema_impl](CpuContext& ctx, MemoryManager&) { poll_sema_impl(ctx, "PollSema"); });
 
     // sceKernelCancelSema(SceKernelSema sema, int* pNumWaitingThreads)
-    // NID: 0xE03334E94D813446ULL (hash-verified). Wakes all waiters; WaitSema
+    // NID: 0xE03334E94D813446ULL, confirmed by ps4libdoc libkernel.sprx.json
+    // (and independently by the Orbis hash). Wakes all waiters; WaitSema
     // observes `cancelled` and returns ECANCELED. Never called in Flappy.
     register_symbol(0xE03334E94D813446ULL, "sceKernelCancelSema", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
@@ -1703,6 +1965,231 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
+    // ---------------------------------------------------------------------
+    // Real Orbis event flags. NIDs from ps4libdoc libkernel.sprx.json.
+    // ---------------------------------------------------------------------
+
+    // sceKernelCreateEventFlag(SceKernelEventFlag* evf, const char* name,
+    //                          uint32_t attr, uint32_t bitPattern, void* opt)
+    // NID: 0x0691686E8509A195ULL
+    register_symbol(0x0691686E8509A195ULL, "sceKernelCreateEventFlag", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr evf_ptr = ctx.rdi;
+            const GuestAddr name_ptr = ctx.rsi;
+            const u32 attr = static_cast<u32>(ctx.rdx);
+            const u32 bits = static_cast<u32>(ctx.rcx);
+            const char* name = (name_ptr > 0x1000 && mem.is_valid_address(name_ptr, 1))
+                                   ? mem.to_host_ptr<char>(name_ptr) : nullptr;
+
+            auto evf = std::make_shared<GuestEventFlag>();
+            evf->bits = bits;
+            u32 id = 0;
+            {
+                std::lock_guard<std::mutex> lock(s_eflag_table_mtx);
+                id = s_next_eflag_id++;
+                s_eflags[id] = evf;
+            }
+            if (evf_ptr != 0 && mem.is_valid_address(evf_ptr, sizeof(u32))) {
+                mem.write_value(evf_ptr, id);
+            }
+            std::fprintf(stderr, "[EventFlag] Create -> id=%u name='%s' attr=0x%x bits=0x%x\n",
+                         id, name ? name : "?", attr, bits);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceKernelDeleteEventFlag(SceKernelEventFlag evf)
+    // NID: 0xF26AA5F4E7109DDEULL
+    register_symbol(0xF26AA5F4E7109DDEULL, "sceKernelDeleteEventFlag", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) {
+            const u32 id = static_cast<u32>(ctx.rdi);
+            std::shared_ptr<GuestEventFlag> evf;
+            {
+                std::lock_guard<std::mutex> lock(s_eflag_table_mtx);
+                auto it = s_eflags.find(id);
+                if (it != s_eflags.end()) {
+                    evf = it->second;
+                    s_eflags.erase(it);
+                }
+            }
+            if (evf) {
+                std::lock_guard<std::mutex> lock(evf->mtx);
+                evf->deleted = true;
+                evf->cv.notify_all();
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // sceKernelSetEventFlag(SceKernelEventFlag evf, uint32_t bitPattern)
+    // NID: 0x20E9D2BC7CEABBA0ULL
+    register_symbol(0x20E9D2BC7CEABBA0ULL, "sceKernelSetEventFlag", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) {
+            const u32 id = static_cast<u32>(ctx.rdi);
+            const u32 bits = static_cast<u32>(ctx.rsi);
+            std::shared_ptr<GuestEventFlag> evf;
+            {
+                std::lock_guard<std::mutex> lock(s_eflag_table_mtx);
+                auto it = s_eflags.find(id);
+                if (it != s_eflags.end()) evf = it->second;
+            }
+            if (!evf) {
+                std::fprintf(stderr, "[EventFlag] Set(%u, 0x%x) -> unknown id\n", id, bits);
+                ctx.rax = 0x80020001ULL; // SCE_KERNEL_ERROR_ESRCH
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(evf->mtx);
+                evf->bits |= bits;
+            }
+            evf->cv.notify_all();
+            std::fprintf(stderr, "[EventFlag] Set(%u, 0x%x)\n", id, bits);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceKernelClearEventFlag(SceKernelEventFlag evf, uint32_t bitPattern)
+    // NID: 0xEEE8411564404BADULL
+    register_symbol(0xEEE8411564404BADULL, "sceKernelClearEventFlag", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) {
+            const u32 id = static_cast<u32>(ctx.rdi);
+            const u32 bits = static_cast<u32>(ctx.rsi);
+            std::shared_ptr<GuestEventFlag> evf;
+            {
+                std::lock_guard<std::mutex> lock(s_eflag_table_mtx);
+                auto it = s_eflags.find(id);
+                if (it != s_eflags.end()) evf = it->second;
+            }
+            if (!evf) {
+                ctx.rax = 0x80020001ULL; // SCE_KERNEL_ERROR_ESRCH
+                return;
+            }
+            std::lock_guard<std::mutex> lock(evf->mtx);
+            evf->bits &= ~bits;
+            ctx.rax = SCE_OK;
+        });
+
+    // Shared match test for Poll/Wait. waitMode bit0 selects AND-match over
+    // OR-match; Orbis callers pass 0x22 here, whose low bit is clear, so the
+    // observed Mono path is treated as OR-match.
+    auto eventflag_satisfied = [](const GuestEventFlag& evf, u32 want, bool and_mode) {
+        return and_mode ? ((evf.bits & want) == want) : ((evf.bits & want) != 0);
+    };
+
+    // sceKernelPollEventFlag(SceKernelEventFlag evf, uint32_t bitPattern,
+    //                        uint32_t* pBitPattern)
+    // NID: 0xF65BE3E438C76620ULL
+    register_symbol(0xF65BE3E438C76620ULL, "sceKernelPollEventFlag", "libkernel",
+        [eventflag_satisfied](CpuContext& ctx, MemoryManager& mem) {
+            const u32 id = static_cast<u32>(ctx.rdi);
+            const u32 want = static_cast<u32>(ctx.rsi);
+            const GuestAddr out_ptr = ctx.rdx;
+            const bool and_mode = (static_cast<u32>(ctx.rcx) & 1u) != 0;
+            std::shared_ptr<GuestEventFlag> evf;
+            {
+                std::lock_guard<std::mutex> lock(s_eflag_table_mtx);
+                auto it = s_eflags.find(id);
+                if (it != s_eflags.end()) evf = it->second;
+            }
+            if (!evf) {
+                ctx.rax = 0x80020001ULL; // SCE_KERNEL_ERROR_ESRCH
+                return;
+            }
+            std::lock_guard<std::mutex> lock(evf->mtx);
+            if (out_ptr != 0 && mem.is_valid_address(out_ptr, sizeof(u32))) {
+                mem.write_value(out_ptr, evf->bits);
+            }
+            ctx.rax = eventflag_satisfied(*evf, want, and_mode) ? SCE_OK
+                                                                : 0x80020010ULL; // EBUSY
+        });
+
+    // sceKernelWaitEventFlag(SceKernelEventFlag evf, uint32_t bitPattern,
+    //                        uint32_t waitMode, uint32_t* pBitPattern,
+    //                        SceKernelUseconds* pTimeout)
+    // NID: 0x253BC17E58586B34ULL -- ps4libdoc: sceKernelWaitEventFlag.
+    // Imported by eboot.bin, mono-ps4.prx and libSceJobManager.prx; it used to
+    // fall through to the generic unimplemented stub. The Flappy trace shows
+    // the Mono runtime calling it with evf=NULL (rdi=0x0), which must return an
+    // error rather than block forever.
+    //
+    // Unity's worker pool creates 'Unity EventFlag' objects and parks six
+    // worker threads in here. Nothing in this runtime ever calls
+    // sceKernelSetEventFlag, so an unbounded wait strands the whole pool with
+    // no producer to wake it. When the guest passes no timeout we therefore cap
+    // the wait and report ETIMEDOUT: the guest re-polls, the host thread is
+    // still yielded, and no thread is parked on a flag nobody can set.
+    //
+    // The cap is 1 ms. A 20 ms cap was measured and is a REGRESSION, not an
+    // optimisation: it looks like it would cut worker churn, but over a 60 s
+    // run the guest spawned 33 threads instead of 12 and main never executed a
+    // single instruction (RIP=0x0, hles=0), with UnityGfxDeviceWorker down at
+    // 4.4 M instructions against 112 M at 1 ms. Longer blocking hands the host
+    // scheduler to the worker pool instead of the thread that drives the game.
+    // Measured: 1 ms -> 410 k HLE calls, main hles=195 k, TID6=112 M;
+    //          20 ms -> 84 k HLE calls, main hles=0,    TID6=4.4 M.
+    constexpr u64 kEventFlagDefaultWaitUsec = 1000;
+    register_symbol(0x253BC17E58586B34ULL, "sceKernelWaitEventFlag", "libkernel",
+        [eventflag_satisfied](CpuContext& ctx, MemoryManager& mem) {
+            const u32 id = static_cast<u32>(ctx.rdi);
+            const u32 want = static_cast<u32>(ctx.rsi);
+            const u32 wait_mode = static_cast<u32>(ctx.rdx);
+            const GuestAddr out_ptr = ctx.rcx;
+            const GuestAddr timo_ptr = ctx.r8;
+            const bool and_mode = (wait_mode & 1u) != 0;
+            const bool clear_on_match = (wait_mode & 2u) != 0;
+
+            std::shared_ptr<GuestEventFlag> evf;
+            {
+                std::lock_guard<std::mutex> lock(s_eflag_table_mtx);
+                auto it = s_eflags.find(id);
+                if (it != s_eflags.end()) evf = it->second;
+            }
+            if (!evf) {
+                std::fprintf(stderr,
+                    "[EventFlag] Wait(%u, want=0x%x, mode=0x%x) -> no such flag\n",
+                    id, want, wait_mode);
+                ctx.rax = 0x80020001ULL; // SCE_KERNEL_ERROR_ESRCH
+                return;
+            }
+
+            auto& tm = get_thread_manager(mem);
+            GuestThread* cur_th = tm.current_thread();
+            if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
+
+            u32 usec = kEventFlagDefaultWaitUsec;
+            const bool guest_timeout = timo_ptr != 0 && mem.is_valid_address(timo_ptr, sizeof(u32));
+            if (guest_timeout) mem.read_value(timo_ptr, usec);
+
+            u32 matched = 0;
+            bool ok = false;
+            {
+                std::unique_lock<std::mutex> lock(evf->mtx);
+                auto pred = [&]() {
+                    return evf->deleted || eventflag_satisfied(*evf, want, and_mode) ||
+                           (g_syscalls && g_syscalls->has_exited());
+                };
+                evf->waiters++;
+                ok = evf->cv.wait_for(lock, std::chrono::microseconds(usec), pred);
+                evf->waiters--;
+                if (ok) {
+                    matched = evf->bits & want;
+                    if (clear_on_match) evf->bits &= ~want;
+                }
+            }
+
+            if (out_ptr != 0 && mem.is_valid_address(out_ptr, sizeof(u32))) {
+                mem.write_value(out_ptr, matched);
+            }
+            if (cur_th) cur_th->state.store(ThreadState::Running);
+            if (!ok) {
+                std::fprintf(stderr, "[EventFlag] Wait(%u, want=0x%x, mode=0x%x) -> ETIMEDOUT after %uus%s\n",
+                             id, want, wait_mode, usec,
+                             guest_timeout ? " (guest timeout)" : " (no producer: capped)");
+                ctx.rax = 0x8002003CULL; // SCE_KERNEL_ERROR_ETIMEDOUT
+                return;
+            }
+            std::fprintf(stderr, "[EventFlag] Wait(%u, want=0x%x, mode=0x%x) -> matched 0x%x\n",
+                         id, want, wait_mode, matched);
+            ctx.rax = SCE_OK;
+        });
+
     // sceKernelIsNeoMode()
     // NID: 0x5AC95C2B51507062ULL ("WslcK1FQcGI")
     register_symbol(0x5AC95C2B51507062ULL, "sceKernelIsNeoMode", "libkernel",
@@ -1746,29 +2233,292 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
+    // ---------------------------------------------------------------------
+    // libScePosix family (NIDs from ps4libdoc libkernel.sprx.json, which
+    // exports these names from both libkernel and libScePosix).
+    // ---------------------------------------------------------------------
+
+    // pthread_mutexattr_init(ScePthreadMutexattr* attr)
+    // NID: 0x7501D612C26DA04EULL -- ps4libdoc: pthread_mutexattr_init
+    // (libkernel + libScePosix). This NID was registered as "scePadInit",
+    // which produced the bogus "scePadInit x42" loop: Unity calls this once
+    // per worker thread with a stack-resident attr (rdi on the main stack,
+    // rsi/rdx stale 0x10). The real scePadInit is 0x86FD65BA226BA903ULL.
+    register_symbol(0x7501D612C26DA04EULL, "pthread_mutexattr_init", "libScePosix",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr attr_ptr = ctx.rdi;
+            // Orbis pthread_mutexattr_t is a 4-byte type field; zeroing only
+            // that keeps neighbouring stack slots (saved RBP, padding) intact.
+            if (attr_ptr != 0 && mem.is_valid_address(attr_ptr, sizeof(u32))) {
+                mem.zero_memory(attr_ptr, sizeof(u32));
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // pthread_create(ScePthread*, const pthread_attr_t*, void* (*)(void*), void*)
+    // NID: 0x3B184807C2C1FCF4ULL -- ps4libdoc: pthread_create. This NID is
+    // imported by eboot.bin AND mono-ps4.prx but was registered as
+    // "scePadSetVibration" (a SCE_OK stub), so every plain-POSIX thread
+    // creation handed the guest a NULL thread id. Same body as the
+    // scePthreadCreate handler above.
+    register_symbol(0x3B184807C2C1FCF4ULL, "pthread_create", "libScePosix", pthread_create_handler);
+
+    // sem_init(sem_t* sem, int pshared, unsigned int value)
+    // NID: 0xA43B8F11FDE6E1F2ULL -- ps4libdoc: sem_init. Imported by eboot.bin
+    // and mono-ps4.prx, and previously registered as "scePadReadState", so
+    // Mono's sem_init calls were overwriting the guest sem_t with 32 bytes of
+    // pad button/stick state -- a live corruption of every semaphore.
+    register_symbol(0xA43B8F11FDE6E1F2ULL, "sem_init", "libScePosix",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr sem_ptr = ctx.rdi;
+            const u32 value = static_cast<u32>(ctx.rdx);
+            if (sem_ptr != 0 && mem.is_valid_address(sem_ptr, sizeof(u32) * 4)) {
+                mem.zero_memory(sem_ptr, sizeof(u32) * 4);
+                mem.write_value(sem_ptr, value);
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // ---------------------------------------------------------------------
+    // POSIX named semaphores. Guest struct: { u32 count; u32 waiters; u32
+    // signalled; u32 pad; } at the caller's pointer, mirroring sem_init above.
+    // Before these existed sem_wait fell through to the generic stub and never
+    // blocked, so producers and consumers ran free of each other.
+    // ---------------------------------------------------------------------
+    auto sem_read = [](MemoryManager& mem, GuestAddr ptr, std::array<u32, 4>& out) -> bool {
+        if (ptr == 0 || !mem.is_valid_address(ptr, sizeof(u32) * 4)) return false;
+        return mem.read_value(ptr, out[0]) && mem.read_value(ptr + 4, out[1]) &&
+               mem.read_value(ptr + 8, out[2]);
+    };
+    auto sem_write = [](MemoryManager& mem, GuestAddr ptr, const std::array<u32, 4>& v) {
+        if (ptr == 0 || !mem.is_valid_address(ptr, sizeof(u32) * 4)) return;
+        mem.write_value(ptr, v[0]);
+        mem.write_value(ptr + 4, v[1]);
+        mem.write_value(ptr + 8, v[2]);
+    };
+
+    // A single condition variable guards every POSIX semaphore. It is only a
+    // parking point: the authoritative count still lives in guest memory at
+    // sem[0], so waking is always a re-read, never a cached decision. Declared
+    // ahead of sem_post so the poster can signal under the same lock the waiter
+    // checks under, which closes the missed-wakeup window.
+    // Reuse the file-scope condition variable above; sem_post below signals it.
+    // (The mutex/CV are declared at namespace scope so shutdown() can reach them.)
+
+    // sem_post(sem_t* sem)
+    // NID: 0x20A3FCB72A744149ULL (libkernel + libScePosix per ps4libdoc)
+    register_symbol(0x20A3FCB72A744149ULL, "sem_post", "libScePosix",
+        [sem_read, sem_write](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr sem_ptr = ctx.rdi;
+            bool ok = false;
+            std::array<u32, 4> sem{};
+            {
+                std::lock_guard<std::mutex> lock(s_sem_cv_mtx);
+                if (sem_read(mem, sem_ptr, sem)) {
+                    sem[0] += 1;
+                    sem[2] += 1;
+                    sem_write(mem, sem_ptr, sem);
+                    ok = true;
+                }
+            }
+            if (!ok) {
+                ctx.rax = static_cast<u64>(-22); // EINVAL
+                return;
+            }
+            s_sem_cv.notify_all();
+            std::fprintf(stderr, "[Sem] post(0x%llx) -> count=%u waiters=%u\n",
+                         (unsigned long long)sem_ptr, sem[0], sem[1]);
+            ctx.rax = SCE_OK;
+        });
+
+    // sem_trywait(sem_t* sem) -- non-blocking decrement.
+    // NID: 0x5815B3B1189F0840ULL
+    register_symbol(0x5815B3B1189F0840ULL, "sem_trywait", "libScePosix",
+        [sem_read, sem_write](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr sem_ptr = ctx.rdi;
+            std::array<u32, 4> sem{};
+            if (!sem_read(mem, sem_ptr, sem)) {
+                ctx.rax = static_cast<u64>(-22);
+                return;
+            }
+            if (sem[0] == 0) {
+                sem[2] += 1; // EAGAIN
+                ctx.rax = static_cast<u64>(-35);
+                return;
+            }
+            sem[0] -= 1;
+            sem_write(mem, sem_ptr, sem);
+            ctx.rax = SCE_OK;
+        });
+
+    // sem_wait(sem_t* sem)
+    // NID: 0x602579746181702AULL
+    //
+    // POSIX sem_wait is an unconditional wait: it returns only when the
+    // semaphore is posted (or on EINTR). It must NOT return a synthetic
+    // ETIMEDOUT to the guest, and this previously did -- 500 iterations of
+    // sleep_for(1ms) then ETIMEDOUT, with no producer ever in sight.
+    //
+    // Unity's thread pool is sensitive to exactly that. The worker body at
+    // 0x975c6-0x97656 pops from the job queue at [r15+0x28], and when the
+    // queue is empty does:
+    //     0x97640  movq 0x70(%r15), %rdi   ; shared "worker idle" sem
+    //     0x97649  callq sem_post          ; announce idle
+    //     0x9764e  movq %r14, %rdi         ; r14 = r15+0x50, own wake sem
+    //     0x97651  callq sem_wait
+    //     0x97656  cmpl $0x0, 0x60(%r15)   ; pool run flag -- NOT eax
+    //     0x9765b  jne  0x975c6
+    // It ignores the return value entirely, so every spurious timeout made an
+    // idle worker wake, find an empty queue, and sem_post the shared semaphore
+    // again. Measured in a 60 s run: 282 posts to 0x151ee70 with zero jobs
+    // executed, and 94 x 500 ms of blocking per worker -- ~47 s of wall clock
+    // per worker, which is where the entire run went (39.4M instructions, about
+    // 5.6 s of compute).
+    //
+    // Park on the condition variable and poll only for shutdown. wait_for is
+    // used rather than wait so an emulator-wide exit still unblocks promptly;
+    // the 20 ms period is a shutdown poll, not a guest-visible timeout.
+    register_symbol(0x602579746181702AULL, "sem_wait", "libScePosix",
+        [sem_read, sem_write](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr sem_ptr = ctx.rdi;
+            auto& tm = get_thread_manager(mem);
+            GuestThread* cur_th = tm.current_thread();
+            if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
+            bool ok = false;
+            bool valid = true;
+            {
+                std::unique_lock<std::mutex> lock(s_sem_cv_mtx);
+                while (true) {
+                    std::array<u32, 4> sem{};
+                    if (!sem_read(mem, sem_ptr, sem)) {
+                        valid = false;
+                        break;
+                    }
+                    if (sem[0] > 0) {
+                        sem[0] -= 1;
+                        sem_write(mem, sem_ptr, sem);
+                        ok = true;
+                        break;
+                    }
+                    if (g_syscalls && g_syscalls->has_exited()) break;
+                    if (s_sem_shutdown.load(std::memory_order_relaxed)) break;
+                    s_sem_cv.wait_for(lock, std::chrono::milliseconds(20));
+                }
+            }
+            if (cur_th) cur_th->state.store(ThreadState::Running);
+            if (!valid) {
+                std::fprintf(stderr, "[Sem] wait(0x%llx) -> EINVAL\n",
+                             (unsigned long long)sem_ptr);
+                ctx.rax = static_cast<u64>(-22);
+                return;
+            }
+            std::fprintf(stderr, "[Sem] wait(0x%llx) -> %s\n", (unsigned long long)sem_ptr,
+                         ok ? "OK" : "shutdown");
+            ctx.rax = ok ? SCE_OK : static_cast<u64>(0x8002003CULL); // SCE_KERNEL_ERROR_ETIMEDOUT
+        });
+
+    // sem_timedwait(sem_t* sem, const struct timespec* abs_timeout)
+    // NID: 0xC39207CAF6A183FAULL
+    register_symbol(0xC39207CAF6A183FAULL, "sem_timedwait", "libScePosix",
+        [sem_read, sem_write](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr sem_ptr = ctx.rdi;
+            const GuestAddr abs_ptr = ctx.rsi;
+            std::array<u32, 4> sem{};
+            if (!sem_read(mem, sem_ptr, sem)) {
+                ctx.rax = static_cast<u64>(-22);
+                return;
+            }
+            if (sem[0] > 0) {
+                sem[0] -= 1;
+                sem_write(mem, sem_ptr, sem);
+                ctx.rax = SCE_OK;
+                return;
+            }
+            // Orbis timespec is 64-bit seconds + 32-bit nanoseconds.
+            u64 abs_sec = 0;
+            u32 abs_nsec = 0;
+            if (abs_ptr != 0 && mem.is_valid_address(abs_ptr, sizeof(u64) + sizeof(u32))) {
+                mem.read_value(abs_ptr, abs_sec);
+                mem.read_value(abs_ptr + 8, abs_nsec);
+            }
+            const u64 now = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+            const u64 deadline = abs_sec != 0 ? abs_sec : now + 1;
+            const u64 wait_us = deadline > now ? (deadline - now) * 1000000ULL + abs_nsec / 1000ULL
+                                               : 0ULL;
+            auto& tm = get_thread_manager(mem);
+            GuestThread* cur_th = tm.current_thread();
+            if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
+            bool ok = false;
+            const u64 deadline_us = now * 1000000ULL + wait_us;
+            while (!ok && (g_syscalls == nullptr || !g_syscalls->has_exited())) {
+                const u64 t = static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count());
+                if (t >= deadline_us) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (!sem_read(mem, sem_ptr, sem)) break;
+                if (sem[0] > 0) {
+                    sem[0] -= 1;
+                    sem_write(mem, sem_ptr, sem);
+                    ok = true;
+                }
+            }
+            if (cur_th) cur_th->state.store(ThreadState::Running);
+            // Orbis errno values are FreeBSD's, not Linux's. FreeBSD ETIMEDOUT is 60;
+// 110 is the Linux value and was wrong here. (FreeBSD EAGAIN is 35 and
+            // Linux's is 11 -- sem_trywait above already returns the correct
+            // FreeBSD 35.) A guest comparing against errno sees a mismatch.
+            ctx.rax = ok ? SCE_OK : static_cast<u64>(-60); // ETIMEDOUT (FreeBSD/Orbis)
+        });
+
+    // sem_destroy(sem_t* sem)
+    // NID: 0x7035B6DF7440C16AULL
+    register_symbol(0x7035B6DF7440C16AULL, "sem_destroy", "libScePosix",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr sem_ptr = ctx.rdi;
+            if (sem_ptr != 0 && mem.is_valid_address(sem_ptr, sizeof(u32) * 4)) {
+                mem.zero_memory(sem_ptr, sizeof(u32) * 4);
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // sem_getvalue(sem_t* sem, int* sval)
+    // NID: 0x06AF8B455FCDE879ULL
+    register_symbol(0x06AF8B455FCDE879ULL, "sem_getvalue", "libScePosix",
+        [sem_read](CpuContext& ctx, MemoryManager& mem) {
+            std::array<u32, 4> sem{};
+            if (!sem_read(mem, ctx.rdi, sem)) {
+                ctx.rax = static_cast<u64>(-22);
+                return;
+            }
+            if (ctx.rsi != 0 && mem.is_valid_address(ctx.rsi, sizeof(i32))) {
+                mem.write_value(ctx.rsi, static_cast<i32>(sem[0]));
+            }
+            ctx.rax = SCE_OK;
+        });
+
 
     // memalign(size_t alignment, size_t size)
     // NID: 0x5237F72B332F4662ULL ("Ujf3KzMvRmI")
     register_symbol(0x5237F72B332F4662ULL, "memalign", "libc",
         [](CpuContext& ctx, MemoryManager&) {
             const GuestSize alignment = ctx.rdi > 0 ? ctx.rdi : 16;
-            const GuestSize size = ctx.rsi;
-            g_guest_heap_current = (g_guest_heap_current + alignment - 1) & ~(alignment - 1);
-            const GuestAddr allocated = g_guest_heap_current;
-            g_guest_heap_current += size;
-            ctx.rax = allocated;
+            ctx.rax = bump_alloc(ctx.rsi, alignment);
         });
 
-    // mspace_memalign(mspace msp, size_t alignment, size_t size)
-    // NID: 0x885D62407CF10495ULL ("iF1iQHzxBJU")
-    register_symbol(0x885D62407CF10495ULL, "mspace_memalign", "libc",
+    // sceLibcMspaceMemalign(mspace msp, size_t boundary, size_t size)
+    // NID: 0x885D62407CF10495ULL -- ps4libdoc calls this sceLibcMspaceMemalign
+    // (libSceLibcInternal). Unity routes its GPU/Garlic allocations through it
+    // (53 calls, ~935 MB in one 60 s run), so it draws from the dedicated
+    // mspace arena rather than the CPU heap -- see mspace_alloc.
+    register_symbol(0x885D62407CF10495ULL, "sceLibcMspaceMemalign", "libSceLibcInternal",
         [](CpuContext& ctx, MemoryManager&) {
             const GuestSize alignment = ctx.rsi > 0 ? ctx.rsi : 16;
-            const GuestSize size = ctx.rdx;
-            g_guest_heap_current = (g_guest_heap_current + alignment - 1) & ~(alignment - 1);
-            const GuestAddr allocated = g_guest_heap_current;
-            g_guest_heap_current += size;
-            ctx.rax = allocated;
+            ctx.rax = mspace_alloc(ctx.rdx, alignment);
         });
 
     // memcpy(void* dest, const void* src, size_t n)
@@ -2449,16 +3199,20 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // Archive Mount stubs (return negative so engine uses loose files on /app0)
-    register_symbol(0xF8546F2A49D48F52ULL, "sceFiosArchiveMountWithOrder", "libSceFios2",
+    // Archive stubs, relabelled to their ps4libdoc names. All three NIDs are
+    // imported by eboot.bin; the bodies are unchanged fail-safe stubs.
+    //   0xF8546F2A49D48F52 -> sceFiosOpGetActualCount   (returns -1: no ops)
+    //   0x186AAE70BF45F982 -> sceFiosDHOpenSync         (returns -1)
+    //   0xB8292024EAD850BE -> sceFiosDHOpen             (returns buffer size)
+    register_symbol(0xF8546F2A49D48F52ULL, "sceFiosOpGetActualCount", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& /*mem*/) {
             ctx.rax = static_cast<u64>(-1);
         });
-    register_symbol(0x186AAE70BF45F982ULL, "sceFiosArchiveMountWithOrderSync", "libSceFios2",
+    register_symbol(0x186AAE70BF45F982ULL, "sceFiosDHOpenSync", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& /*mem*/) {
             ctx.rax = static_cast<u64>(-1);
         });
-    register_symbol(0xB8292024EAD850BEULL, "sceFiosArchiveGetMountBufferSize", "libSceFios2",
+    register_symbol(0xB8292024EAD850BEULL, "sceFiosDHOpen", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& /*mem*/) {
             ctx.rax = 0x10000;
         });
@@ -2608,8 +3362,10 @@ void NidRegistry::register_default_libraries() {
     // libScePad: Controller and User Input
     // =========================================================================
 
-    // scePadInit()
-    register_symbol(0x7501D612C26DA04EULL, "scePadInit", "libScePad",
+    // scePadInit(void)
+    // NID: 0x86FD65BA226BA903ULL -- ps4libdoc: scePadInit. (The NID that used
+    // to carry this label, 0x7501D612C26DA04E, is pthread_mutexattr_init.)
+    register_symbol(0x86FD65BA226BA903ULL, "scePadInit", "libScePad",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
@@ -2621,8 +3377,10 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = 0x200; // valid pad handle
         });
 
-    // scePadClose(int handle)
-    register_symbol(0x8F521313F1282661ULL, "scePadClose", "libScePad",
+    // sceMoveInit(void) -- NID: 0x8F521313F1282661ULL. ps4libdoc resolves this
+    // NID to sceMoveInit (libSceMove), not scePadClose; the SCE_OK body is the
+    // right shape for an init call.
+    register_symbol(0x8F521313F1282661ULL, "sceMoveInit", "libSceMove",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
@@ -2649,17 +3407,26 @@ void NidRegistry::register_default_libraries() {
         }
         ctx.rax = SCE_OK;
     };
-    register_symbol(0xB445383A59BDC10BULL, "scePadReadState", "libScePad", pad_read_state_handler);
-    register_symbol(0xA43B8F11FDE6E1F2ULL, "scePadReadState", "libScePad", pad_read_state_handler);
+    // The real libScePad NIDs, per ps4libdoc known_names.txt. The guest also
+    // imports two NIDs ps4libdoc cannot name, which used to carry these
+    // labels; since the label provably did not hash to the NID, they are
+    // registered under their true NIDs below and the guest's NIDs keep their
+    // (verified) working bodies under honest unknown_* labels.
+    register_symbol(0x6277605EA41557B7ULL, "scePadReadState", "libScePad", pad_read_state_handler);
 
     // scePadSetLightBar(int handle, const ScePadLightBarParam* param)
-    register_symbol(0xD4143F8A8CA539BCULL, "scePadSetLightBar", "libScePad",
+    // NID: 0x451E27A2F50410D6ULL (ps4libdoc). Imported by eboot.bin.
+    register_symbol(0x451E27A2F50410D6ULL, "scePadSetLightBar", "libScePad",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
 
-    // scePadSetVibration(int handle, const ScePadVibrationParam* param)
-    register_symbol(0x3B184807C2C1FCF4ULL, "scePadSetVibration", "libScePad",
+    // Guest-imported NIDs with no ps4libdoc name, previously mislabeled
+    // "scePadReadState" / "scePadSetLightBar". Both are called by eboot.bin;
+    // the first one keeps the ScePadData-shaped body because the guest's pad
+    // loop depends on reading a sane struct, the second is an SCE_OK no-op.
+    register_symbol(0xB445383A59BDC10BULL, "unknown_b445383a", "libScePad", pad_read_state_handler);
+    register_symbol(0xD4143F8A8CA539BCULL, "unknown_d4143f8a", "libScePad",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
@@ -2702,13 +3469,15 @@ void NidRegistry::register_default_libraries() {
         });
 
     // pthread_mutex_lock (reached via mono; POSIX codes coincide with ours on success)
-    register_symbol(0xEC7D224CE7224CBAULL, "pthread_mutex_lock", "mono-ps4",
+    // NIDs 0xEC7D224CE7224CBA / 0xD99F8FA58E826898 are exported by
+    // libScePosix/libkernel per ps4libdoc, not by mono-ps4.
+    register_symbol(0xEC7D224CE7224CBAULL, "pthread_mutex_lock", "libScePosix",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = 0;
         });
 
     // pthread_mutex_unlock (reached via mono)
-    register_symbol(0xD99F8FA58E826898ULL, "pthread_mutex_unlock", "mono-ps4",
+    register_symbol(0xD99F8FA58E826898ULL, "pthread_mutex_unlock", "libScePosix",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = 0;
         });
@@ -2824,8 +3593,10 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // lUoqwTQu4Go
-    register_symbol(0x954A2AC1342EE06AULL, "lUoqwTQu4Go", "libSceUserService",
+    // sceUserServiceGetUserColor -- NID: 0x954A2AC1342EE06AULL ("lUoqwTQu4Go").
+    // ps4libdoc resolves the Sony tag to this name; the SCE_OK body is right
+    // for the init-style call the guest makes here.
+    register_symbol(0x954A2AC1342EE06AULL, "sceUserServiceGetUserColor", "libSceUserService",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
@@ -2838,8 +3609,12 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = 0x80960007ULL; // SCE_USER_SERVICE_ERROR_NO_EVENT
         });
 
-    // Orbis puts alias used by Unity Launcher Control (NID: 0x610D276AFA7E6087ULL)
-    register_symbol(0x610D276AFA7E6087ULL, "puts_orbis", "libc",
+    // puts(const char* s) -- NID: 0x610D276AFA7E6087ULL, which ps4libdoc
+    // libkernel.sprx.json lists as puts (libSceLibcInternal). It was labelled
+    // "puts_orbis", which is a UE-side macro, not an Orbis export. Unity
+    // Launcher Control imports this NID. Body unchanged: delegate to the
+    // handler behind the other puts NID.
+    register_symbol(0x610D276AFA7E6087ULL, "puts", "libSceLibcInternal",
         [this](CpuContext& ctx, MemoryManager& mem) {
             const auto* s = find_by_nid(0x5C0F663677A000A8ULL);
             if (s && s->handler) s->handler(ctx, mem);
@@ -2972,10 +3747,14 @@ void NidRegistry::register_default_libraries() {
             GuestAddr slot = 0;
             if (ns && name) {
                 std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
-                // Fall back to the first image when none is supplied: the
-                // cookies are interchangeable zeros, and a NULL image here
-                // otherwise retries forever upstream.
-                GuestAddr eff_image = (image != 0) ? image : s_mono_arena.first_image;
+                // Fall back to the corlib image when none is supplied: every
+                // System.* lookup goes through mono_get_corlib(), so this is the
+                // image the guest means. The cookies are interchangeable zeros,
+                // and a NULL image here otherwise retries forever upstream.
+                GuestAddr eff_image = (image != 0) ? image
+                                                    : (s_mono_arena.corlib_image != 0
+                                                           ? s_mono_arena.corlib_image
+                                                           : s_mono_arena.first_image);
                 if (eff_image != 0) {
                     MonoArena::ClassKey key{eff_image, ns, name};
                     auto it = s_mono_arena.classes.find(key);
@@ -3003,24 +3782,45 @@ void NidRegistry::register_default_libraries() {
         });
 
     // mono_class_is_subclass_of(MonoClass* klass, MonoClass* parent, gboolean check_interfaces)
-    // NID: 0x1147722929EB0A4CULL — reflexive identity only; distinct cookies
-    // stay 0 so unrelated types are never misclassified.
+    // NID: 0x1147722929EB0A4CULL -- hash-verified against the Mono embedding API.
+    // Guest disassembly at 0x997891 shows this is a type-validation guard, not a
+    // query whose answer is inspected in detail:
+    //
+    //   test rbx, rbx / je skip          ; nothing to validate?
+    //   mov edx, 1 / mov rdi, rbx / mov rsi, r14
+    //   call mono_class_is_subclass_of   ; -> test eax, eax / jne accept
+    //   accept:  mov rax, rbx            ; return the candidate class
+    //   reject:  walk [r15] -> 0x997860  ; recurse up the parent chain
+    //
+    // Answering TRUE for any two live pointers short-circuits that parent walk
+    // and returns the candidate immediately. Answering FALSE (the old
+    // reflexive-identity test, which always failed on our distinct cookies)
+    // sent the guest into the recursive walk on every single call.
     register_symbol(0x1147722929EB0A4CULL, "mono_class_is_subclass_of", "mono-ps4",
         [](CpuContext& ctx, MemoryManager&) {
-            const GuestAddr klass = ctx.rdi;
-            const GuestAddr parent = ctx.rsi;
-            ctx.rax = (klass != 0 && klass == parent) ? 1 : 0;
+            ctx.rax = (ctx.rdi != 0 && ctx.rsi != 0) ? 1 : 0;
         });
 
     // mono_runtime_invoke(MonoMethod* method, void* obj, void** params, MonoObject** exc)
-    // NID: 0xA6B7BD0639320E1BULL — no IL execution; clears *exc so the caller
-    // never reads uninitialized stack garbage as a managed exception.
+    // NID: 0xA6B7BD0639320E1BULL — hash-verified. No IL execution: the managed
+    // body never runs, so the only contract we can honour is "do not report a
+    // managed exception". The caller at 0x98a780 passes (0, 0, stackbuf), i.e.
+    // method = NULL, which is why every direct lookup upstream now hands back a
+    // real cookie instead of NULL. Clears *exc so the caller never reads
+    // uninitialized stack garbage as a managed exception.
     register_symbol(0xA6B7BD0639320E1BULL, "mono_runtime_invoke", "mono-ps4",
         [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr method = ctx.rdi;
+            const GuestAddr obj = ctx.rsi;
+            const GuestAddr params = ctx.rdx;
             const GuestAddr exc_ptr = ctx.rcx;
             if (exc_ptr > 0x1000 && mem.is_valid_address(exc_ptr, sizeof(u64))) {
                 mem.write_value(exc_ptr, static_cast<u64>(0));
             }
+            std::fprintf(stderr, "[Mono] runtime_invoke method=0x%llx obj=0x%llx params=0x%llx -> NULL (no IL)\n",
+                         static_cast<unsigned long long>(method),
+                         static_cast<unsigned long long>(obj),
+                         static_cast<unsigned long long>(params));
             ctx.rax = 0;
         });
 
@@ -3034,11 +3834,12 @@ void NidRegistry::register_default_libraries() {
         });
 
     // mono_get_corlib(void) -> singleton MonoImage* for mscorlib.
-    // NID: 0x47F74CE8E2982CC4ULL (hash-verified against Orbis salt).
-    // Takes no args; the guest leaves garbage in rdi/rsi/rdx. Returns a stable
-    // non-null cookie that feeds class_from_name(image, ns, name) — all
-    // System.* lookups share one image, which is the correct corlib discipline
-    // (previously a per-input derived map handed out a fresh image per call).
+    // NID: 0x47F74CE8E2982CC4ULL (hash-verified: see scripts/crack_mono_nids.py).
+    // Guest call site 0x9878b1 takes no arguments and feeds the result straight
+    // into mono_class_from_name(image, "System.Collections", "IEnumerator") at
+    // 0x9878c7 -- so a NULL here means every System.* lookup is issued with
+    // image = NULL. It also becomes the arena's default image below, so all
+    // corlib lookups share one image cookie (correct corlib discipline).
     register_symbol(0x47F74CE8E2982CC4ULL, "mono_get_corlib", "mono-ps4",
         [](CpuContext& ctx, MemoryManager& mem) {
             std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
@@ -3050,72 +3851,359 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = s_mono_arena.corlib_image;
         });
 
-    // Unity memory allocator, FMOD, and Mono module setup stubs
-    for (Nid stub_nid : {
-             0x2AE3AE0F9F21AA7EULL, // onion_sys_allocator naming / query
-             0xA4EF7A4F0CCE9B91ULL, // virtual query helper
-             0x04DA30C76979F3C1ULL, // init helper
-             0xFE99E3DFFEDAE900ULL, // FMOD / pad init helper
-             0x8941B88CB45FD196ULL, // FMOD mixer thread setup
-             0x54EC7C3469875D3BULL, // thread prio / attr helper
-             0xFEEC04868FFB80EBULL, // thread attr helper
-             0x22EC6752E5E4E818ULL, // mono-ps4.prx post-load query
-             0xFE19F5B5C547AB94ULL, // ALLOC_GFX virtual range naming
-             0x960213B81B11A36AULL, // debug.log stream setup
-             0x47D940F363AB68DBULL, // Unity init helper
-             0x55EED6C524805364ULL, // Unity string/domain setup 1
-             0xC5D3D91AED17EB3BULL, // Unity string/domain setup 2
-             0x4FCEF2B219D790C5ULL,
-             0x72CE3B9DE94CEA50ULL,
-             0x46204874F5E83DD1ULL,
-             0x3B579C5F88AEC0EFULL,
-             0xFEAF6C4747115067ULL,
-             0xE1E3B7F43BAC2E92ULL,
-             0xF737BFA02980EDF6ULL,
-             0x5AA1DFAA34975749ULL,
-             0xF068CCD895AE7A94ULL,
-             0xB8369AEA2E0EF71AULL,
-             0x23FA65EA7B52AD86ULL,
-             0x9141F1F3ED8B6742ULL,
-             0x0E04B6E6017A7AE4ULL,
-             0x7050A9D0D5FCC1FDULL, // libSceGnm init / draw command buffer
-             0x8008429FA5225386ULL, // libSceGnm state / shader setup
-             0xE6E14A7248896113ULL, // libSceGnm state / constant setup
-             0x186B27EE3313C70EULL, // libSceGnm context setup
-             0xFD98F4C8AD37832AULL, // unknown attr helper (NOT Setschedparam; real one is 0x0F3112F61405E1FE)
-             0xD8866B1E72E722DDULL, // Unity init stub
-             0x066E40B33FB6E36FULL, // Unity argv/init stub
-             0x86FD65BA226BA903ULL, // Audio3d / Ajm stub
-             0x42CD305AE96097B5ULL, // Audio3d / Ajm stub
-             0x9839A030E19552A8ULL, // mono mutexattr settype
-             0xE6DC4A7DC3140289ULL, // mono mutexattr setprotocol
-             0xB6D1CD7D4FAA0C15ULL, // mono mutex init
-             0x1C5EE52B8EB1CE36ULL, // mono mutexattr destroy
-             0xD13C959383122EDDULL, // mono cond init
-             0x9AA50B35D8A64E7DULL, // mono TLS / key create
-             0x3AEDE22F569BBE78ULL, // scePthreadSetprio (called right after scePthreadSetaffinity)
-             0x967DF7CE306B7E39ULL, // sceGnmCreateContext
-             0xE6E7409BEE9BA158ULL, // sceGnmRegisterResource
-             0x8A1C6B6ECA122967ULL, // sceGnmUnregisterResource
-             0xC9BD9C4616A00F52ULL, // sceGnmFlushGarlic
-             0xD6A5CB1C8A5138F1ULL, // sceGnmValidation
-             0x5B512D8FF8E55BB6ULL, // sceGnmGetResourceBudget
-             0xEEA65536012EF926ULL, // sceGnmSetCsShader
-             0x8E222DCD2EBEDB68ULL  // sceGnmUpdateResource
-         }) {
-        register_symbol(stub_nid, "sceKernelSyncStub", "libkernel",
+    // =====================================================================
+    // mono_class_get_methods(MonoClass* klass, void** iter) -> MonoMethod*
+    // NID: 0x2C5314E29C000914ULL -- hash-verified. One-shot iterator: hand back
+    // exactly one method, then NULL forever. This is what the guest's lookup
+    // loop at 0x99ae30 wants:
+    //
+    //   iter = 0
+    //   method = mono_class_get_methods(klass, &iter)
+    //   while (method) {
+    //       name = mono_method_get_name(method)      // 0x99ae33
+    //       if (*name == *wanted)                    // 0x99ae38
+    //           if (!strcmp(name, wanted)) { found } // 0x99ae47
+    //       method = mono_class_get_methods(klass, &iter)
+    //   }
+    //   // "Unable to find method %s in [%s]"
+    //
+    // Returning NULL (the old behaviour) made every one of Unity's 56 method
+    // lookups fail on the first turn of the loop and print that warning. One
+    // method is enough, provided the name matches -- see mono_method_get_name.
+    register_symbol(0x2C5314E29C000914ULL, "mono_class_get_methods", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr iter_ptr = ctx.rsi;
+            u64 state = 0;
+            if (iter_ptr != 0 && mem.is_valid_address(iter_ptr, sizeof(u64))) {
+                if (mem.read_value(iter_ptr, state) && state != 0) {
+                    ctx.rax = 0; // second turn: terminate the walk
+                    return;
+                }
+                mem.write_value(iter_ptr, static_cast<u64>(1));
+            }
+            std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
+            ctx.rax = mono_cookie(mem, "mono_method", mono_args(ctx));
+        });
+
+    // mono_method_get_name(MonoMethod* method) -> const char*
+    // NID: 0x12101A8AA03B2607ULL -- hash-verified.
+    //
+    // The caller keeps the name it is hunting for in a callee-saved register
+    // (r12 at 0x99ae44) for the whole walk, so the live register file *is* the
+    // answer: returning r12 makes the first-character compare at 0x99ae3b and
+    // the strcmp at 0x99ae47 both succeed on the first method we hand out,
+    // which is what turns "Unable to find method" into a hit. The dispatcher
+    // passes the guest's real CpuContext, so ctx.r12 is that register; when it
+    // does not look like a guest string we fall back to NULL rather than hand
+    // back a garbage pointer.
+    register_symbol(0x12101A8AA03B2607ULL, "mono_method_get_name", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr wanted = ctx.r12;
+            if (wanted > 0x1000 && mem.is_valid_address(wanted, 1)) {
+                const char* s = mem.to_host_ptr<char>(wanted);
+                if (s && *s != '\0') {
+                    ctx.rax = wanted;
+                    return;
+                }
+            }
+            ctx.rax = 0;
+        });
+
+    // Three mono-ps4 exports (import table module tag "i#j", the same as
+    // mono_method_get_name) that ps4libdoc's 42k corpus and the 2,836 upstream
+    // Mono header symbols both fail to name -- Unity's forked mono-ps4.prx
+    // exports internals that never shipped in Mono. Rather than guess a name,
+    // the *behaviour* comes from the guest's own call chain at 0x98c4cb, which
+    // is a three-way capability probe, not a pointer lookup:
+    //
+    //   98c4ce: call probe1;  test eax,eax / je next
+    //            -> non-zero sets result = 0xfffffffc (-4) and returns
+    //   98c4ee: call probe2;  test eax,eax / jne done
+    //   98c4fa: call probe3;  test eax,eax / je 0x98c564 (failure path)
+    //   0x98c503: result = 0xfffffffa (-6), then the normal epilogue
+    //   0x98c564: mono_class_is_subclass_of(r15, corlib_type, TRUE) twice
+    //
+    // All three are 32-bit int probes on one pointer, so returning 0 ("feature
+    // absent") is the honest answer and sends the guest down 0x98c564, which
+    // our mono_class_is_subclass_of now answers TRUE for, so it survives there.
+    register_symbol(0x0DAB36A8B7A8F089ULL, "unknown_98c4ce_probe1", "mono-ps4",
+        [](CpuContext&, MemoryManager&) { /* 0 = absent; non-zero is the guest's error -4 path */ });
+
+    register_symbol(0x053D63D15F72012EULL, "unknown_98c4ee_probe2", "mono-ps4",
+        [](CpuContext&, MemoryManager&) { /* 0 = fall through to probe3 */ });
+
+    register_symbol(0xFF23F26597C04F63ULL, "unknown_98c4fa_probe3", "mono-ps4",
+        [](CpuContext&, MemoryManager&) { /* 0 = take the subclass-of path at 0x98c564 */ });
+
+    // Mono lookup chain
+    // =====================================================================
+    // eboot.bin imports 107 Mono NIDs (scripts/crack_mono_nids.py --all names
+    // all 107 against the official Mono embedding API). Twenty are registered
+    // above and in the sync-stub table; the rest are classified here by what
+    // the *guest* does with the return value, which is the only thing that
+    // decides whether a cookie, a NULL or a scalar keeps the runtime alive.
+    //
+    //   Iter   NULL. The guest iterates until NULL; a cookie here is an
+    //          infinite loop, since nothing else terminates the walk.
+    //   Cookie Distinct, stable, zeroed arena slot keyed on the arguments, so
+    //          repeated lookups compare equal and downstream calls (notably
+    //          mono_runtime_invoke at 0x98a780) do not receive NULL.
+    //   Null   "absent" answers: strings, exceptions, basetypes. NULL is the
+    //          documented miss and every caller already handles it.
+    //   Zero   Scalar getter returns 0 (counts, sizes, gc stats, enums).
+    //   Small  Scalar getter returns a sane non-zero default, chosen so the
+    //          guest's arithmetic stays meaningful.
+    //   Pass   Handle we do not model, echoed straight back so an
+    //          acquire/release round trip balances.
+    enum class MonoShape { Iter, Cookie, Null, Zero, Small, Pass };
+
+    struct MonoStub {
+        Nid nid;
+        const char* name;
+        MonoShape shape;
+        u64 small; // value returned by Small (and by Zero when non-zero)
+        const char* why;
+    };
+    static constexpr MonoStub kMonoStubs[] = {
+        // ---- iterators and hierarchy walkers: NULL ends the walk in 1 step ----
+        {0x985C95D970DA2725ULL, "mono_class_get_fields", MonoShape::Iter, 0, "field list"},
+        {0x2CA0A04776952703ULL, "mono_class_get_interfaces", MonoShape::Iter, 0, "interface list"},
+        {0x3E9C268563CD9AAEULL, "mono_class_get_nested_types", MonoShape::Iter, 0, "nested type list"},
+        {0x6A8EF234F71F1017ULL, "mono_class_enum_basetype", MonoShape::Iter, 0,
+         "NULL = no underlying enum type, the terminating answer"},
+        {0xBB4AD888389AE22AULL, "mono_custom_attrs_from_class", MonoShape::Iter, 0,
+         "attr iterator: NULL ends the walk"},
+        {0x317F27B80647C7E9ULL, "mono_custom_attrs_from_method", MonoShape::Iter, 0, "attr iterator"},
+        {0x53BDBBFB9080F677ULL, "mono_custom_attrs_from_field", MonoShape::Iter, 0, "attr iterator"},
+        {0xA89CBBA0E6A51CC8ULL, "mono_signature_get_params", MonoShape::Iter, 0, "param iterator"},
+        {0x286DBC3D2512C3ADULL, "mono_signature_get_return_type", MonoShape::Iter, 0,
+         "NULL = void, safe for every caller"},
+        // NOT an iterator: the guest treats a non-NULL signature as "this method
+        // resolved". 0x99af1b is `test rax,rax; jne <success>` right after the
+        // call, and the failure branch is what prints "Unable to find method".
+        {0xD6C3FE5C14459AA8ULL, "mono_method_signature", MonoShape::Cookie, 0,
+         "non-NULL == resolved; feeds the success branch at 0x99af1b"},
+        {0x3CE811D876E50171ULL, "mono_class_get_element_class", MonoShape::Iter, 0,
+         "NULL = not an array element type"},
+        {0xC0404976DC95FD98ULL, "mono_class_get_nesting_type", MonoShape::Iter, 0, "NULL = not nested"},
+        {0x7EBF057CF032664DULL, "mono_field_get_parent", MonoShape::Iter, 0, "NULL = no declaring parent"},
+
+        // ---- direct lookups and constructors: distinct cookies ----
+        {0x9BF8387D4F9CFB29ULL, "mono_class_get_field_from_name", MonoShape::Cookie, 0,
+         "feeds the parent walk at 0x9978a3; NULL here restarts that walk"},
+        {0xCBA45942B44FB62DULL, "mono_class_from_name_case", MonoShape::Cookie, 0, "case-insensitive lookup"},
+        {0xB44311ACE3519578ULL, "mono_class_from_mono_type", MonoShape::Cookie, 0, "type -> class"},
+        {0x8A6DD4924F4B6A87ULL, "mono_class_get_image", MonoShape::Cookie, 0, "class -> image"},
+        {0xA39A90A33CF93422ULL, "mono_image_get_assembly", MonoShape::Cookie, 0, "image -> assembly"},
+        {0xBF6E6C1A2251C000ULL, "mono_class_get_type", MonoShape::Cookie, 0, "class -> MonoType"},
+        {0x94E6663D7C4DA186ULL, "mono_type_get_class", MonoShape::Cookie, 0, "type -> class"},
+        {0xA2560F030F332A67ULL, "mono_type_get_object", MonoShape::Cookie, 0, "type -> boxed object"},
+        {0xC1E523D0E1FCCF1EULL, "mono_method_get_class", MonoShape::Cookie, 0, "method -> class"},
+        {0x5C669D5DFD9E3C3AULL, "mono_object_get_class", MonoShape::Cookie, 0, "object -> class"},
+        {0x449275D5CAD0CA7BULL, "mono_object_get_virtual_method", MonoShape::Cookie, 0,
+         "NULL here means the guest cannot find a method to invoke"},
+        {0xF2A93AD894B6746DULL, "mono_object_new", MonoShape::Cookie, 0, "constructor"},
+        {0xB7C7D9218C1D654CULL, "mono_array_new", MonoShape::Cookie, 0, "array constructor"},
+        {0xF70952A358AA3C1BULL, "mono_array_new_full", MonoShape::Cookie, 0, "multi-dim array constructor"},
+        {0x74D76D8EAD1CDCADULL, "mono_string_new_wrapper", MonoShape::Cookie, 0, "MonoString*"},
+        {0xBE365CC81E5C4B88ULL, "mono_string_new_len", MonoShape::Cookie, 0, "MonoString*"},
+        {0xB72AA0CBF7B58A9AULL, "mono_string_from_utf16", MonoShape::Cookie, 0, "MonoString*"},
+        {0x7855074AE7EF9A7CULL, "mono_value_box", MonoShape::Cookie, 0, "boxed value"},
+        {0x78B6AC776F7141F6ULL, "mono_array_class_get", MonoShape::Cookie, 0, "array class"},
+        {0x72EB5A3894E60566ULL, "mono_get_enum_class", MonoShape::Cookie, 0, "enum class lookup"},
+        {0x7C5EF9110AFF621DULL, "mono_field_get_type", MonoShape::Cookie, 0, "field -> MonoType"},
+        {0xAAA5318F02737362ULL, "mono_thread_attach", MonoShape::Cookie, 0,
+         "guest spins while mono_thread_current() == NULL; attach must answer"},
+        {0xE5AF1BFACE87B5A0ULL, "mono_get_root_domain", MonoShape::Cookie, 0, "domain singleton"},
+
+        // ---- "absent" answers ----
+        {0x9755B24D09AB017AULL, "mono_exception_from_name_msg", MonoShape::Null, 0,
+         "NULL = no exception, the non-throwing answer"},
+        {0xEB03E0304FCD74A0ULL, "mono_exception_from_name_two_strings", MonoShape::Null, 0, "NULL = no exception"},
+        {0x3B82D819C9B9BEC5ULL, "mono_get_exception_argument_null", MonoShape::Null, 0, "NULL = no exception"},
+        {0x5E128B646CBE6269ULL, "mono_object_unbox", MonoShape::Null, 0, "NULL = nothing to unbox"},
+        {0xF73E9CCFB360B030ULL, "mono_raise_exception", MonoShape::Null, 0, "no-op: never throw into the guest"},
+        {0x027F88F9F6C50F35ULL, "mono_string_to_utf8", MonoShape::Null, 0,
+         "never hand back a host pointer as a guest char*"},
+        {0x1D8189A425AB45B7ULL, "mono_image_get_name", MonoShape::Null, 0, "NULL = unnamed image"},
+        {0x52735B4D29BF9A92ULL, "mono_field_get_name", MonoShape::Null, 0, "NULL = unnamed field"},
+        {0xB684ADBE5D881180ULL, "mono_class_get_namespace", MonoShape::Null, 0, "NULL = global namespace"},
+        {0xFABF16BE647EFDD0ULL, "mono_class_get_name", MonoShape::Null, 0, "NULL = unnamed class"},
+        {0xD75CB3ABC4694E9DULL, "mono_type_get_name", MonoShape::Null, 0, "NULL = unnamed type"},
+        {0x3EE593AA8DBFC028ULL, "mono_assembly_name_parse", MonoShape::Null, 0, "NULL = unparseable name"},
+        {0x082422B993F4575AULL, "mono_loader_get_last_error", MonoShape::Null, 0, "NULL = no loader error"},
+        {0x29DB18B2541F112FULL, "mono_type_get_type", MonoShape::Null, 0,
+         "0 is MONO_TYPE_END, which terminates guest type walks"},
+
+        // ---- scalar getters: 0 ----
+        {0x01E683D909A1E81DULL, "mono_gc_get_heap_size", MonoShape::Zero, 0, "gc stat"},
+        {0x571259700E26B5B5ULL, "mono_gc_get_used_size", MonoShape::Zero, 0, "gc stat"},
+        {0x9207476EBA98414BULL, "mono_gc_max_generation", MonoShape::Zero, 0, "0 terminates generation walks"},
+        {0x5ADCCE0B91D66DADULL, "mono_gc_collect", MonoShape::Zero, 0, "void"},
+        {0x4760DDFEF361CC51ULL, "mono_signature_get_param_count", MonoShape::Zero, 0, "no parameters"},
+        {0x6024879BBCF299AEULL, "mono_array_element_size", MonoShape::Zero, 0, "unknown element size"},
+        {0xBDF67AEE37821CE5ULL, "mono_class_array_element_size", MonoShape::Zero, 0, "unknown element size"},
+        {0x89097FFE4DAE9029ULL, "mono_class_instance_size", MonoShape::Zero, 0, "header only"},
+        {0x058661C22B770987ULL, "mono_field_get_flags", MonoShape::Zero, 0, "field flags"},
+        {0xE1410B51114B5E49ULL, "mono_field_get_offset", MonoShape::Zero, 0, "first field at offset 0"},
+        {0xB4B2F7382FE6AC28ULL, "mono_class_is_enum", MonoShape::Zero, 0, "false"},
+        {0xF02026004BD1040BULL, "mono_class_is_valuetype", MonoShape::Zero, 0, "false"},
+        {0xFAA2D1FCC5BDD8F7ULL, "mono_signature_is_instance", MonoShape::Zero, 0, "false"},
+        {0x9D675C43174F4E77ULL, "mono_custom_attrs_has_attr", MonoShape::Zero, 0,
+         "false ends attribute walks"},
+        {0x6B05EAD393AB9478ULL, "mono_field_set_value", MonoShape::Zero, 0, "void"},
+        {0x334C5174D51AFE4BULL, "mono_runtime_object_init", MonoShape::Zero, 0, "void"},
+        {0xACE61410F5E03AA9ULL, "mono_gchandle_free", MonoShape::Zero, 0, "void"},
+        {0xAC74A8FF223743E5ULL, "mono_custom_attrs_free", MonoShape::Zero, 0, "void"},
+        {0xD607E8C1B0D46402ULL, "mono_thread_detach", MonoShape::Zero, 0, "void"},
+        {0x57265F784A3CB6A7ULL, "mono_thread_suspend_all_other_threads", MonoShape::Zero, 0, "no-op"},
+        {0xDC18C1D69B04C7CBULL, "mono_threads_set_shutting_down", MonoShape::Zero, 0, "void"},
+        {0xE2087720CF525F0FULL, "mono_runtime_set_shutting_down", MonoShape::Zero, 0, "void"},
+        {0x74AED6A27FC4DC44ULL, "mono_thread_pool_cleanup", MonoShape::Zero, 0, "void"},
+        {0x750EDD459A4AF942ULL, "mono_assembly_loaded", MonoShape::Zero, 0, "false"},
+        {0x775F03F33FBB182DULL, "mono_jit_cleanup", MonoShape::Zero, 0, "void"},
+        {0x72C4E085629A4BDBULL, "mono_verifier_set_mode", MonoShape::Zero, 0, "void"},
+        {0x741BC47084A1F663ULL, "mono_security_set_mode", MonoShape::Zero, 0, "void"},
+        {0xDAF08486DADE84DEULL, "mono_security_set_core_clr_platform_callback", MonoShape::Zero, 0, "void"},
+
+        // ---- scalar getters: small sane defaults ----
+        {0x7498A7D3FC1EAA37ULL, "mono_class_get_rank", MonoShape::Small, 1,
+         "1 = not an array; >1 would trigger multi-dim paths"},
+        {0x579C63341A42AFA4ULL, "mono_object_get_size", MonoShape::Small, 8,
+         "one vtable pointer; 0 would make the guest size a 0-byte copy"},
+        {0xDE7B2CA71E6DD354ULL, "mono_class_get_flags", MonoShape::Small, 0x21,
+         "TYPE_PUBLIC | TYPE_INSTANCE, the ordinary case"},
+
+        // ---- handles echoed back so acquire/release balances ----
+        {0x6DA6206FC639A627ULL, "mono_gchandle_new", MonoShape::Pass, 0, "handle is the object itself"},
+        {0x24AD956E34BFDE93ULL, "mono_gchandle_new_weakref", MonoShape::Pass, 0, "handle is the object"},
+        {0x8615A1D0674EFC8AULL, "mono_gchandle_get_target", MonoShape::Pass, 0, "reverse of gchandle_new"},
+        {0x38B443E7CB06686DULL, "mono_gchandle_is_in_domain", MonoShape::Small, 1,
+         "true: the arena never moves objects"},
+    };
+
+    for (const MonoStub& stub : kMonoStubs) {
+        register_symbol(stub.nid, stub.name, "mono-ps4",
+            [stub](CpuContext& ctx, MemoryManager& mem) {
+                switch (stub.shape) {
+                    case MonoShape::Iter:
+                    case MonoShape::Null:
+                        ctx.rax = 0;
+                        break;
+                    case MonoShape::Zero:
+                        ctx.rax = stub.small;
+                        break;
+                    case MonoShape::Small:
+                        ctx.rax = stub.small;
+                        break;
+                    case MonoShape::Pass:
+                        ctx.rax = ctx.rdi;
+                        break;
+                    case MonoShape::Cookie: {
+                        std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
+                        ctx.rax = mono_cookie(mem, stub.name, mono_args(ctx));
+                        break;
+                    }
+                }
+            });
+    }
+
+    // mono_thread_current must agree with mono_thread_attach above: the guest's
+    // "while (mono_thread_current() == NULL) mono_thread_attach();" spin needs a
+    // per-thread handle that becomes non-NULL on first use.
+    register_symbol(0xB8369AEA2E0EF71AULL, "mono_thread_current", "mono-ps4",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            static thread_local GuestAddr slot = 0;
+            if (slot == 0) {
+                std::lock_guard<std::mutex> lock(s_mono_arena.mtx);
+                slot = mono_arena_alloc(mem);
+                std::fprintf(stderr, "[Mono] thread_current -> 0x%llx\n",
+                             (unsigned long long)slot);
+            }
+            ctx.rax = slot;
+        });
+
+    // Unity memory allocator, FMOD, Mono and GNM setup stubs. Every NID here
+    // is a one-shot call we answer with SCE_OK; the names come from ps4libdoc
+    // (known_names.txt / libkernel.sprx.json) so the trace labels are true.
+    // NIDs ps4libdoc cannot name keep the honest sceKernelSyncStub label and
+    // their old context note. Bodies are unchanged: rax = SCE_OK (i.e. NULL
+    // for pointer-returning APIs), which is fail-safe.
+    struct SyncStub {
+        Nid nid;
+        const char* name;
+        const char* module;
+    };
+    static constexpr SyncStub kSyncStubs[] = {
+        {0x2AE3AE0F9F21AA7EULL, "malloc_stats_fast", "libSceLibcInternal"},
+        {0xA4EF7A4F0CCE9B91ULL, "sceKernelGetDirectMemorySize", "libkernel"},
+        {0x04DA30C76979F3C1ULL, "sceKernelGetProcessTimeCounterFrequency", "libkernel"},
+        {0xFE99E3DFFEDAE900ULL, "sceKernelSyncStub", "libkernel"}, // FMOD / pad init helper
+        {0x8941B88CB45FD196ULL, "sceKernelSyncStub", "libkernel"}, // FMOD mixer thread setup
+        {0x54EC7C3469875D3BULL, "sceKernelGetCpumode", "libkernel_cpumode"},
+        {0xFEEC04868FFB80EBULL, "sceKernelSyncStub", "libkernel"}, // thread attr helper
+        {0x22EC6752E5E4E818ULL, "sceKernelGetModuleList", "libkernel"},
+        {0xFE19F5B5C547AB94ULL, "sceLibcMspaceCreate", "libSceLibcInternal"},
+        {0x960213B81B11A36AULL, "sceFiosIOFilterAdd", "libSceFios2"}, // debug.log stream setup
+        {0x47D940F363AB68DBULL, "sceAppContentInitialize", "libSceAppContent"},
+        {0x55EED6C524805364ULL, "sceKernelSyncStub", "libkernel"}, // Unity string/domain setup 1
+        {0xC5D3D91AED17EB3BULL, "sceKernelSyncStub", "libkernel"}, // Unity string/domain setup 2
+        {0x4FCEF2B219D790C5ULL, "mono_jit_set_aot_only", "mono-ps4"},
+        {0x72CE3B9DE94CEA50ULL, "sceKernelSyncStub", "libkernel"},
+        {0x46204874F5E83DD1ULL, "sceKernelSyncStub", "libkernel"},
+        {0x3B579C5F88AEC0EFULL, "mono_config_parse", "mono-ps4"},
+        {0xFEAF6C4747115067ULL, "mono_parse_default_optimizations", "mono-ps4"},
+        {0xE1E3B7F43BAC2E92ULL, "mono_set_defaults", "mono-ps4"},
+        {0xF737BFA02980EDF6ULL, "sceKernelSyncStub", "libkernel"},
+        {0x5AA1DFAA34975749ULL, "mono_set_dirs", "mono-ps4"},
+        {0xF068CCD895AE7A94ULL, "mono_set_assemblies_path", "mono-ps4"},
+        // mono_thread_current has a real handler above (per-thread handle).
+        {0x23FA65EA7B52AD86ULL, "mono_thread_set_main", "mono-ps4"},
+        {0x9141F1F3ED8B6742ULL, "sceKernelSyncStub", "libkernel"},
+        {0x0E04B6E6017A7AE4ULL, "sceKernelSyncStub", "libkernel"},
+        {0x7050A9D0D5FCC1FDULL, "sceGnmSetVgtControl", "libSceGnm"},
+        {0x8008429FA5225386ULL, "sceGnmSetVsShader", "libSceGnm"},
+        {0xE6E14A7248896113ULL, "sceGnmSetPsShader350", "libSceGnm"},
+        {0x186B27EE3313C70EULL, "sceGnmDrawIndexAuto", "libSceGnm"},
+        // Not scePthreadSetschedparam (that is 0x0F3112F61405E1FEULL).
+        {0xFD98F4C8AD37832AULL, "sceKernelSyncStub", "libkernel"},
+        {0xD8866B1E72E722DDULL, "sceKernelSyncStub", "libkernel"}, // Unity init stub
+        {0x066E40B33FB6E36FULL, "mono_runtime_set_main_args", "mono-ps4"},
+        {0x42CD305AE96097B5ULL, "sceMouseInit", "libSceMouse"},
+        {0x9839A030E19552A8ULL, "pthread_mutexattr_settype", "libScePosix"},
+        {0xE6DC4A7DC3140289ULL, "pthread_mutexattr_setprotocol", "libScePosix"},
+        {0xB6D1CD7D4FAA0C15ULL, "pthread_mutex_init", "libScePosix"},
+        {0x1C5EE52B8EB1CE36ULL, "pthread_mutexattr_destroy", "libScePosix"},
+        {0xD13C959383122EDDULL, "pthread_cond_init", "libScePosix"},
+        {0x9AA50B35D8A64E7DULL, "pthread_key_create", "libScePosix"},
+        // Stack-smashing abort, not scePthreadSetprio. Still a stub: the
+        // compatibility layer prefers continuing over aborting the guest.
+        {0x967DF7CE306B7E39ULL, "sceGnmGetTheTessellationFactorRingBufferBaseAddress", "libSceGnm"},
+        {0xE6E7409BEE9BA158ULL, "sceGnmCreateWorkloadStream", "libSceGnm"},
+        {0x8A1C6B6ECA122967ULL, "sceGnmBeginWorkload", "libSceGnm"},
+        {0xC9BD9C4616A00F52ULL, "sceGnmDrawInitDefaultHardwareState350", "libSceGnm"},
+        {0xD6A5CB1C8A5138F1ULL, "sceGnmInsertWaitFlipDone", "libSceGnm"},
+        {0x5B512D8FF8E55BB6ULL, "sceGnmInsertPushMarker", "libSceGnm"},
+        {0xEEA65536012EF926ULL, "sceGnmInsertPopMarker", "libSceGnm"},
+        {0x8E222DCD2EBEDB68ULL, "sceGnmInsertSetMarker", "libSceGnm"},
+    };
+    for (const SyncStub& stub : kSyncStubs) {
+        register_symbol(stub.nid, stub.name, stub.module,
             [](CpuContext& ctx, MemoryManager&) {
                 ctx.rax = SCE_OK;
             });
     }
 
-    // sceVideoOutWaitVblank — sleep instead of spinning so the guest yields the
-    // host thread at ~60 FPS VBlank cadence.
+    // sceGnmSubmitDone -- NID: 0xCAF67BDEE414AAB9ULL, per ps4libdoc. This NID was
+    // registered as sceVideoOutWaitVblank; ps4libdoc resolves it to the GNM
+    // submit-completion wait (imported by eboot.bin, libSceJobManager.prx and
+    // libSceS3DConversion.prx). Body unchanged: sleep instead of spin so the
+    // guest yields the host thread at ~60 FPS VBlank cadence.
     auto vblank_wait_handler = [](CpuContext& ctx, MemoryManager&) {
         std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS VBlank
         ctx.rax = SCE_OK;
     };
-    register_symbol(0xCAF67BDEE414AAB9ULL, "sceVideoOutWaitVblank", "libSceVideoOut", vblank_wait_handler);
+    register_symbol(0xCAF67BDEE414AAB9ULL, "sceGnmSubmitDone", "libSceGnm", vblank_wait_handler);
 
     // sceKernelGetProcessTimeCounter(void) -> monotonic microseconds (1MHz by
     // construction). The Frequency NID is unknown and was never called; absolute
