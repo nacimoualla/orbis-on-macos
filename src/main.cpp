@@ -206,6 +206,10 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n================= Guest Execution Output =================\n";
     ps4::RunResult run_res{};
+    // Main does not run through ThreadManager's worker lambda, so t_guest_tid
+    // was never published for it and the write-watch reported main as TID=0.
+    // Publish it here: main is guest TID 1.
+    ps4::t_guest_tid = 1;
     ps4::usize total_instructions = 0;
 
     if (enable_trace) {

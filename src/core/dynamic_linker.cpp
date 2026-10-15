@@ -265,7 +265,13 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             }
         }
         if (print_warning) {
-        std::fprintf(stderr, "[HLE WARNING] Unimplemented stub called: NID=0x%016llx (caller RIP=0x%llx, rdi=0x%llx '%s', rsi=0x%llx '%s', rdx=0x%llx) returning 0 (0x0)\n",
+        // Sequence number and calling thread: without them it is impossible to
+        // tell whether a warning is a cause or a consequence of the abort path
+        // (the teardown sweep signals semas that shutdown already erased).
+        static std::atomic<unsigned long long> s_warn_seq{0};
+        std::fprintf(stderr, "[HLE WARNING #%llu TID=%d rip=0x%llx] Unimplemented stub called: NID=0x%016llx (caller RIP=0x%llx, rdi=0x%llx '%s', rsi=0x%llx '%s', rdx=0x%llx) returning 0 (0x0)\n",
+                     (unsigned long long)(++s_warn_seq),
+                     (int)t_guest_tid, (unsigned long long)t_guest_rip,
                      (unsigned long long)nid, (unsigned long long)ret_addr, (unsigned long long)sctx.args[0],
                      str_arg0 ? str_arg0 : "", (unsigned long long)sctx.args[1],
                      str_arg1 ? str_arg1 : "", (unsigned long long)sctx.args[2]);
