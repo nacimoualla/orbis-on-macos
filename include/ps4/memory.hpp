@@ -140,4 +140,29 @@ private:
     std::unordered_map<u64, u32> m_page_flags;
 };
 
+// Write-watch: arm a guest address range so every store overlapping it is
+// recorded with the guest context responsible. Lives on MemoryManager's write
+// path, not in the executor, so HLE handlers' own stores are caught too.
+struct WatchHit {
+    GuestAddr rip;      // instruction-start RIP of the writing instruction
+    GuestAddr rsp;      // guest rsp at instruction start
+    GuestAddr rbp;      // guest rbp at instruction start
+    int tid;
+    bool from_hle;      // store came from HLE handler code, not the decoder
+    GuestAddr guest_addr;
+    usize size;
+    u64 old_value;
+    u64 new_value;
+};
+
+void set_write_watch(GuestAddr addr, usize size = 8);
+void dump_write_watch_ring();
+
+// Published per guest thread by the executor; read by the write-watch.
+extern thread_local GuestAddr t_guest_rip;
+extern thread_local GuestAddr t_guest_rsp;
+extern thread_local GuestAddr t_guest_rbp;
+extern thread_local int t_guest_tid;
+extern thread_local bool t_guest_in_hle;
+
 } // namespace ps4

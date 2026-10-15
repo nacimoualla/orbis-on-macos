@@ -41,7 +41,7 @@ public:
 
     /// HLE dispatch accounting for the stall watchdog. Const: touches only
     /// globals and thread entries, never the registry itself.
-    void note_hle_dispatch(Nid nid) const;
+    void note_hle_dispatch(Nid nid, GuestAddr caller_rip = 0) const;
     void note_hle_return() const;
 
     /// Total count of registered symbols

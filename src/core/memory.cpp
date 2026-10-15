@@ -122,10 +122,84 @@ bool MemoryManager::protect(GuestAddr addr, GuestSize size, u32 elf_flags) {
     return true;
 }
 
+// Guest address currently being executed on this host thread, published by the
+// executor. MemoryManager needs it so a write-watch can name the instruction
+// that clobbered a location instead of only reporting the corruption later.
+thread_local GuestAddr t_guest_rip = 0;
+thread_local GuestAddr t_guest_rsp = 0;
+thread_local GuestAddr t_guest_rbp = 0;
+thread_local int t_guest_tid = 0;
+thread_local bool t_guest_in_hle = false;
+
+// Optional write-watch. Armed from PS4_WATCH_ADDR. Sits on write_bytes rather
+// than in the executor so it also catches stores made by HLE handler code,
+// which never pass through the instruction decoder.
+//
+// Records into a RING, not the first N: the canary slot is reused stack, so the
+// prologue's install and later activations all write the same address, and a
+// first-hit-only watch reports the benign store and hides the clobber.
+static std::atomic<GuestAddr> g_watch_addr{0};
+static std::atomic<usize> g_watch_size{0};
+static std::atomic<bool> g_watch_armed{false};
+static constexpr usize kWatchRing = 64;
+static std::atomic<usize> g_watch_count{0};
+static WatchHit g_watch_ring[kWatchRing];
+
+void set_write_watch(GuestAddr addr, usize size) {
+    g_watch_addr.store(addr, std::memory_order_relaxed);
+    g_watch_size.store(size, std::memory_order_relaxed);
+    g_watch_armed.store(addr != 0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[watch] armed on 0x%llx..0x%llx (%zu bytes)\n",
+                 (unsigned long long)addr, (unsigned long long)(addr + size), size);
+}
+
+void dump_write_watch_ring() {
+    const usize n = g_watch_count.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[watch] ring: %zu writes recorded (last %zu shown)\n",
+                 n, kWatchRing);
+    const usize start = (n > kWatchRing) ? (n - kWatchRing) : 0;
+    for (usize i = start; i < n; ++i) {
+        const WatchHit& h = g_watch_ring[i % kWatchRing];
+        std::fprintf(stderr,
+                     "[watch] #%-3zu rip=0x%016llx rsp=0x%llx rbp=0x%llx TID=%d %-3s "
+                     "-> 0x%llx (%zu B)  old=0x%016llx new=0x%016llx%s\n",
+                     i, (unsigned long long)h.rip, (unsigned long long)h.rsp,
+                     (unsigned long long)h.rbp, h.tid, h.from_hle ? "HLE" : "dec",
+                     (unsigned long long)h.guest_addr, h.size,
+                     (unsigned long long)h.old_value, (unsigned long long)h.new_value,
+                     (h.old_value != h.new_value) ? "  <-- CHANGED" : "");
+    }
+}
+
 bool MemoryManager::write_bytes(GuestAddr addr, const void* src, usize size) {
     if (!is_valid_address(addr, size)) {
         m_last_error = MemoryError::OutOfBounds;
         return false;
+    }
+
+    // Range overlap, not exact equality: a 16/32-byte VEX or movups store that
+    // merely spans the slot must be caught. This code region is full of those.
+    if (g_watch_armed.load(std::memory_order_relaxed)) {
+        const GuestAddr wa = g_watch_addr.load(std::memory_order_relaxed);
+        const usize ws = g_watch_size.load(std::memory_order_relaxed);
+        if (addr < wa + ws && wa < addr + size) {
+            WatchHit h{};
+            h.rip = t_guest_rip;
+            h.rsp = t_guest_rsp;
+            h.rbp = t_guest_rbp;
+            h.tid = t_guest_tid;
+            h.from_hle = t_guest_in_hle;
+            h.guest_addr = addr;
+            h.size = size;
+            std::memcpy(&h.old_value, m_base + wa, sizeof(h.old_value));
+            h.new_value = h.old_value;
+            // Copy out the first 8 bytes actually being stored, so a 4-byte
+            // store over a zeroed slot is distinguishable from an 8-byte one.
+            const usize take = size < sizeof(h.new_value) ? size : sizeof(h.new_value);
+            if (addr <= wa) std::memcpy(&h.new_value, static_cast<const u8*>(src) + (wa - addr), take);
+            const usize slot = g_watch_count.fetch_add(1, std::memory_order_relaxed);
+            g_watch_ring[slot % kWatchRing] = h;
+        }
     }
 
     std::memcpy(m_base + addr, src, size);
