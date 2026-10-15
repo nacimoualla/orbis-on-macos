@@ -93,6 +93,8 @@ struct GuestSema {
     i32 count{0};
     i32 max_count{0x7fffffff};
     bool deleted{false};
+    bool cancelled{false}; // set by CancelSema; cleared by last waiter out
+    i32 waiters{0};        // threads currently parked in wait (for CancelSema)
 };
 static std::mutex s_sema_table_mtx;
 static std::unordered_map<u32, std::shared_ptr<GuestSema>> s_semas;
@@ -1550,14 +1552,17 @@ void NidRegistry::register_default_libraries() {
 
             std::unique_lock<std::mutex> lock(sema->mtx);
             auto pred = [&]() {
-                return sema->count >= need || sema->deleted || (g_syscalls && g_syscalls->has_exited());
+                return sema->count >= need || sema->deleted || sema->cancelled ||
+                       (g_syscalls && g_syscalls->has_exited());
             };
+            sema->waiters++;
 
             if (timo_ptr != 0 && mem.is_valid_address(timo_ptr, sizeof(u32))) {
                 u32 usec = 0;
                 mem.read_value(timo_ptr, usec);
                 std::fprintf(stderr, "[Sema] WaitSema(%u, need=%d, timeout=%uus)\n", id, need, usec);
                 if (!sema->cv.wait_for(lock, std::chrono::microseconds(usec), pred)) {
+                    sema->waiters--;
                     if (cur_th) cur_th->state.store(ThreadState::Running);
                     ctx.rax = 0x8002003CULL; // SCE_KERNEL_ERROR_ETIMEDOUT
                     return;
@@ -1569,6 +1574,14 @@ void NidRegistry::register_default_libraries() {
                 }
             }
 
+            sema->waiters--;
+            if (sema->cancelled) {
+                // Wake-all: last waiter out clears the flag so future waits block normally.
+                if (sema->waiters == 0) sema->cancelled = false;
+                if (cur_th) cur_th->state.store(ThreadState::Running);
+                ctx.rax = 0x80020055ULL; // SCE_KERNEL_ERROR_ECANCELED (FreeBSD 85)
+                return;
+            }
             if (sema->count >= need) {
                 sema->count -= need;
             }
@@ -1576,8 +1589,8 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // sceKernelSignalSema(SceKernelSema sema, int signalCount)
-    // NIDs: 0x443BB032833D9F45ULL ("RDuwMoM9n0U") and 0x3C4AC6259839E5EBULL
+    // sceKernelSignalSema(SceKernelSema sema, int signalCount). Shared handler
+    // also reused by the verified 0xE1CC... registration below.
     auto signal_sema_handler = [](CpuContext& ctx, MemoryManager&) {
         const u32 id = static_cast<u32>(ctx.rdi);
         const i32 sig = static_cast<i32>(ctx.rsi) > 0 ? static_cast<i32>(ctx.rsi) : 1;
@@ -1597,33 +1610,75 @@ void NidRegistry::register_default_libraries() {
         }
         ctx.rax = SCE_OK;
     };
-    register_symbol(0x443BB032833D9F45ULL, "sceKernelSignalSema", "libkernel", signal_sema_handler);
-    register_symbol(0x3C4AC6259839E5EBULL, "sceKernelSignalSema", "libkernel", signal_sema_handler);
+    // Unknown NIDs with signal-like behavior (hash otherwise, never called in
+    // Flappy; kept on the shared signal handler for compat, honestly labeled).
+    register_symbol(0x443BB032833D9F45ULL, "unknown_443bb032", "libkernel", signal_sema_handler);
+    register_symbol(0x3C4AC6259839E5EBULL, "unknown_3c4ac625", "libkernel", signal_sema_handler);
+
+    // Non-blocking poll helper shared by the real PollSema and the
+    // never-called unknown slot.
+    auto poll_sema_impl = [](CpuContext& ctx, const char* tag) {
+        const u32 id = static_cast<u32>(ctx.rdi);
+        const i32 need = static_cast<i32>(ctx.rsi) > 0 ? static_cast<i32>(ctx.rsi) : 1;
+        std::shared_ptr<GuestSema> sema;
+        {
+            std::lock_guard<std::mutex> lock(s_sema_table_mtx);
+            auto it = s_semas.find(id);
+            if (it != s_semas.end()) sema = it->second;
+        }
+        if (sema) {
+            std::lock_guard<std::mutex> lock(sema->mtx);
+            if (sema->count >= need) {
+                sema->count -= need;
+                ctx.rax = SCE_OK;
+                return;
+            }
+            std::fprintf(stderr, "[Sema] %s(%u, need=%d) -> BUSY (count=%d)\n", tag, id, need,
+                         sema->count);
+        } else {
+            std::fprintf(stderr, "[Sema] %s(%u, need=%d) -> unknown id\n", tag, id, need);
+        }
+        ctx.rax = 0x80020010ULL; // SCE_KERNEL_ERROR_EBUSY
+    };
+    // 0x0528... hashes otherwise (never called in Flappy); honestly labeled,
+    // same non-blocking behavior for compat.
+    register_symbol(0x0528B1D7D1C6C155ULL, "unknown_0528b1d7", "libkernel",
+        [poll_sema_impl](CpuContext& ctx, MemoryManager&) { poll_sema_impl(ctx, "unknown_0528b1d7"); });
 
     // sceKernelPollSema(SceKernelSema sema, int needCount)
-    // NID: 0x0528B1D7D1C6C155ULL ("BSix19HGwVU")
-    register_symbol(0x0528B1D7D1C6C155ULL, "sceKernelPollSema", "libkernel",
-        [](CpuContext& ctx, MemoryManager&) {
+    // NID: 0xD76C0E1E4F32C1BDULL (hash-verified against Orbis salt).
+    register_symbol(0xD76C0E1E4F32C1BDULL, "sceKernelPollSema", "libkernel",
+        [poll_sema_impl](CpuContext& ctx, MemoryManager&) { poll_sema_impl(ctx, "PollSema"); });
+
+    // sceKernelCancelSema(SceKernelSema sema, int* pNumWaitingThreads)
+    // NID: 0xE03334E94D813446ULL (hash-verified). Wakes all waiters; WaitSema
+    // observes `cancelled` and returns ECANCELED. Never called in Flappy.
+    register_symbol(0xE03334E94D813446ULL, "sceKernelCancelSema", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
             const u32 id = static_cast<u32>(ctx.rdi);
-            const i32 need = static_cast<i32>(ctx.rsi) > 0 ? static_cast<i32>(ctx.rsi) : 1;
+            const GuestAddr out_ptr = ctx.rsi;
             std::shared_ptr<GuestSema> sema;
             {
                 std::lock_guard<std::mutex> lock(s_sema_table_mtx);
                 auto it = s_semas.find(id);
                 if (it != s_semas.end()) sema = it->second;
             }
-            if (sema) {
-                std::lock_guard<std::mutex> lock(sema->mtx);
-                if (sema->count >= need) {
-                    sema->count -= need;
-                    ctx.rax = SCE_OK;
-                    return;
-                }
-                std::fprintf(stderr, "[Sema] PollSema(%u, need=%d) -> BUSY (count=%d)\n", id, need, sema->count);
-            } else {
-                std::fprintf(stderr, "[Sema] PollSema(%u, need=%d) -> unknown id\n", id, need);
+            if (!sema) {
+                ctx.rax = SCE_OK;
+                return;
             }
-            ctx.rax = 0x80020010ULL; // SCE_KERNEL_ERROR_EBUSY
+            i32 waiters = 0;
+            {
+                std::lock_guard<std::mutex> lock(sema->mtx);
+                waiters = sema->waiters;
+                sema->cancelled = true;
+                sema->cv.notify_all();
+            }
+            if (out_ptr != 0 && mem.is_valid_address(out_ptr, sizeof(u32))) {
+                mem.write_value(out_ptr, static_cast<u32>(waiters));
+            }
+            std::fprintf(stderr, "[Sema] CancelSema(%u) -> waiters=%d\n", id, waiters);
+            ctx.rax = SCE_OK;
         });
 
     // sceKernelDeleteSema(SceKernelSema sema)
