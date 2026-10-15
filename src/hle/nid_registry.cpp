@@ -2678,11 +2678,34 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
-    register_symbol(0x83C70CDFD11467AAULL, "g8cM39EUZ6o", "libSceAudio3d",
+    // =========================================================================
+    // libSceAudio3d: 3D audio (names hash-verified against Orbis NIDs)
+    // =========================================================================
+    register_symbol(0x83C70CDFD11467AAULL, "sceSysmoduleLoadModule", "libSceSysmodule",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
-    register_symbol(0x5260AF8D29AE648CULL, "UmCvjSmuZIw", "libSceAudio3d",
+    register_symbol(0x5260AF8D29AE648CULL, "sceAudio3dInitialize", "libSceAudio3d",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+    // PortOpen(0xff, stackbuf, heapbuf): return 0 (SCE_OK); no port state kept.
+    register_symbol(0x5DE0C32B4C495900ULL, "sceAudio3dPortOpen", "libSceAudio3d",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+    // ObjectReserve: returns 0. Observed flows never consume the return value
+    // (all later calls pass rdi=-1 = default), so no handle table yet. If a
+    // caller ever threads this return into another call, upgrade to dummies.
+    register_symbol(0x8CEDAD79CE1D2763ULL, "sceAudio3dObjectReserve", "libSceAudio3d",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0xE2EC8737DAB865E5ULL, "sceAudio3dObjectSetAttributes", "libSceAudio3d",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x64E1ABC562E04331ULL, "sceAudio3dPortFlush", "libSceAudio3d",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
