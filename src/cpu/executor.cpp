@@ -431,6 +431,7 @@ StepResult CpuExecutor::step() {
     t_guest_rip = m_context.rip;
     t_guest_rsp = m_context.rsp;
     t_guest_rbp = m_context.rbp;
+    t_guest_rbx = m_context.rbx;
     if (m_syscalls.has_exited()) {
         return StepResult::Exited;
     }

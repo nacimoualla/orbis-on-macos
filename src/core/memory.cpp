@@ -128,6 +128,7 @@ bool MemoryManager::protect(GuestAddr addr, GuestSize size, u32 elf_flags) {
 thread_local GuestAddr t_guest_rip = 0;
 thread_local GuestAddr t_guest_rsp = 0;
 thread_local GuestAddr t_guest_rbp = 0;
+thread_local GuestAddr t_guest_rbx = 0;
 thread_local int t_guest_tid = 0;
 thread_local bool t_guest_in_hle = false;
 
@@ -161,10 +162,10 @@ void dump_write_watch_ring() {
     for (usize i = start; i < n; ++i) {
         const WatchHit& h = g_watch_ring[i % kWatchRing];
         std::fprintf(stderr,
-                     "[watch] #%-3zu rip=0x%016llx rsp=0x%llx rbp=0x%llx TID=%d %-3s "
+                     "[watch] #%-3zu rip=0x%016llx rsp=0x%llx rbp=0x%llx rbx=0x%llx TID=%d %-3s "
                      "-> 0x%llx (%zu B)  old=0x%016llx new=0x%016llx%s\n",
                      i, (unsigned long long)h.rip, (unsigned long long)h.rsp,
-                     (unsigned long long)h.rbp, h.tid, h.from_hle ? "HLE" : "dec",
+                     (unsigned long long)h.rbp, (unsigned long long)h.rbx, h.tid, h.from_hle ? "HLE" : "dec",
                      (unsigned long long)h.guest_addr, h.size,
                      (unsigned long long)h.old_value, (unsigned long long)h.new_value,
                      (h.old_value != h.new_value) ? "  <-- CHANGED" : "");
@@ -187,6 +188,7 @@ bool MemoryManager::write_bytes(GuestAddr addr, const void* src, usize size) {
             h.rip = t_guest_rip;
             h.rsp = t_guest_rsp;
             h.rbp = t_guest_rbp;
+            h.rbx = t_guest_rbx;
             h.tid = t_guest_tid;
             h.from_hle = t_guest_in_hle;
             h.guest_addr = addr;

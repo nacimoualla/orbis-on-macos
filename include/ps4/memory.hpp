@@ -147,6 +147,7 @@ struct WatchHit {
     GuestAddr rip;      // instruction-start RIP of the writing instruction
     GuestAddr rsp;      // guest rsp at instruction start
     GuestAddr rbp;      // guest rbp at instruction start
+    GuestAddr rbx;      // guest rbx at instruction start (the job object)
     int tid;
     bool from_hle;      // store came from HLE handler code, not the decoder
     GuestAddr guest_addr;
@@ -162,6 +163,7 @@ void dump_write_watch_ring();
 extern thread_local GuestAddr t_guest_rip;
 extern thread_local GuestAddr t_guest_rsp;
 extern thread_local GuestAddr t_guest_rbp;
+extern thread_local GuestAddr t_guest_rbx;
 extern thread_local int t_guest_tid;
 extern thread_local bool t_guest_in_hle;
 
