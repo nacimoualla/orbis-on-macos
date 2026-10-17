@@ -57,6 +57,8 @@ using ps4::gui::scan_folder;
 @property (nonatomic, strong) NSMutableArray<NSString*>* logLines;
 @property (nonatomic, strong) dispatch_queue_t ioQueue;
 @property (nonatomic, strong) NSTask* task;
+@property (nonatomic, strong) NSFileHandle* logFile;
+@property (nonatomic, copy) NSString* logPath;
 @end
 
 // C++ state cannot be an ObjC property; a class extension can still hold the
@@ -265,10 +267,47 @@ using ps4::gui::scan_folder;
     t.standardOutput = out;
     t.standardError = out;
 
+    // Tee the run to <runner dir>/logs/run_<timestamp>.log so a session's
+    // output survives the GUI closing. The runner directory is where
+    // runner_path() points, which inside a bundle is Contents/MacOS/.
+    NSString* runnerDir = @(runner_path().c_str()).stringByDeletingLastPathComponent;
+    NSString* logDir = [runnerDir stringByAppendingPathComponent:@"logs"];
+    NSError* dirErr = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:logDir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:&dirErr]) {
+        [self setStatus:[NSString stringWithFormat:@"Log dir failed: %@",
+                                                  dirErr.localizedDescription]];
+    } else {
+        NSDateFormatter* fmt = [NSDateFormatter new];
+        fmt.dateFormat = @"yyyyMMdd-HHmmss";
+        NSString* fname = [NSString stringWithFormat:@"run_%@.log",
+                                                     [fmt stringFromDate:[NSDate date]]];
+        NSString* path = [logDir stringByAppendingPathComponent:fname];
+        // +fileHandleForWritingAtPath: only OPENS an existing file and returns
+        // nil otherwise, so create it first -- otherwise no log is ever written
+        // and nothing complains.
+        NSFileManager* fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path]) {
+            [fm createFileAtPath:path contents:[NSData data] attributes:nil];
+        }
+        self.logFile = [NSFileHandle fileHandleForWritingAtPath:path];
+        self.logPath = path;
+        if (!self.logFile) {
+            [self setStatus:[NSString stringWithFormat:@"Cannot open log %@", path]];
+        } else {
+            [self appendLog:[NSString stringWithFormat:@"=== logging to %@ ===", path]];
+        }
+    }
+
     __weak GameLibraryController* weakSelf = self;
     out.fileHandleForReading.readabilityHandler = ^(NSFileHandle* fh) {
         NSData* data = fh.availableData;
         if (data.length == 0) return;
+        // Write the raw chunk first so the file keeps stdout/stderr interleaving
+        // exactly as the runner produced it, rather than the line-split view.
+        @try { [weakSelf.logFile writeData:data]; } @catch (NSException*) {}
         NSString* s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         if (!s) return;
         for (NSString* line in [s componentsSeparatedByString:@"\n"]) {
@@ -281,9 +320,13 @@ using ps4::gui::scan_folder;
         if (!strongSelf) return;
         strongSelf.runButton.enabled = YES;
         strongSelf.stopButton.enabled = NO;
-        [strongSelf setStatus:[NSString stringWithFormat:@"Exited (%d)",
-                                                        (int)finished.terminationStatus]];
+        [strongSelf setStatus:[NSString stringWithFormat:@"Exited (%d)%@",
+            (int)finished.terminationStatus,
+            strongSelf.logPath.length ? [NSString stringWithFormat:@" - log: %@",
+                                                                strongSelf.logPath] : @""]];
         [strongSelf appendLog:@"\n=== runner exited ==="];
+        [strongSelf.logFile closeFile];
+        strongSelf.logFile = nil;
     };
 
     NSError* err = nil;
@@ -303,12 +346,19 @@ using ps4::gui::scan_folder;
 - (void)onStop:(id)sender {
     [_task terminate];
     _task = nil;
+    [_logFile closeFile];
+    _logFile = nil;
     _runButton.enabled = YES;
     _stopButton.enabled = NO;
-    [self setStatus:@"Stopped"];
+    [self setStatus:_logPath.length ? [NSString stringWithFormat:@"Stopped - log: %@", _logPath]
+                                    : @"Stopped"];
 }
 
-- (void)windowWillClose:(NSNotification*)n { [_task terminate]; }
+- (void)windowWillClose:(NSNotification*)n {
+    [_task terminate];
+    [_logFile closeFile];
+    _logFile = nil;
+}
 
 #pragma mark - Table
 
