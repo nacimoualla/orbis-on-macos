@@ -598,7 +598,9 @@ StepResult CpuExecutor::step() {
             std::fprintf(stderr, "  #%d: 0x%llx\n", i, (unsigned long long)s_rip_history[idx]);
         }
         dump_control_xfers(1);
-        dump_write_watch_ring(0x215d1010);
+        // Filter on the range the operator armed, not a leftover address. A
+        // zero here means "watch not armed" and shows the whole ring.
+        dump_write_watch_ring(write_watch_addr());
         return StepResult::MemoryFault;
     }
 

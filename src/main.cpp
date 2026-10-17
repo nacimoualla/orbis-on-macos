@@ -244,7 +244,7 @@ int main(int argc, char* argv[]) {
             auto t_start = std::chrono::steady_clock::now();
             auto t_last = t_start;
             ps4::usize instrs_last = 0;
-            while (window->is_open() && !syscalls.has_exited()) {
+            while (window->is_open() && !syscalls.has_exited() && (instruction_budget == 0 || total_instructions < instruction_budget)) {
                 window->poll_events();
                 nid_registry.set_pad_buttons(window->input_buttons());
 
@@ -299,6 +299,14 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[CPU] Execution Status: " << ps4::step_result_to_string(run_res.status) << "\n";
     std::cout << "[CPU] Instructions Executed: " << total_instructions << "\n";
+    // Dump an armed write-watch here too, not only on fault. A run that ends on
+    // the instruction budget reports "executed successfully" and never reaches
+    // the fault handler, so the ring would otherwise be silently discarded --
+    // which is exactly the case where you want to know whether the watched slot
+    // was written at all.
+    if (ps4::write_watch_addr() != 0) {
+        ps4::dump_write_watch_ring(ps4::write_watch_addr());
+    }
     if (enable_jit && jit.cached_block_count() > 0) {
         std::cout << "[CPU] JIT Blocks Cached: " << jit.cached_block_count()
                   << " | Total Invocations: " << jit.total_invocations() << "\n";

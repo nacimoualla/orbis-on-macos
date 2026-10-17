@@ -156,6 +156,15 @@ void set_write_watch(GuestAddr addr, usize size) {
                  (unsigned long long)addr, (unsigned long long)(addr + size), size);
 }
 
+GuestAddr write_watch_addr() noexcept {
+    return g_watch_addr.load(std::memory_order_relaxed);
+}
+
+GuestAddr write_watch_end() noexcept {
+    return g_watch_addr.load(std::memory_order_relaxed) +
+           g_watch_size.load(std::memory_order_relaxed);
+}
+
 void dump_write_watch_ring(u64 filter_addr) {
     const usize n = g_watch_count.load(std::memory_order_relaxed);
     std::fprintf(stderr, "[watch] ring: %zu writes recorded, capacity %zu, addr filter=0x%llx\n",

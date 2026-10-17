@@ -158,6 +158,11 @@ struct WatchHit {
 };
 
 void set_write_watch(GuestAddr addr, usize size = 8);
+
+// The armed watch range, so dump sites can filter on what the operator actually
+// asked for instead of a hardcoded address left over from an earlier chase.
+GuestAddr write_watch_addr() noexcept;
+GuestAddr write_watch_end() noexcept;
 void dump_write_watch_ring(u64 filter_addr = 0);
 
 // Published per guest thread by the executor; read by the write-watch.

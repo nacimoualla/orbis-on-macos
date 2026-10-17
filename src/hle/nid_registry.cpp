@@ -2,6 +2,7 @@
 #include "ps4/executor.hpp"
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
+#include "ps4/pm4_translator.hpp"
 #include "ps4/syscall_table.hpp"
 #include "ps4/thread.hpp"
 #include "ps4/vfs.hpp"
@@ -323,7 +324,7 @@ static std::string mono_args(const CpuContext& ctx) {
                  static_cast<unsigned long long>(ctx.rsi),
                  static_cast<unsigned long long>(ctx.rdx));
     dump_control_xfers((int)t_guest_tid);
-    dump_write_watch_ring(ctx.rbp - 0x30); // the canary slot itself
+    dump_write_watch_ring(write_watch_addr());
     std::fprintf(stderr, "[Guest abort] terminating emulator\n");
     std::fflush(stderr);
     std::exit(134);
@@ -360,10 +361,16 @@ void NidRegistry::set_vfs(VirtualFileSystem* vfs) {
 }
 
 static MetalBackend* g_metal_backend = nullptr;
+static std::unique_ptr<Pm4Translator> g_pm4_translator;
 static std::atomic<u32> g_pad_buttons{0};
 
 void NidRegistry::set_metal_backend(MetalBackend* metal) {
     g_metal_backend = metal;
+    if (metal) {
+        g_pm4_translator = std::make_unique<Pm4Translator>(metal);
+    } else {
+        g_pm4_translator.reset();
+    }
 }
 
 void NidRegistry::set_syscall_table(SyscallTable* syscalls) {
@@ -440,6 +447,9 @@ void NidRegistry::shutdown() {
     g_jit = nullptr;
     g_external_vfs = nullptr;
     g_metal_backend = nullptr;
+    if (g_pm4_translator) {
+        g_pm4_translator.reset();
+    }
 }
 
 ThreadManager& NidRegistry::thread_manager(MemoryManager& mem) {
@@ -4287,10 +4297,19 @@ void NidRegistry::register_default_libraries() {
             if (exc_ptr > 0x1000 && mem.is_valid_address(exc_ptr, sizeof(u64))) {
                 mem.write_value(exc_ptr, static_cast<u64>(0));
             }
-            std::fprintf(stderr, "[Mono] runtime_invoke method=0x%llx obj=0x%llx params=0x%llx -> NULL (no IL)\n",
-                         static_cast<unsigned long long>(method),
-                         static_cast<unsigned long long>(obj),
-                         static_cast<unsigned long long>(params));
+            // Gate the trace. Returning 0 means the caller gets nothing it can
+            // advance on, so once the guest stops noticing, this re-enters
+            // hundreds of millions of times -- it alone produced 4.6 GB of log
+            // on a 30 B-instruction run and buried the write-watch ring.
+            static std::atomic<u64> s_invoke_count{0};
+            const u64 n = s_invoke_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 20 || (n % 1000000) == 0) {
+                std::fprintf(stderr, "[Mono] runtime_invoke #%llu method=0x%llx obj=0x%llx params=0x%llx -> NULL (no IL)\n",
+                             static_cast<unsigned long long>(n),
+                             static_cast<unsigned long long>(method),
+                             static_cast<unsigned long long>(obj),
+                             static_cast<unsigned long long>(params));
+            }
             ctx.rax = 0;
         });
 
@@ -4702,21 +4721,49 @@ void NidRegistry::register_default_libraries() {
     // present garbage.
     register_symbol(0xC5BC4D6AD6B0A217ULL, "sceGnmSubmitAndFlipCommandBuffers", "libSceGnmDriver",
         [perform_flip](CpuContext& ctx, MemoryManager& mem) {
-            std::fprintf(stderr, "[Gnm] SubmitAndFlip(rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx)\n",
-                         (unsigned long long)ctx.rdi, (unsigned long long)ctx.rsi,
-                         (unsigned long long)ctx.rdx, (unsigned long long)ctx.rcx,
-                         (unsigned long long)ctx.r8, (unsigned long long)ctx.r9);
-            g_gnm_completed_label.fetch_add(1);
-            sync_gnm_label_slot(mem);
+            const u32 count = static_cast<u32>(ctx.rdi);
+            const GuestAddr dcb_addrs_ptr = ctx.rsi;
+            const GuestAddr dcb_sizes_ptr = ctx.rdx;
 
             u32 buffer_index = 0;
-            i64 flip_arg = 0;
             if (mem.is_valid_address(ctx.rsp + 8, sizeof(u32))) {
                 mem.read_value(ctx.rsp + 8, buffer_index);
             }
+            i64 flip_arg = 0;
             if (mem.is_valid_address(ctx.rsp + 24, sizeof(i64))) {
                 mem.read_value(ctx.rsp + 24, flip_arg);
             }
+
+            std::fprintf(stderr, "[Gnm] SubmitAndFlip(count=%u, dcbAddrs=0x%llx, dcbSizes=0x%llx, bufIdx=%u, flipArg=0x%llx)\n",
+                         count, (unsigned long long)dcb_addrs_ptr, (unsigned long long)dcb_sizes_ptr,
+                         buffer_index, (unsigned long long)flip_arg);
+
+            if (g_pm4_translator && dcb_addrs_ptr != 0 && dcb_sizes_ptr != 0) {
+                g_pm4_translator->set_memory_manager(&mem);
+                for (u32 i = 0; i < count; ++i) {
+                    GuestAddr dcb_gpu_addr = 0;
+                    u32 dcb_size_bytes = 0;
+                    if (mem.is_valid_address(dcb_addrs_ptr + i * sizeof(GuestAddr), sizeof(GuestAddr))) {
+                        mem.read_value(dcb_addrs_ptr + i * sizeof(GuestAddr), dcb_gpu_addr);
+                    }
+                    if (mem.is_valid_address(dcb_sizes_ptr + i * sizeof(u32), sizeof(u32))) {
+                        mem.read_value(dcb_sizes_ptr + i * sizeof(u32), dcb_size_bytes);
+                    }
+
+                    if (dcb_gpu_addr > 0x1000 && dcb_size_bytes >= sizeof(u32) && mem.is_valid_address(dcb_gpu_addr, dcb_size_bytes)) {
+                        const usize pkts_in_dcb = g_pm4_translator->execute_command_buffer(dcb_gpu_addr, dcb_size_bytes);
+                        auto cc = g_pm4_translator->clear_color();
+                        std::fprintf(stderr, "[Gnm] Executed DCB #%u at 0x%llx (%u bytes, %zu pkts, total_draws=%zu, reg_writes=%zu, clear=(%.2f,%.2f,%.2f,%.2f))\n",
+                                     i, (unsigned long long)dcb_gpu_addr, dcb_size_bytes, pkts_in_dcb,
+                                     g_pm4_translator->draw_count(), g_pm4_translator->context_reg_writes(),
+                                     cc.r, cc.g, cc.b, cc.a);
+                    }
+                }
+            }
+
+            g_gnm_completed_label.fetch_add(1);
+            sync_gnm_label_slot(mem);
+
             perform_flip(mem, buffer_index, flip_arg);
             ctx.rax = SCE_OK;
         });
