@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace ps4 {
 
@@ -112,6 +113,17 @@ private:
 
     std::unordered_map<Nid, GuestAddr> m_nid_to_trampoline;
     std::unordered_map<u32, Nid> m_id_to_nid;
+
+    /// Addresses already written with a trampoline for an imported NID.
+    ///
+    /// A trampoline is only a valid placeholder for a symbol that is *called*.
+    /// For a data import the guest reads the slot and dereferences it, so leaving
+    /// a stub address there hands it `B8 xx xx xx xx 0F 05 C3` -- machine code --
+    /// where a struct pointer belongs. eboot imports all 19 STT_OBJECT AOT
+    /// descriptor tables from MonoAssembliesPS4.prx through R_X86_64_64 this way.
+    /// Once the defining module loads, every recorded slot is rewritten with the
+    /// real address.
+    std::unordered_map<Nid, std::vector<GuestAddr>> m_nid_to_slots;
 
     std::unordered_map<u32, LoadedModule> m_modules;
     std::unordered_map<Nid, GuestAddr> m_module_exports;

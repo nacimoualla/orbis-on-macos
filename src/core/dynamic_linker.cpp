@@ -405,6 +405,7 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
     GuestAddr symtab_addr = 0;
     GuestAddr strtab_addr = 0;
     [[maybe_unused]] GuestSize strtab_size = 0;
+    usize synthetic_imports = 0;
 
     // Scan for PT_SCE_PROGLIB / PT_SCE_DYNLIBDATA file offset.
     //
@@ -518,6 +519,8 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
     auto process_rela_table = [&](GuestAddr table_addr, GuestSize table_size) {
         if (table_addr == 0 || table_size == 0) return;
         const usize count = static_cast<usize>(table_size / sizeof(Elf64_Rela));
+        // Undefined symbols whose name did not decode to a real NID get a
+        // synthetic one. Counted so a module's import table can be audited.
         for (usize i = 0; i < count; ++i) {
             const GuestAddr entry_addr = table_addr + (i * sizeof(Elf64_Rela));
             Elf64_Rela rela{};
@@ -545,6 +548,7 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                             }
                             Nid nid = decode_nid_from_string(sym_str);
                             if (nid == 0) {
+                                ++synthetic_imports;
                                 nid = 0x8000000000000000ULL | static_cast<u64>(sym_idx);
                             }
 
@@ -557,6 +561,10 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                             } else {
                                 const GuestAddr tramp = get_or_create_trampoline(nid);
                                 m_memory.write_value(patch_location, tramp + rela.r_addend);
+                                // Remember the slot: this symbol may be DATA, in
+                                // which case a trampoline address is wrong and must
+                                // be replaced once a module provides the real one.
+                                m_nid_to_slots[nid].push_back(patch_location);
                             }
                         }
                     }
@@ -575,6 +583,7 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                             nid = decode_nid_from_string(sym_str);
                         }
                         if (nid == 0) {
+                            ++synthetic_imports;
                             nid = 0x8000000000000000ULL | static_cast<u64>(sym_idx);
                         }
                         if (std::string_view(sym_str).find("f7uOxY9mM1U") != std::string_view::npos ||
@@ -585,6 +594,7 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                             m_memory.write_value(patch_location, STACK_CANARY_ADDR);
                         } else {
                             patch_jump_slot(patch_location, nid);
+                            m_nid_to_slots[nid].push_back(patch_location);
                         }
                     }
                 }
@@ -594,6 +604,11 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
 
     process_rela_table(rela_addr, rela_size);
     process_rela_table(jmprel_addr, pltrel_size);
+    if (synthetic_imports != 0) {
+        std::fprintf(stderr,
+                     "[module] relocation: %zu imported symbols had no decodable NID and "
+                     "fell back to a synthetic one\n", synthetic_imports);
+    }
     return true;
 }
 
@@ -727,8 +742,32 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
         if (stype == ELF64_ST_TYPE_FUNC) ++funcs;
         else ++objs;
         // First definition wins, so an earlier module is not shadowed.
-        m_module_exports.emplace(nid, base + sym.st_value);
+        const GuestAddr real = base + sym.st_value;
+        m_module_exports.emplace(nid, real);
         ++defined;
+
+        // Replace any trampoline already written for this NID.
+        //
+        // A stub address is only correct for a symbol the guest CALLS. For a data
+        // import the guest reads the slot and dereferences it, so a trampoline
+        // makes it consume `B8 xx xx xx xx 0F 05 C3` as a struct pointer. eboot
+        // imports 19 STT_OBJECT AOT descriptor tables from
+        // MonoAssembliesPS4.prx through R_X86_64_64, so all 19 are affected.
+        // Rewriting to the module address is correct for both kinds: a called
+        // function now jumps straight into the module instead of trapping.
+        const auto slots = m_nid_to_slots.find(nid);
+        if (slots != m_nid_to_slots.end()) {
+            usize patched = 0;
+            for (const GuestAddr slot : slots->second) {
+                if (m_memory.write_value(slot, real)) ++patched;
+            }
+            std::fprintf(stderr,
+                         "[module] 0x%x export 0x%016llx (%s) at 0x%llx rewrote %zu "
+                         "import slot(s) previously holding a trampoline\n",
+                         handle, (unsigned long long)nid,
+                         stype == ELF64_ST_TYPE_FUNC ? "func" : "data",
+                         (unsigned long long)real, patched);
+        }
     }
 
     auto it = m_modules.find(handle);
