@@ -56,6 +56,7 @@ add_library(ps4_core
     src/audio/coreaudio_backend.mm
     src/hle/nid_registry.cpp
     src/hle/thread.cpp
+    src/gui/game_import.cpp
 )
 target_include_directories(ps4_core PUBLIC include)
 target_link_libraries(ps4_core PUBLIC
@@ -70,6 +71,7 @@ set_source_files_properties(src/gpu/metal_backend.mm PROPERTIES COMPILE_FLAGS "-
 set_source_files_properties(src/gpu/display_window.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/gpu/pm4_translator.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/audio/coreaudio_backend.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+set_source_files_properties(src/gui/game_library_gui.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 # Main executable runner
 add_executable(ps4-runner
@@ -142,3 +144,47 @@ add_test(NAME Phase15_JitExecutorIntegration COMMAND test_phase15)
 
 
 
+
+# Game import / library GUI (AppKit). Separate binary so the runner stays usable
+# headless; it locates ps4-runner next to itself at runtime.
+add_executable(ps4-gui
+    src/gui/game_library_gui.mm
+)
+target_include_directories(ps4-gui PRIVATE include)
+target_link_libraries(ps4-gui PRIVATE ps4_core)
+set_source_files_properties(src/gui/game_library_gui.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+# Scanner test for the game-import GUI: finds the real dump layout on disk.
+add_executable(test_phase16 tests/test_phase16.cpp src/gui/game_import.cpp)
+target_include_directories(test_phase16 PRIVATE include)
+add_test(NAME Phase16_GameImport COMMAND test_phase16)
+# The scanner test inspects the real games/ layout, so it must run from the
+# source root, not the build directory.
+set_tests_properties(Phase16_GameImport PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# ---------------------------------------------------------------------------
+# ps4-gui.app bundle
+#
+# A bare binary has no dock icon, no bundle identity and does not survive the
+# terminal closing. Wrapping it gives a real double-clickable app. ps4-runner
+# is copied in alongside it because the GUI resolves the runner relative to its
+# own executable path, which inside a bundle is Contents/MacOS/.
+# ---------------------------------------------------------------------------
+set(GUI_BUNDLE "${CMAKE_BINARY_DIR}/ps4-gui.app")
+set(GUI_BUNDLE_MACOS "${GUI_BUNDLE}/Contents/MacOS")
+set(GUI_BUNDLE_RESOURCES "${GUI_BUNDLE}/Contents/Resources")
+
+add_custom_target(ps4-gui-app ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_MACOS}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_RESOURCES}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:ps4-gui>" "${GUI_BUNDLE_MACOS}/ps4-gui"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:ps4-runner>" "${GUI_BUNDLE_MACOS}/ps4-runner"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/cmake/Info.plist.in" "${GUI_BUNDLE}/Contents/Info.plist"
+    COMMAND ${CMAKE_COMMAND} -E echo "APPL????" > "${GUI_BUNDLE}/Contents/PkgInfo"
+    DEPENDS ps4-gui ps4-runner
+    COMMENT "Assembling ps4-gui.app"
+    VERBATIM
+)
