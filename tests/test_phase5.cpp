@@ -376,6 +376,35 @@ int main() {
         assert(read_back == test_val);
     }
 
+    // Test 11: VPCMPEQD and VINSERTF128 (all-ones mask generation)
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x403000ULL;
+        std::vector<ps4::u8> code = {
+            // vpcmpeqd xmm0, xmm0, xmm0 (C5 F9 76 C0)
+            0xC5, 0xF9, 0x76, 0xC0,
+            // vinsertf128 ymm1, ymm0, xmm0, 1 (C4 E3 7D 18 C8 01)
+            0xC4, 0xE3, 0x7D, 0x18, 0xC8, 0x01,
+            // hlt
+            0xF4
+        };
+        assert(memory.write_bytes(code_addr, code.data(), code.size()));
+        cpu.set_entry_point(code_addr);
+
+        ps4::RunResult res = cpu.run();
+        assert(res.status == ps4::StepResult::Halted);
+        // All 4 dwords of xmm0 should be 0xFFFFFFFF
+        for (int i = 0; i < 4; ++i) {
+            assert(cpu.context().ymm[0].d[i] == 0xFFFFFFFFU);
+        }
+        assert(cpu.context().ymm[0].q[2] == 0);
+        assert(cpu.context().ymm[0].q[3] == 0);
+        // All 8 dwords of ymm1 should be 0xFFFFFFFF
+        for (int i = 0; i < 8; ++i) {
+            assert(cpu.context().ymm[1].d[i] == 0xFFFFFFFFU);
+        }
+        std::cout << "  ✓ Test 11: VPCMPEQD and VINSERTF128 all-ones mask verified\n";
+    }
 
     std::cout << "[PHASE 5] PASS: All CPU Execution and Instruction Dispatch tests passed!\n";
     return 0;

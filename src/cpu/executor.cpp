@@ -1738,6 +1738,59 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
+        // VPCMPEQB (0x74), VPCMPEQW (0x75), VPCMPEQD (0x76)
+        // VPCMPGTB (0x64), VPCMPGTW (0x65), VPCMPGTD (0x66)
+        if (vex_map == 1 && (vex_op == 0x74 || vex_op == 0x75 || vex_op == 0x76 ||
+                             vex_op == 0x64 || vex_op == 0x65 || vex_op == 0x66)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            if (vex_op == 0x76) { // VPCMPEQD
+                const usize count = vex_l ? 8 : 4;
+                for (usize i = 0; i < count; ++i) {
+                    res.d[i] = (m_context.ymm[src1].d[i] == src2.d[i]) ? 0xFFFFFFFFU : 0U;
+                }
+            } else if (vex_op == 0x75) { // VPCMPEQW
+                const usize count = vex_l ? 16 : 8;
+                for (usize i = 0; i < count; ++i) {
+                    res.w[i] = (m_context.ymm[src1].w[i] == src2.w[i]) ? 0xFFFFU : 0U;
+                }
+            } else if (vex_op == 0x74) { // VPCMPEQB
+                const usize count = vex_l ? 32 : 16;
+                for (usize i = 0; i < count; ++i) {
+                    res.b[i] = (m_context.ymm[src1].b[i] == src2.b[i]) ? 0xFFU : 0U;
+                }
+            } else if (vex_op == 0x66) { // VPCMPGTD
+                const usize count = vex_l ? 8 : 4;
+                for (usize i = 0; i < count; ++i) {
+                    res.d[i] = (static_cast<i32>(m_context.ymm[src1].d[i]) > static_cast<i32>(src2.d[i])) ? 0xFFFFFFFFU : 0U;
+                }
+            } else if (vex_op == 0x65) { // VPCMPGTW
+                const usize count = vex_l ? 16 : 8;
+                for (usize i = 0; i < count; ++i) {
+                    res.w[i] = (static_cast<i16>(m_context.ymm[src1].w[i]) > static_cast<i16>(src2.w[i])) ? 0xFFFFU : 0U;
+                }
+            } else if (vex_op == 0x64) { // VPCMPGTB
+                const usize count = vex_l ? 32 : 16;
+                for (usize i = 0; i < count; ++i) {
+                    res.b[i] = (static_cast<i8>(m_context.ymm[src1].b[i]) > static_cast<i8>(src2.b[i])) ? 0xFFU : 0U;
+                }
+            }
+            m_context.ymm[dest] = res;
+            if (!vex_l) {
+                m_context.ymm[dest].q[2] = 0;
+                m_context.ymm[dest].q[3] = 0;
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
         // Generic fallback for any other VEX instruction: decode ModR/M and advance
         {
             usize extra_imm = 0;
@@ -2393,6 +2446,50 @@ StepResult CpuExecutor::step() {
             const u8 src = m.reg_id & 15;
             if (m.is_reg) std::memcpy(&m_context.ymm[m.rm_id & 15], &m_context.ymm[src], 16);
             else m_memory.write_bytes(m.mem_addr, &m_context.ymm[src], 16);
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // 0x0F 0x74 (PCMPEQB), 0x0F 0x75 (PCMPEQW), 0x0F 0x76 (PCMPEQD)
+        // 0x0F 0x64 (PCMPGTB), 0x0F 0x65 (PCMPGTW), 0x0F 0x66 (PCMPGTD)
+        if (op1 == 0x74 || op1 == 0x75 || op1 == 0x76 ||
+            op1 == 0x64 || op1 == 0x65 || op1 == 0x66) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, 16);
+
+            CpuContext::YmmReg res{};
+            if (op1 == 0x76) { // PCMPEQD
+                for (usize i = 0; i < 4; ++i) {
+                    res.d[i] = (m_context.ymm[dest].d[i] == src2.d[i]) ? 0xFFFFFFFFU : 0U;
+                }
+            } else if (op1 == 0x75) { // PCMPEQW
+                for (usize i = 0; i < 8; ++i) {
+                    res.w[i] = (m_context.ymm[dest].w[i] == src2.w[i]) ? 0xFFFFU : 0U;
+                }
+            } else if (op1 == 0x74) { // PCMPEQB
+                for (usize i = 0; i < 16; ++i) {
+                    res.b[i] = (m_context.ymm[dest].b[i] == src2.b[i]) ? 0xFFU : 0U;
+                }
+            } else if (op1 == 0x66) { // PCMPGTD
+                for (usize i = 0; i < 4; ++i) {
+                    res.d[i] = (static_cast<i32>(m_context.ymm[dest].d[i]) > static_cast<i32>(src2.d[i])) ? 0xFFFFFFFFU : 0U;
+                }
+            } else if (op1 == 0x65) { // PCMPGTW
+                for (usize i = 0; i < 8; ++i) {
+                    res.w[i] = (static_cast<i16>(m_context.ymm[dest].w[i]) > static_cast<i16>(src2.w[i])) ? 0xFFFFU : 0U;
+                }
+            } else if (op1 == 0x64) { // PCMPGTB
+                for (usize i = 0; i < 16; ++i) {
+                    res.b[i] = (static_cast<i8>(m_context.ymm[dest].b[i]) > static_cast<i8>(src2.b[i])) ? 0xFFU : 0U;
+                }
+            }
+            m_context.ymm[dest] = res;
+            m_context.ymm[dest].q[2] = 0;
+            m_context.ymm[dest].q[3] = 0;
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
         }
