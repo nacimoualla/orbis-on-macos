@@ -157,7 +157,7 @@ struct WatchHit {
 };
 
 void set_write_watch(GuestAddr addr, usize size = 8);
-void dump_write_watch_ring();
+void dump_write_watch_ring(u64 filter_rbp = 0);
 
 // Published per guest thread by the executor; read by the write-watch.
 extern thread_local GuestAddr t_guest_rip;

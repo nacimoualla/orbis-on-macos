@@ -187,7 +187,12 @@ int main(int argc, char* argv[]) {
     // PS4_WATCH_ADDR=0x1ffffac40 ./ps4-runner ... reports the first store to that
     // guest address together with the RIP and TID that made it.
     if (const char* w = std::getenv("PS4_WATCH_ADDR")) {
-        ps4::set_write_watch(std::strtoull(w, nullptr, 0));
+        // The canary slot is NOT deterministic across runs -- it lands wherever
+        // main's frame happens to be -- so allow a range and filter afterwards.
+        const std::size_t wsz = std::getenv("PS4_WATCH_SIZE")
+                              ? std::strtoull(std::getenv("PS4_WATCH_SIZE"), nullptr, 0)
+                              : 8;
+        ps4::set_write_watch(std::strtoull(w, nullptr, 0), static_cast<ps4::usize>(wsz));
     }
     if (enable_jit) {
         cpu.set_jit_compiler(&jit);

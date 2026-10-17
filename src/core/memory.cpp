@@ -142,7 +142,9 @@ thread_local bool t_guest_in_hle = false;
 static std::atomic<GuestAddr> g_watch_addr{0};
 static std::atomic<usize> g_watch_size{0};
 static std::atomic<bool> g_watch_armed{false};
-static constexpr usize kWatchRing = 64;
+// Large: the watched slot is shared stack, so many unrelated frames write it
+// and a small ring rolls past the activation we actually care about.
+static constexpr usize kWatchRing = 4096;
 static std::atomic<usize> g_watch_count{0};
 static WatchHit g_watch_ring[kWatchRing];
 
@@ -154,13 +156,21 @@ void set_write_watch(GuestAddr addr, usize size) {
                  (unsigned long long)addr, (unsigned long long)(addr + size), size);
 }
 
-void dump_write_watch_ring() {
+void dump_write_watch_ring(u64 filter_addr) {
     const usize n = g_watch_count.load(std::memory_order_relaxed);
-    std::fprintf(stderr, "[watch] ring: %zu writes recorded (last %zu shown)\n",
-                 n, kWatchRing);
+    std::fprintf(stderr, "[watch] ring: %zu writes recorded, capacity %zu, addr filter=0x%llx\n",
+                 n, kWatchRing, (unsigned long long)filter_addr);
     const usize start = (n > kWatchRing) ? (n - kWatchRing) : 0;
+    usize shown = 0;
     for (usize i = start; i < n; ++i) {
         const WatchHit& h = g_watch_ring[i % kWatchRing];
+        // Filter by ADDRESS, not rbp. The clobbering store comes from a callee
+        // prologue whose rbp differs from the failing frame's, so an rbp filter
+        // excludes precisely the culprit.
+        if (filter_addr != 0) {
+            if (!(h.guest_addr <= filter_addr && filter_addr < h.guest_addr + h.size)) continue;
+        }
+        ++shown;
         std::fprintf(stderr,
                      "[watch] #%-3zu rip=0x%016llx rsp=0x%llx rbp=0x%llx rbx=0x%llx TID=%d %-3s "
                      "-> 0x%llx (%zu B)  old=0x%016llx new=0x%016llx%s\n",
@@ -170,6 +180,7 @@ void dump_write_watch_ring() {
                      (unsigned long long)h.old_value, (unsigned long long)h.new_value,
                      (h.old_value != h.new_value) ? "  <-- CHANGED" : "");
     }
+    std::fprintf(stderr, "[watch] ring: %zu writes matched filter\n", shown);
 }
 
 bool MemoryManager::write_bytes(GuestAddr addr, const void* src, usize size) {
@@ -193,12 +204,12 @@ bool MemoryManager::write_bytes(GuestAddr addr, const void* src, usize size) {
             h.from_hle = t_guest_in_hle;
             h.guest_addr = addr;
             h.size = size;
-            std::memcpy(&h.old_value, m_base + wa, sizeof(h.old_value));
+            std::memcpy(&h.old_value, m_base + addr, sizeof(h.old_value));
             h.new_value = h.old_value;
             // Copy out the first 8 bytes actually being stored, so a 4-byte
             // store over a zeroed slot is distinguishable from an 8-byte one.
             const usize take = size < sizeof(h.new_value) ? size : sizeof(h.new_value);
-            if (addr <= wa) std::memcpy(&h.new_value, static_cast<const u8*>(src) + (wa - addr), take);
+            std::memcpy(&h.new_value, src, take);
             const usize slot = g_watch_count.fetch_add(1, std::memory_order_relaxed);
             g_watch_ring[slot % kWatchRing] = h;
         }
