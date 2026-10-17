@@ -138,8 +138,33 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
                 sym->name != "strcmp" && sym->name != "strncmp" && sym->name != "strncpy" &&
                 sym->name != "malloc" && sym->name != "free" && sym->name != "memalign" &&
                 sym->name != "mono_add_internal_call" &&
+                sym->name != "sceKernelClockGettime" &&
+                sym->name != "sceKernelGetProcessTimeCounter" &&
+                sym->name != "scePthreadMutexLock" &&
+                sym->name != "scePthreadMutexUnlock" &&
+                sym->name != "scePthreadMutexTrylock" &&
+                sym->name != "scePthreadSelf" &&
+                sym->name != "sceAudio3dObjectSetAttributes" &&
+                sym->name != "sceAudio3dPortFlush" &&
+                sym->name != "sceKernelUsleep" &&
+                sym->name != "sceKernelWaitSema" &&
+                sym->name != "sceKernelSignalSema" &&
                 sym->name != "sceKernelSyncStub")) {
                 const u64 n = s_logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                // Log the head densely, then sample. Unbounded, this trace produced
+                // 16 GB of log on a 30 B-instruction run: mono_runtime_invoke alone
+                // fires ~400 M times when nothing consumes its return value, which
+                // buried the watch ring we armed. Set PS4_LOG_HLE=all to restore
+                // the full trace when that is genuinely what you want.
+                static const bool s_log_all = [] {
+                    const char* v = std::getenv("PS4_LOG_HLE");
+                    return v && std::string_view(v) == "all";
+                }();
+                const bool is_gnm = (sym->name.rfind("sceGnm", 0) == 0);
+                if (!s_log_all && !is_gnm && n > 2000 && (n % 100000) != 0) {
+                    s_suppressed.fetch_add(1, std::memory_order_relaxed);
+                    // fall through to the handler without printing
+                } else {
                 std::fprintf(stderr, "[HLE CALL] T%-3u %s (NID=0x%llx, caller RIP=0x%llx, rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx) [logged=%llu suppressed=%llu]\n",
                              (unsigned)hle_tid,
                              sym->name.c_str(), (unsigned long long)nid, (unsigned long long)ret_addr,
@@ -148,6 +173,7 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
                              (unsigned long long)sctx.args[4], (unsigned long long)sctx.args[5],
                              (unsigned long long)n,
                              (unsigned long long)s_suppressed.load(std::memory_order_relaxed));
+                }
             } else {
                 s_suppressed.fetch_add(1, std::memory_order_relaxed);
             }
