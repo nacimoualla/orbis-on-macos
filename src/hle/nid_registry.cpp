@@ -145,6 +145,32 @@ struct FiosFile {
 static std::unordered_map<i32, FiosFile> s_fios_files;
 static i32 s_next_fios_fd = 200;
 
+class AudioDeadlinePacer {
+public:
+    void pace(u32 grain_samples, u32 sample_rate = 48000) {
+        if (grain_samples == 0 || sample_rate == 0) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto step = std::chrono::nanoseconds(static_cast<u64>(grain_samples) * 1'000'000'000ULL / sample_rate);
+        if (m_next.time_since_epoch().count() == 0 || (now - m_next) > std::chrono::milliseconds(100)) {
+            m_next = now;
+        }
+        m_next += step;
+        if (m_next > now) {
+            std::this_thread::sleep_until(m_next);
+        }
+    }
+private:
+    std::chrono::steady_clock::time_point m_next{};
+};
+
+struct FlipState {
+    std::atomic<u64> flip_count{0};
+    std::atomic<i64> last_flip_arg{0};
+    std::atomic<u32> current_buffer{0};
+    std::atomic<u64> last_flip_time_us{0};
+};
+static FlipState s_flip_state;
+
 // Real Orbis semaphore table for Unity worker threads (file scope so the
 // watchdog dump and synthetic wake can inspect it).
 struct GuestSema {
@@ -231,8 +257,10 @@ static GuestAddr mono_arena_alloc(MemoryManager& mem) {
         g_guest_heap_current.store(cur + kMonoArenaSize);
     }
     if (s_mono_arena.next + kMonoSlotSize > s_mono_arena.end) {
-        std::fprintf(stderr, "[Mono] arena exhausted (4096 slots)\n");
-        return 0;
+        std::fprintf(stderr, "\n[FATAL] Mono arena exhausted! Hit ceiling of 4096 slots (1 MB). "
+                             "Expand kMonoArenaSize in src/hle/nid_registry.cpp.\n");
+        std::fflush(stderr);
+        std::abort();
     }
     const GuestAddr slot = s_mono_arena.next;
     s_mono_arena.next += kMonoSlotSize;
@@ -423,27 +451,26 @@ ThreadManager* NidRegistry::thread_manager() const noexcept {
 }
 
 void NidRegistry::note_hle_dispatch(Nid nid, GuestAddr caller_rip) const {
-    if (g_thread_manager) {
-        const ScePthreadId tid = g_thread_manager->current_thread_id();
-        if (GuestThread* th = g_thread_manager->get_thread(tid)) {
-            th->last_nid.store(nid, std::memory_order_relaxed);
-            th->hle_caller_rip.store(caller_rip, std::memory_order_relaxed);
-            th->hle_calls.fetch_add(1, std::memory_order_relaxed);
-            th->in_hle.store(true, std::memory_order_relaxed);
-        }
+    if (GuestThread* th = ThreadManager::current_guest_thread()) {
+        th->last_nid.store(nid, std::memory_order_relaxed);
+        th->hle_caller_rip.store(caller_rip, std::memory_order_relaxed);
+        th->hle_calls.fetch_add(1, std::memory_order_relaxed);
+        th->in_hle.store(true, std::memory_order_relaxed);
     }
 }
 
 void NidRegistry::note_hle_return() const {
-    if (g_thread_manager) {
-        if (GuestThread* th = g_thread_manager->get_thread(g_thread_manager->current_thread_id())) {
-            th->in_hle.store(false, std::memory_order_relaxed);
-        }
+    if (GuestThread* th = ThreadManager::current_guest_thread()) {
+        th->in_hle.store(false, std::memory_order_relaxed);
     }
 }
 
 void NidRegistry::set_pad_buttons(u32 buttons) {
     g_pad_buttons.store(buttons, std::memory_order_relaxed);
+}
+
+u64 NidRegistry::get_flip_count() const noexcept {
+    return s_flip_state.flip_count.load(std::memory_order_relaxed);
 }
 
 void NidRegistry::register_symbol(Nid nid, std::string_view name, std::string_view module_name, HleFunction handler) {
@@ -2830,8 +2857,13 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0xE1D5176E5161A4FEULL, "sceAudioOutOpen", "libaudioout",
         [](CpuContext& ctx, MemoryManager&) {
             const i32 type = static_cast<i32>(ctx.rsi);
+            const u32 grain = (ctx.rcx > 0) ? static_cast<u32>(ctx.rcx) : 256;
+            const u32 freq = (ctx.r8 > 0) ? static_cast<u32>(ctx.r8) : 48000;
+            AudioPortConfig cfg{};
+            cfg.grain = grain;
+            cfg.sample_rate = freq;
             auto& am = get_audio_manager();
-            const i32 handle = am.open_port(type);
+            const i32 handle = am.open_port(type, cfg);
             ctx.rax = static_cast<u64>(handle);
         });
 
@@ -2850,15 +2882,18 @@ void NidRegistry::register_default_libraries() {
             const GuestAddr ptr = ctx.rsi;
             auto& am = get_audio_manager();
 
-            constexpr usize SAMPLE_COUNT = 512 * 2; // 512 stereo frames
-            constexpr usize BYTE_SIZE = SAMPLE_COUNT * sizeof(i16);
+            const u32 grain = am.get_port_grain(handle);
+            const u32 sample_rate = am.get_port_sample_rate(handle);
+            const usize sample_count = static_cast<usize>(grain) * 2; // stereo frames
+            const usize byte_size = sample_count * sizeof(i16);
 
-            if (ptr != 0 && mem.is_valid_address(ptr, BYTE_SIZE)) {
+            if (ptr != 0 && mem.is_valid_address(ptr, byte_size)) {
                 const auto* pcm = mem.to_host_ptr<i16>(ptr);
                 if (pcm) {
-                    std::span<const i16> samples(pcm, SAMPLE_COUNT);
+                    std::span<const i16> samples(pcm, sample_count);
                     am.output_samples(handle, samples);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    thread_local AudioDeadlinePacer s_audio_out_pacer;
+                    s_audio_out_pacer.pace(grain, sample_rate);
                     ctx.rax = SCE_OK;
                     return;
                 }
@@ -2991,25 +3026,35 @@ void NidRegistry::register_default_libraries() {
                                  b[48],b[49],b[50],b[51],b[52],b[53],b[54],b[55], b[56],b[57],b[58],b[59],b[60],b[61],b[62],b[63]);
                 }
             }
+            const GuestAddr res_ptr = ctx.rsi;
+            if (res_ptr > 0x1000 && mem.is_valid_address(res_ptr, 24)) {
+                mem.zero_memory(res_ptr, 24);
+            }
             ctx.rax = SCE_OK;
         });
 
     // sceSaveDataGetSaveDataMemory2(const void* param, ...)
-    // NID: 0x43038EEEF7A09D5FULL -- imported by eboot.bin. Called from
-    // 0x10ad06a, immediate sibling of the setup call above (same worker, same
-    // init sequence), rdi = 0x1cff9fee0.
-    //
-    //   10ad06a: callq <import>
-    //   10ad06f: movl  %eax, %ecx
-    //   10ad071: testl %ecx, %ecx
-    //   10ad073: je    0x10ad07e            ; success -> continue
-    //   10ad075: xorl  %eax, %eax
-    //   10ad079: callq 0x10ad840            ; error reporter
-    // The success path (0x10ad07e+) fills its *own* stack buffer and hands it
-    // to 0x10ad8f0; nothing in it dereferences a callee-written output. So this
-    // is an int status call too, and 0 is the honest answer.
+    // NID: 0x43038EEEF7A09D5FULL -- imported by eboot.bin.
     register_symbol(0x43038EEEF7A09D5FULL, "sceSaveDataGetSaveDataMemory2", "libSceSaveData",
-        [](CpuContext& ctx, MemoryManager&) {
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr param_ptr = ctx.rdi;
+            if (param_ptr > 0x1000 && mem.is_valid_address(param_ptr, 40)) {
+                GuestAddr data_ptr = 0;
+                mem.read_value(param_ptr + 8, data_ptr);
+                if (data_ptr > 0x1000 && mem.is_valid_address(data_ptr, 24)) {
+                    GuestAddr buf_addr = 0;
+                    u64 buf_size = 0;
+                    mem.read_value(data_ptr + 0, buf_addr);
+                    mem.read_value(data_ptr + 8, buf_size);
+                    if (buf_addr > 0x1000 && buf_size > 0 && buf_size <= 0x1000000 && mem.is_valid_address(buf_addr, buf_size)) {
+                        mem.zero_memory(buf_addr, buf_size);
+                    }
+                }
+            }
+            const GuestAddr res_ptr = ctx.rsi;
+            if (res_ptr > 0x1000 && mem.is_valid_address(res_ptr, 24)) {
+                mem.zero_memory(res_ptr, 24);
+            }
             ctx.rax = SCE_OK;
         });
 
@@ -3536,10 +3581,83 @@ void NidRegistry::register_default_libraries() {
         });
 
     // =========================================================================
+    // =========================================================================
     // libSceVideoOut: Display and Frame Presentation
     // =========================================================================
     static std::vector<GuestAddr> s_registered_buffers;
 
+    struct FlipSubscription {
+        u32 eq_id{0};
+        u64 udata{0};
+    };
+    static std::mutex s_flip_subs_mtx;
+    static std::vector<FlipSubscription> s_flip_subscriptions;
+
+    struct GnmEqSubscription {
+        u32 eq_id{0};
+        i32 event_id{0};
+        u64 udata{0};
+    };
+    static std::mutex s_gnm_eq_mtx;
+    static std::vector<GnmEqSubscription> s_gnm_eq_subscriptions;
+
+    auto trigger_gnm_eop_events = []() {
+        if (!g_thread_manager) return;
+        std::lock_guard<std::mutex> lock(s_gnm_eq_mtx);
+        for (const auto& sub : s_gnm_eq_subscriptions) {
+            SceKernelEvent ev{};
+            ev.ident = static_cast<u64>(sub.event_id);
+            ev.filter = 0;
+            ev.flags = 0;
+            ev.fflags = 0;
+            ev.data = 0;
+            ev.udata = sub.udata;
+            g_thread_manager->equeue_signal(sub.eq_id, ev);
+        }
+    };
+
+    auto perform_flip = [&trigger_gnm_eop_events](MemoryManager& mem, u32 buffer_index, i64 flip_arg) {
+        const u64 count = s_flip_state.flip_count.fetch_add(1) + 1;
+        const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        s_flip_state.last_flip_time_us.store(now_us);
+        s_flip_state.last_flip_arg.store(flip_arg);
+        s_flip_state.current_buffer.store(buffer_index);
+
+        std::fprintf(stderr, "[VideoOut] perform_flip #%llu: buffer=%u, flipArg=0x%llx\n",
+                     (unsigned long long)count, buffer_index, (unsigned long long)flip_arg);
+
+        if (g_metal_backend && buffer_index < s_registered_buffers.size()) {
+            const GuestAddr buf_addr = s_registered_buffers[buffer_index];
+            const usize pitch = g_metal_backend->width() * 4;
+            const usize frame_size = pitch * g_metal_backend->height();
+            if (buf_addr != 0 && mem.is_valid_address(buf_addr, frame_size)) {
+                void* pixels = mem.to_host_ptr<void>(buf_addr);
+                if (pixels) {
+                    g_metal_backend->upload_pixels(pixels, pitch);
+                }
+            }
+        }
+
+        if (g_thread_manager) {
+            std::lock_guard<std::mutex> lock(s_flip_subs_mtx);
+            if (!s_flip_subscriptions.empty()) {
+                for (const auto& sub : s_flip_subscriptions) {
+                    SceKernelEvent ev{};
+                    ev.ident = 1;
+                    ev.filter = -1;
+                    ev.flags = 0;
+                    ev.fflags = 0;
+                    ev.data = flip_arg;
+                    ev.udata = sub.udata;
+                    g_thread_manager->equeue_signal(sub.eq_id, ev);
+                }
+            } else {
+                g_thread_manager->signal_flip_event(flip_arg);
+            }
+        }
+        trigger_gnm_eop_events();
+    };
 
     // sceVideoOutRegisterBuffers(int handle, int startIndex, void* const* addresses, int bufferCount, ...)
     auto reg_buffers_handler = [](CpuContext& ctx, MemoryManager& mem) {
@@ -3608,10 +3726,39 @@ void NidRegistry::register_default_libraries() {
     // NID: 0xEA43E78F9D53EB66ULL ("6kPnj51T62Y")
     register_symbol(0xEA43E78F9D53EB66ULL, "sceVideoOutGetResolutionStatus", "libSceVideoOut", res_status_handler);
 
-    // sceVideoOutAddFlipEvent
+    // sceVideoOutGetFlipStatus(int handle, SceVideoOutFlipStatus *status)
+    // NID: 0x49B537770A7CD254ULL
+    register_symbol(0x49B537770A7CD254ULL, "sceVideoOutGetFlipStatus", "libSceVideoOut",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr status_ptr = ctx.rsi;
+            if (status_ptr != 0 && mem.is_valid_address(status_ptr, 32)) {
+                mem.write_value(status_ptr + 0, s_flip_state.flip_count.load());
+                mem.write_value(status_ptr + 8, s_flip_state.last_flip_time_us.load());
+                mem.write_value(status_ptr + 16, s_flip_state.last_flip_arg.load());
+                mem.write_value(status_ptr + 24, static_cast<u32>(0)); // flipMode
+                mem.write_value(status_ptr + 28, s_flip_state.current_buffer.load());
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // sceVideoOutWaitVblank(int handle)
+    // NID: 0x8FA45A01495A2EFDULL
+    register_symbol(0x8FA45A01495A2EFDULL, "sceVideoOutWaitVblank", "libSceVideoOut",
+        [](CpuContext& ctx, MemoryManager&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            ctx.rax = SCE_OK;
+        });
+
+    // sceVideoOutAddFlipEvent(SceKernelEqueue eq, int videoHandle, void *udata)
     // NID: 0x1D7CE32BDC88DF49ULL ("HXzjK9yI30k")
     register_symbol(0x1D7CE32BDC88DF49ULL, "sceVideoOutAddFlipEvent", "libSceVideoOut",
         [](CpuContext& ctx, MemoryManager&) {
+            const u32 eq_id = static_cast<u32>(ctx.rdi);
+            const u64 udata = ctx.rdx;
+            std::lock_guard<std::mutex> lock(s_flip_subs_mtx);
+            s_flip_subscriptions.push_back({eq_id, udata});
+            std::fprintf(stderr, "[VideoOut] AddFlipEvent: eq=%u, udata=0x%llx\n",
+                         eq_id, (unsigned long long)udata);
             ctx.rax = SCE_OK;
         });
 
@@ -3640,20 +3787,10 @@ void NidRegistry::register_default_libraries() {
     // sceVideoOutSubmitFlip(int handle, int bufferIndex, unsigned int flipMode, int64_t flipArg)
     // NID: 0x538E8DC0E889A72BULL ("U46NwOiJpys")
     register_symbol(0x538E8DC0E889A72BULL, "sceVideoOutSubmitFlip", "libSceVideoOut",
-        [](CpuContext& ctx, MemoryManager& mem) {
+        [perform_flip](CpuContext& ctx, MemoryManager& mem) {
             const u32 buf_idx = static_cast<u32>(ctx.rsi);
-            if (g_metal_backend && buf_idx < s_registered_buffers.size()) {
-                const GuestAddr buf_addr = s_registered_buffers[buf_idx];
-                const usize pitch = g_metal_backend->width() * 4;
-                const usize frame_size = pitch * g_metal_backend->height();
-                if (buf_addr != 0 && mem.is_valid_address(buf_addr, frame_size)) {
-                    void* pixels = mem.to_host_ptr<void>(buf_addr);
-                    if (pixels) {
-                        g_metal_backend->upload_pixels(pixels, pitch);
-                    }
-                }
-            }
-            get_thread_manager(mem).signal_flip_event(static_cast<i64>(ctx.rcx));
+            const i64 flip_arg = static_cast<i64>(ctx.rcx);
+            perform_flip(mem, buf_idx, flip_arg);
             ctx.rax = SCE_OK;
         });
 
@@ -3851,7 +3988,8 @@ void NidRegistry::register_default_libraries() {
         });
     register_symbol(0x64E1ABC562E04331ULL, "sceAudio3dPortFlush", "libSceAudio3d",
         [](CpuContext& ctx, MemoryManager&) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            thread_local AudioDeadlinePacer s_audio3d_pacer;
+            s_audio3d_pacer.pace(256, 48000);
             ctx.rax = SCE_OK;
         });
 
@@ -4550,16 +4688,23 @@ void NidRegistry::register_default_libraries() {
     // until the index register is confirmed — uploading the wrong buffer would
     // present garbage.
     register_symbol(0xC5BC4D6AD6B0A217ULL, "sceGnmSubmitAndFlipCommandBuffers", "libSceGnmDriver",
-        [](CpuContext& ctx, MemoryManager& mem) {
+        [perform_flip](CpuContext& ctx, MemoryManager& mem) {
             std::fprintf(stderr, "[Gnm] SubmitAndFlip(rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx)\n",
                          (unsigned long long)ctx.rdi, (unsigned long long)ctx.rsi,
                          (unsigned long long)ctx.rdx, (unsigned long long)ctx.rcx,
                          (unsigned long long)ctx.r8, (unsigned long long)ctx.r9);
             g_gnm_completed_label.fetch_add(1);
             sync_gnm_label_slot(mem);
-            if (g_thread_manager) {
-                g_thread_manager->signal_flip_event(static_cast<i64>(ctx.rcx));
+
+            u32 buffer_index = 0;
+            i64 flip_arg = 0;
+            if (mem.is_valid_address(ctx.rsp + 8, sizeof(u32))) {
+                mem.read_value(ctx.rsp + 8, buffer_index);
             }
+            if (mem.is_valid_address(ctx.rsp + 24, sizeof(i64))) {
+                mem.read_value(ctx.rsp + 24, flip_arg);
+            }
+            perform_flip(mem, buffer_index, flip_arg);
             ctx.rax = SCE_OK;
         });
 
@@ -4568,9 +4713,10 @@ void NidRegistry::register_default_libraries() {
     // a full frame early. Real presentation lives in 0xC5BC... below.)
     // NID: 0x15ADF1EF938E2D10ULL
     register_symbol(0x15ADF1EF938E2D10ULL, "sceGnmEndWorkload", "libSceGnmDriver",
-        [](CpuContext& ctx, MemoryManager& mem) {
+        [trigger_gnm_eop_events](CpuContext& ctx, MemoryManager& mem) {
             g_gnm_completed_label.fetch_add(1);
             sync_gnm_label_slot(mem);
+            trigger_gnm_eop_events();
             ctx.rax = SCE_OK;
         });
 
@@ -4594,15 +4740,17 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // sceGnmAddEqEvent — record the registration; full EOP routing once the arg
-    // layout is known from the first-call log below.
-    // NID: 0x6F4C729659D563F2ULL (was mislabeled sceGnmInitialize in the stub loop)
+    // sceGnmAddEqEvent — register equeue event for EOP / fence completion.
+    // NID: 0x6F4C729659D563F2ULL
     register_symbol(0x6F4C729659D563F2ULL, "sceGnmAddEqEvent", "libSceGnmDriver",
         [](CpuContext& ctx, MemoryManager&) {
-            std::fprintf(stderr, "[Gnm] AddEqEvent(rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx)\n",
-                         (unsigned long long)ctx.rdi, (unsigned long long)ctx.rsi,
-                         (unsigned long long)ctx.rdx, (unsigned long long)ctx.rcx,
-                         (unsigned long long)ctx.r8, (unsigned long long)ctx.r9);
+            const u32 eq_id = static_cast<u32>(ctx.rdi);
+            const i32 event_id = static_cast<i32>(ctx.rsi);
+            const u64 udata = ctx.rdx;
+            std::lock_guard<std::mutex> lock(s_gnm_eq_mtx);
+            s_gnm_eq_subscriptions.push_back({eq_id, event_id, udata});
+            std::fprintf(stderr, "[Gnm] AddEqEvent: eq=%u, id=%d, udata=0x%llx\n",
+                         eq_id, event_id, (unsigned long long)udata);
             ctx.rax = SCE_OK;
         });
 }

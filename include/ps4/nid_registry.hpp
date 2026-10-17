@@ -69,6 +69,9 @@ public:
     /// Set pad digital buttons bitmask (e.g. from keyboard/mouse input)
     void set_pad_buttons(u32 buttons);
 
+    /// Get total number of video flips performed
+    [[nodiscard]] u64 get_flip_count() const noexcept;
+
 private:
     std::unordered_map<Nid, HleSymbol> m_symbols_by_nid;
     std::unordered_map<std::string, Nid> m_nids_by_name;

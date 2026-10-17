@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <thread>
 #include "ps4/common.hpp"
@@ -237,9 +238,12 @@ int main(int argc, char* argv[]) {
     if (!syscalls.has_exited() &&
         (run_res.status == ps4::StepResult::Ok || run_res.status == ps4::StepResult::Syscall)) {
         if (window && window->is_open()) {
-            // Interactive 60 FPS Presentation Loop:
+            // Interactive Presentation Loop:
             // Run guest execution batches each frame, pump user input events, and present via Metal
             const ps4::usize frame_slice = 2000000;
+            auto t_start = std::chrono::steady_clock::now();
+            auto t_last = t_start;
+            ps4::usize instrs_last = 0;
             while (window->is_open() && !syscalls.has_exited()) {
                 window->poll_events();
                 nid_registry.set_pad_buttons(window->input_buttons());
@@ -248,22 +252,46 @@ int main(int argc, char* argv[]) {
                 total_instructions += run_res.instructions_executed;
                 if (run_res.status != ps4::StepResult::Ok) break;
 
-                window->present_frame();
-                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                const auto now = std::chrono::steady_clock::now();
+                const double dt = std::chrono::duration<double>(now - t_last).count();
+                const double dt_total = std::chrono::duration<double>(now - t_start).count();
+                const double cur_mips = (dt > 0.0) ? ((total_instructions - instrs_last) / dt / 1e6) : 0.0;
+                const double avg_mips = (dt_total > 0.0) ? (total_instructions / dt_total / 1e6) : 0.0;
+                instrs_last = total_instructions;
+                t_last = now;
+
+                std::cout << "[CPU Progress] " << total_instructions << " instrs ("
+                          << std::fixed << std::setprecision(1) << cur_mips << " M instr/s, avg "
+                          << avg_mips << " M instr/s), RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n" << std::flush;
+
+                if (nid_registry.get_flip_count() > 0) {
+                    window->present_frame();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                }
             }
         } else {
             // Console / Headless Execution Loop
             const ps4::usize batch = 1000000;
             const ps4::usize max_total = instruction_budget;
+            auto t_start = std::chrono::steady_clock::now();
+            auto t_last = t_start;
+            ps4::usize instrs_last = 0;
             while (total_instructions < max_total && !syscalls.has_exited()) {
                 run_res = cpu.run(batch);
                 total_instructions += run_res.instructions_executed;
                 if (run_res.status != ps4::StepResult::Ok) break;
-                // Flush per tick: stdout is block-buffered when redirected to a file, so on
-                // SIGTERM the buffered ticks are lost and a 60 s run can report
-                // only the first couple of ticks -- which reads exactly like a
-                // throughput regression when it is pure measurement loss.
-                std::cout << "[CPU Progress] " << total_instructions << " instrs, RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n" << std::flush;
+
+                const auto now = std::chrono::steady_clock::now();
+                const double dt = std::chrono::duration<double>(now - t_last).count();
+                const double dt_total = std::chrono::duration<double>(now - t_start).count();
+                const double cur_mips = (dt > 0.0) ? ((total_instructions - instrs_last) / dt / 1e6) : 0.0;
+                const double avg_mips = (dt_total > 0.0) ? (total_instructions / dt_total / 1e6) : 0.0;
+                instrs_last = total_instructions;
+                t_last = now;
+
+                std::cout << "[CPU Progress] " << total_instructions << " instrs ("
+                          << std::fixed << std::setprecision(1) << cur_mips << " M instr/s, avg "
+                          << avg_mips << " M instr/s), RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n" << std::flush;
             }
         }
     }

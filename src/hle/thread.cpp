@@ -38,14 +38,15 @@ void note_hle_activity() {
     s_last_hle_us.store(host_now_us(), std::memory_order_relaxed);
 }
 
+thread_local GuestThread* t_current_guest_thread{nullptr};
+
 ScePthreadId current_hle_thread_id() {
     return t_current_thread_id;
 }
 
-// Per-thread last-HLE time for the watchdog trigger. Keyed by guest TID so one
-// chattering thread (e.g. a keepalive) can't veto snapshots of stuck threads.
-std::mutex s_hle_tid_mtx;
-std::unordered_map<ScePthreadId, u64> s_hle_last_us;
+// Per-thread last-HLE time for the watchdog trigger (lock-free atomic array).
+static constexpr usize MAX_HLE_TRACKED_THREADS = 256;
+static std::atomic<u64> s_hle_last_us[MAX_HLE_TRACKED_THREADS]{};
 
 // Post-stall verbose logging (see post_stall_verbose): once the first stall
 // episode dumps, HLE dispatch logs everything except keepalive TID 5.
@@ -65,8 +66,9 @@ std::atomic<bool> s_first_episode_done{false};
 void note_hle_activity_for(ScePthreadId tid) {
     const u64 now = host_now_us();
     s_last_hle_us.store(now, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(s_hle_tid_mtx);
-    s_hle_last_us[tid] = now;
+    if (tid < MAX_HLE_TRACKED_THREADS) {
+        s_hle_last_us[tid].store(now, std::memory_order_relaxed);
+    }
 }
 
 ThreadManager::ThreadManager(MemoryManager& memory, SyscallTable* syscalls)
@@ -78,6 +80,7 @@ ThreadManager::ThreadManager(MemoryManager& memory, SyscallTable* syscalls)
     main_thread->id = 1;
     main_thread->name = "main";
     main_thread->state.store(ThreadState::Running);
+    t_current_guest_thread = main_thread.get();
     m_threads[1] = std::move(main_thread);
 
     note_hle_activity(); // grace period: no stall can predate the manager itself
@@ -211,6 +214,7 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
     GuestThread* raw_thread = thread_ptr.get();
     raw_thread->host_thread = std::thread([this, raw_thread, host_task]() {
         t_current_thread_id = raw_thread->id;
+        t_current_guest_thread = raw_thread;
         m_threads_started.fetch_add(1);
         raw_thread->state.store(ThreadState::Running);
 
@@ -302,7 +306,12 @@ ScePthreadId ThreadManager::current_thread_id() const {
 }
 
 GuestThread* ThreadManager::current_thread() {
+    if (t_current_guest_thread) return t_current_guest_thread;
     return get_thread(t_current_thread_id);
+}
+
+GuestThread* ThreadManager::current_guest_thread() noexcept {
+    return t_current_guest_thread;
 }
 
 GuestThread* ThreadManager::get_thread(ScePthreadId id) {
@@ -403,7 +412,6 @@ void ThreadManager::watchdog_loop() {
         bool any_stuck = false;
         {
             std::lock_guard<std::mutex> lock(m_threads_mutex);
-            std::lock_guard<std::mutex> hle_lock(s_hle_tid_mtx);
             for (const auto& [id, th] : m_threads) {
                 if (!th) continue;
                 if (th->state.load() == ThreadState::Terminated) {
@@ -425,9 +433,9 @@ void ThreadManager::watchdog_loop() {
                 const bool frozen = (rip == it->second.first && instrs == it->second.second);
                 it->second = {rip, instrs};
                 if (!frozen) continue;
-                auto hit = s_hle_last_us.find(id);
-                if (hit == s_hle_last_us.end()) continue;
-                if (now <= hit->second || now - hit->second < kStallThresholdUs) continue;
+                if (id >= MAX_HLE_TRACKED_THREADS) continue;
+                const u64 last = s_hle_last_us[id].load(std::memory_order_relaxed);
+                if (last == 0 || now <= last || now - last < kStallThresholdUs) continue;
                 any_stuck = true;
             }
         }

@@ -27,6 +27,7 @@ struct AudioPortConfig {
     i32 format{SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO};
     f32 volume_left{1.0f};
     f32 volume_right{1.0f};
+    u32 grain{256};
 };
 
 struct SceAudioOutPortInfo {

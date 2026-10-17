@@ -358,8 +358,62 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 return false;
             }
 
+            case IT_WRITE_DATA: {
+                if (packet.payload.size() >= 4 && m_impl->memory) {
+                    const u32 addr_lo = packet.payload[1];
+                    const u32 addr_hi = packet.payload[2];
+                    const GuestAddr dst_addr = (static_cast<u64>(addr_hi) << 32) | addr_lo;
+                    const usize count = packet.payload.size() - 3;
+                    const usize byte_size = count * sizeof(u32);
+                    if (dst_addr > 0x1000 && m_impl->memory->is_valid_address(dst_addr, byte_size)) {
+                        m_impl->memory->write_bytes(dst_addr, &packet.payload[3], byte_size);
+                    }
+                }
+                return true;
+            }
+
+            case IT_WAIT_REG_MEM: {
+                return true;
+            }
+
             case IT_EVENT_WRITE:
                 return true;
+
+            case IT_RELEASE_MEM: {
+                if (packet.payload.size() >= 5 && m_impl->memory) {
+                    const u32 addr_lo = packet.payload[2];
+                    const u32 addr_hi = packet.payload[3];
+                    const GuestAddr label_addr = (static_cast<u64>(addr_hi) << 32) | addr_lo;
+                    const u32 data_lo = packet.payload[4];
+                    const u32 data_hi = packet.payload.size() >= 6 ? packet.payload[5] : 0;
+                    const u64 data_val = (static_cast<u64>(data_hi) << 32) | data_lo;
+                    if (label_addr > 0x1000 && m_impl->memory->is_valid_address(label_addr, 4)) {
+                        m_impl->memory->write_value(label_addr, data_val);
+                    }
+                }
+                return true;
+            }
+
+            case IT_DMA_DATA: {
+                if (packet.payload.size() >= 6 && m_impl->memory) {
+                    const u32 src_lo = packet.payload[1];
+                    const u32 src_hi = packet.payload[2];
+                    const u32 dst_lo = packet.payload[3];
+                    const u32 dst_hi = packet.payload[4];
+                    const GuestAddr src_addr = (static_cast<u64>(src_hi) << 32) | src_lo;
+                    const GuestAddr dst_addr = (static_cast<u64>(dst_hi) << 32) | dst_lo;
+                    const usize byte_size = packet.payload[5] & 0x1FFFFF;
+                    if (byte_size > 0 && m_impl->memory->is_valid_address(src_addr, byte_size) &&
+                        m_impl->memory->is_valid_address(dst_addr, byte_size)) {
+                        const void* src = m_impl->memory->to_host_ptr<void>(src_addr);
+                        void* dst = m_impl->memory->to_host_ptr<void>(dst_addr);
+                        if (src && dst) {
+                            std::memcpy(dst, src, byte_size);
+                        }
+                    }
+                }
+                return true;
+            }
 
             default:
                 return true;

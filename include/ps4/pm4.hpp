@@ -19,7 +19,11 @@ enum Pm4Opcode : u8 {
     IT_DISPATCH_DIRECT  = 0x15,
     IT_DRAW_INDEX_2     = 0x27,
     IT_DRAW_INDEX_AUTO  = 0x2D,
+    IT_WRITE_DATA       = 0x37,
+    IT_WAIT_REG_MEM     = 0x3C,
     IT_EVENT_WRITE      = 0x46,
+    IT_RELEASE_MEM      = 0x47,
+    IT_DMA_DATA         = 0x50,
     IT_SET_CONTEXT_REG  = 0x69,
     IT_SET_SH_REG       = 0x76
 };

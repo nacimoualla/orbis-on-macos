@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cmath>
 #include <iostream>
+#include <mutex>
 
 namespace ps4 {
 
@@ -395,22 +396,57 @@ bool CpuExecutor::setup_default_stack(GuestAddr stack_base, GuestSize stack_size
 // operand cannot be handled this way (register destination, or an address with
 // no host mapping) so the caller can fall back to its existing path.
 // ---------------------------------------------------------------------------
+// Striped mutex pool for atomic memory ops (misaligned accesses and CMPXCHG16B)
+static constexpr usize ATOMIC_STRIPE_COUNT = 64;
+struct alignas(64) StripedMutex {
+    std::mutex mtx;
+};
+static StripedMutex s_atomic_mutexes[ATOMIC_STRIPE_COUNT];
+
+static inline std::mutex& get_atomic_mutex(GuestAddr addr) {
+    return s_atomic_mutexes[(addr >> 3) % ATOMIC_STRIPE_COUNT].mtx;
+}
+
 template <typename T>
-static int guest_atomic_cas(MemoryManager& mem, GuestAddr addr, T desired, T* out_actual) {
+static int guest_atomic_cas(MemoryManager& mem, GuestAddr addr, T expected, T desired, T* out_actual) {
+    if ((addr & (sizeof(T) - 1)) != 0) {
+        std::lock_guard<std::mutex> lock(get_atomic_mutex(addr));
+        T* p = mem.to_host_ptr<T>(addr);
+        if (!p) return -1;
+        T current;
+        std::memcpy(&current, p, sizeof(T));
+        *out_actual = current;
+        if (current == expected) {
+            std::memcpy(p, &desired, sizeof(T));
+            return 1;
+        }
+        return 0;
+    }
     T* p = mem.to_host_ptr<T>(addr);
     if (!p) return -1;
-    T expected = __atomic_load_n(p, __ATOMIC_SEQ_CST);
-    if (__atomic_compare_exchange_n(p, &expected, desired, /*weak=*/false,
+    T exp = expected;
+    if (__atomic_compare_exchange_n(p, &exp, desired, /*weak=*/false,
                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
         *out_actual = expected;
         return 1;
     }
-    *out_actual = expected; // compare_exchange_n already refreshed it
+    *out_actual = exp;
     return 0;
 }
 
 template <typename T>
 static int guest_atomic_xadd(MemoryManager& mem, GuestAddr addr, T operand, T* out_old) {
+    if ((addr & (sizeof(T) - 1)) != 0) {
+        std::lock_guard<std::mutex> lock(get_atomic_mutex(addr));
+        T* p = mem.to_host_ptr<T>(addr);
+        if (!p) return -1;
+        T cur;
+        std::memcpy(&cur, p, sizeof(T));
+        *out_old = cur;
+        T next = cur + operand;
+        std::memcpy(p, &next, sizeof(T));
+        return 1;
+    }
     T* p = mem.to_host_ptr<T>(addr);
     if (!p) return -1;
     *out_old = __atomic_fetch_add(p, operand, __ATOMIC_SEQ_CST);
@@ -419,9 +455,89 @@ static int guest_atomic_xadd(MemoryManager& mem, GuestAddr addr, T operand, T* o
 
 template <typename T>
 static int guest_atomic_xchg(MemoryManager& mem, GuestAddr addr, T operand, T* out_old) {
+    if ((addr & (sizeof(T) - 1)) != 0) {
+        std::lock_guard<std::mutex> lock(get_atomic_mutex(addr));
+        T* p = mem.to_host_ptr<T>(addr);
+        if (!p) return -1;
+        T cur;
+        std::memcpy(&cur, p, sizeof(T));
+        *out_old = cur;
+        std::memcpy(p, &operand, sizeof(T));
+        return 1;
+    }
     T* p = mem.to_host_ptr<T>(addr);
     if (!p) return -1;
     *out_old = __atomic_exchange_n(p, operand, __ATOMIC_SEQ_CST);
+    return 1;
+}
+
+template <typename T>
+static int guest_atomic_and(MemoryManager& mem, GuestAddr addr, T operand, T* out_old) {
+    if ((addr & (sizeof(T) - 1)) != 0) {
+        std::lock_guard<std::mutex> lock(get_atomic_mutex(addr));
+        T* p = mem.to_host_ptr<T>(addr);
+        if (!p) return -1;
+        T cur;
+        std::memcpy(&cur, p, sizeof(T));
+        *out_old = cur;
+        T next = cur & operand;
+        std::memcpy(p, &next, sizeof(T));
+        return 1;
+    }
+    T* p = mem.to_host_ptr<T>(addr);
+    if (!p) return -1;
+    *out_old = __atomic_fetch_and(p, operand, __ATOMIC_SEQ_CST);
+    return 1;
+}
+
+template <typename T>
+static int guest_atomic_or(MemoryManager& mem, GuestAddr addr, T operand, T* out_old) {
+    if ((addr & (sizeof(T) - 1)) != 0) {
+        std::lock_guard<std::mutex> lock(get_atomic_mutex(addr));
+        T* p = mem.to_host_ptr<T>(addr);
+        if (!p) return -1;
+        T cur;
+        std::memcpy(&cur, p, sizeof(T));
+        *out_old = cur;
+        T next = cur | operand;
+        std::memcpy(p, &next, sizeof(T));
+        return 1;
+    }
+    T* p = mem.to_host_ptr<T>(addr);
+    if (!p) return -1;
+    *out_old = __atomic_fetch_or(p, operand, __ATOMIC_SEQ_CST);
+    return 1;
+}
+
+template <typename T>
+static int guest_atomic_xor(MemoryManager& mem, GuestAddr addr, T operand, T* out_old) {
+    if ((addr & (sizeof(T) - 1)) != 0) {
+        std::lock_guard<std::mutex> lock(get_atomic_mutex(addr));
+        T* p = mem.to_host_ptr<T>(addr);
+        if (!p) return -1;
+        T cur;
+        std::memcpy(&cur, p, sizeof(T));
+        *out_old = cur;
+        T next = cur ^ operand;
+        std::memcpy(p, &next, sizeof(T));
+        return 1;
+    }
+    T* p = mem.to_host_ptr<T>(addr);
+    if (!p) return -1;
+    *out_old = __atomic_fetch_xor(p, operand, __ATOMIC_SEQ_CST);
+    return 1;
+}
+
+template <typename T>
+static int guest_atomic_neg(MemoryManager& mem, GuestAddr addr, T* out_old) {
+    std::lock_guard<std::mutex> lock(get_atomic_mutex(addr));
+    T* p = mem.to_host_ptr<T>(addr);
+    if (!p) return -1;
+    T cur;
+    std::memcpy(&cur, p, sizeof(T));
+    *out_old = cur;
+    T next = static_cast<T>(0) - cur;
+    std::memcpy(p, &next, sizeof(T));
     return 1;
 }
 
@@ -558,9 +674,29 @@ StepResult CpuExecutor::step() {
             if (bits == 16) return static_cast<u16>(get_gpr64(m_context, m.rm_id));
             return get_gpr8(m_context, m.rm_id, has_rex);
         }
-        if (bits == 64) { u64 v = 0; m_memory.read_value(m.mem_addr, v); return v; }
-        if (bits == 32) { u32 v = 0; m_memory.read_value(m.mem_addr, v); return v; }
-        if (bits == 16) { u16 v = 0; m_memory.read_value(m.mem_addr, v); return v; }
+        if (bits == 64) {
+            if ((m.mem_addr & 7) == 0) {
+                const auto* p = m_memory.to_host_ptr<u64>(m.mem_addr);
+                if (p) return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+            }
+            u64 v = 0; m_memory.read_value(m.mem_addr, v); return v;
+        }
+        if (bits == 32) {
+            if ((m.mem_addr & 3) == 0) {
+                const auto* p = m_memory.to_host_ptr<u32>(m.mem_addr);
+                if (p) return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+            }
+            u32 v = 0; m_memory.read_value(m.mem_addr, v); return v;
+        }
+        if (bits == 16) {
+            if ((m.mem_addr & 1) == 0) {
+                const auto* p = m_memory.to_host_ptr<u16>(m.mem_addr);
+                if (p) return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+            }
+            u16 v = 0; m_memory.read_value(m.mem_addr, v); return v;
+        }
+        const auto* p = m_memory.to_host_ptr<u8>(m.mem_addr);
+        if (p) return __atomic_load_n(p, __ATOMIC_ACQUIRE);
         u8 v = 0; m_memory.read_value(m.mem_addr, v); return v;
     };
 
@@ -577,10 +713,33 @@ StepResult CpuExecutor::step() {
             std::fprintf(stderr, "[WRITE_ZERO] RIP=0x%llx addr=0x%llx val=0x%llx bits=%zu\n",
                          (unsigned long long)start_rip, (unsigned long long)m.mem_addr, (unsigned long long)val, bits);
         }
-        if (bits == 64) m_memory.write_value(m.mem_addr, val);
-        else if (bits == 32) m_memory.write_value(m.mem_addr, static_cast<u32>(val));
-        else if (bits == 16) m_memory.write_value(m.mem_addr, static_cast<u16>(val));
-        else m_memory.write_value(m.mem_addr, static_cast<u8>(val));
+        if (bits == 64) {
+            if ((m.mem_addr & 7) == 0) {
+                auto* p = m_memory.to_host_ptr<u64>(m.mem_addr);
+                if (p) { __atomic_store_n(p, val, __ATOMIC_RELEASE); return; }
+            }
+            m_memory.write_value(m.mem_addr, val);
+            return;
+        }
+        if (bits == 32) {
+            if ((m.mem_addr & 3) == 0) {
+                auto* p = m_memory.to_host_ptr<u32>(m.mem_addr);
+                if (p) { __atomic_store_n(p, static_cast<u32>(val), __ATOMIC_RELEASE); return; }
+            }
+            m_memory.write_value(m.mem_addr, static_cast<u32>(val));
+            return;
+        }
+        if (bits == 16) {
+            if ((m.mem_addr & 1) == 0) {
+                auto* p = m_memory.to_host_ptr<u16>(m.mem_addr);
+                if (p) { __atomic_store_n(p, static_cast<u16>(val), __ATOMIC_RELEASE); return; }
+            }
+            m_memory.write_value(m.mem_addr, static_cast<u16>(val));
+            return;
+        }
+        auto* p = m_memory.to_host_ptr<u8>(m.mem_addr);
+        if (p) { __atomic_store_n(p, static_cast<u8>(val), __ATOMIC_RELEASE); return; }
+        m_memory.write_value(m.mem_addr, static_cast<u8>(val));
     };
 
     // 0x90: NOP
@@ -1978,10 +2137,10 @@ StepResult CpuExecutor::step() {
                                    : static_cast<u32>(get_gpr64(m_context, m.reg_id));
                 int handled = -1;
                 u64 actual = 0;
-                if (bits == 64) handled = guest_atomic_cas<u64>(m_memory, m.mem_addr, static_cast<u64>(reg_val), reinterpret_cast<u64*>(&actual));
-                else if (bits == 32) handled = guest_atomic_cas<u32>(m_memory, m.mem_addr, static_cast<u32>(reg_val), reinterpret_cast<u32*>(&actual));
-                else if (bits == 16) handled = guest_atomic_cas<u16>(m_memory, m.mem_addr, static_cast<u16>(reg_val), reinterpret_cast<u16*>(&actual));
-                else handled = guest_atomic_cas<u8>(m_memory, m.mem_addr, static_cast<u8>(reg_val), reinterpret_cast<u8*>(&actual));
+                if (bits == 64) handled = guest_atomic_cas<u64>(m_memory, m.mem_addr, static_cast<u64>(acc), static_cast<u64>(reg_val), reinterpret_cast<u64*>(&actual));
+                else if (bits == 32) handled = guest_atomic_cas<u32>(m_memory, m.mem_addr, static_cast<u32>(acc), static_cast<u32>(reg_val), reinterpret_cast<u32*>(&actual));
+                else if (bits == 16) handled = guest_atomic_cas<u16>(m_memory, m.mem_addr, static_cast<u16>(acc), static_cast<u16>(reg_val), reinterpret_cast<u16*>(&actual));
+                else handled = guest_atomic_cas<u8>(m_memory, m.mem_addr, static_cast<u8>(acc), static_cast<u8>(reg_val), reinterpret_cast<u8*>(&actual));
                 if (handled >= 0) {
                     const u64 rm_val = actual & mask;
                     update_flags_sub(m_context, acc, rm_val, acc - rm_val, bits);
@@ -2134,6 +2293,29 @@ StepResult CpuExecutor::step() {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u64 bit_offset = get_gpr64(m_context, m.reg_id) % op_bits;
+            if (!m.is_reg && (lock_prefix || op1 != 0xA3)) {
+                int handled = -1;
+                u64 old_raw = 0;
+                const u64 mask = (1ULL << bit_offset);
+                if (op1 == 0xAB) { // BTS
+                    if (op_bits == 64) handled = guest_atomic_or<u64>(m_memory, m.mem_addr, mask, &old_raw);
+                    else if (op_bits == 32) { u32 o = 0; handled = guest_atomic_or<u32>(m_memory, m.mem_addr, static_cast<u32>(mask), &o); old_raw = o; }
+                    else { u16 o = 0; handled = guest_atomic_or<u16>(m_memory, m.mem_addr, static_cast<u16>(mask), &o); old_raw = o; }
+                } else if (op1 == 0xB3) { // BTR
+                    if (op_bits == 64) handled = guest_atomic_and<u64>(m_memory, m.mem_addr, ~mask, &old_raw);
+                    else if (op_bits == 32) { u32 o = 0; handled = guest_atomic_and<u32>(m_memory, m.mem_addr, static_cast<u32>(~mask), &o); old_raw = o; }
+                    else { u16 o = 0; handled = guest_atomic_and<u16>(m_memory, m.mem_addr, static_cast<u16>(~mask), &o); old_raw = o; }
+                } else if (op1 == 0xBB) { // BTC
+                    if (op_bits == 64) handled = guest_atomic_xor<u64>(m_memory, m.mem_addr, mask, &old_raw);
+                    else if (op_bits == 32) { u32 o = 0; handled = guest_atomic_xor<u32>(m_memory, m.mem_addr, static_cast<u32>(mask), &o); old_raw = o; }
+                    else { u16 o = 0; handled = guest_atomic_xor<u16>(m_memory, m.mem_addr, static_cast<u16>(mask), &o); old_raw = o; }
+                }
+                if (handled >= 0) {
+                    m_context.set_flag(CpuContext::FLAG_CF, ((old_raw >> bit_offset) & 1) != 0);
+                    m_context.rip = start_rip + cursor + m.bytes_consumed;
+                    return StepResult::Ok;
+                }
+            }
             u64 val = read_rm(m, op_bits);
             m_context.set_flag(CpuContext::FLAG_CF, ((val >> bit_offset) & 1) != 0);
             if (op1 == 0xAB) val |= (1ULL << bit_offset);
@@ -2151,6 +2333,29 @@ StepResult CpuExecutor::step() {
             const u8 imm8 = raw_code[cursor + m.bytes_consumed];
             const u64 bit_offset = imm8 % op_bits;
             const u8 sub_op = m.reg_id & 7;
+            if (!m.is_reg && (lock_prefix || sub_op != 4)) {
+                int handled = -1;
+                u64 old_raw = 0;
+                const u64 mask = (1ULL << bit_offset);
+                if (sub_op == 5) { // BTS
+                    if (op_bits == 64) handled = guest_atomic_or<u64>(m_memory, m.mem_addr, mask, &old_raw);
+                    else if (op_bits == 32) { u32 o = 0; handled = guest_atomic_or<u32>(m_memory, m.mem_addr, static_cast<u32>(mask), &o); old_raw = o; }
+                    else { u16 o = 0; handled = guest_atomic_or<u16>(m_memory, m.mem_addr, static_cast<u16>(mask), &o); old_raw = o; }
+                } else if (sub_op == 6) { // BTR
+                    if (op_bits == 64) handled = guest_atomic_and<u64>(m_memory, m.mem_addr, ~mask, &old_raw);
+                    else if (op_bits == 32) { u32 o = 0; handled = guest_atomic_and<u32>(m_memory, m.mem_addr, static_cast<u32>(~mask), &o); old_raw = o; }
+                    else { u16 o = 0; handled = guest_atomic_and<u16>(m_memory, m.mem_addr, static_cast<u16>(~mask), &o); old_raw = o; }
+                } else if (sub_op == 7) { // BTC
+                    if (op_bits == 64) handled = guest_atomic_xor<u64>(m_memory, m.mem_addr, mask, &old_raw);
+                    else if (op_bits == 32) { u32 o = 0; handled = guest_atomic_xor<u32>(m_memory, m.mem_addr, static_cast<u32>(mask), &o); old_raw = o; }
+                    else { u16 o = 0; handled = guest_atomic_xor<u16>(m_memory, m.mem_addr, static_cast<u16>(mask), &o); old_raw = o; }
+                }
+                if (handled >= 0) {
+                    m_context.set_flag(CpuContext::FLAG_CF, ((old_raw >> bit_offset) & 1) != 0);
+                    m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+                    return StepResult::Ok;
+                }
+            }
             u64 val = read_rm(m, op_bits);
             m_context.set_flag(CpuContext::FLAG_CF, ((val >> bit_offset) & 1) != 0);
             if (sub_op == 5) val |= (1ULL << bit_offset);
@@ -2394,6 +2599,7 @@ StepResult CpuExecutor::step() {
             const u8 sub_op = m.reg_id & 7;
             if (sub_op == 1) { // CMPXCHG8B / CMPXCHG16B
                 if (m.is_reg) return StepResult::IllegalInstruction;
+                std::lock_guard<std::mutex> lock(get_atomic_mutex(m.mem_addr));
                 if (rex_w) {
                     // CMPXCHG16B m128: compares RDX:RAX with m128
                     u64 mem_low = 0, mem_high = 0;
@@ -2536,6 +2742,43 @@ StepResult CpuExecutor::step() {
         if ((alu_dir & 2) == 0) {
             // dir 0/1: OP r/m, reg
             const u64 src = (bits == 8) ? get_gpr8(m_context, m.reg_id, has_rex) : (bits == 64) ? get_gpr64(m_context, m.reg_id) : static_cast<u32>(get_gpr64(m_context, m.reg_id));
+            if (!m.is_reg && lock_prefix && alu_major != 7 /* not CMP */) {
+                int handled = -1;
+                u64 old_raw = 0;
+                if (alu_major == 0) { // ADD
+                    if (bits == 64) handled = guest_atomic_xadd<u64>(m_memory, m.mem_addr, src, &old_raw);
+                    else if (bits == 32) { u32 o = 0; handled = guest_atomic_xadd<u32>(m_memory, m.mem_addr, static_cast<u32>(src), &o); old_raw = o; }
+                    else if (bits == 16) { u16 o = 0; handled = guest_atomic_xadd<u16>(m_memory, m.mem_addr, static_cast<u16>(src), &o); old_raw = o; }
+                    else { u8 o = 0; handled = guest_atomic_xadd<u8>(m_memory, m.mem_addr, static_cast<u8>(src), &o); old_raw = o; }
+                } else if (alu_major == 1) { // OR
+                    if (bits == 64) handled = guest_atomic_or<u64>(m_memory, m.mem_addr, src, &old_raw);
+                    else if (bits == 32) { u32 o = 0; handled = guest_atomic_or<u32>(m_memory, m.mem_addr, static_cast<u32>(src), &o); old_raw = o; }
+                    else if (bits == 16) { u16 o = 0; handled = guest_atomic_or<u16>(m_memory, m.mem_addr, static_cast<u16>(src), &o); old_raw = o; }
+                    else { u8 o = 0; handled = guest_atomic_or<u8>(m_memory, m.mem_addr, static_cast<u8>(src), &o); old_raw = o; }
+                } else if (alu_major == 4) { // AND
+                    if (bits == 64) handled = guest_atomic_and<u64>(m_memory, m.mem_addr, src, &old_raw);
+                    else if (bits == 32) { u32 o = 0; handled = guest_atomic_and<u32>(m_memory, m.mem_addr, static_cast<u32>(src), &o); old_raw = o; }
+                    else if (bits == 16) { u16 o = 0; handled = guest_atomic_and<u16>(m_memory, m.mem_addr, static_cast<u16>(src), &o); old_raw = o; }
+                    else { u8 o = 0; handled = guest_atomic_and<u8>(m_memory, m.mem_addr, static_cast<u8>(src), &o); old_raw = o; }
+                } else if (alu_major == 5) { // SUB
+                    if (bits == 64) handled = guest_atomic_xadd<u64>(m_memory, m.mem_addr, static_cast<u64>(0 - src), &old_raw);
+                    else if (bits == 32) { u32 o = 0; handled = guest_atomic_xadd<u32>(m_memory, m.mem_addr, static_cast<u32>(0 - src), &o); old_raw = o; }
+                    else if (bits == 16) { u16 o = 0; handled = guest_atomic_xadd<u16>(m_memory, m.mem_addr, static_cast<u16>(0 - src), &o); old_raw = o; }
+                    else { u8 o = 0; handled = guest_atomic_xadd<u8>(m_memory, m.mem_addr, static_cast<u8>(0 - src), &o); old_raw = o; }
+                } else if (alu_major == 6) { // XOR
+                    if (bits == 64) handled = guest_atomic_xor<u64>(m_memory, m.mem_addr, src, &old_raw);
+                    else if (bits == 32) { u32 o = 0; handled = guest_atomic_xor<u32>(m_memory, m.mem_addr, static_cast<u32>(src), &o); old_raw = o; }
+                    else if (bits == 16) { u16 o = 0; handled = guest_atomic_xor<u16>(m_memory, m.mem_addr, static_cast<u16>(src), &o); old_raw = o; }
+                    else { u8 o = 0; handled = guest_atomic_xor<u8>(m_memory, m.mem_addr, static_cast<u8>(src), &o); old_raw = o; }
+                }
+                if (handled >= 0) {
+                    const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+                    const u64 dst = old_raw & mask;
+                    execute_alu_op(m_context, alu_major, dst, src, bits);
+                    m_context.rip = start_rip + cursor + m.bytes_consumed;
+                    return StepResult::Ok;
+                }
+            }
             const u64 dst = read_rm(m, bits);
             const u64 res = execute_alu_op(m_context, alu_major, dst, src, bits);
             if (alu_major != 7) write_rm(m, res, bits); // CMP doesn't write back
@@ -2795,6 +3038,44 @@ StepResult CpuExecutor::step() {
             imm = (bits == 64) ? static_cast<u64>(static_cast<i64>(imm32)) : static_cast<u32>(imm32);
         }
 
+        if (!m.is_reg && lock_prefix && alu_op != 7 /* not CMP */) {
+            int handled = -1;
+            u64 old_raw = 0;
+            if (alu_op == 0) { // ADD
+                if (bits == 64) handled = guest_atomic_xadd<u64>(m_memory, m.mem_addr, imm, &old_raw);
+                else if (bits == 32) { u32 o = 0; handled = guest_atomic_xadd<u32>(m_memory, m.mem_addr, static_cast<u32>(imm), &o); old_raw = o; }
+                else if (bits == 16) { u16 o = 0; handled = guest_atomic_xadd<u16>(m_memory, m.mem_addr, static_cast<u16>(imm), &o); old_raw = o; }
+                else { u8 o = 0; handled = guest_atomic_xadd<u8>(m_memory, m.mem_addr, static_cast<u8>(imm), &o); old_raw = o; }
+            } else if (alu_op == 1) { // OR
+                if (bits == 64) handled = guest_atomic_or<u64>(m_memory, m.mem_addr, imm, &old_raw);
+                else if (bits == 32) { u32 o = 0; handled = guest_atomic_or<u32>(m_memory, m.mem_addr, static_cast<u32>(imm), &o); old_raw = o; }
+                else if (bits == 16) { u16 o = 0; handled = guest_atomic_or<u16>(m_memory, m.mem_addr, static_cast<u16>(imm), &o); old_raw = o; }
+                else { u8 o = 0; handled = guest_atomic_or<u8>(m_memory, m.mem_addr, static_cast<u8>(imm), &o); old_raw = o; }
+            } else if (alu_op == 4) { // AND
+                if (bits == 64) handled = guest_atomic_and<u64>(m_memory, m.mem_addr, imm, &old_raw);
+                else if (bits == 32) { u32 o = 0; handled = guest_atomic_and<u32>(m_memory, m.mem_addr, static_cast<u32>(imm), &o); old_raw = o; }
+                else if (bits == 16) { u16 o = 0; handled = guest_atomic_and<u16>(m_memory, m.mem_addr, static_cast<u16>(imm), &o); old_raw = o; }
+                else { u8 o = 0; handled = guest_atomic_and<u8>(m_memory, m.mem_addr, static_cast<u8>(imm), &o); old_raw = o; }
+            } else if (alu_op == 5) { // SUB
+                if (bits == 64) handled = guest_atomic_xadd<u64>(m_memory, m.mem_addr, static_cast<u64>(0 - imm), &old_raw);
+                else if (bits == 32) { u32 o = 0; handled = guest_atomic_xadd<u32>(m_memory, m.mem_addr, static_cast<u32>(0 - imm), &o); old_raw = o; }
+                else if (bits == 16) { u16 o = 0; handled = guest_atomic_xadd<u16>(m_memory, m.mem_addr, static_cast<u16>(0 - imm), &o); old_raw = o; }
+                else { u8 o = 0; handled = guest_atomic_xadd<u8>(m_memory, m.mem_addr, static_cast<u8>(0 - imm), &o); old_raw = o; }
+            } else if (alu_op == 6) { // XOR
+                if (bits == 64) handled = guest_atomic_xor<u64>(m_memory, m.mem_addr, imm, &old_raw);
+                else if (bits == 32) { u32 o = 0; handled = guest_atomic_xor<u32>(m_memory, m.mem_addr, static_cast<u32>(imm), &o); old_raw = o; }
+                else if (bits == 16) { u16 o = 0; handled = guest_atomic_xor<u16>(m_memory, m.mem_addr, static_cast<u16>(imm), &o); old_raw = o; }
+                else { u8 o = 0; handled = guest_atomic_xor<u8>(m_memory, m.mem_addr, static_cast<u8>(imm), &o); old_raw = o; }
+            }
+            if (handled >= 0) {
+                const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+                const u64 dst = old_raw & mask;
+                execute_alu_op(m_context, alu_op, dst, imm, bits);
+                m_context.rip = start_rip + cursor + m.bytes_consumed + imm_sz;
+                return StepResult::Ok;
+            }
+        }
+
         const u64 dst = read_rm(m, bits);
         const u64 res = execute_alu_op(m_context, alu_op, dst, imm, bits);
         if (alu_op != 7) write_rm(m, res, bits); // CMP doesn't write back
@@ -2884,12 +3165,39 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
         if (sub_op == 2) { // NOT r/m
+            if (!m.is_reg && lock_prefix) {
+                int handled = -1;
+                u64 old_raw = 0;
+                if (bits == 64) handled = guest_atomic_xor<u64>(m_memory, m.mem_addr, ~0ULL, &old_raw);
+                else if (bits == 32) { u32 o = 0; handled = guest_atomic_xor<u32>(m_memory, m.mem_addr, 0xFFFFFFFFU, &o); old_raw = o; }
+                else if (bits == 16) { u16 o = 0; handled = guest_atomic_xor<u16>(m_memory, m.mem_addr, 0xFFFFU, &o); old_raw = o; }
+                else { u8 o = 0; handled = guest_atomic_xor<u8>(m_memory, m.mem_addr, 0xFFU, &o); old_raw = o; }
+                if (handled >= 0) {
+                    m_context.rip = start_rip + cursor + m.bytes_consumed;
+                    return StepResult::Ok;
+                }
+            }
             const u64 val = read_rm(m, bits);
             write_rm(m, ~val, bits);
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
         }
         if (sub_op == 3) { // NEG r/m
+            if (!m.is_reg && lock_prefix) {
+                int handled = -1;
+                u64 old_raw = 0;
+                if (bits == 64) handled = guest_atomic_neg<u64>(m_memory, m.mem_addr, &old_raw);
+                else if (bits == 32) { u32 o = 0; handled = guest_atomic_neg<u32>(m_memory, m.mem_addr, &o); old_raw = o; }
+                else if (bits == 16) { u16 o = 0; handled = guest_atomic_neg<u16>(m_memory, m.mem_addr, &o); old_raw = o; }
+                else { u8 o = 0; handled = guest_atomic_neg<u8>(m_memory, m.mem_addr, &o); old_raw = o; }
+                if (handled >= 0) {
+                    const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+                    const u64 val = old_raw & mask;
+                    execute_alu_op(m_context, 5 /* SUB */, 0, val, bits);
+                    m_context.rip = start_rip + cursor + m.bytes_consumed;
+                    return StepResult::Ok;
+                }
+            }
             const u64 val = read_rm(m, bits);
             const u64 res = execute_alu_op(m_context, 5 /* SUB */, 0, val, bits);
             write_rm(m, res, bits);
@@ -3109,6 +3417,16 @@ StepResult CpuExecutor::step() {
         const u8 sub_op = m.reg_id & 7;
         const bool old_cf = m_context.flag_cf();
         if (sub_op == 0) { // INC r/m8
+            if (!m.is_reg && lock_prefix) {
+                u8 old_raw = 0;
+                if (guest_atomic_xadd<u8>(m_memory, m.mem_addr, 1, &old_raw) >= 0) {
+                    const u8 res = static_cast<u8>(old_raw + 1);
+                    update_flags_add(m_context, old_raw, 1, res, 8);
+                    m_context.set_flag(CpuContext::FLAG_CF, old_cf);
+                    m_context.rip = start_rip + cursor + m.bytes_consumed;
+                    return StepResult::Ok;
+                }
+            }
             const u8 val = static_cast<u8>(read_rm(m, 8));
             const u8 res = static_cast<u8>(val + 1);
             update_flags_add(m_context, val, 1, res, 8);
@@ -3118,6 +3436,16 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
         if (sub_op == 1) { // DEC r/m8
+            if (!m.is_reg && lock_prefix) {
+                u8 old_raw = 0;
+                if (guest_atomic_xadd<u8>(m_memory, m.mem_addr, static_cast<u8>(-1), &old_raw) >= 0) {
+                    const u8 res = static_cast<u8>(old_raw - 1);
+                    update_flags_sub(m_context, old_raw, 1, res, 8);
+                    m_context.set_flag(CpuContext::FLAG_CF, old_cf);
+                    m_context.rip = start_rip + cursor + m.bytes_consumed;
+                    return StepResult::Ok;
+                }
+            }
             const u8 val = static_cast<u8>(read_rm(m, 8));
             const u8 res = static_cast<u8>(val - 1);
             update_flags_sub(m_context, val, 1, res, 8);
@@ -3136,6 +3464,22 @@ StepResult CpuExecutor::step() {
 
         if (sub_op == 0) { // INC r/m
             const bool old_cf = m_context.flag_cf();
+            if (!m.is_reg && lock_prefix) {
+                int handled = -1;
+                u64 old_raw = 0;
+                if (op_bits == 64) handled = guest_atomic_xadd<u64>(m_memory, m.mem_addr, 1ULL, &old_raw);
+                else if (op_bits == 32) { u32 o = 0; handled = guest_atomic_xadd<u32>(m_memory, m.mem_addr, 1U, &o); old_raw = o; }
+                else { u16 o = 0; handled = guest_atomic_xadd<u16>(m_memory, m.mem_addr, 1U, &o); old_raw = o; }
+                if (handled >= 0) {
+                    const u64 mask = (op_bits == 64) ? ~0ULL : ((1ULL << op_bits) - 1);
+                    const u64 val = old_raw & mask;
+                    const u64 res = (val + 1) & mask;
+                    update_flags_add(m_context, val, 1, res, op_bits);
+                    m_context.set_flag(CpuContext::FLAG_CF, old_cf);
+                    m_context.rip = start_rip + cursor + m.bytes_consumed;
+                    return StepResult::Ok;
+                }
+            }
             const u64 val = read_rm(m, op_bits);
             const u64 res = (val + 1);
             update_flags_add(m_context, val, 1, res, op_bits);
@@ -3146,6 +3490,22 @@ StepResult CpuExecutor::step() {
         }
         if (sub_op == 1) { // DEC r/m
             const bool old_cf = m_context.flag_cf();
+            if (!m.is_reg && lock_prefix) {
+                int handled = -1;
+                u64 old_raw = 0;
+                if (op_bits == 64) handled = guest_atomic_xadd<u64>(m_memory, m.mem_addr, static_cast<u64>(-1LL), &old_raw);
+                else if (op_bits == 32) { u32 o = 0; handled = guest_atomic_xadd<u32>(m_memory, m.mem_addr, static_cast<u32>(-1), &o); old_raw = o; }
+                else { u16 o = 0; handled = guest_atomic_xadd<u16>(m_memory, m.mem_addr, static_cast<u16>(-1), &o); old_raw = o; }
+                if (handled >= 0) {
+                    const u64 mask = (op_bits == 64) ? ~0ULL : ((1ULL << op_bits) - 1);
+                    const u64 val = old_raw & mask;
+                    const u64 res = (val - 1) & mask;
+                    update_flags_sub(m_context, val, 1, res, op_bits);
+                    m_context.set_flag(CpuContext::FLAG_CF, old_cf);
+                    m_context.rip = start_rip + cursor + m.bytes_consumed;
+                    return StepResult::Ok;
+                }
+            }
             const u64 val = read_rm(m, op_bits);
             const u64 res = (val - 1);
             update_flags_sub(m_context, val, 1, res, op_bits);

@@ -143,6 +143,7 @@ public:
 
     /// Get pointer to current thread
     [[nodiscard]] GuestThread* current_thread();
+    [[nodiscard]] static GuestThread* current_guest_thread() noexcept;
 
     /// Get pointer to thread by ID
     [[nodiscard]] GuestThread* get_thread(ScePthreadId id);

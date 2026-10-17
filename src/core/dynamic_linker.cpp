@@ -132,7 +132,8 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             // cross-run counter mismatch.
             static std::atomic<u64> s_suppressed{0};
             static std::atomic<u64> s_logged{0};
-            if (verbose || (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" &&
+            static const bool s_log_hle = (std::getenv("PS4_LOG_HLE") != nullptr && std::strcmp(std::getenv("PS4_LOG_HLE"), "1") == 0);
+            if ((s_log_hle || verbose) && (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" &&
                 sym->name != "strlen" && sym->name != "memcpy" && sym->name != "memmove" &&
                 sym->name != "strcmp" && sym->name != "strncmp" && sym->name != "strncpy" &&
                 sym->name != "malloc" && sym->name != "free" && sym->name != "memalign" &&

@@ -263,6 +263,94 @@ int main() {
         std::cout << "  ✓ Test 10: All 6 required Orbis NIDs verified by name and 64-bit hash\n";
     }
 
+    // Test 11: Multi-threaded Semaphore Stress & CancelSema Regression Test
+    {
+        ps4::NidRegistry registry;
+        registry.register_default_libraries();
+        auto* create_sym = registry.find_by_name("sceKernelCreateSema");
+        auto* wait_sym   = registry.find_by_name("sceKernelWaitSema");
+        auto* sig_sym    = registry.find_by_name("sceKernelSignalSema");
+        auto* cancel_sym = registry.find_by_name("sceKernelCancelSema");
+        auto* del_sym    = registry.find_by_name("sceKernelDeleteSema");
+        assert(create_sym && wait_sym && sig_sym && cancel_sym && del_sym);
+
+        // 1. Regression test: CancelSema must not latch stale cancellation for future waiters
+        const ps4::GuestAddr sema_id_ptr = 0x750000ULL;
+        ps4::CpuContext ctx{};
+        ctx.rdi = sema_id_ptr;
+        ctx.rsi = 0; // name
+        ctx.rdx = 0; // attr
+        ctx.rcx = 0; // init_count = 0
+        ctx.r8  = 100; // max_count
+        create_sym->handler(ctx, memory);
+        ps4::u32 sema_id = 0;
+        memory.read_value(sema_id_ptr, sema_id);
+        assert(sema_id > 0);
+
+        // Call CancelSema when NO threads are waiting
+        ctx.rdi = sema_id;
+        ctx.rsi = 0; // setCount = 0
+        ctx.rdx = 0; // out_waiters = null
+        cancel_sym->handler(ctx, memory);
+        assert(ctx.rax == 0);
+
+        // Now test that a subsequent WaitSema does NOT immediately wake with ECANCELED
+        std::atomic<bool> wait_woken{false};
+        std::atomic<ps4::u64> wait_res{0};
+        std::thread waiter([&]() {
+            ps4::CpuContext w_ctx{};
+            w_ctx.rdi = sema_id;
+            w_ctx.rsi = 1; // needCount = 1
+            w_ctx.rdx = 0; // infinite timeout
+            wait_sym->handler(w_ctx, memory);
+            wait_res.store(w_ctx.rax);
+            wait_woken.store(true);
+        });
+
+        // Wait to ensure waiter is parked on the semaphore
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        assert(!wait_woken.load()); // Crucial: must NOT have woken due to stale cancel!
+
+        // Now Signal the semaphore
+        ctx.rdi = sema_id;
+        ctx.rsi = 1;
+        sig_sym->handler(ctx, memory);
+        waiter.join();
+        assert(wait_woken.load());
+        assert(wait_res.load() == 0); // SCE_OK
+
+        // 2. Multi-threaded stress test across multiple concurrent threads
+        constexpr int NUM_THREADS = 8;
+        constexpr int ITERS = 200;
+        std::vector<std::thread> workers;
+        std::atomic<int> completed{0};
+        for (int t = 0; t < NUM_THREADS; ++t) {
+            workers.emplace_back([&]() {
+                for (int i = 0; i < ITERS; ++i) {
+                    ps4::CpuContext local_ctx{};
+                    local_ctx.rdi = sema_id;
+                    local_ctx.rsi = 1;
+                    sig_sym->handler(local_ctx, memory);
+
+                    local_ctx.rdi = sema_id;
+                    local_ctx.rsi = 1;
+                    local_ctx.rdx = 0;
+                    wait_sym->handler(local_ctx, memory);
+                }
+                completed.fetch_add(1);
+            });
+        }
+        for (auto& w : workers) w.join();
+        assert(completed.load() == NUM_THREADS);
+
+        // Clean up
+        ctx.rdi = sema_id;
+        del_sym->handler(ctx, memory);
+        assert(ctx.rax == 0);
+
+        std::cout << "  ✓ Test 11: Semaphore multi-threaded stress and CancelSema regression test verified\n";
+    }
+
     std::cout << "[PHASE 9] PASS: All Threading & Synchronization HLE tests passed!\n";
     return 0;
 }
