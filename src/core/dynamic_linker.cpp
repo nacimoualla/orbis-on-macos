@@ -516,15 +516,17 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
         return false;
     };
 
-    auto process_rela_table = [&](GuestAddr table_addr, GuestSize table_size) {
+    auto process_rela_table = [&](GuestAddr table_addr, GuestSize table_size, const char* what) {
         if (table_addr == 0 || table_size == 0) return;
         const usize count = static_cast<usize>(table_size / sizeof(Elf64_Rela));
+        usize applied = 0, unread = 0;
         // Undefined symbols whose name did not decode to a real NID get a
         // synthetic one. Counted so a module's import table can be audited.
         for (usize i = 0; i < count; ++i) {
             const GuestAddr entry_addr = table_addr + (i * sizeof(Elf64_Rela));
             Elf64_Rela rela{};
-            if (!read_data(entry_addr, &rela, sizeof(rela))) continue;
+            if (!read_data(entry_addr, &rela, sizeof(rela))) { ++unread; continue; }
+            ++applied;
 
             const u32 type = ELF64_R_TYPE(rela.r_info);
             const u32 sym_idx = ELF64_R_SYM(rela.r_info);
@@ -600,10 +602,14 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                 }
             }
         }
+        if (count != 0) {
+            std::fprintf(stderr, "[module] %s: %zu relocs, %zu read, %zu unread\n",
+                         what, count, applied, unread);
+        }
     };
 
-    process_rela_table(rela_addr, rela_size);
-    process_rela_table(jmprel_addr, pltrel_size);
+    process_rela_table(rela_addr, rela_size, "RELA");
+    process_rela_table(jmprel_addr, pltrel_size, "JMPREL");
     if (synthetic_imports != 0) {
         std::fprintf(stderr,
                      "[module] relocation: %zu imported symbols had no decodable NID and "
