@@ -7,7 +7,34 @@
 namespace ps4 {
 
 /// CPU execution register context for x86_64 architecture
+// x87 state. Separate from the GPRs because the stack is 80-bit, which no
+// native register type holds exactly.
+//
+// cw defaults to 0x037F per the Intel SDM: precision control = extended (11),
+// rounding = nearest-even (10), all exception masks set (1111).
+struct X87State {
+    static constexpr u16 kDefaultControlWord = 0x037F;
+
+    u16 cw{kDefaultControlWord};
+    u16 sw{0};
+    u64 st[8]{};   // 80-bit values, stored in the low 64 bits with explicit exponent
+    u16 tag[8]{};  // 0 = valid, non-zero = empty/unused
+    u8  top{0};
+    u16 se_st[8]{};  // sign+exponent word for each stack slot
+
+    [[nodiscard]] bool empty(int i) const noexcept { return tag[i] != 0; }
+
+    void push(u64 mantissa, u16 se) noexcept {
+        top = static_cast<u8>((top - 1) & 7);
+        st[top] = mantissa;
+        se_st[top] = se;
+        tag[top] = 0;
+    }
+};
+
 struct CpuContext {
+    X87State fpu;
+
     // 64-bit General-Purpose Registers (SysV ABI / Orbis OS)
     Reg64 rax{0};
     Reg64 rbx{0};

@@ -317,6 +317,8 @@ int main(int argc, char* argv[]) {
     if (ps4::write_watch_addr() != 0) {
         ps4::dump_write_watch_ring(ps4::write_watch_addr());
     }
+    std::fprintf(stderr, "[map] final table at run exit:\n");
+    memory.dump_mappings();
     if (enable_jit && jit.cached_block_count() > 0) {
         std::cout << "[CPU] JIT Blocks Cached: " << jit.cached_block_count()
                   << " | Total Invocations: " << jit.total_invocations() << "\n";

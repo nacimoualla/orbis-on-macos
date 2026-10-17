@@ -24,6 +24,19 @@ enum class MemoryError {
 
 std::string_view memory_error_to_string(MemoryError error);
 
+// A guest address range claimed by some owner: a module segment, the loader's
+// arena, thread stacks, the HLE trampoline pool.
+//
+// Registered ranges are checked for intersection before anything is written
+// into them. A silent overlap is the worst failure mode available here: it
+// produces a GOT that reads as arbitrary bytes rather than an address, and the
+// symptom surfaces thousands of instructions later at an unrelated fault.
+struct GuestMapping {
+    GuestAddr start{0};
+    GuestAddr size{0};
+    std::string owner;
+};
+
 class MemoryManager {
 public:
     MemoryManager();
@@ -133,11 +146,25 @@ public:
         return memory_error_to_string(m_last_error);
     }
 
+    /// Claim [addr, addr+size) for \p owner. Returns false and reports both
+    /// ranges and both owners if the range intersects an existing mapping.
+    [[nodiscard]] bool reserve_mapping(GuestAddr addr, GuestAddr size, std::string_view owner);
+
+    /// Release a mapping previously claimed by reserve_mapping().
+    void release_mapping(GuestAddr addr);
+
+    /// Every registered mapping, ordered by start address.
+    [[nodiscard]] std::vector<GuestMapping> mappings() const;
+
+    /// Print the mapping table to stderr.
+    void dump_mappings() const;
+
 private:
     u8* m_base{nullptr};
     GuestSize m_total_size{GUEST_MEMORY_SIZE};
     MemoryError m_last_error{MemoryError::None};
     std::unordered_map<u64, u32> m_page_flags;
+    std::vector<GuestMapping> m_mappings;
 };
 
 // Write-watch: arm a guest address range so every store overlapping it is

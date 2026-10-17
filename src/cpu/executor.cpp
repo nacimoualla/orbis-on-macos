@@ -3776,8 +3776,237 @@ StepResult CpuExecutor::step() {
         return StepResult::Ok;
     }
 
-    std::fprintf(stderr, "[CPU] Unhandled opcode at RIP=0x%llx: %02x %02x %02x %02x %02x %02x %02x %02x (cursor=%zu, rex=0x%02x, op0=0x%02x)\n",
-                 (unsigned long long)start_rip,
+    // ---------------------------------------------------------------- x87 ---
+    // Encodings implemented, all verified against the Intel SDM opcode map:
+    //   D9 /0  FLD m32fp     D9 /2 FST m32fp   D9 /3 FSTP m32fp
+    //   D9 /5  FLDCW m16     D9 /7 FNSTCW m16
+    //   D9 C0+i FLD ST(i)    D9 C8+i FXCH ST(i) D9 E0 FCHS   D9 E1 FABS
+    //   DD /0  FLD m64fp     DD /2 FST m64fp   DD /3 FSTP m64fp
+    //   DB /0  FILD m16int   DB /3 FISTP m16int
+    //   DF /0  FILD m32int   DF /5 FILD m64int DF /7 FISTP m32int
+    //   D8/DC/DE/D0 arithmetic and compare (D8=m32fp, DC=m64fp, DE=m16int)
+    // NOT implemented: FISTP m64int does not exist in x87 (FIST/FISTP are 16
+    // and 32-bit integer only), FBLD/FBSTP (m80 BCD), FCOMPP, FUCOMPP.
+    if (op0 == 0xD8 || op0 == 0xD9 || op0 == 0xDA || op0 == 0xDB ||
+        op0 == 0xDC || op0 == 0xDD || op0 == 0xDE || op0 == 0xDF) {
+        // Decode the ModRM (and any SIB/disp) to get the operand address AND the
+        // true instruction length. len must be advanced as the bytes are
+        // consumed -- conflating "length" with "cursor" here silently truncated
+        // every short x87 instruction.
+        // `cursor` already counts the opcode byte (see the 0x99 handler, which
+        // advances with `start_rip + cursor` for a 1-byte opcode). Starting at
+        // cursor+1 skipped a byte and decoded the wrong ModRM entirely.
+        usize len = cursor;
+        u8 modrm = 0;
+        if (len >= 8) return StepResult::MemoryFault;
+        modrm = raw_code[len++];
+        const u8 mod = (modrm >> 6) & 3;
+        const u8 regf = (modrm >> 3) & 7;
+        const u8 rmf = modrm & 7;
+
+        usize rmf_is_mem = (mod != 3);
+        if (rmf_is_mem && rmf == 4) ++len;   // SIB follows
+        usize disp_size = 0;
+        if (mod == 1) disp_size = 1;
+        else if (mod == 2) disp_size = 4;
+
+        GuestAddr ea = 0;
+        bool have_ea = false;
+        i32 disp = 0;
+        if (len + disp_size > 8) return StepResult::MemoryFault;
+        if (disp_size == 1) {
+            disp = static_cast<i8>(raw_code[len]);
+        } else if (disp_size == 4) {
+            std::memcpy(&disp, raw_code + len, 4);
+        }
+        len += disp_size;
+
+        if (rmf_is_mem) {
+            if (mod == 0 && rmf == 5) {
+                // RIP-relative: displacement is relative to the END of the
+                // instruction, which is only known now that len is final.
+                ea = start_rip + len + disp;
+                have_ea = true;
+            } else {
+                static const GuestAddr kReg[8] = {
+                    m_context.rax, m_context.rcx, m_context.rdx, m_context.rbx,
+                    m_context.rsp, m_context.rbp, m_context.rsi, m_context.rdi};
+                GuestAddr base = kReg[rmf];
+                if (rmf == 4) {
+                    u8 sib = 0;
+                    if (len >= 1) sib = raw_code[len - disp_size - 1];
+                    const u8 scale = sib >> 6;
+                    const u8 index = (sib >> 3) & 7;
+                    const u8 bsel = sib & 7;
+                    static const GuestAddr kIdx[8] = {
+                        m_context.rax, m_context.rcx, m_context.rdx, m_context.rbx,
+                        m_context.rsp, m_context.rbp, m_context.rsi, m_context.rdi};
+                    base = kReg[bsel] + (kIdx[index] << scale);
+                }
+                ea = base + disp;
+                have_ea = true;
+            }
+        }
+
+        X87State& f = m_context.fpu;
+        auto load_mem = [&](usize n, i64* out) -> bool {
+            if (!have_ea) return false;
+            u64 raw = 0;
+            if (!m_memory.read_bytes(ea, &raw, n)) return false;
+            *out = static_cast<i64>(raw);
+            return true;
+        };
+        auto push_double = [&](double d) {
+            u64 bits = 0;
+            std::memcpy(&bits, &d, sizeof(bits));
+            f.push(bits, 0);
+        };
+        auto store_double = [&](usize n) -> bool {
+            if (!have_ea) return false;
+            const double d = [&] { double v; std::memcpy(&v, &f.st[f.top], sizeof(v)); return v; }();
+            if (n == 4) { const u32 v = static_cast<u32>(d); return m_memory.write_bytes(ea, &v, 4); }
+            u64 v = 0; std::memcpy(&v, &d, sizeof(v));
+            return m_memory.write_bytes(ea, &v, 8);
+        };
+        // FISTP honours RC (cw bits 10-11): 00 toward zero, 01 nearest-even,
+        // 10 toward +inf, 11 toward -inf.
+        auto store_int = [&](usize n) -> bool {
+            if (!have_ea) return false;
+            double d; std::memcpy(&d, &f.st[f.top], sizeof(d));
+            const int rc = (f.cw >> 10) & 3;
+            double adj = d;
+            switch (rc) {
+                case 0: adj = std::trunc(d); break;             // toward zero
+                case 1: { double r = std::nearbyint(d);
+                          if (std::abs(d - std::trunc(d)) == 0.5) {
+                              const double fl = std::floor(d), ce = std::ceil(d);
+                              r = (std::fabs(d - fl) <= std::fabs(d - ce)) ? fl : ce;
+                          }
+                          adj = r; break; }                       // nearest-even
+                case 2: adj = std::ceil(d); break;               // toward +inf
+                default: adj = std::floor(d); break;             // toward -inf
+            }
+            // Inexact -> clear precision, set IE. Masked, so no trap.
+            if (adj != d) f.sw |= 0x0001;
+            f.sw |= 0x0100;
+            if (n == 2) { const i16 v = static_cast<i16>(adj); return m_memory.write_bytes(ea, &v, 2); }
+            if (n == 4) { const i32 v = static_cast<i32>(adj); return m_memory.write_bytes(ea, &v, 4); }
+            const i64 v = static_cast<i64>(adj); return m_memory.write_bytes(ea, &v, 8);
+        };
+
+        static const bool s_trace_x87 = std::getenv("PS4_TRACE_X87") != nullptr;
+        if (s_trace_x87) {
+            std::fprintf(stderr, "[x87] op=0x%02x modrm=0x%02x mod=%u ext=%u rm=%u len=%zu ea=0x%llx\n",
+                         op0, modrm, (unsigned)mod, (unsigned)regf, (unsigned)rmf, len,
+                         (unsigned long long)ea);
+        }
+        bool handled = true;
+        switch (op0) {
+            case 0xD9: {
+                if (mod == 3) {
+                    if ((modrm & 0xC0) == 0xC0) {           // D9 C0+i / C8+i / D0+i / E0+i
+                        const u8 i = rmf;
+                        switch (regf) {
+                            case 0: { double d; std::memcpy(&d, &f.st[i], sizeof(d));
+                                      push_double(d); } break;                    // FLD ST(i)
+                            case 1: store_double(8); break;                        // FST ST(0)
+                            case 2: { double d; std::memcpy(&d, &f.st[i], sizeof(d));
+                                      double s; std::memcpy(&s, &f.st[f.top], sizeof(s));
+                                      std::memcpy(&f.st[f.top], &s, 8);
+                                      std::memcpy(&f.st[i], &d, 8); } break;       // FXCH
+                            case 4: { double d; std::memcpy(&d, &f.st[f.top], sizeof(d));
+                                      push_double(-d); } break;                    // FCHS
+                            case 5: { double d; std::memcpy(&d, &f.st[f.top], sizeof(d));
+                                      push_double(std::abs(d)); } break;          // FABS
+                            case 7: store_double(8); break;                        // FSTP ST(0)
+                            default: handled = false;
+                        }
+                    } else { handled = false; }
+                } else {
+                    i64 raw = 0;
+                    switch (regf) {
+                        case 0: if (load_mem(4, &raw)) push_double(static_cast<float>(raw));
+                                else handled = false; break;                       // FLD m32
+                        case 2: if (load_mem(4, &raw)) { const float v = static_cast<float>(raw);
+                                if (m_memory.write_bytes(ea, &v, 4)) {} else handled = false; }
+                                else handled = false; break;                       // FST m32
+                        case 3: if (load_mem(4, &raw)) { const float v = static_cast<float>(raw);
+                                push_double(v); if (!m_memory.write_bytes(ea, &v, 4)) handled = false; }
+                                else handled = false; break;                       // FSTP m32
+                        case 5: { u16 cw = 0;
+                                  if (m_memory.read_bytes(ea, &cw, 2)) f.cw = cw;
+                                  else { std::fprintf(stderr, "[x87] FLDCW read FAILED ea=0x%llx\n",
+                                                      (unsigned long long)ea); handled = false; } } break;  // FLDCW
+                        case 7: { if (!m_memory.write_bytes(ea, &f.cw, 2)) {
+                                    std::fprintf(stderr, "[x87] FNSTCW write FAILED ea=0x%llx\n",
+                                                 (unsigned long long)ea);
+                                    handled = false; } }
+                                break;                                            // FNSTCW
+                        default: handled = false;
+                    }
+                }
+                break;
+            }
+            case 0xDD: {
+                i64 raw = 0;
+                switch (regf) {
+                    case 0: if (load_mem(8, &raw)) push_double(static_cast<double>(raw));
+                            else handled = false; break;                            // FLD m64
+                    case 2: if (load_mem(8, &raw)) { double v; std::memcpy(&v, &raw, 8);
+                            if (!m_memory.write_bytes(ea, &v, 8)) handled = false; }
+                            else handled = false; break;                            // FST m64
+                    case 3: if (load_mem(8, &raw)) { double v; std::memcpy(&v, &raw, 8);
+                            push_double(v);
+                            if (!m_memory.write_bytes(ea, &v, 8)) handled = false; }
+                            else handled = false; break;                            // FSTP m64
+                    default: handled = false;
+                }
+                break;
+            }
+            case 0xDB: {
+                i64 raw = 0;
+                switch (regf) {
+                    case 0: if (load_mem(2, &raw)) push_double(static_cast<double>(raw));
+                            else handled = false; break;                            // FILD m16
+                    case 3: store_int(2); break;                                    // FISTP m16
+                    default: handled = false;
+                }
+                break;
+            }
+            case 0xDF: {
+                i64 raw = 0;
+                switch (regf) {
+                    case 0: if (load_mem(4, &raw)) push_double(static_cast<double>(raw));
+                            else handled = false; break;                            // FILD m32
+                    case 5: if (load_mem(8, &raw)) push_double(static_cast<double>(raw));
+                            else handled = false; break;                            // FILD m64
+                    case 7: store_int(4); break;                                    // FISTP m32
+                    default: handled = false;
+                }
+                break;
+            }
+            default:
+                handled = false;
+        }
+        if (handled) {
+            // One-shot trace so a bad operand address is visible without
+            // spamming a hot path.
+            static std::atomic<u32> s_x87_trace{0};
+            if (s_x87_trace.fetch_add(1, std::memory_order_relaxed) < 400) {
+                std::fprintf(stderr,
+                             "[x87] op=0x%02x modrm=0x%02x ext=%u ea=0x%llx have_ea=%d "
+                             "rip=0x%llx cw=0x%04x sw=0x%04x top=%u\n",
+                             op0, modrm, (unsigned)regf,
+                             (unsigned long long)ea, have_ea ? 1 : 0,
+                             (unsigned long long)start_rip, f.cw, f.sw, f.top);
+            }
+            m_context.rip = start_rip + len;
+            return StepResult::Ok;
+        }
+        // fall through to the unhandled report
+    }
+
+    std::fprintf(stderr, "[CPU] Unhandled opcode at RIP=0x%llx: %02x %02x %02x %02x %02x %02x %02x %02x (cursor=%zu, rex=0x%02x, op0=0x%02x)\n",                 (unsigned long long)start_rip,
                  raw_code[0], raw_code[1], raw_code[2], raw_code[3], raw_code[4], raw_code[5], raw_code[6], raw_code[7],
                  cursor, rex, op0);
     std::fprintf(stderr, "[CPU] Recent RIP history (last 32 instructions):\n");

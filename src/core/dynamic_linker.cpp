@@ -792,7 +792,7 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
 }
 
 bool DynamicLinker::map_segments(std::span<const u8> file_data, const ElfLoader& loader,
-                                 GuestAddr base, GuestSize* span_out) {
+                                 GuestAddr base, GuestSize* span_out, u32 handle) {
     GuestSize span = 0;
     for (const auto& ph : loader.program_headers()) {
         if (ph.p_type != PT_LOAD && ph.p_type != PT_SCE_RELRO) continue;
@@ -803,6 +803,14 @@ bool DynamicLinker::map_segments(std::span<const u8> file_data, const ElfLoader&
             return false;
         }
         const GuestAddr dst = base + ph.p_vaddr;
+        char label[96];
+        std::snprintf(label, sizeof(label), "module@0x%x:seg@0x%llx", handle,
+                      (unsigned long long)ph.p_vaddr);
+        if (!m_memory.reserve_mapping(dst, ph.p_memsz, label)) {
+            std::fprintf(stderr, "[module] 0x%x: refusing to map segment at 0x%llx\n",
+                         handle, (unsigned long long)dst);
+            return false;
+        }
         if (ph.p_filesz > 0) {
             if (seg_off + static_cast<usize>(ph.p_filesz) > file_data.size()) {
                 std::fprintf(stderr, "[module] segment 0x%llx+0x%llx runs past end of file\n",
@@ -904,7 +912,7 @@ u32 DynamicLinker::load_module(const std::string& path, GuestAddr base, bool run
     m_modules.emplace(handle, mod);
 
     GuestSize span = 0;
-    if (!map_segments(data, loader, base, &span)) {
+    if (!map_segments(data, loader, base, &span, handle)) {
         m_modules.erase(handle);
         return 0;
     }
@@ -980,22 +988,26 @@ DynamicLinker* active_linker() noexcept { return g_active_linker; }
 void set_active_linker(DynamicLinker* linker) noexcept { g_active_linker = linker; }
 
 GuestAddr module_base_allocator(GuestSize need) noexcept {
-    // Reserve the module's ACTUAL span, not a fixed stride.
+    // Reserve the module's ACTUAL span, then advance past it with a guard gap.
     //
     // A fixed 2 MB bump overlapped mono-ps4.prx, whose span is 0x24ab68. The next
     // module landed at 0x160200000 -- inside the first module's RELRO -- and its
     // LOAD[0] copy (0x114d8b0 bytes) overwrote the GOT, including a jump slot
     // that had just been correctly patched to a trampoline. A later PLT
     // `jmp qword ptr [rip+disp]` through that slot then landed on raw file bytes.
-    const GuestAddr align = kModuleBaseAlign;
-    const GuestAddr base = (g_next_module_base + align - 1) & ~(align - 1);
+    //
+    // next_base = align_up(base + span, 0x4000) + kModuleGuardGap
+    constexpr GuestAddr kModuleAlign = 0x4000;
+    constexpr GuestAddr kModuleGuardGap = 0x40000; // 256 KB of unmapped slack
+
+    const GuestAddr base = (g_next_module_base + kModuleAlign - 1) & ~(kModuleAlign - 1);
     const GuestAddr end = base + need;
     if (end >= kModuleBaseCeiling) {
         std::fprintf(stderr, "[module] module base space exhausted (need 0x%llx at 0x%llx)\n",
                      (unsigned long long)need, (unsigned long long)base);
         return 0;
     }
-    g_next_module_base = end;
+    g_next_module_base = ((end + kModuleAlign - 1) & ~(kModuleAlign - 1)) + kModuleGuardGap;
     return base;
 }
 

@@ -109,7 +109,7 @@ private:
                             GuestAddr base, u32 handle, GuestSize span);
 
     /// Copy PT_LOAD contents to \p base + p_vaddr and zero the .bss tail.
-    bool map_segments(std::span<const u8> file_data, const ElfLoader& loader, GuestAddr base, GuestSize* span_out);
+    bool map_segments(std::span<const u8> file_data, const ElfLoader& loader, GuestAddr base, GuestSize* span_out, u32 handle);
 
     MemoryManager& m_memory;
     SyscallTable& m_syscalls;

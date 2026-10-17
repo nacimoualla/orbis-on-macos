@@ -193,6 +193,47 @@ void dump_write_watch_ring(u64 filter_addr) {
     std::fprintf(stderr, "[watch] ring: %zu writes matched filter\n", shown);
 }
 
+bool MemoryManager::reserve_mapping(GuestAddr addr, GuestAddr size, std::string_view owner) {
+    if (size == 0) return true;
+    const GuestAddr end = addr + size;
+    for (const auto& m : m_mappings) {
+        if (addr < m.start + m.size && m.start < end) {
+            std::fprintf(stderr,
+                         "[map] OVERLAP: cannot map '%.*s' [0x%llx,0x%llx) because it "
+                         "intersects '%s' [0x%llx,0x%llx)\n",
+                         (int)owner.size(), owner.data(),
+                         (unsigned long long)addr, (unsigned long long)end,
+                         m.owner.c_str(),
+                         (unsigned long long)m.start, (unsigned long long)(m.start + m.size));
+            return false;
+        }
+    }
+    m_mappings.push_back({addr, size, std::string(owner)});
+    std::sort(m_mappings.begin(), m_mappings.end(),
+              [](const GuestMapping& a, const GuestMapping& b) { return a.start < b.start; });
+    return true;
+}
+
+void MemoryManager::release_mapping(GuestAddr addr) {
+    m_mappings.erase(std::remove_if(m_mappings.begin(), m_mappings.end(),
+                                    [&](const GuestMapping& m) { return m.start == addr; }),
+                     m_mappings.end());
+}
+
+std::vector<GuestMapping> MemoryManager::mappings() const { return m_mappings; }
+
+void MemoryManager::dump_mappings() const {
+    std::fprintf(stderr, "[map] registered guest mappings (%zu):\n", m_mappings.size());
+    std::fprintf(stderr, "  %-34s %14s %14s %12s\n", "owner", "start", "end", "size");
+    for (const auto& m : m_mappings) {
+        std::fprintf(stderr, "  %-34s 0x%09llx 0x%09llx 0x%08llx\n",
+                     m.owner.size() > 34 ? m.owner.substr(0, 31).c_str() : m.owner.c_str(),
+                     (unsigned long long)m.start,
+                     (unsigned long long)(m.start + m.size),
+                     (unsigned long long)m.size);
+    }
+}
+
 bool MemoryManager::write_bytes(GuestAddr addr, const void* src, usize size) {
     if (!is_valid_address(addr, size)) {
         m_last_error = MemoryError::OutOfBounds;
@@ -293,6 +334,14 @@ bool MemoryManager::load_elf_segments(const ElfLoader& loader, std::span<const u
 
         if (!is_valid_address(seg.p_vaddr, seg.p_memsz)) {
             m_last_error = MemoryError::OutOfBounds;
+            return false;
+        }
+
+        char label[64];
+        std::snprintf(label, sizeof(label), "elf-segment@0x%llx",
+                      (unsigned long long)seg.p_vaddr);
+        if (!reserve_mapping(seg.p_vaddr, seg.p_memsz, label)) {
+            m_last_error = MemoryError::InvalidSegment;
             return false;
         }
 
