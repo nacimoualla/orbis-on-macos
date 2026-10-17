@@ -8,7 +8,8 @@
 // games/flappy_bird/ED1633-NPXX51362_00-TER1520000000000/.
 
 #import <AppKit/AppKit.h>
-#include <mach-o/dyld.h>
+#import <mach-o/dyld.h>
+#include <unistd.h>
 
 #include <string>
 #include <vector>
@@ -27,7 +28,39 @@ static std::string runner_path() {
     return p.substr(0, slash) + "/ps4-runner";
 }
 
-static NSString* human_size(ps4::u64 bytes) {
+// Where run logs go, and the ONLY place they go: <repo root>/Logs.
+//
+// Resolved by walking up from this executable until a CMakeLists.txt is found,
+// so it resolves identically whether the app runs from the bundle
+// (build/ps4-gui.app/Contents/MacOS/) or as a loose binary (build/).
+//
+// There is deliberately no fallback. An earlier version wrote inside the .app
+// bundle, which is wrong twice over: it buries logs somewhere unintuitive, and
+// a future code signature would be invalidated by files appearing under
+// Contents/. Rather than silently scattering logs to a second location, an
+// unresolved root is reported and the run is not logged.
+static bool repo_root(std::string& out) {
+    char buf[4096] = {0};
+    uint32_t n = uint32_t(sizeof(buf) - 1);
+    if (_NSGetExecutablePath(buf, &n) != 0) return false;
+    std::string dir(buf);
+    const size_t slash = dir.find_last_of('/');
+    if (slash != std::string::npos) dir = dir.substr(0, slash);
+
+    for (int hops = 0; hops < 8; ++hops) {
+        const size_t s2 = dir.find_last_of('/');
+        if (s2 == std::string::npos) break;
+        dir = dir.substr(0, s2);
+        if (dir.empty()) break;
+        if (::access((dir + "/CMakeLists.txt").c_str(), F_OK) == 0) {
+            out = dir;
+            return true;
+        }
+    }
+    return false;
+}
+
+NSString* human_size(ps4::u64 bytes) {
     if (bytes >= (1ull << 30))
         return [NSString stringWithFormat:@"%.2f GB", double(bytes) / 1073741824.0];
     if (bytes >= (1ull << 20))
@@ -267,19 +300,26 @@ using ps4::gui::scan_folder;
     t.standardOutput = out;
     t.standardError = out;
 
-    // Tee the run to <runner dir>/logs/run_<timestamp>.log so a session's
-    // output survives the GUI closing. The runner directory is where
-    // runner_path() points, which inside a bundle is Contents/MacOS/.
-    NSString* runnerDir = @(runner_path().c_str()).stringByDeletingLastPathComponent;
-    NSString* logDir = [runnerDir stringByAppendingPathComponent:@"logs"];
-    NSError* dirErr = nil;
-    if (![[NSFileManager defaultManager] createDirectoryAtPath:logDir
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:&dirErr]) {
-        [self setStatus:[NSString stringWithFormat:@"Log dir failed: %@",
-                                                  dirErr.localizedDescription]];
+    // Tee the run to <repo root>/Logs/run_<timestamp>.log so a session's
+    // output survives the GUI closing.
+    std::string root;
+    if (!repo_root(root)) {
+        // Single destination, no fallback: say so rather than write elsewhere.
+        [self setStatus:@"Cannot locate repo root; logs disabled"];
+        [self appendLog:@"[gui] could not locate the repo root (no CMakeLists.txt "
+                        "above the executable); run logs are disabled"];
     } else {
+        NSString* logDir =
+            [[NSString stringWithUTF8String:root.c_str()]
+                stringByAppendingPathComponent:@"Logs"];
+        NSError* dirErr = nil;
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:logDir
+                                      withIntermediateDirectories:YES
+                                                       attributes:nil
+                                                            error:&dirErr]) {
+            [self setStatus:[NSString stringWithFormat:@"Log dir failed: %@",
+                                                      dirErr.localizedDescription]];
+        } else {
         NSDateFormatter* fmt = [NSDateFormatter new];
         fmt.dateFormat = @"yyyyMMdd-HHmmss";
         NSString* fname = [NSString stringWithFormat:@"run_%@.log",
@@ -298,6 +338,7 @@ using ps4::gui::scan_folder;
             [self setStatus:[NSString stringWithFormat:@"Cannot open log %@", path]];
         } else {
             [self appendLog:[NSString stringWithFormat:@"=== logging to %@ ===", path]];
+        }
         }
     }
 
