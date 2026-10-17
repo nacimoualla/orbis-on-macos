@@ -53,6 +53,45 @@ struct CpuContext {
         else rflags &= ~flag;
     }
 
+    void update_flags_logic(u64 result, usize bits) noexcept {
+        const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+        const u64 masked = result & mask;
+        set_flag(FLAG_CF, false);
+        set_flag(FLAG_OF, false);
+        set_flag(FLAG_ZF, (masked == 0));
+        set_flag(FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
+        const u64 sign_bit = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
+        set_flag(FLAG_SF, (masked & sign_bit) != 0);
+    }
+
+    void update_flags_add(u64 a, u64 b, u64 result, usize bits) noexcept {
+        const u64 sign_mask = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
+        const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+        const u64 masked = result & mask;
+        set_flag(FLAG_ZF, (masked == 0));
+        set_flag(FLAG_SF, (masked & sign_mask) != 0);
+        set_flag(FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
+        set_flag(FLAG_CF, masked < (a & mask));
+        const bool a_sign = (a & sign_mask) != 0;
+        const bool b_sign = (b & sign_mask) != 0;
+        const bool res_sign = (masked & sign_mask) != 0;
+        set_flag(FLAG_OF, (a_sign == b_sign) && (a_sign != res_sign));
+    }
+
+    void update_flags_sub(u64 a, u64 b, u64 result, usize bits) noexcept {
+        const u64 sign_mask = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
+        const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+        const u64 masked = result & mask;
+        set_flag(FLAG_ZF, (masked == 0));
+        set_flag(FLAG_SF, (masked & sign_mask) != 0);
+        set_flag(FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
+        set_flag(FLAG_CF, (a & mask) < (b & mask));
+        const bool a_sign = (a & sign_mask) != 0;
+        const bool b_sign = (b & sign_mask) != 0;
+        const bool res_sign = (masked & sign_mask) != 0;
+        set_flag(FLAG_OF, (a_sign != b_sign) && (a_sign != res_sign));
+    }
+
     // Segment base registers (for TLS emulation)
     Reg64 fs_base{0};
     Reg64 gs_base{0};

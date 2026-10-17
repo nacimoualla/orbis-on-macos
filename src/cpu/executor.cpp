@@ -114,42 +114,15 @@ inline void set_gpr64(CpuContext& ctx, u8 reg_idx, u64 val) {
 }
 
 inline void update_flags_logic(CpuContext& ctx, u64 result, usize bits) {
-    const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
-    const u64 masked = result & mask;
-    ctx.set_flag(CpuContext::FLAG_CF, false);
-    ctx.set_flag(CpuContext::FLAG_OF, false);
-    ctx.set_flag(CpuContext::FLAG_ZF, (masked == 0));
-    ctx.set_flag(CpuContext::FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
-    const u64 sign_bit = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
-    ctx.set_flag(CpuContext::FLAG_SF, (masked & sign_bit) != 0);
+    ctx.update_flags_logic(result, bits);
 }
 
 inline void update_flags_add(CpuContext& ctx, u64 a, u64 b, u64 result, usize bits) {
-    const u64 sign_mask = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
-    const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
-    const u64 masked = result & mask;
-    ctx.set_flag(CpuContext::FLAG_ZF, (masked == 0));
-    ctx.set_flag(CpuContext::FLAG_SF, (masked & sign_mask) != 0);
-    ctx.set_flag(CpuContext::FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
-    ctx.set_flag(CpuContext::FLAG_CF, masked < (a & mask));
-    const bool a_sign = (a & sign_mask) != 0;
-    const bool b_sign = (b & sign_mask) != 0;
-    const bool res_sign = (masked & sign_mask) != 0;
-    ctx.set_flag(CpuContext::FLAG_OF, (a_sign == b_sign) && (a_sign != res_sign));
+    ctx.update_flags_add(a, b, result, bits);
 }
 
 inline void update_flags_sub(CpuContext& ctx, u64 a, u64 b, u64 result, usize bits) {
-    const u64 sign_mask = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
-    const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
-    const u64 masked = result & mask;
-    ctx.set_flag(CpuContext::FLAG_ZF, (masked == 0));
-    ctx.set_flag(CpuContext::FLAG_SF, (masked & sign_mask) != 0);
-    ctx.set_flag(CpuContext::FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
-    ctx.set_flag(CpuContext::FLAG_CF, (a & mask) < (b & mask));
-    const bool a_sign = (a & sign_mask) != 0;
-    const bool b_sign = (b & sign_mask) != 0;
-    const bool res_sign = (masked & sign_mask) != 0;
-    ctx.set_flag(CpuContext::FLAG_OF, (a_sign != b_sign) && (a_sign != res_sign));
+    ctx.update_flags_sub(a, b, result, bits);
 }
 
 inline bool check_condition(const CpuContext& ctx, u8 cc) {
@@ -624,6 +597,8 @@ StepResult CpuExecutor::step() {
             int idx = (s_rip_hist_idx - i + 128) % 128;
             std::fprintf(stderr, "  #%d: 0x%llx\n", i, (unsigned long long)s_rip_history[idx]);
         }
+        dump_control_xfers(1);
+        dump_write_watch_ring(0x215d1010);
         return StepResult::MemoryFault;
     }
 
@@ -634,6 +609,7 @@ StepResult CpuExecutor::step() {
 
     const GuestAddr start_rip = m_context.rip;
     s_rip_history[s_rip_hist_idx++ % 128] = start_rip;
+
     u8 rex = 0;
     bool has_rex = false;
     bool operand_size_16 = false;
