@@ -273,7 +273,20 @@ bool MemoryManager::load_elf_segments(const ElfLoader& loader, std::span<const u
     }
 
     for (const auto& seg : loader.load_segments()) {
-        if (seg.p_offset > file_data.size() || seg.p_filesz > file_data.size() - seg.p_offset || seg.p_memsz < seg.p_filesz) {
+        // Ask the loader where the bytes actually are. In a SELF-wrapped module
+        // seg.p_offset is the pre-packing layout and is stale -- eboot.bin's
+        // PT_LOAD[0] claims 0x4000 but its data starts at 0xaeb0, so copying
+        // from p_offset maps the wrong 0x4000 bytes and the first guest
+        // instruction lands in a string.
+        bool seg_found = false;
+        const usize src_off = loader.segment_file_offset(seg, &seg_found);
+        if (!seg_found) {
+            m_last_error = MemoryError::InvalidSegment;
+            return false;
+        }
+        if (src_off > file_data.size() ||
+            seg.p_filesz > file_data.size() - src_off ||
+            seg.p_memsz < seg.p_filesz) {
             m_last_error = MemoryError::InvalidSegment;
             return false;
         }
@@ -285,7 +298,7 @@ bool MemoryManager::load_elf_segments(const ElfLoader& loader, std::span<const u
 
         // Copy file content to guest virtual address
         if (seg.p_filesz > 0) {
-            std::memcpy(m_base + seg.p_vaddr, file_data.data() + seg.p_offset, seg.p_filesz);
+            std::memcpy(m_base + seg.p_vaddr, file_data.data() + src_off, seg.p_filesz);
         }
 
         // Zero out .bss region if memsz > filesz
