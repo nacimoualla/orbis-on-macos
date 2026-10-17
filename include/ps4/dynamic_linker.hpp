@@ -80,6 +80,15 @@ public:
 
     [[nodiscard]] const LoadedModule* module(u32 handle) const noexcept;
     [[nodiscard]] usize module_count() const noexcept { return m_modules.size(); }
+
+    /// Which loaded module contains this guest address, and at what offset.
+    /// Returns nullptr when the address is not inside any module.
+    [[nodiscard]] const LoadedModule* module_for_addr(GuestAddr addr,
+                                                      GuestAddr* offset) const noexcept;
+
+    /// Lowest address the NID importer assigned to a module, or 0 if none.
+    /// Used to tell a module range apart from the base module's.
+    [[nodiscard]] GuestAddr first_module_base() const noexcept;
     [[nodiscard]] usize module_export_count() const noexcept { return m_module_exports.size(); }
 
     /// Total number of generated trampolines
@@ -97,10 +106,10 @@ private:
     /// Walk the SCE dynamic table and record every symbol table whose
     /// st_shndx != SHN_UNDEF into m_module_exports.
     void build_export_table(std::span<const u8> file_data, const ElfLoader& loader,
-                            GuestAddr base, u32 handle);
+                            GuestAddr base, u32 handle, GuestSize span);
 
     /// Copy PT_LOAD contents to \p base + p_vaddr and zero the .bss tail.
-    bool map_segments(std::span<const u8> file_data, const ElfLoader& loader, GuestAddr base);
+    bool map_segments(std::span<const u8> file_data, const ElfLoader& loader, GuestAddr base, GuestSize* span_out);
 
     MemoryManager& m_memory;
     SyscallTable& m_syscalls;
@@ -142,6 +151,9 @@ void set_active_linker(DynamicLinker* linker) noexcept;
 
 /// Next free guest address for module mapping. Sits in the mspace arena range,
 /// well clear of the 0x1C0000000 direct-memory ceiling.
-GuestAddr module_base_allocator() noexcept;
+/// Reserve \p need bytes of module space and return the base, or 0 if the
+/// region is exhausted. The reservation accounts for the real span, so
+/// consecutive modules cannot overlap.
+GuestAddr module_base_allocator(GuestSize need) noexcept;
 
 } // namespace ps4

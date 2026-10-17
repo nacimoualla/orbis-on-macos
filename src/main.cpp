@@ -129,6 +129,12 @@ int main(int argc, char* argv[]) {
     nid_registry.register_default_libraries();
 
     ps4::DynamicLinker linker(memory, syscalls, nid_registry);
+    // State up front which module-loading mode this run will use, so a log can
+    // never be ambiguous about whether Mono actually executed.
+    {
+        const char* prx = std::getenv("PS4_LOAD_PRX");
+        std::fprintf(stderr, "[prx] mode=%s\n", (prx && prx[0] && std::strcmp(prx, "0") != 0) ? "real" : "hle");
+    }
     // Hand the linker to HLE handlers: sceKernelLoadStartModule needs it to map
     // PRX modules for real, and the trampoline dispatcher it owns is what makes
     // those modules' exports take over from our stubs.

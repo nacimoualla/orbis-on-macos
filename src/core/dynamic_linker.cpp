@@ -664,7 +664,7 @@ bool decode_nid_token(const char* tok11, Nid* out) {
 } // namespace
 
 void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfLoader& loader,
-                                       GuestAddr base, u32 handle) {
+                                       GuestAddr base, u32 handle, GuestSize span) {
     const usize proglib_off = loader.proglib_file_offset();
     const usize proglib_size = loader.proglib_file_size();
     if (proglib_off == 0 || proglib_size == 0 ||
@@ -783,13 +783,16 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
         it->second.fini = fini;
     }
     std::fprintf(stderr,
-                 "[module] 0x%x %s: %zu syms, %zu exported, DT_INIT=0x%llx DT_FINI=0x%llx\n",
+                 "[module] 0x%x %s: base=0x%llx span=0x%llx (ends 0x%llx) | %zu syms, "
+                 "%zu exported, DT_INIT=0x%llx DT_FINI=0x%llx\n",
                  handle, loader.is_self_container() ? "SELF/PRX" : "ELF",
+                 (unsigned long long)base, (unsigned long long)span,
+                 (unsigned long long)(base + span),
                  total, defined, (unsigned long long)init, (unsigned long long)fini);
 }
 
 bool DynamicLinker::map_segments(std::span<const u8> file_data, const ElfLoader& loader,
-                                 GuestAddr base) {
+                                 GuestAddr base, GuestSize* span_out) {
     GuestSize span = 0;
     for (const auto& ph : loader.program_headers()) {
         if (ph.p_type != PT_LOAD && ph.p_type != PT_SCE_RELRO) continue;
@@ -825,8 +828,9 @@ bool DynamicLinker::map_segments(std::span<const u8> file_data, const ElfLoader&
                 p += n;
             }
         }
-        span = std::max<GuestSize>(span, ph.p_memsz);
+        span = std::max<GuestSize>(span, ph.p_vaddr + ph.p_memsz);
     }
+    if (span_out) *span_out = span;
     return span != 0;
 }
 
@@ -849,12 +853,47 @@ u32 DynamicLinker::load_module(const std::string& path, GuestAddr base, bool run
                      std::string(loader.error_message()).c_str());
         return 0;
     }
-    if (!loader.needs_load_base() && base != 0) {
-        // ET_EXEC is already linked at absolute addresses; honouring a base
-        // would relocate code that was not meant to move.
-        std::fprintf(stderr, "[module] %s is ET_EXEC, ignoring base 0x%llx\n",
+
+    // Compute the span from the program headers before choosing a base, so the
+    // reservation is the real footprint.
+    GuestSize needed = 0;
+    for (const auto& ph : loader.program_headers()) {
+        if (ph.p_type != PT_LOAD && ph.p_type != PT_SCE_RELRO) continue;
+        needed = std::max<GuestSize>(needed, ph.p_vaddr + ph.p_memsz);
+    }
+    if (needed == 0) {
+        std::fprintf(stderr, "[module] %s: no loadable segments\n", path.c_str());
+        return 0;
+    }
+
+    if (base == 0) {
+        if (loader.needs_load_base()) {
+            base = module_base_allocator(needed);
+            if (base == 0) return 0;
+        }
+        // else: fixed-address executable, maps where its headers say
+    } else if (!loader.needs_load_base()) {
+        std::fprintf(stderr, "[module] %s has fixed addresses, ignoring base 0x%llx\n",
                      path.c_str(), (unsigned long long)base);
         base = 0;
+    }
+
+    // Refuse to map on top of an existing module. This is a loader bug if it
+    // ever fires, and silently overlapping produces a GOT that reads as
+    // arbitrary bytes rather than an address.
+    if (base != 0) {
+        for (const auto& [h, m] : m_modules) {
+            if (m.base == 0) continue;
+            if (base < m.base + m.size && m.base < base + needed) {
+                std::fprintf(stderr,
+                             "[module] REFUSING to map %s at 0x%llx: overlaps module 0x%x "
+                             "[0x%llx,0x%llx)\n",
+                             path.c_str(), (unsigned long long)base, h,
+                             (unsigned long long)m.base,
+                             (unsigned long long)(m.base + m.size));
+                return 0;
+            }
+        }
     }
 
     const u32 handle = ++m_next_module_handle;
@@ -864,19 +903,18 @@ u32 DynamicLinker::load_module(const std::string& path, GuestAddr base, bool run
     mod.base = base;
     m_modules.emplace(handle, mod);
 
-    if (!map_segments(data, loader, base)) {
+    GuestSize span = 0;
+    if (!map_segments(data, loader, base, &span)) {
         m_modules.erase(handle);
         return 0;
     }
+    m_modules.find(handle)->second.size = span;
 
     // Relocate before reading exports: the symbol values we record are the
     // pre-relocation ones, but the import bindings written here are what make
     // the module's own calls land somewhere sane.
     resolve_relocations(data, loader, base);
-    build_export_table(data, loader, base, handle);
-
-    auto it = m_modules.find(handle);
-    if (it != m_modules.end()) it->second.size = loader.needs_load_base() ? base : 0;
+    build_export_table(data, loader, base, handle, span);
 
     if (run_init) run_module_init(handle);
     return handle;
@@ -905,6 +943,27 @@ const LoadedModule* DynamicLinker::module(u32 handle) const noexcept {
     return it == m_modules.end() ? nullptr : &it->second;
 }
 
+const LoadedModule* DynamicLinker::module_for_addr(GuestAddr addr, GuestAddr* offset) const noexcept {
+    for (const auto& [handle, mod] : m_modules) {
+        if (mod.base == 0) continue;
+        const GuestAddr size = mod.size ? mod.size : 0x1000;
+        if (addr >= mod.base && addr < mod.base + size) {
+            if (offset) *offset = addr - mod.base;
+            return &mod;
+        }
+    }
+    if (offset) *offset = addr;
+    return nullptr;
+}
+
+GuestAddr DynamicLinker::first_module_base() const noexcept {
+    GuestAddr lo = 0;
+    for (const auto& [handle, mod] : m_modules) {
+        if (mod.base != 0 && (lo == 0 || mod.base < lo)) lo = mod.base;
+    }
+    return lo;
+}
+
 namespace {
 DynamicLinker* g_active_linker = nullptr;
 
@@ -920,14 +979,23 @@ constexpr GuestAddr kModuleBaseAlign = 0x200000ULL;
 DynamicLinker* active_linker() noexcept { return g_active_linker; }
 void set_active_linker(DynamicLinker* linker) noexcept { g_active_linker = linker; }
 
-GuestAddr module_base_allocator() noexcept {
-    const GuestAddr base = g_next_module_base;
-    g_next_module_base += kModuleBaseAlign;
-    if (g_next_module_base >= kModuleBaseCeiling) {
-        std::fprintf(stderr, "[module] module base space exhausted at 0x%llx\n",
-                     (unsigned long long)base);
+GuestAddr module_base_allocator(GuestSize need) noexcept {
+    // Reserve the module's ACTUAL span, not a fixed stride.
+    //
+    // A fixed 2 MB bump overlapped mono-ps4.prx, whose span is 0x24ab68. The next
+    // module landed at 0x160200000 -- inside the first module's RELRO -- and its
+    // LOAD[0] copy (0x114d8b0 bytes) overwrote the GOT, including a jump slot
+    // that had just been correctly patched to a trampoline. A later PLT
+    // `jmp qword ptr [rip+disp]` through that slot then landed on raw file bytes.
+    const GuestAddr align = kModuleBaseAlign;
+    const GuestAddr base = (g_next_module_base + align - 1) & ~(align - 1);
+    const GuestAddr end = base + need;
+    if (end >= kModuleBaseCeiling) {
+        std::fprintf(stderr, "[module] module base space exhausted (need 0x%llx at 0x%llx)\n",
+                     (unsigned long long)need, (unsigned long long)base);
         return 0;
     }
+    g_next_module_base = end;
     return base;
 }
 

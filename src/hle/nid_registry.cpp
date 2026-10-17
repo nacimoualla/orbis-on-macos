@@ -689,15 +689,25 @@ void NidRegistry::register_default_libraries() {
     // The load is best-effort. A module that fails to map returns 0 (the real
     // failure value) rather than a fake handle, so callers can tell the
     // difference instead of jumping into an unmapped page.
+    // sceKernelLoadStartModule
+    // NID: 0xC33BEA4F852A297FULL
     register_symbol(0xC33BEA4F852A297FULL, "sceKernelLoadStartModule", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr path_addr = ctx.rdi;
             const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
-                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
-            if (path == nullptr) {
-                ctx.rax = 0;
+                                   ? mem.to_host_ptr<char>(path_addr) : "unknown";
+
+            // If PS4_LOAD_PRX is not explicitly set, use HLE stubs:
+            // mono-ps4.prx contains imported symbols whose relocations cannot yet be
+            // resolved cleanly, causing an infinite loop when called from Unity.
+            if (!std::getenv("PS4_LOAD_PRX")) {
+                static u32 s_module_id = 0x2000;
+                const u32 handle = ++s_module_id;
+                std::fprintf(stderr, "[HLE] sceKernelLoadStartModule('%s') -> handle 0x%x (HLE mode)\n", path, handle);
+                ctx.rax = handle;
                 return;
             }
+
             auto& vfs = get_vfs();
             auto resolved = vfs.resolve_path(path);
             const std::string host_path = resolved ? resolved->string() : std::string(path);
@@ -708,11 +718,8 @@ void NidRegistry::register_default_libraries() {
                 ctx.rax = 0;
                 return;
             }
-            const GuestAddr base = ps4::module_base_allocator();
-            if (base == 0) {
-                ctx.rax = 0;
-                return;
-            }
+            // base 0: let load_module reserve the module's real span.
+            const GuestAddr base = 0;
             // run_init stays false: MonoAssembliesPS4.prx has DT_INIT == 0, and
             // the guest drives these modules through its own startup path.
             // Calling a null entry point would jump straight to the module base.

@@ -1,4 +1,5 @@
 #include "ps4/executor.hpp"
+#include "ps4/dynamic_linker.hpp"
 #include "ps4/jit_compiler.hpp"
 #include <chrono>
 #include <cstring>
@@ -592,6 +593,139 @@ StepResult CpuExecutor::step() {
         m_memory.read_value(m_context.rsp, ret);
         std::fprintf(stderr, "[CPU FAULT] RIP=0x%llx, RSP=0x%llx (return=0x%llx)\n",
                      (unsigned long long)m_context.rip, (unsigned long long)m_context.rsp, (unsigned long long)ret);
+
+        // Which loaded module, if any, contains the faulting address.
+        GuestAddr moff = 0;
+        const LoadedModule* mod = nullptr;
+        if (DynamicLinker* lk = active_linker()) mod = lk->module_for_addr(m_context.rip, &moff);
+        if (mod != nullptr) {
+            std::fprintf(stderr, "[CPU FAULT] module handle=0x%x path=%s base=0x%llx "
+                                 "module+0x%llx (span 0x%llx)\n",
+                         mod->handle, mod->path.c_str(), (unsigned long long)mod->base,
+                         (unsigned long long)moff, (unsigned long long)mod->size);
+        } else {
+            std::fprintf(stderr, "[CPU FAULT] module=<none: not inside any loaded module>\n");
+        }
+
+        // 64 bytes ending at RIP (the instruction stream that led here) plus 16
+        // bytes AT the faulting RIP.
+        if (m_context.rip >= 64) {
+            u8 pre[64], at[16];
+            if (m_memory.read_bytes(m_context.rip - 64, pre, sizeof(pre)) &&
+                m_memory.read_bytes(m_context.rip, at, sizeof(at))) {
+                std::fprintf(stderr, "[CPU FAULT] code 64 bytes BEFORE rip:\n  ");
+                for (int i = 0; i < 64; i += 16) {
+                    std::fprintf(stderr, "0x%016llx: ", (unsigned long long)(m_context.rip - 64 + i));
+                    for (int j = 0; j < 16; ++j) std::fprintf(stderr, "%02x ", pre[i + j]);
+                    std::fprintf(stderr, "\n  ");
+                }
+                std::fprintf(stderr, "\n[CPU FAULT] code AT rip:\n  ");
+                for (int j = 0; j < 16; ++j) std::fprintf(stderr, "%02x ", at[j]);
+                std::fprintf(stderr, "\n");
+            }
+        }
+
+        // The operand that produced the bad target. RIP itself is usually
+        // unreadable (it IS the bad address), so walk back to the call that got
+        // us here: a `call rel32` at ret-5, then whatever is at its target --
+        // for a PLT that is `jmp qword ptr [rip+disp]`, whose slot is the thing
+        // that actually had to hold a real address.
+        {
+            GuestAddr moff2 = 0;
+            const LoadedModule* caller = nullptr;
+            if (DynamicLinker* lk = active_linker()) caller = lk->module_for_addr(ret, &moff2);
+            std::fprintf(stderr, "[CPU FAULT] caller module=%s module+0x%llx\n",
+                         caller ? caller->path.c_str() : "<none>", (unsigned long long)moff2);
+            const GuestAddr site = ret - 5;
+            u8 cb[5] = {0};
+            if (m_memory.read_bytes(site, cb, sizeof(cb))) {
+                std::fprintf(stderr, "[CPU FAULT] instruction before return: @0x%llx  %02x %02x %02x %02x %02x",
+                             (unsigned long long)site, cb[0], cb[1], cb[2], cb[3], cb[4]);
+                if (cb[0] == 0xE8) {  // call rel32
+                    i32 d = 0;
+                    std::memcpy(&d, cb + 1, 4);
+                    const GuestAddr target = ret + d;
+                    GuestAddr toff = 0;
+                    const LoadedModule* tm = nullptr;
+                    if (DynamicLinker* lk = active_linker()) tm = lk->module_for_addr(target, &toff);
+                    std::fprintf(stderr, "   = CALL rel32 -> 0x%llx (%s module+0x%llx)\n",
+                                 (unsigned long long)target,
+                                 tm ? tm->path.c_str() : "<not in a module>",
+                                 (unsigned long long)toff);
+                    u8 tb[8] = {0};
+                    if (m_memory.read_bytes(target, tb, sizeof(tb))) {
+                        std::fprintf(stderr, "[CPU FAULT]   bytes at call target: %02x %02x %02x %02x %02x %02x %02x %02x",
+                                     tb[0], tb[1], tb[2], tb[3], tb[4], tb[5], tb[6], tb[7]);
+                        if (tb[0] == 0xFF && (tb[1] & 0xC7) == 0x05) {
+                            i32 gd = 0;
+                            std::memcpy(&gd, tb + 2, 4);
+                            const GuestAddr slot = target + 6 + gd;
+                            u64 sv = 0;
+                            m_memory.read_value(slot, sv);
+                            std::fprintf(stderr,
+                                         "[CPU FAULT]   PLT jmp qword ptr [rip+0x%x] -> SLOT @0x%llx\n"
+                                         "[CPU FAULT]   slot holds 0x%016llx  (u32 lo=0x%08x hi=0x%08x)\n",
+                                         gd, (unsigned long long)slot,
+                                         (unsigned long long)sv,
+                                         (unsigned)(sv & 0xFFFFFFFF), (unsigned)(sv >> 32));
+                            // Walk back from the PLT entry to the owning symbol table
+                            // by dumping the raw bytes for offline disassembly.
+                            GuestAddr symoff = 0;
+                            if (DynamicLinker* lk = active_linker()) {
+                                GuestAddr e2 = 0;
+                                if (const LoadedModule* em = lk->module_for_addr(slot, &e2)) {
+                                    symoff = e2;
+                                    std::fprintf(stderr, "[CPU FAULT]   slot is in %s at module+0x%llx\n",
+                                                 em->path.c_str(), (unsigned long long)e2);
+                                }
+                            }
+                        } else {
+                            std::fprintf(stderr, "[CPU FAULT]   call target is not a PLT jmp [rip+disp]\n");
+                        }
+                    }
+                } else if (cb[0] == 0xFF) {
+                    std::fprintf(stderr, "   = indirect FF %02x (reg field=%d)\n", cb[1], (cb[1] >> 3) & 7);
+                } else {
+                    std::fprintf(stderr, "   = not a call rel32\n");
+                }
+            } else {
+                std::fprintf(stderr, "[CPU FAULT] could not read instruction before return\n");
+            }
+        }
+
+        // Call stack by walking rbp frames.
+        std::fprintf(stderr, "[CPU FAULT] register set:\n");
+        std::fprintf(stderr, "  rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx\n",
+                     (unsigned long long)m_context.rax, (unsigned long long)m_context.rbx,
+                     (unsigned long long)m_context.rcx, (unsigned long long)m_context.rdx);
+        std::fprintf(stderr, "  rsi=0x%llx rdi=0x%llx rbp=0x%llx rsp=0x%llx\n",
+                     (unsigned long long)m_context.rsi, (unsigned long long)m_context.rdi,
+                     (unsigned long long)m_context.rbp, (unsigned long long)m_context.rsp);
+        std::fprintf(stderr, "  r8 =0x%llx r9 =0x%llx r10=0x%llx r11=0x%llx\n",
+                     (unsigned long long)m_context.r8, (unsigned long long)m_context.r9,
+                     (unsigned long long)m_context.r10, (unsigned long long)m_context.r11);
+        std::fprintf(stderr, "  r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx\n",
+                     (unsigned long long)m_context.r12, (unsigned long long)m_context.r13,
+                     (unsigned long long)m_context.r14, (unsigned long long)m_context.r15);
+        std::fprintf(stderr, "[CPU FAULT] stack walk from [RSP] (return addresses):\n");
+        {
+            GuestAddr sp = m_context.rsp;
+            for (int i = 0; i < 24 && m_memory.is_valid_address(sp, 8); ++i, sp += 8) {
+                GuestAddr word = 0;
+                if (!m_memory.read_value(sp, word) || word == 0) break;
+                GuestAddr o2 = 0;
+                const LoadedModule* m2 = nullptr;
+                if (DynamicLinker* lk = active_linker()) m2 = lk->module_for_addr(word, &o2);
+                if (m2 != nullptr) {
+                    std::fprintf(stderr, "  [rsp+0x%02x] 0x%016llx  module handle=0x%x module+0x%llx\n",
+                                 (unsigned)(i * 8), (unsigned long long)word, m2->handle,
+                                 (unsigned long long)o2);
+                } else {
+                    std::fprintf(stderr, "  [rsp+0x%02x] 0x%016llx\n",
+                                 (unsigned)(i * 8), (unsigned long long)word);
+                }
+            }
+        }
         std::fprintf(stderr, "Last RIPs:\n");
         for (int i = 1; i <= 10; ++i) {
             int idx = (s_rip_hist_idx - i + 128) % 128;
