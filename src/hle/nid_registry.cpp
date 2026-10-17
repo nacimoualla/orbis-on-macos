@@ -1,4 +1,5 @@
 #include "ps4/audio_manager.hpp"
+#include "ps4/executor.hpp"
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
 #include "ps4/syscall_table.hpp"
@@ -152,8 +153,8 @@ struct GuestSema {
     i32 count{0};
     i32 max_count{0x7fffffff};
     bool deleted{false};
-    bool cancelled{false}; // set by CancelSema; cleared by last waiter out
-    i32 waiters{0};        // threads currently parked in wait (for CancelSema)
+    u64 cancel_generation{0}; // bumped by CancelSema to wake active waiters with ECANCELED
+    i32 waiters{0};           // threads currently parked in wait (for CancelSema)
 };
 static std::mutex s_sema_table_mtx;
 static std::unordered_map<u32, std::shared_ptr<GuestSema>> s_semas;
@@ -260,6 +261,66 @@ static std::string mono_args(const CpuContext& ctx) {
                   static_cast<unsigned long long>(ctx.rsi),
                   static_cast<unsigned long long>(ctx.rdx));
     return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Imports that must not return to the guest
+// ---------------------------------------------------------------------------
+// A body that only sets rax and returns is *not* a conservative stub for these.
+// The guest has no code after the call that can make progress: what sits there
+// is the callee's alignment sled, then the next function's prologue, so control
+// walks into unrelated code until it branches to a garbage pointer. That is how
+// a canary failure was reported as "Memory fault / invalid instruction pointer"
+// at RIP=0x3b480151ed5a1d8d with the canary itself invisible (commit 9b8365c).
+//
+// So terminate, and print enough to name the failure. 134 = 128 + SIGABRT, the
+// conventional abort() status, which also lets a run's exit code tell a guest
+// abort apart from a clean exit.
+[[noreturn]] static void guest_abort(std::string_view reason, const CpuContext& ctx,
+                                     MemoryManager& mem) {
+    // The return address of the call site is [rsp]; ctx.rip is wherever the
+    // trampoline landed and is NOT the call site.
+    GuestAddr ret = 0;
+    mem.read_value(ctx.rsp, ret);
+    std::fprintf(stderr,
+                 "[Guest abort] %.*s\n"
+                 "  call site (return addr) = 0x%llx\n"
+                 "  rbp = 0x%llx   rsp = 0x%llx\n"
+                 "  rdi = 0x%llx   rsi = 0x%llx   rdx = 0x%llx\n",
+                 static_cast<int>(reason.size()), reason.data(),
+                 static_cast<unsigned long long>(ret),
+                 static_cast<unsigned long long>(ctx.rbp),
+                 static_cast<unsigned long long>(ctx.rsp),
+                 static_cast<unsigned long long>(ctx.rdi),
+                 static_cast<unsigned long long>(ctx.rsi),
+                 static_cast<unsigned long long>(ctx.rdx));
+    dump_control_xfers((int)t_guest_tid);
+    dump_write_watch_ring(ctx.rbp - 0x30); // the canary slot itself
+    std::fprintf(stderr, "[Guest abort] terminating emulator\n");
+    std::fflush(stderr);
+    std::exit(134);
+}
+
+// exit(status) / _exit(status).
+// Runs the process teardown the runner and every guest waiter loop key off
+// (SyscallTable::has_exited, which is also what release of untimed POSIX
+// waiters keys off), then stops *this* thread: there is nothing to return into
+// once the process is gone. rip=0 is the same "stop executing" convention
+// scePthreadExit already uses.
+//
+// quick_exit is also noreturn but the guest does not import it, so it is not
+// registered: a dead registration with a name nothing imports is noise in the
+// trace, not a fix.
+static void libc_exit_handler(CpuContext& ctx, MemoryManager& mem) {
+    const i32 status = static_cast<i32>(ctx.rdi);
+    std::fprintf(stderr, "[HLE] Guest called exit(%d)\n", status);
+    if (g_syscalls) {
+        SyscallContext sctx(mem);
+        sctx.args[0] = static_cast<u64>(status);
+        g_syscalls->dispatch(SYS_exit, sctx);
+    }
+    ctx.rip = 0;
+    ctx.rax = 0;
 }
 
 } // namespace
@@ -529,8 +590,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // __stack_chk_fail(void)
-    // NID: 0x3AEDE22F569BBE78ULL -- imported by eboot.bin, and ps4libdoc lists
-    // it as the __stack_chk_fail of the stack-protector runtime.
+    // NID: 0x3AEDE22F569BBE78ULL ("8Op3OmHl3zY") -- imported by eboot.bin;
+    // ps4libdoc lists it as the stack-protector runtime's canary failure.
     //
     // This MUST NOT RETURN. The guest calls it when the canary at [rbp-0x30]
     // no longer matches the guard at *0x14fd360. It was registered in the
@@ -540,15 +601,10 @@ void NidRegistry::register_default_libraries() {
     // "Memory fault / invalid instruction pointer" with the canary failure
     // invisible. Real __stack_chk_fail calls __fortify_fail and aborts, so
     // terminating is the faithful behaviour -- and it turns an unactionable
-    // wild jump into a report that names the actual failure.
+    // wild jump into a report that names the actual failure. See the shared
+    // noreturn helper above.
     register_symbol(0x3AEDE22F569BBE78ULL, "__stack_chk_fail", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
-            // The return address of the call site is [rsp]; ctx.rip is wherever
-            // the trampoline landed and is NOT the call site. Reporting ctx.rip
-            // here pointed 4.6 MB away from the real fault and briefly looked
-            // like a second, moving failure.
-            GuestAddr ret = 0;
-            mem.read_value(ctx.rsp, ret);
             // Canaries: the frame's copy lives at [rbp-0x30], the guard is the
             // pointer at 0x14fd360. Print both plus the 64 bytes around the
             // frame canary -- ASCII points at a string copy overrun, a run of
@@ -559,12 +615,11 @@ void NidRegistry::register_default_libraries() {
             mem.read_value(ctx.rbp - 0x30, frame_canary);
             std::fprintf(stderr,
                          "[Guest abort] __stack_chk_fail: canary mismatch\n"
-                         "  call site (return addr) = 0x%llx\n"
                          "  rbp                      = 0x%llx  (canary slot = 0x%llx)\n"
                          "  guard ptr  *0x14fd360   = 0x%llx\n"
                          "  guard value             = 0x%016llx\n"
                          "  frame canary            = 0x%016llx\n",
-                         (unsigned long long)ret, (unsigned long long)ctx.rbp,
+                         (unsigned long long)ctx.rbp,
                          (unsigned long long)(ctx.rbp - 0x30),
                          (unsigned long long)guard_ptr,
                          (unsigned long long)guard_val,
@@ -581,10 +636,7 @@ void NidRegistry::register_default_libraries() {
                              (unsigned long long)a, (unsigned long long)v,
                              ok ? "" : "  (unreadable)");
             }
-            dump_write_watch_ring();
-            std::fprintf(stderr, "[Guest abort] terminating emulator\n");
-            std::fflush(stderr);
-            std::exit(134); // 128 + SIGABRT, the conventional abort() status
+            guest_abort("__stack_chk_fail: canary mismatch", ctx, mem);
         });
 
     // sceKernelLoadStartModule
@@ -1115,14 +1167,8 @@ void NidRegistry::register_default_libraries() {
         });
 
     // scePthreadExit(void *value_ptr)
-    // NID: 0xDE483BAD3D0D408BULL
-    register_symbol(0xDE483BAD3D0D408BULL, "scePthreadExit", "libkernel",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            auto& tm = get_thread_manager(mem);
-            tm.exit_current_thread(ctx.rdi);
-            ctx.rip = 0;
-            ctx.rax = SCE_OK;
-        });
+    // NID: 0xDE483BAD3D0D408BULL. Shares the body with pthread_exit above;
+    // Orbis's own thread-exit import and the POSIX one are the same operation.
 
     // sceKernelCreateEqueue(SceKernelEqueue *eq, const char *name)
     // NID: 0x0F439D14C8E9E3A2ULL ("D0OdFMjp46I")
@@ -1153,6 +1199,32 @@ void NidRegistry::register_default_libraries() {
             std::fprintf(stderr, "[HLE] sceKernelDeleteEqueue(id=%u)\n", eq_id);
             ctx.rax = tm.equeue_delete(eq_id) ? SCE_OK : static_cast<u64>(-22);
         });
+
+    // exit(int status) / _exit(int status) -- NIDs 0xB8C7A2D56F6EC8DA /
+    // 0xE99F37B18585940F. Both are imported by the guest (exit by eboot.bin,
+    // _exit by libc.prx) and both are noreturn; they were falling through to
+    // the unimplemented stub, which returns 0 and lets the guest walk into the
+    // callee's alignment sled after the process is already gone. The bodies are
+    // identical because we keep no atexit registry to skip for _exit: that is a
+    // consequence of the __cxa_atexit decision further down, not a body left
+    // unimplemented.
+    register_symbol(0xB8C7A2D56F6EC8DAULL, "exit", "libc", libc_exit_handler);
+    register_symbol(0xE99F37B18585940FULL, "_exit", "libc", libc_exit_handler);
+
+    // pthread_exit(void* retval) -- NID: 0x149AD3E4BB940405, imported by
+    // eboot.bin. noreturn for the *calling thread*: it was unregistered, so the
+    // stub returned 0 and the thread went on executing the function that had
+    // just called pthread_exit. scePthreadExit (0xDE483BAD3D0D408B) shares the
+    // body -- Orbis's own thread-exit import and the POSIX one are the same
+    // operation.
+    auto pthread_exit_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        auto& tm = get_thread_manager(mem);
+        tm.exit_current_thread(ctx.rdi);
+        ctx.rip = 0;
+        ctx.rax = SCE_OK;
+    };
+    register_symbol(0x149AD3E4BB940405ULL, "pthread_exit", "libc", pthread_exit_handler);
+    register_symbol(0xDE483BAD3D0D408BULL, "scePthreadExit", "libkernel", pthread_exit_handler);
 
     // sceKernelWaitEqueue(SceKernelEqueue eq, SceKernelEvent *ev, int num, int *out, const SceKernelUseconds *timo)
     // NID: 0x7F3C8C2ACF648A6DULL ("fzyMKs9kim0")
@@ -1425,11 +1497,18 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x0DF8AF3C0AE1B9C8ULL, "memcmp", "libc", memcmp_handler);
     register_symbol(0xC8B9E10AC0F38A0DULL, "memcmp", "libc", memcmp_handler);
 
-    // abort()
-    // NID: 0x2F54814E40BE0AFCULL / 0xFC0ABE404E81542FULL ("L1SBTkC+Cvw")
-    auto abort_handler = [](CpuContext& ctx, MemoryManager&) {
-        std::fprintf(stderr, "[HLE] Guest called abort() at caller RIP=0x%llx\n", (unsigned long long)ctx.rip);
-        ctx.rax = -1;
+    // abort(void)
+    // NID: 0x2F54814E40BE0AFCULL ("L1SBTkC+Cvw") / 0xFC0ABE404E81542FULL, both
+    // imported by eboot.bin.
+    //
+    // This MUST NOT RETURN, and it was returning: the body set rax = -1 and
+    // came back, so the guest resumed the code after abort() inside a process
+    // it had just killed -- the identical failure mode __stack_chk_fail had
+    // before 9b8365c. Real abort() raises SIGABRT, so terminating is faithful
+    // and turns a silent walk into the guest's own alignment sled into a
+    // report that names the abort and the call site that raised it.
+    auto abort_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        guest_abort("abort(): guest raised SIGABRT", ctx, mem);
     };
     register_symbol(0x2F54814E40BE0AFCULL, "abort", "libc", abort_handler);
     register_symbol(0xFC0ABE404E81542FULL, "abort", "libc", abort_handler);
@@ -1786,6 +1865,39 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
+    // qsort(void* base, size_t nmemb, size_t size, int (*compar)(const void*, const void*))
+    // NID: 0x00425D215653126AULL -- imported by eboot.bin and
+    // libSceFaceTracker.prx. Was unregistered, so it fell through to the
+    // unimplemented stub and logged five times a run.
+    //
+    // qsort returns void, so the stub's `rax = 0` was never a wrong *return
+    // value* -- the damage is that the array is not sorted. The honest answer
+    // is still not to sort it: compar is a guest function pointer, and calling
+    // it would mean re-entering the guest CPU core from inside an HLE handler,
+    // which is exactly what the RSP floor and the write-watch ring exist to
+    // police against.
+    //
+    // So: register the call, log it once, leave the array in input order.
+    // Input order is deterministic and reproducible -- the conservative no-op,
+    // what a sort whose comparator reports every pair equal produces. The
+    // alternative (guessing an order, or half-sorting) fabricates state the
+    // guest cannot tell from real data, which is precisely the failure mode
+    // this audit is removing elsewhere.
+    register_symbol(0x00425D215653126AULL, "qsort", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            static std::atomic<bool> s_logged{false};
+            if (!s_logged.exchange(true)) {
+                std::fprintf(stderr,
+                             "[qsort] base=0x%llx nmemb=%llu size=%llu compar=0x%llx"
+                             " -- the comparator is guest code and cannot be invoked from HLE;"
+                             " array left in input order\n",
+                             (unsigned long long)ctx.rdi,
+                             (unsigned long long)ctx.rsi,
+                             (unsigned long long)ctx.rdx,
+                             (unsigned long long)ctx.rcx);
+            }
+        });
+
     // sceKernelWaitSema(SceKernelSema sema, int needCount, SceKernelUseconds* pTimeout)
     // NID: 0x6716B45614154EC9ULL ("Zxa0VhQVTsk")
     register_symbol(0x6716B45614154EC9ULL, "sceKernelWaitSema", "libkernel",
@@ -1822,8 +1934,10 @@ void NidRegistry::register_default_libraries() {
             }
 
             std::unique_lock<std::mutex> lock(sema->mtx);
+            const u64 start_cancel_gen = sema->cancel_generation;
             auto pred = [&]() {
-                return sema->count >= need || sema->deleted || sema->cancelled ||
+                return sema->count >= need || sema->deleted ||
+                       (sema->cancel_generation != start_cancel_gen) ||
                        (g_syscalls && g_syscalls->has_exited());
             };
             sema->waiters++;
@@ -1839,18 +1953,35 @@ void NidRegistry::register_default_libraries() {
                     return;
                 }
             } else {
-                std::fprintf(stderr, "[Sema] WaitSema(%u, need=%d, timeout=infinite)\n", id, need);
+                std::fprintf(stderr, "[Sema] WaitSema(%u, need=%d, timeout=infinite) count=%u deleted=%d gen=%llu\n",
+                             id, need, sema->count, sema->deleted ? 1 : 0,
+                             (unsigned long long)start_cancel_gen);
                 while (!pred()) {
                     sema->cv.wait_for(lock, std::chrono::milliseconds(50), pred);
+                }
+                // Diagnostic: did we return without the semaphore actually being
+                // satisfied? That is a silent no-op wait -- the requester runs
+                // on while its producer is still in flight.
+                if (sema->count < need) {
+                    std::fprintf(stderr,
+                        "[HLE WARNING TID=%d rip=0x%llx] WaitSema(%u) returned with count=%u < need=%d "
+                        "-- woke on deleted=%d cancelled=%d has_exited=%d, NOT on a post\n",
+                        (int)t_guest_tid, (unsigned long long)t_guest_rip, id, sema->count, need,
+                        sema->deleted ? 1 : 0,
+                        (sema->cancel_generation != start_cancel_gen) ? 1 : 0,
+                        (g_syscalls && g_syscalls->has_exited()) ? 1 : 0);
                 }
             }
 
             sema->waiters--;
-            if (sema->cancelled) {
-                // Wake-all: last waiter out clears the flag so future waits block normally.
-                if (sema->waiters == 0) sema->cancelled = false;
+            if (sema->cancel_generation != start_cancel_gen) {
                 if (cur_th) cur_th->state.store(ThreadState::Running);
                 ctx.rax = 0x80020055ULL; // SCE_KERNEL_ERROR_ECANCELED (FreeBSD 85)
+                return;
+            }
+            if (sema->deleted) {
+                if (cur_th) cur_th->state.store(ThreadState::Running);
+                ctx.rax = 0x80020003ULL; // SCE_KERNEL_ERROR_ESRCH
                 return;
             }
             if (sema->count >= need) {
@@ -1927,14 +2058,17 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0xD76C0E1E4F32C1BDULL, "sceKernelPollSema", "libkernel",
         [poll_sema_impl](CpuContext& ctx, MemoryManager&) { poll_sema_impl(ctx, "PollSema"); });
 
-    // sceKernelCancelSema(SceKernelSema sema, int* pNumWaitingThreads)
+    // sceKernelCancelSema(SceKernelSema sema, int setCount, int* pNumWaitingThreads)
     // NID: 0xE03334E94D813446ULL, confirmed by ps4libdoc libkernel.sprx.json
-    // (and independently by the Orbis hash). Wakes all waiters; WaitSema
-    // observes `cancelled` and returns ECANCELED. Never called in Flappy.
+    // (and independently by the Orbis hash). Wakes active waiters (WaitSema
+    // observes cancel_generation change and returns ECANCELED). If setCount >= 0,
+    // updates the semaphore count. If pNumWaitingThreads != NULL, writes number
+    // of cancelled waiters.
     register_symbol(0xE03334E94D813446ULL, "sceKernelCancelSema", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const u32 id = static_cast<u32>(ctx.rdi);
-            const GuestAddr out_ptr = ctx.rsi;
+            const i32 set_count = static_cast<i32>(ctx.rsi);
+            const GuestAddr out_ptr = ctx.rdx;
             std::shared_ptr<GuestSema> sema;
             {
                 std::lock_guard<std::mutex> lock(s_sema_table_mtx);
@@ -1942,20 +2076,26 @@ void NidRegistry::register_default_libraries() {
                 if (it != s_semas.end()) sema = it->second;
             }
             if (!sema) {
-                ctx.rax = SCE_OK;
+                ctx.rax = 0x80020003ULL; // SCE_KERNEL_ERROR_ESRCH
                 return;
             }
             i32 waiters = 0;
             {
                 std::lock_guard<std::mutex> lock(sema->mtx);
                 waiters = sema->waiters;
-                sema->cancelled = true;
-                sema->cv.notify_all();
+                if (set_count >= 0) {
+                    sema->count = std::min(sema->max_count, set_count);
+                }
+                if (waiters > 0) {
+                    sema->cancel_generation++;
+                    sema->cv.notify_all();
+                }
             }
-            if (out_ptr != 0 && mem.is_valid_address(out_ptr, sizeof(u32))) {
-                mem.write_value(out_ptr, static_cast<u32>(waiters));
+            if (out_ptr != 0 && mem.is_valid_address(out_ptr, sizeof(i32))) {
+                mem.write_value(out_ptr, waiters);
             }
-            std::fprintf(stderr, "[Sema] CancelSema(%u) -> waiters=%d\n", id, waiters);
+            std::fprintf(stderr, "[Sema] CancelSema(%u, setCount=%d) -> cancelled waiters=%d count=%d\n",
+                         id, set_count, waiters, sema->count);
             ctx.rax = SCE_OK;
         });
 
@@ -2593,10 +2733,34 @@ void NidRegistry::register_default_libraries() {
         });
 
     // __cxa_atexit(void (*func)(void*), void* arg, void* dso_handle)
-    // NID: 0xB6CBC49A77A7CF8FULL ("tsvEmnenz48")
+    // NID: 0xB6CBC49A77A7CF8FULL ("tsvEmnenz48") -- imported by eboot.bin,
+    // libSceHeadTracker.prx and libSceAudioLatencyEstimation.prx.
+    //
+    // rdi is a *guest* function pointer. Registering 0 (success) and never
+    // invoking func is the only answer available: an HLE handler cannot call
+    // back into guest code, and a half-dialled "run the destructors" would
+    // have to re-enter the CPU core from inside a handler. The consequence is
+    // documented rather than discovered: guest static destructors never run, so
+    // nothing in the guest may depend on at-exit side effects (flushing a
+    // save file, releasing a GPU buffer) before the process is torn down.
+    // exit()/__cxa_finalize below therefore terminate rather than attempt a
+    // sweep. That is a deliberate trade: the alternative -- returning an error
+    // -- makes __cxa_atexit's return a lie the guest checks, and every caller
+    // of it is generated code with no error path.
     register_symbol(0xB6CBC49A77A7CF8FULL, "__cxa_atexit", "libc",
         [](CpuContext& ctx, MemoryManager&) {
-            ctx.rax = 0; // Success
+            ctx.rax = 0; // Success; the handler itself is never invoked.
+        });
+
+    // __cxa_finalize(void* dso_handle) -- NID: 0x1F67BCB7949C4067, imported by
+    // libSceAudioLatencyEstimation.prx, libSceFace.prx and libSceFaceTracker.prx.
+    // No-op for the same reason as __cxa_atexit: it exists to run the
+    // handlers that registration stashed, and the handlers are guest code.
+    // Registered under its real ps4libdoc name so the trace says what happened
+    // instead of printing "Unimplemented stub called ... returning 0".
+    register_symbol(0x1F67BCB7949C4067ULL, "__cxa_finalize", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 0; // Success; no handlers to run (see __cxa_atexit).
         });
 
     // strcmp(const char* s1, const char* s2)
@@ -2780,6 +2944,132 @@ void NidRegistry::register_default_libraries() {
                 return;
             }
             ctx.rax = static_cast<u64>(-14);
+        });
+
+    // =========================================================================
+    // libsave_data: the memory-budget pair, and libSceVideoOut /
+    // libSceSocialScreen entries that were falling through to the generic
+    // unimplemented stub. Each of these is registered under the name
+    // ps4libdoc's 42k corpus gives it (known_names.txt), so the log now states
+    // what the guest actually called rather than "Unimplemented stub called:
+    // NID=0x... returning 0". Four were firing on every run, at the call sites
+    // cited below.
+    // =========================================================================
+
+    // sceSaveDataSetupSaveDataMemory2(const void* param)
+    // NID: 0xA10C921147E05D10ULL -- imported by eboot.bin. Called from
+    // 0x10acf7e (guest `callq` whose return address is 0x10acf83) by the
+    // worker at TID 4, with rdi = 0x1cff9fea0 (a heap param struct).
+    //
+    // Guest code at the call site (eboot.elf, vaddr == file offset):
+    //   10acf7e: callq <import>
+    //   10acf83: movl  %eax, %ecx
+    //   10acf85: testl %ecx, %ecx
+    //   10acf87: je    0x10acfb2            ; success -> continue
+    //   10acf89: xorl  %eax, %eax
+    //   10acf8d: callq 0x10ad840            ; error reporter
+    // It is an int-returning status call with an *input* struct; the success
+    // path reads nothing the callee was meant to fill in (it only pages in its
+    // own pointers at 0x10acfb2+). Returning 0 is therefore correct here and is
+    // kept: the memory "setup" is a budget reservation we do not need to
+    // model, and the guest's success path is the healthy one.
+    // The first call dumps the param struct so the layout can be decoded
+    // later instead of guessed at now.
+    register_symbol(0xA10C921147E05D10ULL, "sceSaveDataSetupSaveDataMemory2", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            static std::atomic<bool> s_logged{false};
+            const GuestAddr p = ctx.rdi;
+            const bool dump = !s_logged.exchange(true);
+            if (dump && p > 0x1000 && mem.is_valid_address(p, 64)) {
+                const u8* b = mem.to_host_ptr<u8>(p);
+                if (b) {
+                    std::fprintf(stderr, "[SaveData] SetupSaveDataMemory2 rdi=0x%llx struct: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                 (unsigned long long)p, b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7], b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15],
+                                 b[16],b[17],b[18],b[19],b[20],b[21],b[22],b[23], b[24],b[25],b[26],b[27],b[28],b[29],b[30],b[31],
+                                 b[32],b[33],b[34],b[35],b[36],b[37],b[38],b[39], b[40],b[41],b[42],b[43],b[44],b[45],b[46],b[47],
+                                 b[48],b[49],b[50],b[51],b[52],b[53],b[54],b[55], b[56],b[57],b[58],b[59],b[60],b[61],b[62],b[63]);
+                }
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataGetSaveDataMemory2(const void* param, ...)
+    // NID: 0x43038EEEF7A09D5FULL -- imported by eboot.bin. Called from
+    // 0x10ad06a, immediate sibling of the setup call above (same worker, same
+    // init sequence), rdi = 0x1cff9fee0.
+    //
+    //   10ad06a: callq <import>
+    //   10ad06f: movl  %eax, %ecx
+    //   10ad071: testl %ecx, %ecx
+    //   10ad073: je    0x10ad07e            ; success -> continue
+    //   10ad075: xorl  %eax, %eax
+    //   10ad079: callq 0x10ad840            ; error reporter
+    // The success path (0x10ad07e+) fills its *own* stack buffer and hands it
+    // to 0x10ad8f0; nothing in it dereferences a callee-written output. So this
+    // is an int status call too, and 0 is the honest answer.
+    register_symbol(0x43038EEEF7A09D5FULL, "sceSaveDataGetSaveDataMemory2", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+
+    // sceVideoOutGetDeviceCapabilityInfo_(int handle, void* info, size_t size)
+    // NID: 0x90654B73786D404FULL ("YIvXmjmhRBs") -- imported by eboot.bin.
+    // Called from 0x10a7b74, return address 0x10a7b79, by TID 1.
+    //
+    //   10a7b58: leaq  -0x170(%rbp), %rsi    ; info  = caller stack buffer
+    //   10a7b5f: movl  $0x8, %edx            ; size  = 8
+    //   10a7b6e: movl  0x298(%rax), %edi     ; handle = 0x100
+    //   10a7b74: callq <import>
+    //   10a7b79: movl  %eax, %ecx
+    //   10a7b7b: testl %ecx, %ecx
+    //   10a7b7d: je    0x10a7b88             ; success -> continue
+    //   10a7b7f: xorl  %eax, %eax
+    //   10a7b83: callq 0x7eb9a0              ; error reporter
+    //
+    // This one DOES have an output struct, and it is the shape of bug worth
+    // avoiding: the stub returned 0 (success) without writing anything, so the
+    // guest read whatever the stack slot happened to hold at [rbp-0x170] as a
+    // capability value. It tests byte 0 of that struct immediately:
+    //   10a7c0b: cmpb $0x0, -0x170(%rbp)
+    //   10a7c12: js   0x10a7c2e
+    //
+    // The output is implemented rather than error-returned: zero the caller's
+    // buffer (exactly `size` bytes, so the size argument stays authoritative)
+    // and answer SCE_OK. "No capabilities" is the truthful answer -- we do not
+    // model a video-out capability set -- and it is deterministic, which a
+    // never-written stack slot is not. An error here would be a lie dressed as
+    // a diagnostic: the device does exist.
+    register_symbol(0x90654B73786D404FULL, "sceVideoOutGetDeviceCapabilityInfo_", "libSceVideoOut",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr info_ptr = ctx.rsi;
+            const GuestSize size = ctx.rdx;
+            if (info_ptr > 0x1000 && size <= 0x1000 && mem.is_valid_address(info_ptr, size)) {
+                mem.zero_memory(info_ptr, size);
+                ctx.rax = SCE_OK;
+                return;
+            }
+            ctx.rax = static_cast<u64>(-14); // -EFAULT
+        });
+
+    // sceSocialScreenInitialize(int mode) -- NID: 0xA48EE81523CFEB90ULL,
+    // imported by eboot.bin. Called from 0x1065f20, return address 0x1065f25.
+    //
+    //   1065f16: movl $0xf2, %edi            ; mode = 0xf2
+    //   1065f20: callq <import>
+    //   1065f25: movl $0xff, %edi            ; args for the next import
+    //   1065f2a: movl $0x5, %esi
+    //   1065f33: callq 0x11f7f60
+    //   1065f38: movl  %eax, %ecx
+    //   1065f3a: testl %ecx, %ecx
+    //   1065f3c: js    0x106621a             ; only *this* call's result is checked
+    // No output struct, and the return value of the social-screen import is
+    // discarded -- the guest re-derives its status from the next call. Answer
+    // SCE_OK; the SocialScreen family (Terminate/OpenSeparateMode/
+    // CloseSeparateMode/SetMode) is not modelled, so "initialized" here means
+    // only "do not block the call chain".
+    register_symbol(0xA48EE81523CFEB90ULL, "sceSocialScreenInitialize", "libSceSocialScreen",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
         });
 
     // ==========================================
