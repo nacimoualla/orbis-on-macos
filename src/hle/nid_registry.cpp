@@ -2520,8 +2520,11 @@ void NidRegistry::register_default_libraries() {
                 return;
             }
             s_sem_cv.notify_all();
-            std::fprintf(stderr, "[Sem] post(0x%llx) -> count=%u waiters=%u\n",
-                         (unsigned long long)sem_ptr, sem[0], sem[1]);
+            static const bool s_log_sem = (std::getenv("PS4_LOG_SEM") != nullptr);
+            if (s_log_sem) {
+                std::fprintf(stderr, "[Sem] post(0x%llx) -> count=%u waiters=%u\n",
+                             (unsigned long long)sem_ptr, sem[0], sem[1]);
+            }
             ctx.rax = SCE_OK;
         });
 
@@ -2606,9 +2609,19 @@ void NidRegistry::register_default_libraries() {
                 ctx.rax = static_cast<u64>(-22);
                 return;
             }
-            std::fprintf(stderr, "[Sem] wait(0x%llx) -> %s\n", (unsigned long long)sem_ptr,
-                         ok ? "OK" : "shutdown");
-            ctx.rax = ok ? SCE_OK : static_cast<u64>(0x8002003CULL); // SCE_KERNEL_ERROR_ETIMEDOUT
+            if (!ok) {
+                // Process is shutting down. Park this worker thread until termination rather
+                // than returning to guest code to spin endlessly.
+                if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                ctx.rax = static_cast<u64>(0x8002003CULL);
+                return;
+            }
+            static const bool s_log_sem = (std::getenv("PS4_LOG_SEM") != nullptr);
+            if (s_log_sem) {
+                std::fprintf(stderr, "[Sem] wait(0x%llx) -> OK\n", (unsigned long long)sem_ptr);
+            }
+            ctx.rax = SCE_OK;
         });
 
     // sem_timedwait(sem_t* sem, const struct timespec* abs_timeout)

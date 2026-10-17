@@ -276,7 +276,7 @@ int main(int argc, char* argv[]) {
             auto t_start = std::chrono::steady_clock::now();
             auto t_last = t_start;
             ps4::usize instrs_last = 0;
-            while (total_instructions < max_total && !syscalls.has_exited()) {
+            while ((max_total == 0 || total_instructions < max_total) && !syscalls.has_exited()) {
                 run_res = cpu.run(batch);
                 total_instructions += run_res.instructions_executed;
                 if (run_res.status != ps4::StepResult::Ok) break;
