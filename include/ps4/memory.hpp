@@ -150,14 +150,15 @@ struct WatchHit {
     GuestAddr rbx;      // guest rbx at instruction start (the job object)
     int tid;
     bool from_hle;      // store came from HLE handler code, not the decoder
-    GuestAddr guest_addr;
-    usize size;
-    u64 old_value;
-    u64 new_value;
+    GuestAddr guest_addr;  // start of the store
+    usize size;            // length of the store
+    GuestAddr sample_addr; // first byte of the store/watch overlap (see write_bytes)
+    u64 old_value;         // 8 bytes at sample_addr before the store
+    u64 new_value;         // same 8 bytes after; only `min(overlap,8)` are meaningful
 };
 
 void set_write_watch(GuestAddr addr, usize size = 8);
-void dump_write_watch_ring(u64 filter_rbp = 0);
+void dump_write_watch_ring(u64 filter_addr = 0);
 
 // Published per guest thread by the executor; read by the write-watch.
 extern thread_local GuestAddr t_guest_rip;

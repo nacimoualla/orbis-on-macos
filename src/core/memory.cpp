@@ -173,10 +173,11 @@ void dump_write_watch_ring(u64 filter_addr) {
         ++shown;
         std::fprintf(stderr,
                      "[watch] #%-3zu rip=0x%016llx rsp=0x%llx rbp=0x%llx rbx=0x%llx TID=%d %-3s "
-                     "-> 0x%llx (%zu B)  old=0x%016llx new=0x%016llx%s\n",
+                     "-> 0x%llx (%zu B)  sampled@0x%llx  old=0x%016llx new=0x%016llx%s\n",
                      i, (unsigned long long)h.rip, (unsigned long long)h.rsp,
                      (unsigned long long)h.rbp, (unsigned long long)h.rbx, h.tid, h.from_hle ? "HLE" : "dec",
                      (unsigned long long)h.guest_addr, h.size,
+                     (unsigned long long)h.sample_addr,
                      (unsigned long long)h.old_value, (unsigned long long)h.new_value,
                      (h.old_value != h.new_value) ? "  <-- CHANGED" : "");
     }
@@ -204,12 +205,28 @@ bool MemoryManager::write_bytes(GuestAddr addr, const void* src, usize size) {
             h.from_hle = t_guest_in_hle;
             h.guest_addr = addr;
             h.size = size;
-            std::memcpy(&h.old_value, m_base + addr, sizeof(h.old_value));
-            h.new_value = h.old_value;
-            // Copy out the first 8 bytes actually being stored, so a 4-byte
-            // store over a zeroed slot is distinguishable from an 8-byte one.
-            const usize take = size < sizeof(h.new_value) ? size : sizeof(h.new_value);
-            std::memcpy(&h.new_value, src, take);
+
+            // Sample old/new at the START OF THE OVERLAP, not at the store base.
+            // A wide store (movups/VEX) that merely spans the watched slot begins
+            // before it, so sampling at `addr` reads 8 bytes that are outside the
+            // watch entirely -- often the same bytes the store happens to rewrite,
+            // which made every range-spanning write report old == new and look
+            // like a no-op. Overlap start is the only address the watch actually
+            // covers, so it is the only one whose before/after is meaningful.
+            const GuestAddr ov_lo = (addr > wa) ? addr : wa;
+            const GuestAddr ov_hi = (wa + ws < addr + size) ? (wa + ws) : (addr + size);
+            usize take = ov_hi - ov_lo;
+            if (take > sizeof(h.new_value)) take = sizeof(h.new_value);
+            // Never sample past the mapped region; a store near the top of memory
+            // would otherwise turn instrumentation into an out-of-bounds read.
+            if (ov_lo + take > m_total_size) take = m_total_size - ov_lo;
+            h.sample_addr = ov_lo;
+            h.old_value = 0;
+            h.new_value = 0;
+            std::memcpy(&h.old_value, m_base + ov_lo, take);
+            // The store's source buffer is indexed from its own base, so shift by
+            // the same offset to land on the same guest byte.
+            std::memcpy(&h.new_value, static_cast<const u8*>(src) + (ov_lo - addr), take);
             const usize slot = g_watch_count.fetch_add(1, std::memory_order_relaxed);
             g_watch_ring[slot % kWatchRing] = h;
         }
