@@ -60,4 +60,7 @@ private:
     JitCompiler* m_jit{nullptr};
 };
 
+// Dump the calling thread's control-transfer ring (diagnostic).
+void dump_control_xfers(int tid);
+
 } // namespace ps4

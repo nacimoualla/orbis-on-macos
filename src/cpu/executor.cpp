@@ -425,6 +425,46 @@ static int guest_atomic_xchg(MemoryManager& mem, GuestAddr addr, T operand, T* o
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// Control-transfer ring (diagnostic).
+//
+// The stack canary at [rbp-0x30] is clobbered by a callee prologue, but a
+// frame canary alone cannot say HOW control reached that callee. This records
+// the last 64 control transfers per thread -- CALL, RET, indirect JMP and
+// SYSCALL -- with the guest stack pointer and frame pointer, so a dump at the
+// abort shows the exact call/ret sequence and F1's real entry point.
+// ---------------------------------------------------------------------------
+struct Xfer {
+    GuestAddr from_rip;
+    GuestAddr to_rip;
+    GuestAddr rsp;
+    GuestAddr rbp;
+    u8 kind; // 0=CALL 1=RET 2=IND-JMP 3=SYSCALL 4=IRET
+};
+static constexpr usize kXferRing = 64;
+static thread_local Xfer t_xfer[kXferRing];
+static thread_local usize t_xfer_n = 0;
+
+static void record_xfer(GuestAddr from, GuestAddr to, GuestAddr rsp, GuestAddr rbp, u8 kind) {
+    Xfer& e = t_xfer[t_xfer_n % kXferRing];
+    e = Xfer{from, to, rsp, rbp, kind};
+    ++t_xfer_n;
+}
+
+void dump_control_xfers(int tid) {
+    static const char* kNames[] = {"CALL ", "RET  ", "IJMP ", "SYSC ", "IRET "};
+    const usize n = t_xfer_n;
+    std::fprintf(stderr, "[xfer] thread %d: %zu transfers recorded\n", tid, n);
+    const usize start = (n > kXferRing) ? (n - kXferRing) : 0;
+    for (usize i = start; i < n; ++i) {
+        const Xfer& e = t_xfer[i % kXferRing];
+        std::fprintf(stderr, "[xfer] #%-3zu %s 0x%016llx -> 0x%016llx  rsp=0x%llx rbp=0x%llx\n",
+                     i, kNames[e.kind < 5 ? e.kind : 0],
+                     (unsigned long long)e.from_rip, (unsigned long long)e.to_rip,
+                     (unsigned long long)e.rsp, (unsigned long long)e.rbp);
+    }
+}
+
 StepResult CpuExecutor::step() {
     // Publish the executing RIP so a MemoryManager write-watch can name the
     // instruction responsible for a clobbered address.
@@ -569,6 +609,7 @@ StepResult CpuExecutor::step() {
         sctx.rsp     = m_context.rsp;
         sctx.rbp     = m_context.rbp;
 
+        record_xfer(start_rip, 0, m_context.rsp, m_context.rbp, 3);
         m_syscalls.dispatch(static_cast<u32>(m_context.rax), sctx);
         if (!sctx.cpu_rip_modified) {
             m_context.rax = sctx.rax;
@@ -3031,6 +3072,7 @@ StepResult CpuExecutor::step() {
         if (!m_memory.write_value(m_context.rsp, ret_addr)) {
             return StepResult::MemoryFault;
         }
+        record_xfer(start_rip, ret_addr + rel32, m_context.rsp, m_context.rbp, 0);
         m_context.rip = ret_addr + rel32;
         return StepResult::Ok;
     }
@@ -3041,6 +3083,7 @@ StepResult CpuExecutor::step() {
         if (!m_memory.read_value(m_context.rsp, ret_addr)) {
             return StepResult::MemoryFault;
         }
+        record_xfer(start_rip, ret_addr, m_context.rsp + 8, m_context.rbp, 1);
         m_context.rsp += 8;
         m_context.rip = ret_addr;
         return StepResult::Ok;
@@ -3116,11 +3159,13 @@ StepResult CpuExecutor::step() {
             m_context.rsp -= 8;
             const u64 ret_addr = start_rip + cursor + m.bytes_consumed;
             if (!m_memory.write_value(m_context.rsp, ret_addr)) return StepResult::MemoryFault;
+            record_xfer(start_rip, target, m_context.rsp, m_context.rbp, 0);
             m_context.rip = target;
             return StepResult::Ok;
         }
         if (sub_op == 4) { // JMP r/m64 (PLT stubs)
             const u64 target = read_rm(m, 64);
+            record_xfer(start_rip, target, m_context.rsp, m_context.rbp, 2);
             m_context.rip = target;
             return StepResult::Ok;
         }
