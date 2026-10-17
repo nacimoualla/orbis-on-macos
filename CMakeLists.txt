@@ -161,3 +161,30 @@ add_test(NAME Phase16_GameImport COMMAND test_phase16)
 # The scanner test inspects the real games/ layout, so it must run from the
 # source root, not the build directory.
 set_tests_properties(Phase16_GameImport PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# ---------------------------------------------------------------------------
+# ps4-gui.app bundle
+#
+# A bare binary has no dock icon, no bundle identity and does not survive the
+# terminal closing. Wrapping it gives a real double-clickable app. ps4-runner
+# is copied in alongside it because the GUI resolves the runner relative to its
+# own executable path, which inside a bundle is Contents/MacOS/.
+# ---------------------------------------------------------------------------
+set(GUI_BUNDLE "${CMAKE_BINARY_DIR}/ps4-gui.app")
+set(GUI_BUNDLE_MACOS "${GUI_BUNDLE}/Contents/MacOS")
+set(GUI_BUNDLE_RESOURCES "${GUI_BUNDLE}/Contents/Resources")
+
+add_custom_target(ps4-gui-app ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_MACOS}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_RESOURCES}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:ps4-gui>" "${GUI_BUNDLE_MACOS}/ps4-gui"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:ps4-runner>" "${GUI_BUNDLE_MACOS}/ps4-runner"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/cmake/Info.plist.in" "${GUI_BUNDLE}/Contents/Info.plist"
+    COMMAND ${CMAKE_COMMAND} -E echo "APPL????" > "${GUI_BUNDLE}/Contents/PkgInfo"
+    DEPENDS ps4-gui ps4-runner
+    COMMENT "Assembling ps4-gui.app"
+    VERBATIM
+)
