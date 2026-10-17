@@ -2858,6 +2858,7 @@ void NidRegistry::register_default_libraries() {
                 if (pcm) {
                     std::span<const i16> samples(pcm, SAMPLE_COUNT);
                     am.output_samples(handle, samples);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     ctx.rax = SCE_OK;
                     return;
                 }
@@ -3850,6 +3851,7 @@ void NidRegistry::register_default_libraries() {
         });
     register_symbol(0x64E1ABC562E04331ULL, "sceAudio3dPortFlush", "libSceAudio3d",
         [](CpuContext& ctx, MemoryManager&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
             ctx.rax = SCE_OK;
         });
 
