@@ -118,6 +118,21 @@ void Arm64Emitter::eor_reg(u8 rd, u8 rn, u8 rm) {
        rd);
 }
 
+void Arm64Emitter::add_w(u8 rd, u8 rn, u8 rm) {
+  // ADD Wd, Wn, Wm (32-bit, zero-extends result into 64-bit Xd)
+  emit(0x0b000000 | (static_cast<u32>(rm) << 16) | (static_cast<u32>(rn) << 5) | rd);
+}
+
+void Arm64Emitter::sub_w(u8 rd, u8 rn, u8 rm) {
+  // SUB Wd, Wn, Wm (32-bit, zero-extends result into 64-bit Xd)
+  emit(0x4b000000 | (static_cast<u32>(rm) << 16) | (static_cast<u32>(rn) << 5) | rd);
+}
+
+void Arm64Emitter::blr(u8 rn) {
+  // BLR Xn (indirect branch with link)
+  emit(0xd63f0000 | (static_cast<u32>(rn) << 5));
+}
+
 void Arm64Emitter::emit_prologue() {
   // stp x19, x30, [sp, -16]!
   emit(0xa9bf7bf3);
@@ -132,9 +147,26 @@ void Arm64Emitter::emit_epilogue() {
   emit(0xd65f03c0);
 }
 
-// =============================================================================
-// JitCompiler Implementation
-// =============================================================================
+extern "C" {
+void jit_flags_add64(CpuContext* ctx, u64 a, u64 b, u64 res) {
+  ctx->update_flags_add(a, b, res, 64);
+}
+void jit_flags_add32(CpuContext* ctx, u64 a, u64 b, u64 res) {
+  ctx->update_flags_add(a, b, res, 32);
+}
+void jit_flags_sub64(CpuContext* ctx, u64 a, u64 b, u64 res) {
+  ctx->update_flags_sub(a, b, res, 64);
+}
+void jit_flags_sub32(CpuContext* ctx, u64 a, u64 b, u64 res) {
+  ctx->update_flags_sub(a, b, res, 32);
+}
+void jit_flags_logic64(CpuContext* ctx, u64 res) {
+  ctx->update_flags_logic(res, 64);
+}
+void jit_flags_logic32(CpuContext* ctx, u64 res) {
+  ctx->update_flags_logic(res, 32);
+}
+}
 
 namespace {
 
@@ -358,16 +390,51 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
       continue;
     }
 
-    // Multi-byte NOP: 0x0F 0x1F /0
-    if (op0 == 0x0F && memory.is_valid_address(current_rip + cursor, 3) &&
-        code[cursor + 1] == 0x1F) {
-      const u8 modrm = code[cursor + 2];
+    // Multi-byte NOP: 0x0F 0x1F /0 (and 0x66 0x0F 0x1F /0)
+    // Also 2-byte NOP: 0x66 0x90
+    if (op0 == 0x66 && memory.is_valid_address(current_rip + cursor, 2) &&
+        code[cursor + 1] == 0x90) {
+      m_emitter.nop();
+      current_rip += cursor + 2;
+      instructions++;
+      continue;
+    }
+
+    if ((op0 == 0x0F && memory.is_valid_address(current_rip + cursor, 3) &&
+         code[cursor + 1] == 0x1F) ||
+        (op0 == 0x66 && memory.is_valid_address(current_rip + cursor, 4) &&
+         code[cursor + 1] == 0x0F && code[cursor + 2] == 0x1F)) {
+      const bool has_66 = (op0 == 0x66);
+      const usize modrm_offset = has_66 ? 3 : 2;
+      const u8 modrm = code[cursor + modrm_offset];
       const u8 mod = (modrm >> 6) & 3;
-      usize len = 3;
-      if (mod == 1)
-        len = 4;
-      else if (mod == 2)
-        len = 7;
+      const u8 rm = modrm & 7;
+      usize len = modrm_offset + 1;
+
+      if (mod == 0) {
+        if (rm == 4) { // SIB follows
+          len += 1;
+          if (memory.is_valid_address(current_rip + cursor, len)) {
+            const u8 sib = code[cursor + modrm_offset + 1];
+            if ((sib & 7) == 5) {
+              len += 4;
+            }
+          }
+        } else if (rm == 5) { // RIP-relative disp32
+          len += 4;
+        }
+      } else if (mod == 1) { // disp8
+        len += 1;
+        if (rm == 4) { // SIB follows
+          len += 1;
+        }
+      } else if (mod == 2) { // disp32
+        len += 4;
+        if (rm == 4) { // SIB follows
+          len += 1;
+        }
+      }
+
       if (memory.is_valid_address(current_rip + cursor, len)) {
         m_emitter.nop();
         current_rip += cursor + len;
@@ -572,11 +639,30 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
 
         if (dst_idx == src_idx) {
           m_emitter.str_zero(19, off_dst);
+          m_emitter.mov_reg(0, 19);
+          m_emitter.mov_imm64(1, 0); // res = 0
+          m_emitter.mov_imm64(16, reinterpret_cast<u64>(rex_w ? &jit_flags_logic64 : &jit_flags_logic32));
+          m_emitter.blr(16);
         } else {
-          m_emitter.ldr_reg(0, 19, off_dst);
-          m_emitter.ldr_reg(1, 19, off_src);
-          m_emitter.eor_reg(0, 0, 1);
-          m_emitter.str_reg(0, 19, off_dst);
+          if (rex_w) {
+            m_emitter.ldr_reg(0, 19, off_dst);
+            m_emitter.ldr_reg(1, 19, off_src);
+            m_emitter.eor_reg(0, 0, 1);
+            m_emitter.str_reg(0, 19, off_dst);
+            m_emitter.mov_reg(1, 0);
+            m_emitter.mov_reg(0, 19);
+            m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_logic64));
+            m_emitter.blr(16);
+          } else {
+            m_emitter.ldr_w(0, 19, off_dst);
+            m_emitter.ldr_w(1, 19, off_src);
+            m_emitter.eor_reg(0, 0, 1);
+            m_emitter.str_reg(0, 19, off_dst);
+            m_emitter.mov_reg(1, 0);
+            m_emitter.mov_reg(0, 19);
+            m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_logic32));
+            m_emitter.blr(16);
+          }
         }
         current_rip += cursor + 2;
         instructions++;
@@ -598,10 +684,23 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
         const u32 off_dst = get_gpr_offset(dst_idx);
         const u32 off_src = get_gpr_offset(src_idx);
 
-        m_emitter.ldr_reg(0, 19, off_dst);
-        m_emitter.ldr_reg(1, 19, off_src);
-        m_emitter.add_reg(0, 0, 1);
-        m_emitter.str_reg(0, 19, off_dst);
+        if (rex_w) {
+          m_emitter.ldr_reg(1, 19, off_dst);
+          m_emitter.ldr_reg(2, 19, off_src);
+          m_emitter.add_reg(3, 1, 2);
+          m_emitter.str_reg(3, 19, off_dst);
+          m_emitter.mov_reg(0, 19);
+          m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_add64));
+          m_emitter.blr(16);
+        } else {
+          m_emitter.ldr_w(1, 19, off_dst);
+          m_emitter.ldr_w(2, 19, off_src);
+          m_emitter.add_w(3, 1, 2);
+          m_emitter.str_reg(3, 19, off_dst);
+          m_emitter.mov_reg(0, 19);
+          m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_add32));
+          m_emitter.blr(16);
+        }
         current_rip += cursor + 2;
         instructions++;
         continue;
@@ -622,10 +721,23 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
         const u32 off_dst = get_gpr_offset(dst_idx);
         const u32 off_src = get_gpr_offset(src_idx);
 
-        m_emitter.ldr_reg(0, 19, off_dst);
-        m_emitter.ldr_reg(1, 19, off_src);
-        m_emitter.sub_reg(0, 0, 1);
-        m_emitter.str_reg(0, 19, off_dst);
+        if (rex_w) {
+          m_emitter.ldr_reg(1, 19, off_dst);
+          m_emitter.ldr_reg(2, 19, off_src);
+          m_emitter.sub_reg(3, 1, 2);
+          m_emitter.str_reg(3, 19, off_dst);
+          m_emitter.mov_reg(0, 19);
+          m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_sub64));
+          m_emitter.blr(16);
+        } else {
+          m_emitter.ldr_w(1, 19, off_dst);
+          m_emitter.ldr_w(2, 19, off_src);
+          m_emitter.sub_w(3, 1, 2);
+          m_emitter.str_reg(3, 19, off_dst);
+          m_emitter.mov_reg(0, 19);
+          m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_sub32));
+          m_emitter.blr(16);
+        }
         current_rip += cursor + 2;
         instructions++;
         continue;
@@ -646,10 +758,25 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
         const u32 off_dst = get_gpr_offset(dst_idx);
         const u32 off_src = get_gpr_offset(src_idx);
 
-        m_emitter.ldr_reg(0, 19, off_dst);
-        m_emitter.ldr_reg(1, 19, off_src);
-        m_emitter.and_reg(0, 0, 1);
-        m_emitter.str_reg(0, 19, off_dst);
+        if (rex_w) {
+          m_emitter.ldr_reg(0, 19, off_dst);
+          m_emitter.ldr_reg(1, 19, off_src);
+          m_emitter.and_reg(0, 0, 1);
+          m_emitter.str_reg(0, 19, off_dst);
+          m_emitter.mov_reg(1, 0);
+          m_emitter.mov_reg(0, 19);
+          m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_logic64));
+          m_emitter.blr(16);
+        } else {
+          m_emitter.ldr_w(0, 19, off_dst);
+          m_emitter.ldr_w(1, 19, off_src);
+          m_emitter.and_reg(0, 0, 1);
+          m_emitter.str_reg(0, 19, off_dst);
+          m_emitter.mov_reg(1, 0);
+          m_emitter.mov_reg(0, 19);
+          m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_logic32));
+          m_emitter.blr(16);
+        }
         current_rip += cursor + 2;
         instructions++;
         continue;
@@ -670,10 +797,25 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
         const u32 off_dst = get_gpr_offset(dst_idx);
         const u32 off_src = get_gpr_offset(src_idx);
 
-        m_emitter.ldr_reg(0, 19, off_dst);
-        m_emitter.ldr_reg(1, 19, off_src);
-        m_emitter.orr_reg(0, 0, 1);
-        m_emitter.str_reg(0, 19, off_dst);
+        if (rex_w) {
+          m_emitter.ldr_reg(0, 19, off_dst);
+          m_emitter.ldr_reg(1, 19, off_src);
+          m_emitter.orr_reg(0, 0, 1);
+          m_emitter.str_reg(0, 19, off_dst);
+          m_emitter.mov_reg(1, 0);
+          m_emitter.mov_reg(0, 19);
+          m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_logic64));
+          m_emitter.blr(16);
+        } else {
+          m_emitter.ldr_w(0, 19, off_dst);
+          m_emitter.ldr_w(1, 19, off_src);
+          m_emitter.orr_reg(0, 0, 1);
+          m_emitter.str_reg(0, 19, off_dst);
+          m_emitter.mov_reg(1, 0);
+          m_emitter.mov_reg(0, 19);
+          m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_logic32));
+          m_emitter.blr(16);
+        }
         current_rip += cursor + 2;
         instructions++;
         continue;
@@ -690,22 +832,48 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
         const u32 off = get_gpr_offset(reg_idx);
 
         if (subop == 0) { // ADD
-          m_emitter.ldr_reg(0, 19, off);
-          if (imm8 >= 0)
-            m_emitter.add_imm(0, 0, static_cast<u32>(imm8));
-          else
-            m_emitter.sub_imm(0, 0, static_cast<u32>(-imm8));
-          m_emitter.str_reg(0, 19, off);
+          if (rex_w) {
+            const u64 imm64 = static_cast<u64>(static_cast<i64>(imm8));
+            m_emitter.ldr_reg(1, 19, off);
+            m_emitter.mov_imm64(2, imm64);
+            m_emitter.add_reg(3, 1, 2);
+            m_emitter.str_reg(3, 19, off);
+            m_emitter.mov_reg(0, 19);
+            m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_add64));
+            m_emitter.blr(16);
+          } else {
+            const u32 imm32 = static_cast<u32>(static_cast<i32>(imm8));
+            m_emitter.ldr_w(1, 19, off);
+            m_emitter.mov_imm64(2, imm32);
+            m_emitter.add_w(3, 1, 2);
+            m_emitter.str_reg(3, 19, off);
+            m_emitter.mov_reg(0, 19);
+            m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_add32));
+            m_emitter.blr(16);
+          }
           current_rip += cursor + 3;
           instructions++;
           continue;
         } else if (subop == 5) { // SUB
-          m_emitter.ldr_reg(0, 19, off);
-          if (imm8 >= 0)
-            m_emitter.sub_imm(0, 0, static_cast<u32>(imm8));
-          else
-            m_emitter.add_imm(0, 0, static_cast<u32>(-imm8));
-          m_emitter.str_reg(0, 19, off);
+          if (rex_w) {
+            const u64 imm64 = static_cast<u64>(static_cast<i64>(imm8));
+            m_emitter.ldr_reg(1, 19, off);
+            m_emitter.mov_imm64(2, imm64);
+            m_emitter.sub_reg(3, 1, 2);
+            m_emitter.str_reg(3, 19, off);
+            m_emitter.mov_reg(0, 19);
+            m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_sub64));
+            m_emitter.blr(16);
+          } else {
+            const u32 imm32 = static_cast<u32>(static_cast<i32>(imm8));
+            m_emitter.ldr_w(1, 19, off);
+            m_emitter.mov_imm64(2, imm32);
+            m_emitter.sub_w(3, 1, 2);
+            m_emitter.str_reg(3, 19, off);
+            m_emitter.mov_reg(0, 19);
+            m_emitter.mov_imm64(16, reinterpret_cast<u64>(&jit_flags_sub32));
+            m_emitter.blr(16);
+          }
           current_rip += cursor + 3;
           instructions++;
           continue;

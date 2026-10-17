@@ -50,8 +50,11 @@ public:
     void and_reg(u8 rd, u8 rn, u8 rm);
     void orr_reg(u8 rd, u8 rn, u8 rm);
     void eor_reg(u8 rd, u8 rn, u8 rm);
+    void add_w(u8 rd, u8 rn, u8 rm);
+    void sub_w(u8 rd, u8 rn, u8 rm);
     void b(i32 offset_words);
     void b_cond(u8 cond, i32 offset_words);
+    void blr(u8 rn);
 
     // Block calling convention helpers
     void emit_prologue();
