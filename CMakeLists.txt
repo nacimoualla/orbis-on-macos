@@ -162,6 +162,13 @@ add_test(NAME Phase16_GameImport COMMAND test_phase16)
 # source root, not the build directory.
 set_tests_properties(Phase16_GameImport PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+# x87 rounding / control-word vectors. Drives real instruction bytes through the
+# interpreter so the test and the emulator cannot diverge silently.
+add_executable(test_x87 tests/test_x87.cpp)
+target_include_directories(test_x87 PRIVATE include)
+target_link_libraries(test_x87 PRIVATE ps4_core)
+add_test(NAME Phase17_X87 COMMAND test_x87)
+
 # ---------------------------------------------------------------------------
 # ps4-gui.app bundle
 #

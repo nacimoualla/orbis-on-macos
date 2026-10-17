@@ -303,6 +303,61 @@ inline ModRmResult decode_modrm(const u8* code, usize available, GuestAddr next_
     return res;
 }
 
+// 80-bit extended <-> host double.
+//
+// PRECISION LOST: the x87 stack slot holds an 80-bit value with a 64-bit
+// mantissa and an explicit integer bit. Each slot here is a host double, so
+// only 53 mantissa bits survive, and the explicit integer bit is folded into
+// the implicit leading one. An FLD m80 / FSTP m80 pair therefore round-trips
+// any value representable in binary64 exactly, but a value needing bits 54..64
+// of the extended mantissa comes back rounded. The sign and exponent survive
+// intact, including denormals, infinities and NaN payloads only insofar as a
+// double can express them.
+double f80_to_double(const u8 in[10]) {
+    u64 mant = 0;
+    for (int i = 7; i >= 0; --i) mant = (mant << 8) | in[i];
+    const u16 se = static_cast<u16>(in[8] | (in[9] << 8));
+    const u64 exp80 = se & 0x7FFF;
+    const u64 sign = (se >> 15) & 1;
+    if (exp80 == 0 && mant == 0) return sign ? -0.0 : 0.0;
+    if (exp80 == 0x7FFF) {
+        // Preserve NaN-ness; the payload cannot fit a double's NaN space fully,
+        // so map any non-zero low mantissa to a quiet NaN with that sign.
+        const bool is_nan = (mant & 0x7FFFFFFFFFFFFFFFULL) != 0;
+        if (!is_nan) return sign ? -INFINITY : INFINITY;
+        return sign ? -NAN : NAN;
+    }
+    // Unbias: extended bias 16383, double bias 1023.
+    const u64 be = exp80 - 0x3800 + 1023;
+    const u64 frac = (mant & 0x000FFFFFFFFFFFFFULL) | 0x0008000000000000ULL;
+    u64 bits = (sign << 63) | (be << 52) | frac;
+    double d;
+    std::memcpy(&d, &bits, 8);
+    return d;
+}
+
+void double_to_f80(double d, u8 out[10]) {
+    std::memset(out, 0, 10);
+    u64 bits;
+    std::memcpy(&bits, &d, 8);
+    const u64 frac = bits & 0x000FFFFFFFFFFFFFULL;
+    const u64 be = (bits >> 52) & 0x7FF;
+    const u64 sign = (bits >> 63) & 1;
+    u16 se;
+    if (be == 0 && frac == 0) {
+        se = static_cast<u16>(sign << 15);
+    } else if (be == 0x7FF) {
+        se = static_cast<u16>((sign << 15) | 0x7FFF);
+        out[8] = out[9] = 0xFF;
+    } else {
+        se = static_cast<u16>((sign << 15) | (be - 1023 + 0x3800));
+        const u64 mant = frac | 0x8000000000000000ULL;
+        for (int i = 0; i < 8; ++i) out[i] = static_cast<u8>((mant >> (8 * i)) & 0xFF);
+    }
+    out[8] = static_cast<u8>(se & 0xFF);
+    out[9] = static_cast<u8>((se >> 8) & 0xFF);
+}
+
 } // namespace
 
 CpuExecutor::CpuExecutor(MemoryManager& memory, SyscallTable& syscalls)
@@ -3828,7 +3883,7 @@ StepResult CpuExecutor::step() {
                 ea = start_rip + len + disp;
                 have_ea = true;
             } else {
-                static const GuestAddr kReg[8] = {
+                const GuestAddr kReg[8] = {
                     m_context.rax, m_context.rcx, m_context.rdx, m_context.rbx,
                     m_context.rsp, m_context.rbp, m_context.rsi, m_context.rdi};
                 GuestAddr base = kReg[rmf];
@@ -3838,7 +3893,7 @@ StepResult CpuExecutor::step() {
                     const u8 scale = sib >> 6;
                     const u8 index = (sib >> 3) & 7;
                     const u8 bsel = sib & 7;
-                    static const GuestAddr kIdx[8] = {
+                    const GuestAddr kIdx[8] = {
                         m_context.rax, m_context.rcx, m_context.rdx, m_context.rbx,
                         m_context.rsp, m_context.rbp, m_context.rsi, m_context.rdi};
                     base = kReg[bsel] + (kIdx[index] << scale);
@@ -3861,32 +3916,96 @@ StepResult CpuExecutor::step() {
             std::memcpy(&bits, &d, sizeof(bits));
             f.push(bits, 0);
         };
+        // x87 memory operands are IEEE-754 ENCODINGS, not integers. Reinterpret
+        // the bits; converting the value to an integer (the previous behaviour)
+        // stored the whole-number part as a bit pattern, which is not a float.
         auto store_double = [&](usize n) -> bool {
             if (!have_ea) return false;
-            const double d = [&] { double v; std::memcpy(&v, &f.st[f.top], sizeof(v)); return v; }();
-            if (n == 4) { const u32 v = static_cast<u32>(d); return m_memory.write_bytes(ea, &v, 4); }
-            u64 v = 0; std::memcpy(&v, &d, sizeof(v));
-            return m_memory.write_bytes(ea, &v, 8);
+            double d;
+            std::memcpy(&d, &f.st[f.top], sizeof(d));
+            if (n == 4) { const float v = static_cast<float>(d); return m_memory.write_bytes(ea, &v, 4); }
+            return m_memory.write_bytes(ea, &d, 8);
         };
-        // FISTP honours RC (cw bits 10-11): 00 toward zero, 01 nearest-even,
-        // 10 toward +inf, 11 toward -inf.
+        // Reads an IEEE-754 operand of n bytes and pushes it as a double.
+        // n == 4 -> binary32, n == 8 -> binary64, n == 10 -> 80-bit extended.
+        auto load_float = [&](usize n) -> bool {
+            if (!have_ea) return false;
+            if (n == 4) {
+                float v = 0;
+                if (!m_memory.read_bytes(ea, &v, 4)) return false;
+                push_double(static_cast<double>(v));
+                return true;
+            }
+            if (n == 8) {
+                double v = 0;
+                if (!m_memory.read_bytes(ea, &v, 8)) return false;
+                push_double(v);
+                return true;
+            }
+            if (n == 10) {
+                u8 b[10];
+                if (!m_memory.read_bytes(ea, b, 10)) return false;
+                push_double(f80_to_double(b));
+                return true;
+            }
+            return false;
+        };
+        // Rounding is explicit: the host FPCR is never touched, so a guest that
+        // reads the host rounding mode cannot observe us changing it.
+        //
+        // Control word layout (Intel SDM): bits 8-9 are precision control,
+        // bits 10-11 are rounding control. They are distinct fields and the
+        // guest manipulates them separately -- `and ecx,0xFCFF` clears PC while
+        // preserving RC, then `or ecx,0x0200` sets PC=10 (53-bit) and leaves
+        // RC=00. So the mode must come from bits 10-11 and nothing else.
+        //
+        // PRECISION CONTROL IS IGNORED. Each stack slot is a host double, so
+        // arithmetic is always 53-bit and PC=24/53/64 cannot be honoured. That
+        // happens to match the PC=10 the guest selects, so no visible difference
+        // arises here, but a guest asking for 64-bit extended would silently get
+        // double precision. An m80 load/store boundary conversion is subject to
+        // the same 53-bit limit.
+        auto nearest_even = [](double d) -> double {
+            const double fl = std::floor(d);
+            const double diff = d - fl;
+            if (diff > 0.5) return fl + 1.0;
+            if (diff < 0.5) return fl;
+            return (std::fmod(fl, 2.0) == 0.0) ? fl : (fl + 1.0);
+        };
         auto store_int = [&](usize n) -> bool {
             if (!have_ea) return false;
             double d; std::memcpy(&d, &f.st[f.top], sizeof(d));
+
+            // RC = bits 10-11: 00 nearest-even, 01 down(-inf), 10 up(+inf),
+            // 11 truncate(toward zero).
             const int rc = (f.cw >> 10) & 3;
-            double adj = d;
+            double adj;
             switch (rc) {
-                case 0: adj = std::trunc(d); break;             // toward zero
-                case 1: { double r = std::nearbyint(d);
-                          if (std::abs(d - std::trunc(d)) == 0.5) {
-                              const double fl = std::floor(d), ce = std::ceil(d);
-                              r = (std::fabs(d - fl) <= std::fabs(d - ce)) ? fl : ce;
-                          }
-                          adj = r; break; }                       // nearest-even
-                case 2: adj = std::ceil(d); break;               // toward +inf
-                default: adj = std::floor(d); break;             // toward -inf
+                case 0:  adj = nearest_even(d); break;
+                case 1:  adj = std::floor(d);   break;
+                case 2:  adj = std::ceil(d);    break;
+                default: adj = std::trunc(d);   break;
             }
-            // Inexact -> clear precision, set IE. Masked, so no trap.
+
+            // Overflow or NaN yields the "integer indefinite" value and sets IE.
+            const bool bad = std::isnan(d) || std::isinf(d);
+            bool over = bad;
+            if (!over) {
+                if (n == 2)      over = (d < -32768.0    || d > 32767.0);
+                else if (n == 4) over = (d < -2147483648.0 || d > 2147483647.0);
+                else             over = (d < -9223372036854775808.0 || d >= 9223372036854775808.0);
+            }
+            if (over) {
+                f.sw |= 0x0001;   // IE
+                f.sw |= 0x0100;   // also set the C2-ish "invalid" style flag we track
+                if (n == 2) { const u16 v = 0x8000; return m_memory.write_bytes(ea, &v, 2); }
+                if (n == 4) { const u32 v = 0x80000000u; return m_memory.write_bytes(ea, &v, 4); }
+                const u64 v = 0x8000000000000000ULL;
+                return m_memory.write_bytes(ea, &v, 8);
+            }
+
+            // Inexact -> set IE. All exceptions are masked (cw 0x037F default),
+            // so this records rather than traps.
             if (adj != d) f.sw |= 0x0001;
             f.sw |= 0x0100;
             if (n == 2) { const i16 v = static_cast<i16>(adj); return m_memory.write_bytes(ea, &v, 2); }
@@ -3925,14 +4044,10 @@ StepResult CpuExecutor::step() {
                 } else {
                     i64 raw = 0;
                     switch (regf) {
-                        case 0: if (load_mem(4, &raw)) push_double(static_cast<float>(raw));
-                                else handled = false; break;                       // FLD m32
-                        case 2: if (load_mem(4, &raw)) { const float v = static_cast<float>(raw);
-                                if (m_memory.write_bytes(ea, &v, 4)) {} else handled = false; }
-                                else handled = false; break;                       // FST m32
-                        case 3: if (load_mem(4, &raw)) { const float v = static_cast<float>(raw);
-                                push_double(v); if (!m_memory.write_bytes(ea, &v, 4)) handled = false; }
-                                else handled = false; break;                       // FSTP m32
+                        case 0: if (!load_float(4)) handled = false; break;        // FLD m32fp
+                        case 2: if (!store_double(4)) handled = false; break;       // FST m32fp
+                        case 3: if (!store_double(4)) handled = false;
+                                f.top = static_cast<u8>((f.top + 1) & 7); break;     // FSTP m32fp
                         case 5: { u16 cw = 0;
                                   if (m_memory.read_bytes(ea, &cw, 2)) f.cw = cw;
                                   else { std::fprintf(stderr, "[x87] FLDCW read FAILED ea=0x%llx\n",
@@ -3950,15 +4065,10 @@ StepResult CpuExecutor::step() {
             case 0xDD: {
                 i64 raw = 0;
                 switch (regf) {
-                    case 0: if (load_mem(8, &raw)) push_double(static_cast<double>(raw));
-                            else handled = false; break;                            // FLD m64
-                    case 2: if (load_mem(8, &raw)) { double v; std::memcpy(&v, &raw, 8);
-                            if (!m_memory.write_bytes(ea, &v, 8)) handled = false; }
-                            else handled = false; break;                            // FST m64
-                    case 3: if (load_mem(8, &raw)) { double v; std::memcpy(&v, &raw, 8);
-                            push_double(v);
-                            if (!m_memory.write_bytes(ea, &v, 8)) handled = false; }
-                            else handled = false; break;                            // FSTP m64
+                    case 0: if (!load_float(8)) handled = false; break;             // FLD m64fp
+                    case 2: if (!store_double(8)) handled = false; break;            // FST m64fp
+                    case 3: if (!store_double(8)) handled = false;
+                            f.top = static_cast<u8>((f.top + 1) & 7); break;         // FSTP m64fp
                     default: handled = false;
                 }
                 break;
@@ -3967,8 +4077,19 @@ StepResult CpuExecutor::step() {
                 i64 raw = 0;
                 switch (regf) {
                     case 0: if (load_mem(2, &raw)) push_double(static_cast<double>(raw));
-                            else handled = false; break;                            // FILD m16
-                    case 3: store_int(2); break;                                    // FISTP m16
+                            else handled = false; break;                            // FILD m16int
+                    case 2: store_int(2); break;                                    // FIST m16int (no pop)
+                    case 3: if (store_int(2)) f.top = static_cast<u8>((f.top + 1) & 7);
+                            else handled = false; break;                           // FISTP m16int
+                    case 5: if (!load_float(10)) handled = false; break;             // FLD m80
+                    case 7: {                                                       // FSTP m80
+                        if (!have_ea) { handled = false; break; }
+                        double d; std::memcpy(&d, &f.st[f.top], sizeof(d));
+                        u8 buf[10]; double_to_f80(d, buf);
+                        if (!m_memory.write_bytes(ea, buf, 10)) handled = false;
+                        f.top = static_cast<u8>((f.top + 1) & 7);
+                        break;
+                    }
                     default: handled = false;
                 }
                 break;
@@ -3980,7 +4101,8 @@ StepResult CpuExecutor::step() {
                             else handled = false; break;                            // FILD m32
                     case 5: if (load_mem(8, &raw)) push_double(static_cast<double>(raw));
                             else handled = false; break;                            // FILD m64
-                    case 7: store_int(4); break;                                    // FISTP m32
+                    case 7: if (store_int(4)) f.top = static_cast<u8>((f.top + 1) & 7);
+                            else handled = false; break;                           // FISTP m32int
                     default: handled = false;
                 }
                 break;
@@ -3991,15 +4113,6 @@ StepResult CpuExecutor::step() {
         if (handled) {
             // One-shot trace so a bad operand address is visible without
             // spamming a hot path.
-            static std::atomic<u32> s_x87_trace{0};
-            if (s_x87_trace.fetch_add(1, std::memory_order_relaxed) < 400) {
-                std::fprintf(stderr,
-                             "[x87] op=0x%02x modrm=0x%02x ext=%u ea=0x%llx have_ea=%d "
-                             "rip=0x%llx cw=0x%04x sw=0x%04x top=%u\n",
-                             op0, modrm, (unsigned)regf,
-                             (unsigned long long)ea, have_ea ? 1 : 0,
-                             (unsigned long long)start_rip, f.cw, f.sw, f.top);
-            }
             m_context.rip = start_rip + len;
             return StepResult::Ok;
         }
