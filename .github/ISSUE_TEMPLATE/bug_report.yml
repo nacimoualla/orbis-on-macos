@@ -1,0 +1,36 @@
+name: Bug report
+description: Something isn't working
+title: "[bug]: "
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you ran, what you expected, what you got (logs welcome, trimmed to the relevant ~50 lines).
+      placeholder: "./build/ps4-runner --no-jit samples/hello_orbis.elf stalls at ..."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Exact commands, sample ELF used, and whether --no-jit changes anything.
+      placeholder: "cmake -B build -DCMAKE_BUILD_TYPE=Release && ..."
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: macOS version, Apple Silicon chip, Xcode/CLT version, commit hash.
+      placeholder: "macOS 15.x, M3, Xcode 16.x, commit abc1234"
+    validations:
+      required: true
+  - type: checkboxes
+    id: cleanroom
+    attributes:
+      label: Clean-room check
+      options:
+        - label: "No proprietary Sony files, keys, or game content are attached to this report"
+          required: true

@@ -2,6 +2,7 @@
 
 **A PlayStation 4 (PS4) emulator & Orbis compatibility layer for Apple Silicon macOS.**
 
+[![Build](https://github.com/nacimoualla/orbis-on-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/nacimoualla/orbis-on-macos/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/nacimoualla/orbis-on-macos?style=social)](https://github.com/nacimoualla/orbis-on-macos/stargazers)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black)](https://github.com/nacimoualla/orbis-on-macos)
@@ -11,7 +12,7 @@
 
 `orbis-on-macos` is an open-source **PlayStation 4 emulator** — a clean-room **userland compatibility layer & runtime** that runs PS4 (Orbis OS) games and apps **natively on Apple Silicon macOS**. Instead of emulating the whole console, it loads a PS4 `eboot.bin`/ELF or PRX module, maps the guest's 8 GB address space into the Mac's unified memory, dynamically recompiles guest `x86_64` code to native `ARM64`, translates the GNM/Metal GPU command stream and delivers audio through CoreAudio — all on top of Darwin/Mach and Apple frameworks.
 
-> **Status:** Phases 1–14 implemented and verified (see [ROADMAP.md](ROADMAP.md)). CPU interpreter + ARM64 JIT, PRX/NID dynamic linker, Orbis syscall HLE, VFS, Metal graphics pipeline, CoreAudio, and threading are all in place.
+> **Status:** Phases 1–15 implemented and verified (see [ROADMAP.md](ROADMAP.md)). CPU interpreter + ARM64 JIT, PRX/NID dynamic linker, Orbis syscall HLE, VFS, Metal graphics pipeline, CoreAudio, and threading are all in place.
 
 ## 🗺️ Progress & Roadmap
 
@@ -26,8 +27,7 @@ The **runtime foundation and ARM64 JIT are complete and tested** — ELF/PRX loa
 
 The remaining **Phases 16–22** are what move it from *synthetic `samples/*.elf`* to *real retail titles* — input, broader HLE, real GCN→MSL shaders, and retail loading. Tracked on the [Next-Up board (#1)](https://github.com/nacimoualla/orbis-on-macos/issues/1):
 
-- **✅ Foundation + JIT (Phases 1–15):** done
-- [x] [#2](https://github.com/nacimoualla/orbis-on-macos/issues/2) · **P15** — Connect the ARM64 JIT — `done`
+- **✅ Foundation + JIT (Phases 1–15):** done (no tracking issue — see [ROADMAP.md](ROADMAP.md))
 - [ ] [#3](https://github.com/nacimoualla/orbis-on-macos/issues/3) · **P16** — Input (`libScePad` + GameController) — `ready-for-agent` ← *start here*
 - [ ] [#4](https://github.com/nacimoualla/orbis-on-macos/issues/4) · **P17** — Display & present (`libSceVideoOut`) — `ready-for-human`
 - [ ] [#5](https://github.com/nacimoualla/orbis-on-macos/issues/5) · **P18** — Expand HLE coverage — `needs-triage`
@@ -108,6 +108,14 @@ This builds the `ps4_core` library, the `ps4-runner` CLI, and the 15 `test_phase
 ./build/ps4-runner [options] <path-to-eboot.bin-or-elf>
 ```
 
+Options: `--window/-w`, `--headless`, `--budget N` (headless instruction budget,
+default 100 M), `--no-jit`, `--trace/-t`, `--strict-hle`.
+
+> **JIT caveat:** with the JIT enabled (the default) the guest stalls in a
+> vectorised loop at `0x58d1b2` before the Mono bootstrap and never reaches the
+> engine. `--no-jit` gets through. Use `--no-jit` plus a raised `--budget` for
+> Mono-phase smoke tests. See `docs/nid-audit.md`.
+
 | Option | Meaning |
 |---|---|
 | `--window`, `-w` | Open an interactive macOS Metal window (60 FPS presentation loop). |
@@ -159,11 +167,21 @@ python3 tests/test_verify_nids_adversarial.py
 
 ### Debugging HLE coverage
 
-Two stdlib-only scripts support NID work:
+The HLE registry is checked against [ps4libdoc](https://github.com/idc/ps4libdoc), whose symbol tables make a wrong NID *label* provable rather than a matter of taste. Three corpora are cached under `data/libdoc/`:
 
-- `python3 scripts/verify_nids.py [--eboot <eboot.bin|elf>] [--registry <nid_registry.cpp>]` — validates the Sony NID hash against test vectors, audits every `register_symbol` name/NID pair in the registry, and cross-references a game's imports (resolved vs. unresolved).
-- `python3 scripts/check_log_nids.py <run-log> [names.txt]` — flags every `[HLE CALL] label (NID=…)` line whose label doesn't hash to its NID, and optionally resolves the real name from a candidate list. Run it on any `ps4-runner` log to catch misregistered handlers.
-- `python3 scripts/crack_nids.py` — hashes every string in the game's `eboot.bin` and Mono PRXs against target NIDs to resolve unknown imports (extend `TARGETS` for new ones).
+- `libkernel.sprx.json` — per-module dump: symbol NIDs plus the library that exports them (libkernel, libScePosix, libSceLibcInternal, libSceGnmDriver).
+- `known_names.txt` — 42,010 symbol names across every PS4 module; resolves a NID to a name without a module dump.
+- `mono_embedding_api.txt` — every `mono_*` identifier in the official Mono headers, for mono-ps4 NIDs.
+
+Scripts, all stdlib-only:
+
+- `python3 scripts/audit_nids_libdoc.py` — **the one to run after touching `nid_registry.cpp`.** Compares every registration against all three corpora, then hashes the label itself so NIDs ps4libdoc cannot name are still checked. Cross-references the guest's import tables (eboot + every PRX) to separate a live bug from a dead registration. Exits non-zero only on a mislabeled NID the guest actually imports.
+- `python3 scripts/crack_mono_nids.py [--all] [--refresh]` — hash-verifies the `mono_*` labels against the Mono embedding API; `--all` lists every Mono NID the guest imports with its real API name.
+- `python3 scripts/verify_nids.py [--eboot <eboot.bin|elf>] [--registry <nid_registry.cpp>]` — validates the Sony NID hash against test vectors, audits every `register_symbol` name/NID pair, and cross-references a game's imports.
+- `python3 scripts/check_log_nids.py <run-log> [names.txt]` — flags every `[HLE CALL] label (NID=…)` line whose label doesn't hash to its NID.
+- `python3 scripts/crack_nids.py` — hashes every string in the game's `eboot.bin` and Mono PRXs against target NIDs.
+
+Why this matters: labels are load-bearing. `0x7501D612C26DA04E` was registered as `scePadInit` when it is `pthread_mutexattr_init`, which is why the trace showed a nonsensical "scePadInit ×42"; the same NID also carried a pad-state writer onto Mono's `sem_init`, overwriting guest semaphores. Run the audit after any registry edit.
 
 At runtime, a stall watchdog in the thread manager dumps per-thread RIP/GPRs after ~2 s of per-thread HLE silence — look for `[WATCHDOG stall-a/b]` blocks in run logs when the game stops progressing.
 
@@ -181,7 +199,8 @@ At runtime, a stall watchdog in the thread manager dumps per-thread RIP/GPRs aft
 │   └── hle/                # NID registry, threading
 ├── samples/                # Synthetic test ELF fixtures (hello/sample/dynamic/triangle)
 ├── tests/                  # test_phase1..15 (CTest)
-├── scripts/                # NID verification + log checker, SELF unpacker
+├── scripts/                # NID audit vs ps4libdoc, Mono NID cracker, log checker, SELF unpacker
+├── data/libdoc/            # ps4libdoc symbol corpora used by the NID audit
 ├── vfs_root/               # Default VFS mount points (/app0, /data, /savedata)
 ├── docs/
 │   ├── adr/                # Architecture Decision Records (0001–0009)
@@ -196,6 +215,12 @@ At runtime, a stall watchdog in the thread manager dumps per-thread RIP/GPRs aft
 - [ROADMAP.md](ROADMAP.md) — interactive, phase-by-phase implementation plan.
 - [GLOSSARY.md](GLOSSARY.md) — canonical terminology (Orbis, GNM, NID, PRX, HLE, …).
 - [docs/adr/](docs/adr/) — architecture decision records.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to pick an issue, build, test, and open a PR.
+- [SECURITY.md](SECURITY.md) — how to report vulnerabilities privately.
+
+## 🤝 Contributing
+
+Contributors welcome — the fastest way in is [#3 · Phase 16 Input](https://github.com/nacimoualla/orbis-on-macos/issues/3) (`ready-for-agent`), tracked under the [Next-Up board (#1)](https://github.com/nacimoualla/orbis-on-macos/issues/1). Five-minute path: fork → `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` → `cd build && ctest --output-on-failure` → open a focused PR. Full guide in [CONTRIBUTING.md](CONTRIBUTING.md). Clean-room only: never commit Sony code, keys, firmware, `*.prx`/`*.sprx`, `*.pkg`, `eboot.bin`, or game content.
 
 ## 🙏 Related projects
 

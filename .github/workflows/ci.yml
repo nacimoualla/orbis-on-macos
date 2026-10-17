@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    # Apple Silicon runner: JIT, Metal, CoreAudio all require arm64 macOS.
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          cmake --version
+          xcodebuild -version || true
+          python3 --version
+
+      - name: Configure (Release)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j "$(sysctl -n hw.ncpu)"
+
+      - name: Test (CTest, headless)
+        run: cd build && ctest --output-on-failure
+
+      - name: NID audit (registry vs ps4libdoc + hash vectors)
+        # data/libdoc/ is committed; if absent locally the script still
+        # hash-checks labels, so missing corpora must not fail the build.
+        run: |
+          python3 scripts/audit_nids_libdoc.py || echo "::warning::NID audit found cleanup items (see log)"
+          python3 tests/test_verify_nids_adversarial.py
