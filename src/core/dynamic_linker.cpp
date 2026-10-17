@@ -447,15 +447,11 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                 if (dyn.d_tag == DT_RELASZ || dyn.d_tag == DT_SCE_RELASZ) rela_size = dyn.d_un.d_val;
                 if (dyn.d_tag == DT_JMPREL || dyn.d_tag == DT_SCE_JMPREL) jmprel_addr = dyn.d_un.d_ptr;
                 if (dyn.d_tag == DT_PLTRELSZ || dyn.d_tag == DT_SCE_PLTRELSZ) pltrel_size = dyn.d_un.d_val;
-                // 0x6100003F carries the symbol table in shipped PRX modules --
-                // see reloc.hpp for the measurement against mono-ps4.prx. It is
-                // deliberately NOT honoured for a bare ELF: that tag was measured
-                // on SELF/PRX modules, and eboot.elf's dynamic section also
-                // contains it. Recognising it there flips eboot onto a
-                // symbol-resolving relocation path that was previously inert,
-                // which corrupts its GOT rather than fixing it.
-                if (dyn.d_tag == DT_SYMTAB || dyn.d_tag == DT_SCE_SYMTAB ||
-                    (loader.is_self_container() && dyn.d_tag == DT_SCE_SYMTAB_EXPORT)) {
+                // DT_SCE_SYMTAB (0x61000039) is the symbol table OFFSET; the tag
+                // past SYMENT is its byte SIZE. Only the offset belongs here --
+                // treating the size as an offset lands mid-table and shifts every
+                // st_name. See reloc.hpp for the measurement.
+                if (dyn.d_tag == DT_SYMTAB || dyn.d_tag == DT_SCE_SYMTAB) {
                     symtab_addr = dyn.d_un.d_ptr;
                 }
                 if (dyn.d_tag == DT_STRTAB || dyn.d_tag == DT_SCE_STRTAB) strtab_addr = dyn.d_un.d_ptr;
@@ -618,6 +614,7 @@ namespace {
 
 /// SHN_UNDEF. Spelled locally because this file does not pull in <elf.h>.
 constexpr u16 SHN_UNDEF_LOCAL = 0;
+constexpr u8 ELF64_ST_TYPE_FUNC = 2;
 
 constexpr std::string_view kBase64Url =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -643,24 +640,6 @@ bool decode_nid_token(const char* tok11, Nid* out) {
     return true;
 }
 
-/// Given a PROGLIB-relative st_name, find the 11-character base64 token it
-/// refers to. Scans backwards a bounded distance, since the recorded offset is
-/// the middle of the 16-byte record.
-bool resolve_export_nid(const u8* proglib, usize proglib_size, u64 st_name, Nid* out) {
-    if (st_name >= proglib_size) return false;
-    for (usize back = 0; back <= 16; ++back) {
-        if (st_name < back) break;
-        const usize at = static_cast<usize>(st_name) - back;
-        if (at + 11 > proglib_size) break;
-        Nid nid = 0;
-        if (decode_nid_token(reinterpret_cast<const char*>(proglib + at), &nid) && nid != 0) {
-            *out = nid;
-            return true;
-        }
-    }
-    return false;
-}
-
 } // namespace
 
 void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfLoader& loader,
@@ -680,7 +659,7 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
     // same 0x6100003F holds 0x2a0, which is not a symbol table, and 0x61000039
     // holds the real one at 0x268. So gather every candidate and pick the one
     // that actually parses as Elf64_Sym rather than trusting a tag.
-    std::vector<usize> symtab_candidates;
+    usize symtab_off = 0, symtab_sz = 0, strtab_off = 0;
     GuestAddr init = 0, fini = 0;
     const usize dyn_off = loader.dynamic_offset_file_offset();
     if (dyn_off == 0 || dyn_off + sizeof(Elf64_Dyn) > file_data.size()) {
@@ -695,8 +674,15 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
     for (usize i = 0; i * sizeof(Elf64_Dyn) < dyn_size; ++i) {
         const auto& d = dyn[i];
         if (d.d_tag == DT_NULL) break;
-        if (d.d_tag == DT_SCE_SYMTAB_EXPORT || d.d_tag == DT_SCE_SYMTAB || d.d_tag == DT_SYMTAB) {
-            symtab_candidates.push_back(static_cast<usize>(d.d_un.d_ptr));
+        // Offset and size are separate tags. Reading the size as an offset lands
+        // partway into the table and shifts every st_name, which is what made a
+        // backwards scan for the name token look necessary.
+        if (d.d_tag == DT_SYMTAB || d.d_tag == DT_SCE_SYMTAB) {
+            symtab_off = static_cast<usize>(d.d_un.d_ptr);
+        } else if (d.d_tag == DT_SCE_SYMTABSZ) {
+            symtab_sz = static_cast<usize>(d.d_un.d_val);
+        } else if (d.d_tag == DT_STRTAB || d.d_tag == DT_SCE_STRTAB) {
+            strtab_off = static_cast<usize>(d.d_un.d_ptr);
         } else if (d.d_tag == DT_INIT) {
             init = d.d_un.d_ptr;
         } else if (d.d_tag == DT_FINI) {
@@ -704,50 +690,42 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
         }
     }
 
-    // Score each candidate by how many consecutive entries look like symbols.
-    auto score_symtab = [&](usize off) -> usize {
-        if (off == 0 || off + sizeof(Elf64_Sym) > proglib_size) return 0;
-        usize n = 0;
-        while (off + ((n + 1) * sizeof(Elf64_Sym)) <= proglib_size && n < 64) {
-            Elf64_Sym sym{};
-            std::memcpy(&sym, proglib + off + (n * sizeof(Elf64_Sym)), sizeof(sym));
-            if (sym.st_name == 0 && sym.st_value == 0 && sym.st_shndx == 0) break;
-            if (sym.st_name > proglib_size || sym.st_shndx > 0xFFFF) return n;
-            ++n;
-        }
-        return n;
-    };
-    usize symtab_off = 0;
-    usize best = 0;
-    for (const usize cand : symtab_candidates) {
-        const usize n = score_symtab(cand);
-        if (n > best) { best = n; symtab_off = cand; }
-    }
-    if (symtab_off == 0 || best == 0) {
-        std::fprintf(stderr, "[module] 0x%x: no symbol table found (%zu candidates)\n",
-                     handle, symtab_candidates.size());
+    if (symtab_off == 0 || symtab_sz < sizeof(Elf64_Sym) ||
+        symtab_off + symtab_sz > proglib_size) {
+        std::fprintf(stderr, "[module] 0x%x: bad symbol table (off=0x%zx size=0x%zx "
+                            "proglib=0x%zx)\n",
+                     handle, symtab_off, symtab_sz, proglib_size);
         auto it0 = m_modules.find(handle);
         if (it0 != m_modules.end()) { it0->second.init = init; it0->second.fini = fini; }
         return;
     }
+    const usize total = symtab_sz / sizeof(Elf64_Sym);
 
-    // Walk to the terminating all-zero symbol.
-    usize total = 0;
-    while ((symtab_off + ((total + 1) * sizeof(Elf64_Sym))) <= proglib_size) {
-        Elf64_Sym sym{};
-        std::memcpy(&sym, proglib + symtab_off + (total * sizeof(Elf64_Sym)), sizeof(sym));
-        if (sym.st_name == 0 && sym.st_value == 0 && sym.st_shndx == 0) break;
-        ++total;
-    }
+    // st_name indexes the string table, so the token sits at
+    // PROGLIB + strtab_off + st_name -- at byte 0, not partway in.
+    auto token_at = [&](u32 st_name) -> Nid {
+        if (strtab_off == 0 || st_name == 0) return 0;
+        const usize at = strtab_off + st_name;
+        if (at + 11 > proglib_size) return 0;
+        Nid nid = 0;
+        if (!decode_nid_token(reinterpret_cast<const char*>(proglib + at), &nid)) return 0;
+        return nid;
+    };
 
-    usize defined = 0;
+    usize defined = 0, objs = 0, funcs = 0;
     for (usize i = 0; i < total; ++i) {
         Elf64_Sym sym{};
         std::memcpy(&sym, proglib + symtab_off + (i * sizeof(Elf64_Sym)), sizeof(sym));
-        // Undefined means "imported from somewhere else" -- not ours to export.
+        // SHN_UNDEF means "imported from somewhere else" -- not ours to export.
         if (sym.st_shndx == SHN_UNDEF_LOCAL) continue;
-        Nid nid = 0;
-        if (!resolve_export_nid(proglib, proglib_size, sym.st_name, &nid)) continue;
+        const Nid nid = token_at(sym.st_name);
+        if (nid == 0) continue;
+        // Take every defined symbol, not just STT_FUNC. AOT module descriptor
+        // tables are STT_OBJECT data; filtering on FUNC alone is what made
+        // MonoAssembliesPS4.prx look like it exported nothing.
+        const u8 stype = sym.st_info & 0xF;
+        if (stype == ELF64_ST_TYPE_FUNC) ++funcs;
+        else ++objs;
         // First definition wins, so an earlier module is not shadowed.
         m_module_exports.emplace(nid, base + sym.st_value);
         ++defined;
