@@ -60,6 +60,17 @@ inline constexpr i64 DT_SCE_STRSZ                = 0x61000037;
 inline constexpr i64 DT_SCE_SYMTAB               = 0x61000039;
 inline constexpr i64 DT_SCE_SYMENT               = 0x6100003B;
 
+// Two tags past the documented set. Measured against mono-ps4.prx and
+// MonoAssembliesPS4.prx, where DT_SCE_SYMTAB (0x61000039) holds 0x38e8 -- an
+// offset into the string blob that yields zero valid Elf64_Sym -- while
+// 0x6100003F holds 0x5400, which parses as 6024 consecutive well-formed
+// symbols, 516 of them defined (st_shndx != SHN_UNDEF) with info=0x12
+// (STB_GLOBAL|STT_FUNC). Of those, 78 are NIDs this project already HLEs.
+// So 0x6100003F is the one carrying the symbol table in shipped modules.
+inline constexpr i64 DT_SCE_STRTAB_2             = 0x6100003D; // unnamed; not STRTAB
+inline constexpr i64 DT_SCE_SYMTAB_EXPORT        = 0x6100003F; // real DT_SCE_SYMTAB
+
+
 // x86_64 Relocation Types (ELF64_R_TYPE)
 inline constexpr u32 R_X86_64_NONE      = 0;
 inline constexpr u32 R_X86_64_64        = 1;

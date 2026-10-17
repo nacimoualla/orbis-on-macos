@@ -1,4 +1,5 @@
 #include "ps4/audio_manager.hpp"
+#include "ps4/dynamic_linker.hpp"
 #include "ps4/executor.hpp"
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
@@ -678,14 +679,46 @@ void NidRegistry::register_default_libraries() {
 
     // sceKernelLoadStartModule
     // NID: 0xC33BEA4F852A297FULL
+    //
+    // Really loads the module. It used to mint an incrementing integer and hand
+    // that back, so mono-ps4.prx and MonoAssembliesPS4.prx were "loaded" while
+    // not one instruction of either had executed -- every mono-ps4 NID kept
+    // resolving to our s_mono_arena cookie stubs, and every static constructor
+    // in the game silently did nothing.
+    //
+    // The load is best-effort. A module that fails to map returns 0 (the real
+    // failure value) rather than a fake handle, so callers can tell the
+    // difference instead of jumping into an unmapped page.
     register_symbol(0xC33BEA4F852A297FULL, "sceKernelLoadStartModule", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
-            static u32 s_module_id = 0x2000;
             const GuestAddr path_addr = ctx.rdi;
             const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
-                                   ? mem.to_host_ptr<char>(path_addr) : "unknown";
-            const u32 handle = ++s_module_id;
-            std::fprintf(stderr, "[HLE] sceKernelLoadStartModule('%s') -> handle 0x%x\n", path, handle);
+                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
+            if (path == nullptr) {
+                ctx.rax = 0;
+                return;
+            }
+            auto& vfs = get_vfs();
+            auto resolved = vfs.resolve_path(path);
+            const std::string host_path = resolved ? resolved->string() : std::string(path);
+
+            DynamicLinker* linker = ps4::active_linker();
+            if (linker == nullptr) {
+                std::fprintf(stderr, "[HLE] sceKernelLoadStartModule('%s'): no linker, failed\n", path);
+                ctx.rax = 0;
+                return;
+            }
+            const GuestAddr base = ps4::module_base_allocator();
+            if (base == 0) {
+                ctx.rax = 0;
+                return;
+            }
+            // run_init stays false: MonoAssembliesPS4.prx has DT_INIT == 0, and
+            // the guest drives these modules through its own startup path.
+            // Calling a null entry point would jump straight to the module base.
+            const u32 handle = linker->load_module(host_path, base, /*run_init=*/false);
+            std::fprintf(stderr, "[HLE] sceKernelLoadStartModule('%s' -> '%s') -> handle 0x%x\n",
+                         path, host_path.c_str(), handle);
             ctx.rax = handle;
         });
 
@@ -4650,10 +4683,6 @@ void NidRegistry::register_default_libraries() {
         {0x23FA65EA7B52AD86ULL, "mono_thread_set_main", "mono-ps4"},
         {0x9141F1F3ED8B6742ULL, "sceKernelSyncStub", "libkernel"},
         {0x0E04B6E6017A7AE4ULL, "sceKernelSyncStub", "libkernel"},
-        {0x7050A9D0D5FCC1FDULL, "sceGnmSetVgtControl", "libSceGnm"},
-        {0x8008429FA5225386ULL, "sceGnmSetVsShader", "libSceGnm"},
-        {0xE6E14A7248896113ULL, "sceGnmSetPsShader350", "libSceGnm"},
-        {0x186B27EE3313C70EULL, "sceGnmDrawIndexAuto", "libSceGnm"},
         // Not scePthreadSetschedparam (that is 0x0F3112F61405E1FEULL).
         {0xFD98F4C8AD37832AULL, "sceKernelSyncStub", "libkernel"},
         {0xD8866B1E72E722DDULL, "sceKernelSyncStub", "libkernel"}, // Unity init stub
@@ -4671,10 +4700,6 @@ void NidRegistry::register_default_libraries() {
         {0xE6E7409BEE9BA158ULL, "sceGnmCreateWorkloadStream", "libSceGnm"},
         {0x8A1C6B6ECA122967ULL, "sceGnmBeginWorkload", "libSceGnm"},
         {0xC9BD9C4616A00F52ULL, "sceGnmDrawInitDefaultHardwareState350", "libSceGnm"},
-        {0xD6A5CB1C8A5138F1ULL, "sceGnmInsertWaitFlipDone", "libSceGnm"},
-        {0x5B512D8FF8E55BB6ULL, "sceGnmInsertPushMarker", "libSceGnm"},
-        {0xEEA65536012EF926ULL, "sceGnmInsertPopMarker", "libSceGnm"},
-        {0x8E222DCD2EBEDB68ULL, "sceGnmInsertSetMarker", "libSceGnm"},
     };
     for (const SyncStub& stub : kSyncStubs) {
         register_symbol(stub.nid, stub.name, stub.module,
@@ -4682,6 +4707,211 @@ void NidRegistry::register_default_libraries() {
                 ctx.rax = SCE_OK;
             });
     }
+
+    // Helper to write PM4 NOP padding for remaining space in a DCB reservation
+    auto write_dcb_nop_padding = [](MemoryManager& mem, GuestAddr addr, u32 num_dwords) {
+        if (num_dwords == 0) return;
+        if (num_dwords == 1) {
+            mem.write_value<u32>(addr, 0x80000000U);
+        } else {
+            std::vector<u32> words(num_dwords, 0U);
+            words[0] = 0xC0001000U | ((num_dwords - 2) << 16);
+            mem.write_bytes(addr, words.data(), static_cast<GuestSize>(num_dwords) * sizeof(u32));
+        }
+    };
+
+    // GNM DCB-writing stubs: the caller reserves `rsi` DWORDs at `rdi` in the DCB.
+    // Each stub fills the reserved range with a valid PM4 Type-3 IT_NOP packet
+    // (0xC0001000 | ((n-2) << 16)), preserving packet cursor alignment so that
+    // subsequent PM4 packets in the command stream do not desynchronize.
+    struct DcbWriterStub {
+        Nid nid;
+        const char* name;
+        const char* module;
+    };
+    static const DcbWriterStub kDcbWriterStubs[] = {
+        {0x7050A9D0D5FCC1FDULL, "sceGnmSetVgtControl", "libSceGnm"},
+        {0x103F7F163AFC4DAEULL, "sceGnmDrawIndexIndirect", "libSceGnm"},
+        {0xD01CCB1A58DCC01AULL, "sceGnmDispatchDirect", "libSceGnm"},
+        {0x678DEF2A9E64EEBDULL, "sceGnmDispatchIndirect", "libSceGnm"},
+        {0xF8016F3845EB2899ULL, "sceGnmSetEmbeddedVsShader", "libSceGnm"},
+        {0x5FD3A6C3D770BF93ULL, "sceGnmSetEmbeddedPsShader", "libSceGnm"},
+        {0x1541C6F2C437479FULL, "sceGnmSetEsShader", "libSceGnm"},
+        {0x509C0DB8C05C5009ULL, "sceGnmSetGsShader", "libSceGnm"},
+        {0x54936316DAA2179CULL, "sceGnmSetHsShader", "libSceGnm"},
+        {0xD6A5CB1C8A5138F1ULL, "sceGnmInsertWaitFlipDone", "libSceGnm"},
+        {0x5B512D8FF8E55BB6ULL, "sceGnmInsertPushMarker", "libSceGnm"},
+        {0xEEA65536012EF926ULL, "sceGnmInsertPopMarker", "libSceGnm"},
+        {0x8E222DCD2EBEDB68ULL, "sceGnmInsertSetMarker", "libSceGnm"},
+    };
+    for (const DcbWriterStub& stub : kDcbWriterStubs) {
+        register_symbol(stub.nid, stub.name, stub.module,
+            [write_dcb_nop_padding](CpuContext& ctx, MemoryManager& mem) {
+                const GuestAddr dcb_addr = ctx.rdi;
+                const u32 num_dwords = static_cast<u32>(ctx.rsi);
+                if (num_dwords > 0 && num_dwords <= 65536 &&
+                    mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+                    write_dcb_nop_padding(mem, dcb_addr, num_dwords);
+                }
+                ctx.rax = SCE_OK;
+            });
+    }
+
+    // sceGnmDrawIndexAuto -- writes IT_DRAW_INDEX_AUTO (0x2D, 3 DWORDs) + NOP padding
+    register_symbol(0x186B27EE3313C70EULL, "sceGnmDrawIndexAuto", "libSceGnm",
+        [write_dcb_nop_padding](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dcb_addr = ctx.rdi;
+            const u32 num_dwords = static_cast<u32>(ctx.rsi);
+            const u32 index_count = static_cast<u32>(ctx.rdx);
+            const u32 initiator = ctx.rcx ? static_cast<u32>(ctx.rcx) : 2U; // DI_SRC_SEL_AUTO_INDEX = 2
+
+            if (num_dwords >= 3 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+                u32 pkt[3];
+                pkt[0] = 0xC0012D00U; // Type 3, count=1, opcode=0x2D (IT_DRAW_INDEX_AUTO)
+                pkt[1] = index_count;
+                pkt[2] = initiator;
+                mem.write_bytes(dcb_addr, pkt, sizeof(pkt));
+                write_dcb_nop_padding(mem, dcb_addr + sizeof(pkt), num_dwords - 3);
+            } else if (num_dwords > 0 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+                write_dcb_nop_padding(mem, dcb_addr, num_dwords);
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // sceGnmDrawIndex -- writes IT_DRAW_INDEX_2 (0x28, 6 DWORDs) + NOP padding
+    register_symbol(0x1E54CFA19FE863B6ULL, "sceGnmDrawIndex", "libSceGnm",
+        [write_dcb_nop_padding](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dcb_addr = ctx.rdi;
+            const u32 num_dwords = static_cast<u32>(ctx.rsi);
+            const u32 index_count = static_cast<u32>(ctx.rdx);
+            const GuestAddr index_buffer_addr = ctx.rcx;
+            const u32 base_vertex = static_cast<u32>(ctx.r8);
+            const u32 instance_count = static_cast<u32>(ctx.r9 ? ctx.r9 : 1);
+
+            std::fprintf(stderr, "[HLE sceGnmDrawIndex] dcb=0x%llx dwords=%u idx_count=%u idx_buf=0x%llx (rcx) base_vtx=%u instances=%u\n",
+                         (unsigned long long)dcb_addr, num_dwords, index_count,
+                         (unsigned long long)index_buffer_addr, base_vertex, instance_count);
+
+            if (num_dwords >= 6 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+                u32 pkt[6];
+                pkt[0] = 0xC0042800U; // Type 3, count=4, opcode=0x28 (IT_DRAW_INDEX_2)
+                pkt[1] = index_count;
+                pkt[2] = static_cast<u32>(index_buffer_addr & 0xFFFFFFFFU);
+                pkt[3] = static_cast<u32>((index_buffer_addr >> 32) & 0xFFFFFFFFU);
+                pkt[4] = index_count;
+                pkt[5] = 4U; // PrimitiveType::TriangleList
+                mem.write_bytes(dcb_addr, pkt, sizeof(pkt));
+                write_dcb_nop_padding(mem, dcb_addr + sizeof(pkt), num_dwords - 6);
+            } else if (num_dwords > 0 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+                write_dcb_nop_padding(mem, dcb_addr, num_dwords);
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // Shared handler for sceGnmSetVsShader & sceGnmUpdateVsShader:
+    // rdx points to Gnm::VsStageRegisters in guest memory:
+    // +0x00: m_spiShaderPgmLoVs, +0x04: m_spiShaderPgmHiVs
+    // +0x08: m_spiShaderPgmRsrc1Vs, +0x0C: m_spiShaderPgmRsrc2Vs
+    // +0x10: m_spiVsOutConfig, +0x14: m_spiShaderPosFormat, +0x18: m_paClVsOutCntl
+    auto vs_shader_handler = [write_dcb_nop_padding](const char* func_name, CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr dcb_addr = ctx.rdi;
+        const u32 num_dwords = static_cast<u32>(ctx.rsi);
+        const GuestAddr vs_regs_addr = ctx.rdx;
+        const u32 modifier = static_cast<u32>(ctx.rcx);
+
+        u32 pgm_lo = 0, pgm_hi = 0, rsrc1 = 0, rsrc2 = 0;
+        u32 out_cfg = 0, pos_fmt = 0, pa_cl = 0;
+        if (vs_regs_addr && mem.is_valid_address(vs_regs_addr, 28)) {
+            mem.read_value(vs_regs_addr + 0x00, pgm_lo);
+            mem.read_value(vs_regs_addr + 0x04, pgm_hi);
+            mem.read_value(vs_regs_addr + 0x08, rsrc1);
+            mem.read_value(vs_regs_addr + 0x0C, rsrc2);
+            mem.read_value(vs_regs_addr + 0x10, out_cfg);
+            mem.read_value(vs_regs_addr + 0x14, pos_fmt);
+            mem.read_value(vs_regs_addr + 0x18, pa_cl);
+        }
+        const u64 isa_addr = ((static_cast<u64>(pgm_hi) << 32) | pgm_lo) << 8;
+        std::fprintf(stderr, "[HLE %s] dcb=0x%llx dwords=%u vs_regs=0x%llx mod=0x%x -> VS ISA: 0x%llx (lo=0x%08x hi=0x%08x rsrc1=0x%08x rsrc2=0x%08x out_cfg=0x%08x pos_fmt=0x%08x pa_cl=0x%08x)\n",
+                     func_name, (unsigned long long)dcb_addr, num_dwords, (unsigned long long)vs_regs_addr, modifier,
+                     (unsigned long long)isa_addr, pgm_lo, pgm_hi, rsrc1, rsrc2, out_cfg, pos_fmt, pa_cl);
+
+        if (num_dwords >= 6 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+            u32 pkt[6];
+            pkt[0] = 0xC0047600U; // Type 3, count=4 (5 payload dwords), opcode=0x76 (IT_SET_SH_REG)
+            pkt[1] = 0x0048U;      // mmSPI_SHADER_PGM_LO_VS
+            pkt[2] = pgm_lo;
+            pkt[3] = pgm_hi;
+            pkt[4] = rsrc1;
+            pkt[5] = rsrc2;
+            mem.write_bytes(dcb_addr, pkt, sizeof(pkt));
+            write_dcb_nop_padding(mem, dcb_addr + sizeof(pkt), num_dwords - 6);
+        } else if (num_dwords > 0 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+            write_dcb_nop_padding(mem, dcb_addr, num_dwords);
+        }
+        ctx.rax = SCE_OK;
+    };
+
+    register_symbol(0x8008429FA5225386ULL, "sceGnmSetVsShader", "libSceGnm",
+        [vs_shader_handler](CpuContext& ctx, MemoryManager& mem) {
+            vs_shader_handler("sceGnmSetVsShader", ctx, mem);
+        });
+
+    register_symbol(0x577D55D3552249C6ULL, "sceGnmUpdateVsShader", "libSceGnm",
+        [vs_shader_handler](CpuContext& ctx, MemoryManager& mem) {
+            vs_shader_handler("sceGnmUpdateVsShader", ctx, mem);
+        });
+
+    // sceGnmSetPsShader350 -- writes IT_SET_SH_REG (0x76, count=4, base_reg=0x0008 mmSPI_SHADER_PGM_LO_PS) + NOP padding
+    // rdx points to Gnm::PsStageRegisters in guest memory:
+    // +0x00: m_spiShaderPgmLoPs, +0x04: m_spiShaderPgmHiPs
+    // +0x08: m_spiShaderPgmRsrc1Ps, +0x0C: m_spiShaderPgmRsrc2Ps
+    // +0x10: m_spiShaderZFormat, +0x14: m_spiShaderColFormat, +0x18: m_spiPsInputEna
+    // +0x1C: m_spiPsInputAddr, +0x20: m_spiPsInControl, +0x24: m_spiBarycCntl
+    // +0x28: m_dbShaderControl, +0x2C: m_cbShaderMask
+    register_symbol(0xE6E14A7248896113ULL, "sceGnmSetPsShader350", "libSceGnm",
+        [write_dcb_nop_padding](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dcb_addr = ctx.rdi;
+            const u32 num_dwords = static_cast<u32>(ctx.rsi);
+            const GuestAddr ps_regs_addr = ctx.rdx;
+            const u32 modifier = static_cast<u32>(ctx.rcx);
+
+            u32 pgm_lo = 0, pgm_hi = 0, rsrc1 = 0, rsrc2 = 0;
+            u32 z_fmt = 0, col_fmt = 0, in_ena = 0, in_addr = 0;
+            u32 in_ctrl = 0, baryc = 0, db_ctrl = 0, cb_mask = 0;
+            if (ps_regs_addr && mem.is_valid_address(ps_regs_addr, 48)) {
+                mem.read_value(ps_regs_addr + 0x00, pgm_lo);
+                mem.read_value(ps_regs_addr + 0x04, pgm_hi);
+                mem.read_value(ps_regs_addr + 0x08, rsrc1);
+                mem.read_value(ps_regs_addr + 0x0C, rsrc2);
+                mem.read_value(ps_regs_addr + 0x10, z_fmt);
+                mem.read_value(ps_regs_addr + 0x14, col_fmt);
+                mem.read_value(ps_regs_addr + 0x18, in_ena);
+                mem.read_value(ps_regs_addr + 0x1C, in_addr);
+                mem.read_value(ps_regs_addr + 0x20, in_ctrl);
+                mem.read_value(ps_regs_addr + 0x24, baryc);
+                mem.read_value(ps_regs_addr + 0x28, db_ctrl);
+                mem.read_value(ps_regs_addr + 0x2C, cb_mask);
+            }
+            const u64 isa_addr = ((static_cast<u64>(pgm_hi) << 32) | pgm_lo) << 8;
+            std::fprintf(stderr, "[HLE sceGnmSetPsShader350] dcb=0x%llx dwords=%u ps_regs=0x%llx mod=0x%x -> PS ISA: 0x%llx (lo=0x%08x hi=0x%08x rsrc1=0x%08x rsrc2=0x%08x z_fmt=0x%x col_fmt=0x%x in_ena=0x%x in_addr=0x%x in_ctrl=0x%x baryc=0x%x db_ctrl=0x%x cb_mask=0x%x)\n",
+                         (unsigned long long)dcb_addr, num_dwords, (unsigned long long)ps_regs_addr, modifier,
+                         (unsigned long long)isa_addr, pgm_lo, pgm_hi, rsrc1, rsrc2, z_fmt, col_fmt, in_ena, in_addr, in_ctrl, baryc, db_ctrl, cb_mask);
+
+            if (num_dwords >= 6 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+                u32 pkt[6];
+                pkt[0] = 0xC0047600U; // Type 3, count=4 (5 payload dwords), opcode=0x76 (IT_SET_SH_REG)
+                pkt[1] = 0x0008U;      // mmSPI_SHADER_PGM_LO_PS
+                pkt[2] = pgm_lo;
+                pkt[3] = pgm_hi;
+                pkt[4] = rsrc1;
+                pkt[5] = rsrc2;
+                mem.write_bytes(dcb_addr, pkt, sizeof(pkt));
+                write_dcb_nop_padding(mem, dcb_addr + sizeof(pkt), num_dwords - 6);
+            } else if (num_dwords > 0 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+                write_dcb_nop_padding(mem, dcb_addr, num_dwords);
+            }
+            ctx.rax = SCE_OK;
+        });
 
     // sceGnmSubmitDone -- NID: 0xCAF67BDEE414AAB9ULL, per ps4libdoc. This NID was
     // registered as sceVideoOutWaitVblank; ps4libdoc resolves it to the GNM

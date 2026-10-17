@@ -129,6 +129,10 @@ int main(int argc, char* argv[]) {
     nid_registry.register_default_libraries();
 
     ps4::DynamicLinker linker(memory, syscalls, nid_registry);
+    // Hand the linker to HLE handlers: sceKernelLoadStartModule needs it to map
+    // PRX modules for real, and the trampoline dispatcher it owns is what makes
+    // those modules' exports take over from our stubs.
+    ps4::set_active_linker(&linker);
     if (enable_strict_hle) {
         linker.set_strict_hle(true);
         std::cout << "[Linker] Strict HLE mode ENABLED (fail-loud diagnostic crash on missing NIDs)\n";

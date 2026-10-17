@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <span>
+#include <string>
 
 namespace ps4 {
 
@@ -19,6 +20,23 @@ inline constexpr u32 HLE_SYSCALL_DISPATCH_BASE = 0x80000000;
 // Orbis OS return codes
 inline constexpr u64 SCE_KERNEL_ERROR_EINVAL = 0x80020016ULL;
 inline constexpr u64 SCE_USER_SERVICE_ERROR_NO_EVENT = 0x80960007ULL;
+
+// A module mapped into guest address space and known to export symbols.
+//
+// PS4 modules do not publish an ELF .dynsym a consumer can walk. Each module
+// carries a symbol table in its PT_SCE_PROGLIB, reached through the SCE dynamic
+// tags, and each name is a 16-byte record "<11-char base64>#XX#YY\0" rather than
+// a C identifier. The base64 is big-endian over the 64-bit NID, so exports are
+// naturally keyed by Nid -- the same key the HLE trampolines already use.
+struct LoadedModule {
+    u32 handle{0};
+    std::string path;
+    GuestAddr base{0};
+    GuestAddr init{0};          // DT_INIT, 0 when the module has no entry point
+    GuestAddr fini{0};          // DT_FINI
+    GuestSize size{0};          // total mapped span
+    usize export_count{0};
+};
 
 class DynamicLinker {
 public:
@@ -36,6 +54,33 @@ public:
     /// Patch a specific GOT jump slot directly to an NID's trampoline
     bool patch_jump_slot(GuestAddr got_slot_addr, Nid nid);
 
+    // --- PRX module loading -------------------------------------------------
+
+    /// Map a PRX at \p base, relocate it, and record its exports.
+    ///
+    /// The guest address must already be reserved (see module_base allocator);
+    /// this only writes into it. Returns a handle, or 0 on failure.
+    ///
+    /// \p run_init is deliberately separate from loading: MonoAssembliesPS4.prx
+    /// has DT_INIT == 0, so calling an entry point unconditionally would jump to
+    /// the module base. Call run_module_init() for the modules that have one.
+    u32 load_module(const std::string& path, GuestAddr base, bool run_init = false);
+
+    /// Call a loaded module's DT_INIT (a no-op when it is 0).
+    bool run_module_init(u32 handle);
+
+    /// Guest address of the given NID in any loaded module, or 0.
+    ///
+    /// Consulted by the trampoline dispatcher before the HLE registry, so a
+    /// module loaded after the executable's relocations already ran still takes
+    /// over every NID it exports. The trampoline stub carries only a dispatch
+    /// id, so no GOT patching or stub rewriting is needed.
+    [[nodiscard]] GuestAddr find_export(Nid nid) const noexcept;
+
+    [[nodiscard]] const LoadedModule* module(u32 handle) const noexcept;
+    [[nodiscard]] usize module_count() const noexcept { return m_modules.size(); }
+    [[nodiscard]] usize module_export_count() const noexcept { return m_module_exports.size(); }
+
     /// Total number of generated trampolines
     [[nodiscard]] usize trampoline_count() const noexcept { return m_nid_to_trampoline.size(); }
 
@@ -45,7 +90,17 @@ public:
 
     /// Benign stubs whitelist
     void add_to_whitelist(Nid nid);
-    [[nodiscard]] bool is_whitelisted(Nid nid) const noexcept;private:
+    [[nodiscard]] bool is_whitelisted(Nid nid) const noexcept;
+
+private:
+    /// Walk the SCE dynamic table and record every symbol table whose
+    /// st_shndx != SHN_UNDEF into m_module_exports.
+    void build_export_table(std::span<const u8> file_data, const ElfLoader& loader,
+                            GuestAddr base, u32 handle);
+
+    /// Copy PT_LOAD contents to \p base + p_vaddr and zero the .bss tail.
+    bool map_segments(std::span<const u8> file_data, const ElfLoader& loader, GuestAddr base);
+
     MemoryManager& m_memory;
     SyscallTable& m_syscalls;
     NidRegistry& m_registry;
@@ -57,10 +112,24 @@ public:
 
     std::unordered_map<Nid, GuestAddr> m_nid_to_trampoline;
     std::unordered_map<u32, Nid> m_id_to_nid;
+
+    std::unordered_map<u32, LoadedModule> m_modules;
+    std::unordered_map<Nid, GuestAddr> m_module_exports;
+    u32 m_next_module_handle{0x2000};
 };
 
 /// Unimplemented-stub warning stats (suppressed-after-cap totals). Defined in
 /// dynamic_linker.cpp; called from the run exit path.
 void dump_hle_warning_stats();
+
+/// The process-wide linker, so HLE handlers can reach module loading without
+/// threading a reference through every registry signature. main.cpp installs it
+/// once the linker is constructed; it is null before that and after teardown.
+DynamicLinker* active_linker() noexcept;
+void set_active_linker(DynamicLinker* linker) noexcept;
+
+/// Next free guest address for module mapping. Sits in the mspace arena range,
+/// well clear of the 0x1C0000000 direct-memory ceiling.
+GuestAddr module_base_allocator() noexcept;
 
 } // namespace ps4

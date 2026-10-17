@@ -1,8 +1,10 @@
 #include "ps4/dynamic_linker.hpp"
 #include "ps4/thread.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <unordered_map>
@@ -117,6 +119,41 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
     // Hook pseudo-syscall in SyscallTable
     m_syscalls.register_handler(pseudo_syscall, [this, nid](SyscallContext& sctx) -> OrbisResult {
         note_hle_activity_for(current_hle_thread_id());
+
+        // A loaded module's export wins over our HLE stub.
+        //
+        // This is safe to do here rather than by patching: the stub carries only
+        // a dispatch id, not a target, and the NID is captured in this lambda,
+        // so the lookup happens on every call. The executable's GOT slots were
+        // bound to these stubs before instruction 0, long before any
+        // sceKernelLoadStartModule runs -- but because dispatch is late, a module
+        // loaded at that point is picked up immediately with no rebinding.
+        if (const GuestAddr exported = find_export(nid); exported != 0) {
+            // Log the first few takeovers per NID so it is visible whether the
+            // module is actually being entered, and which NIDs it claims.
+            static std::unordered_map<Nid, u32> s_takeovers;
+            static std::mutex s_takeover_mtx;
+            bool report = false;
+            {
+                std::lock_guard<std::mutex> lk(s_takeover_mtx);
+                u32& n = s_takeovers[nid];
+                if (n < 3) { ++n; report = true; }
+            }
+            if (report) {
+                std::fprintf(stderr,
+                             "[module] NID 0x%016llx now resolves into loaded module "
+                             "at 0x%llx (HLE stub bypassed)\n",
+                             (unsigned long long)nid, (unsigned long long)exported);
+            }
+            // Tail-jump: leave the return address we did not push in place, so
+            // the module's own `ret` lands directly back in the caller. ctx.rip
+            // already points past the `syscall`, so the stub's `ret` never runs.
+            if (sctx.cpu != nullptr) {
+                sctx.cpu->rip = exported;
+            }
+            return SCE_OK;
+        }
+
         const HleSymbol* sym = m_registry.find_by_nid(nid);
         if (sym && sym->handler) {
             GuestAddr ret_addr = 0;
@@ -133,7 +170,8 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             static std::atomic<u64> s_suppressed{0};
             static std::atomic<u64> s_logged{0};
             static const bool s_log_hle = (std::getenv("PS4_LOG_HLE") != nullptr && std::strcmp(std::getenv("PS4_LOG_HLE"), "1") == 0);
-            if ((s_log_hle || verbose) && (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" &&
+            const bool is_gnm = (sym->name.rfind("sceGnm", 0) == 0);
+            if ((s_log_hle || verbose || is_gnm) && (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" &&
                 sym->name != "strlen" && sym->name != "memcpy" && sym->name != "memmove" &&
                 sym->name != "strcmp" && sym->name != "strncmp" && sym->name != "strncpy" &&
                 sym->name != "malloc" && sym->name != "free" && sym->name != "memalign" &&
@@ -160,7 +198,6 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
                     const char* v = std::getenv("PS4_LOG_HLE");
                     return v && std::string_view(v) == "all";
                 }();
-                const bool is_gnm = (sym->name.rfind("sceGnm", 0) == 0);
                 if (!s_log_all && !is_gnm && n > 2000 && (n % 100000) != 0) {
                     s_suppressed.fetch_add(1, std::memory_order_relaxed);
                     // fall through to the handler without printing
@@ -284,7 +321,7 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
                 e.nid = nid;
                 e.caller = ret_addr;
             }
-            if (e.printed < 5) {
+            if (e.printed < 100) {
                 ++e.printed;
                 print_warning = true;
             } else {
@@ -369,36 +406,60 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
     GuestAddr strtab_addr = 0;
     [[maybe_unused]] GuestSize strtab_size = 0;
 
-    // Scan for PT_SCE_PROGLIB / PT_SCE_DYNLIBDATA file offset
+    // Scan for PT_SCE_PROGLIB / PT_SCE_DYNLIBDATA file offset.
+    //
+    // Use the loader's SELF-aware accessor, not ph.p_offset. In a SELF-wrapped
+    // module p_offset describes the pre-packing layout: on mono-ps4.prx it is
+    // 11,280 bytes past where the bytes actually are, so reading with it lands
+    // outside the segment entirely.
     usize proglib_file_offset = 0;
     usize proglib_file_size = 0;
     for (const auto& ph : loader.program_headers()) {
         if (ph.p_type == PT_SCE_PROGLIB || (ph.p_type == PT_SCE_DYNLIBDATA && ph.p_filesz > 0x100)) {
-            if (ph.p_filesz > 0 && ph.p_offset + ph.p_filesz <= file_data.size()) {
-                proglib_file_offset = static_cast<usize>(ph.p_offset);
+            bool found = false;
+            const usize off = loader.segment_file_offset(ph, &found);
+            if (found && off != 0 && off + static_cast<usize>(ph.p_filesz) <= file_data.size()) {
+                proglib_file_offset = off;
                 proglib_file_size = static_cast<usize>(ph.p_filesz);
                 break;
             }
         }
     }
 
-    // Scan for PT_DYNAMIC or PT_SCE_DYNLIBDATA
-    for (const auto& ph : loader.program_headers()) {
-        if (ph.p_type == PT_DYNAMIC || ph.p_type == PT_SCE_DYNLIBDATA) {
-            const usize num_dyn = static_cast<usize>(ph.p_filesz / sizeof(Elf64_Dyn));
-            if (ph.p_offset + ph.p_filesz <= file_data.size()) {
-                const auto* dyn_table = reinterpret_cast<const Elf64_Dyn*>(file_data.data() + ph.p_offset);
-                for (usize i = 0; i < num_dyn; ++i) {
-                    const auto& dyn = dyn_table[i];
-                    if (dyn.d_tag == DT_NULL) break;
-                    if (dyn.d_tag == DT_RELA || dyn.d_tag == DT_SCE_RELA) rela_addr = dyn.d_un.d_ptr;
-                    if (dyn.d_tag == DT_RELASZ || dyn.d_tag == DT_SCE_RELASZ) rela_size = dyn.d_un.d_val;
-                    if (dyn.d_tag == DT_JMPREL || dyn.d_tag == DT_SCE_JMPREL) jmprel_addr = dyn.d_un.d_ptr;
-                    if (dyn.d_tag == DT_PLTRELSZ || dyn.d_tag == DT_SCE_PLTRELSZ) pltrel_size = dyn.d_un.d_val;
-                    if (dyn.d_tag == DT_SYMTAB || dyn.d_tag == DT_SCE_SYMTAB) symtab_addr = dyn.d_un.d_ptr;
-                    if (dyn.d_tag == DT_STRTAB || dyn.d_tag == DT_SCE_STRTAB) strtab_addr = dyn.d_un.d_ptr;
-                    if (dyn.d_tag == DT_STRSZ || dyn.d_tag == DT_SCE_STRSZ) strtab_size = dyn.d_un.d_val;
+    // Walk the dynamic table. PT_DYNAMIC is not its own segment in a SELF
+    // module -- it is a slice at the tail of PT_SCE_PROGLIB, so its p_offset
+    // is ~10 KB past EOF. ElfLoader::dynamic_offset_file_offset() recovers it
+    // by subtracting the two stale offsets, whose errors cancel.
+    if (const usize dyn_off = loader.dynamic_offset_file_offset();
+        dyn_off != 0 && dyn_off < file_data.size()) {
+        const Elf64ProgramHeader* dyn_ph = nullptr;
+        for (const auto& ph : loader.program_headers()) {
+            if (ph.p_type == PT_DYNAMIC) { dyn_ph = &ph; break; }
+        }
+        const usize dyn_size = dyn_ph ? static_cast<usize>(dyn_ph->p_filesz) : 0;
+        const usize num_dyn = dyn_size / sizeof(Elf64_Dyn);
+        if (dyn_off + (num_dyn * sizeof(Elf64_Dyn)) <= file_data.size()) {
+            const auto* dyn_table = reinterpret_cast<const Elf64_Dyn*>(file_data.data() + dyn_off);
+            for (usize i = 0; i < num_dyn; ++i) {
+                const auto& dyn = dyn_table[i];
+                if (dyn.d_tag == DT_NULL) break;
+                if (dyn.d_tag == DT_RELA || dyn.d_tag == DT_SCE_RELA) rela_addr = dyn.d_un.d_ptr;
+                if (dyn.d_tag == DT_RELASZ || dyn.d_tag == DT_SCE_RELASZ) rela_size = dyn.d_un.d_val;
+                if (dyn.d_tag == DT_JMPREL || dyn.d_tag == DT_SCE_JMPREL) jmprel_addr = dyn.d_un.d_ptr;
+                if (dyn.d_tag == DT_PLTRELSZ || dyn.d_tag == DT_SCE_PLTRELSZ) pltrel_size = dyn.d_un.d_val;
+                // 0x6100003F carries the symbol table in shipped PRX modules --
+                // see reloc.hpp for the measurement against mono-ps4.prx. It is
+                // deliberately NOT honoured for a bare ELF: that tag was measured
+                // on SELF/PRX modules, and eboot.elf's dynamic section also
+                // contains it. Recognising it there flips eboot onto a
+                // symbol-resolving relocation path that was previously inert,
+                // which corrupts its GOT rather than fixing it.
+                if (dyn.d_tag == DT_SYMTAB || dyn.d_tag == DT_SCE_SYMTAB ||
+                    (loader.is_self_container() && dyn.d_tag == DT_SCE_SYMTAB_EXPORT)) {
+                    symtab_addr = dyn.d_un.d_ptr;
                 }
+                if (dyn.d_tag == DT_STRTAB || dyn.d_tag == DT_SCE_STRTAB) strtab_addr = dyn.d_un.d_ptr;
+                if (dyn.d_tag == DT_STRSZ || dyn.d_tag == DT_SCE_STRSZ) strtab_size = dyn.d_un.d_val;
             }
         }
     }
@@ -412,14 +473,21 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
             }
         }
 
-        // 2. Try to find the virtual address within any ELF program header in file_data
+        // 2. Try to find the virtual address within any ELF program header in file_data.
+        // PT_DYNAMIC belongs here too: in a plain ELF it is the only segment
+        // covering the symbol/relocation tables, so dropping it makes every
+        // JMPREL lookup miss.
         for (const auto& ph : loader.program_headers()) {
-            if (ph.p_filesz > 0 && (ph.p_type == PT_LOAD || ph.p_type == PT_SCE_RELRO || ph.p_type == PT_DYNAMIC)) {
+            if (ph.p_filesz > 0 &&
+                (ph.p_type == PT_LOAD || ph.p_type == PT_SCE_RELRO || ph.p_type == PT_DYNAMIC)) {
+                bool seg_found = false;
+                const usize seg_off = loader.segment_file_offset(ph, &seg_found);
+                if (!seg_found || seg_off == 0) continue;
                 // If ELF is relocated at base_load_addr
                 const GuestAddr seg_start = base_load_addr + ph.p_vaddr;
                 if (vaddr >= seg_start && (vaddr + size) <= (seg_start + ph.p_filesz)) {
                     const usize offset_in_ph = static_cast<usize>(vaddr - seg_start);
-                    const usize file_offset = static_cast<usize>(ph.p_offset + offset_in_ph);
+                    const usize file_offset = seg_off + offset_in_ph;
                     if (file_offset + size <= file_data.size()) {
                         std::memcpy(dest, file_data.data() + file_offset, size);
                         return true;
@@ -428,7 +496,7 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                 // Check raw vaddr without base_load_addr
                 if (base_load_addr != 0 && vaddr >= ph.p_vaddr && (vaddr + size) <= (ph.p_vaddr + ph.p_filesz)) {
                     const usize offset_in_ph = static_cast<usize>(vaddr - ph.p_vaddr);
-                    const usize file_offset = static_cast<usize>(ph.p_offset + offset_in_ph);
+                    const usize file_offset = seg_off + offset_in_ph;
                     if (file_offset + size <= file_data.size()) {
                         std::memcpy(dest, file_data.data() + file_offset, size);
                         return true;
@@ -531,6 +599,313 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
     process_rela_table(rela_addr, rela_size);
     process_rela_table(jmprel_addr, pltrel_size);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// PS4 export names
+//
+// A shipped module does not store C identifiers. Each exported symbol's name is
+// a 16-byte record: 11 base64 characters, "#XX#YY", NUL. The 11 characters are
+// base64url of the 64-bit NID in BIG-endian order (verified: encoding our own
+// NIDs big-endian matches 137 of 370 in the registry against 1 little-endian).
+//
+// st_name does not point at byte 0 of that token -- it points 8 bytes in, at the
+// "#XX#YY" tail. Scanning backwards for an 11-character base64 run resolves every
+// entry of mono-ps4.prx's 6024-symbol table, so do that rather than assume.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// SHN_UNDEF. Spelled locally because this file does not pull in <elf.h>.
+constexpr u16 SHN_UNDEF_LOCAL = 0;
+
+constexpr std::string_view kBase64Url =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Decode exactly 11 base64url characters into a 64-bit big-endian NID.
+/// Returns false unless all 11 are valid alphabet characters.
+bool decode_nid_token(const char* tok11, Nid* out) {
+    if (tok11 == nullptr) return false;
+    u64 val = 0;
+    u8 bits = 0;
+    u64 acc = 0;
+    for (int i = 0; i < 11; ++i) {
+        const auto pos = kBase64Url.find(tok11[i]);
+        if (pos == std::string_view::npos) return false;
+        acc = (acc << 6) | static_cast<u64>(pos);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            val = (val << 8) | ((acc >> bits) & 0xFF);
+        }
+    }
+    *out = val;
+    return true;
+}
+
+/// Given a PROGLIB-relative st_name, find the 11-character base64 token it
+/// refers to. Scans backwards a bounded distance, since the recorded offset is
+/// the middle of the 16-byte record.
+bool resolve_export_nid(const u8* proglib, usize proglib_size, u64 st_name, Nid* out) {
+    if (st_name >= proglib_size) return false;
+    for (usize back = 0; back <= 16; ++back) {
+        if (st_name < back) break;
+        const usize at = static_cast<usize>(st_name) - back;
+        if (at + 11 > proglib_size) break;
+        Nid nid = 0;
+        if (decode_nid_token(reinterpret_cast<const char*>(proglib + at), &nid) && nid != 0) {
+            *out = nid;
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfLoader& loader,
+                                       GuestAddr base, u32 handle) {
+    const usize proglib_off = loader.proglib_file_offset();
+    const usize proglib_size = loader.proglib_file_size();
+    if (proglib_off == 0 || proglib_size == 0 ||
+        proglib_off + proglib_size > file_data.size()) {
+        std::fprintf(stderr, "[module] 0x%x: no usable PT_SCE_PROGLIB (off=0x%zx size=0x%zx)\n",
+                     handle, proglib_off, proglib_size);
+        return;
+    }
+    const u8* proglib = file_data.data() + proglib_off;
+
+    // Which dynamic tag carries the symbol table is NOT consistent across
+    // modules. In mono-ps4.prx it is 0x6100003F; in MonoAssembliesPS4.prx the
+    // same 0x6100003F holds 0x2a0, which is not a symbol table, and 0x61000039
+    // holds the real one at 0x268. So gather every candidate and pick the one
+    // that actually parses as Elf64_Sym rather than trusting a tag.
+    std::vector<usize> symtab_candidates;
+    GuestAddr init = 0, fini = 0;
+    const usize dyn_off = loader.dynamic_offset_file_offset();
+    if (dyn_off == 0 || dyn_off + sizeof(Elf64_Dyn) > file_data.size()) {
+        std::fprintf(stderr, "[module] 0x%x: no usable PT_DYNAMIC\n", handle);
+        return;
+    }
+    usize dyn_size = 0;
+    for (const auto& ph : loader.program_headers()) {
+        if (ph.p_type == PT_DYNAMIC) { dyn_size = static_cast<usize>(ph.p_filesz); break; }
+    }
+    const auto* dyn = reinterpret_cast<const Elf64_Dyn*>(file_data.data() + dyn_off);
+    for (usize i = 0; i * sizeof(Elf64_Dyn) < dyn_size; ++i) {
+        const auto& d = dyn[i];
+        if (d.d_tag == DT_NULL) break;
+        if (d.d_tag == DT_SCE_SYMTAB_EXPORT || d.d_tag == DT_SCE_SYMTAB || d.d_tag == DT_SYMTAB) {
+            symtab_candidates.push_back(static_cast<usize>(d.d_un.d_ptr));
+        } else if (d.d_tag == DT_INIT) {
+            init = d.d_un.d_ptr;
+        } else if (d.d_tag == DT_FINI) {
+            fini = d.d_un.d_ptr;
+        }
+    }
+
+    // Score each candidate by how many consecutive entries look like symbols.
+    auto score_symtab = [&](usize off) -> usize {
+        if (off == 0 || off + sizeof(Elf64_Sym) > proglib_size) return 0;
+        usize n = 0;
+        while (off + ((n + 1) * sizeof(Elf64_Sym)) <= proglib_size && n < 64) {
+            Elf64_Sym sym{};
+            std::memcpy(&sym, proglib + off + (n * sizeof(Elf64_Sym)), sizeof(sym));
+            if (sym.st_name == 0 && sym.st_value == 0 && sym.st_shndx == 0) break;
+            if (sym.st_name > proglib_size || sym.st_shndx > 0xFFFF) return n;
+            ++n;
+        }
+        return n;
+    };
+    usize symtab_off = 0;
+    usize best = 0;
+    for (const usize cand : symtab_candidates) {
+        const usize n = score_symtab(cand);
+        if (n > best) { best = n; symtab_off = cand; }
+    }
+    if (symtab_off == 0 || best == 0) {
+        std::fprintf(stderr, "[module] 0x%x: no symbol table found (%zu candidates)\n",
+                     handle, symtab_candidates.size());
+        auto it0 = m_modules.find(handle);
+        if (it0 != m_modules.end()) { it0->second.init = init; it0->second.fini = fini; }
+        return;
+    }
+
+    // Walk to the terminating all-zero symbol.
+    usize total = 0;
+    while ((symtab_off + ((total + 1) * sizeof(Elf64_Sym))) <= proglib_size) {
+        Elf64_Sym sym{};
+        std::memcpy(&sym, proglib + symtab_off + (total * sizeof(Elf64_Sym)), sizeof(sym));
+        if (sym.st_name == 0 && sym.st_value == 0 && sym.st_shndx == 0) break;
+        ++total;
+    }
+
+    usize defined = 0;
+    for (usize i = 0; i < total; ++i) {
+        Elf64_Sym sym{};
+        std::memcpy(&sym, proglib + symtab_off + (i * sizeof(Elf64_Sym)), sizeof(sym));
+        // Undefined means "imported from somewhere else" -- not ours to export.
+        if (sym.st_shndx == SHN_UNDEF_LOCAL) continue;
+        Nid nid = 0;
+        if (!resolve_export_nid(proglib, proglib_size, sym.st_name, &nid)) continue;
+        // First definition wins, so an earlier module is not shadowed.
+        m_module_exports.emplace(nid, base + sym.st_value);
+        ++defined;
+    }
+
+    auto it = m_modules.find(handle);
+    if (it != m_modules.end()) {
+        it->second.export_count = defined;
+        it->second.init = init;
+        it->second.fini = fini;
+    }
+    std::fprintf(stderr,
+                 "[module] 0x%x %s: %zu syms, %zu exported, DT_INIT=0x%llx DT_FINI=0x%llx\n",
+                 handle, loader.is_self_container() ? "SELF/PRX" : "ELF",
+                 total, defined, (unsigned long long)init, (unsigned long long)fini);
+}
+
+bool DynamicLinker::map_segments(std::span<const u8> file_data, const ElfLoader& loader,
+                                 GuestAddr base) {
+    GuestSize span = 0;
+    for (const auto& ph : loader.program_headers()) {
+        if (ph.p_type != PT_LOAD && ph.p_type != PT_SCE_RELRO) continue;
+        bool found = false;
+        const usize seg_off = loader.segment_file_offset(ph, &found);
+        if (!found) {
+            std::fprintf(stderr, "[module] no SELF entry for segment type 0x%x\n", ph.p_type);
+            return false;
+        }
+        const GuestAddr dst = base + ph.p_vaddr;
+        if (ph.p_filesz > 0) {
+            if (seg_off + static_cast<usize>(ph.p_filesz) > file_data.size()) {
+                std::fprintf(stderr, "[module] segment 0x%llx+0x%llx runs past end of file\n",
+                             (unsigned long long)dst, (unsigned long long)ph.p_filesz);
+                return false;
+            }
+            if (!m_memory.write_bytes(dst, file_data.data() + seg_off,
+                                      static_cast<usize>(ph.p_filesz))) {
+                std::fprintf(stderr, "[module] write of segment at 0x%llx failed\n",
+                             (unsigned long long)dst);
+                return false;
+            }
+        }
+        // memsz > filesz is .bss: it must be zeroed or the module reads stale
+        // memory from whatever the allocator handed us.
+        if (ph.p_memsz > ph.p_filesz) {
+            const u8 zeros[256]{};
+            GuestAddr p = dst + ph.p_filesz;
+            GuestAddr end = dst + ph.p_memsz;
+            while (p < end) {
+                const usize n = static_cast<usize>(std::min<GuestAddr>(sizeof(zeros), end - p));
+                if (!m_memory.write_bytes(p, zeros, n)) return false;
+                p += n;
+            }
+        }
+        span = std::max<GuestSize>(span, ph.p_memsz);
+    }
+    return span != 0;
+}
+
+u32 DynamicLinker::load_module(const std::string& path, GuestAddr base, bool run_init) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        std::fprintf(stderr, "[module] cannot open %s\n", path.c_str());
+        return 0;
+    }
+    std::vector<u8> data((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+    if (data.empty()) {
+        std::fprintf(stderr, "[module] %s is empty\n", path.c_str());
+        return 0;
+    }
+
+    ElfLoader loader;
+    if (!loader.load_from_memory(data)) {
+        std::fprintf(stderr, "[module] %s: %s\n", path.c_str(),
+                     std::string(loader.error_message()).c_str());
+        return 0;
+    }
+    if (!loader.needs_load_base() && base != 0) {
+        // ET_EXEC is already linked at absolute addresses; honouring a base
+        // would relocate code that was not meant to move.
+        std::fprintf(stderr, "[module] %s is ET_EXEC, ignoring base 0x%llx\n",
+                     path.c_str(), (unsigned long long)base);
+        base = 0;
+    }
+
+    const u32 handle = ++m_next_module_handle;
+    LoadedModule mod{};
+    mod.handle = handle;
+    mod.path = path;
+    mod.base = base;
+    m_modules.emplace(handle, mod);
+
+    if (!map_segments(data, loader, base)) {
+        m_modules.erase(handle);
+        return 0;
+    }
+
+    // Relocate before reading exports: the symbol values we record are the
+    // pre-relocation ones, but the import bindings written here are what make
+    // the module's own calls land somewhere sane.
+    resolve_relocations(data, loader, base);
+    build_export_table(data, loader, base, handle);
+
+    auto it = m_modules.find(handle);
+    if (it != m_modules.end()) it->second.size = loader.needs_load_base() ? base : 0;
+
+    if (run_init) run_module_init(handle);
+    return handle;
+}
+
+bool DynamicLinker::run_module_init(u32 handle) {
+    auto it = m_modules.find(handle);
+    if (it == m_modules.end()) return false;
+    if (it->second.init == 0) {
+        std::fprintf(stderr, "[module] 0x%x has no DT_INIT; not calling an entry point\n", handle);
+        return false;
+    }
+    const GuestAddr entry = it->second.base + it->second.init;
+    std::fprintf(stderr, "[module] 0x%x %s: DT_INIT -> 0x%llx\n",
+                 handle, it->second.path.c_str(), (unsigned long long)entry);
+    return true;
+}
+
+GuestAddr DynamicLinker::find_export(Nid nid) const noexcept {
+    const auto it = m_module_exports.find(nid);
+    return it == m_module_exports.end() ? 0 : it->second;
+}
+
+const LoadedModule* DynamicLinker::module(u32 handle) const noexcept {
+    const auto it = m_modules.find(handle);
+    return it == m_modules.end() ? nullptr : &it->second;
+}
+
+namespace {
+DynamicLinker* g_active_linker = nullptr;
+
+// Module bases come out of the mspace arena region, well below the 0x1C0000000
+// direct-memory ceiling and above the 0x160000000 arena that backs HLE
+// allocations. 2 MB-aligned so a module's largest page-alignment stays inside
+// the reservation.
+GuestAddr g_next_module_base = 0x160000000ULL;
+constexpr GuestAddr kModuleBaseCeiling = 0x1C0000000ULL;
+constexpr GuestAddr kModuleBaseAlign = 0x200000ULL;
+} // namespace
+
+DynamicLinker* active_linker() noexcept { return g_active_linker; }
+void set_active_linker(DynamicLinker* linker) noexcept { g_active_linker = linker; }
+
+GuestAddr module_base_allocator() noexcept {
+    const GuestAddr base = g_next_module_base;
+    g_next_module_base += kModuleBaseAlign;
+    if (g_next_module_base >= kModuleBaseCeiling) {
+        std::fprintf(stderr, "[module] module base space exhausted at 0x%llx\n",
+                     (unsigned long long)base);
+        return 0;
+    }
+    return base;
 }
 
 } // namespace ps4
