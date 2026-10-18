@@ -719,15 +719,25 @@ constexpr std::string_view kBase64Url =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Decode exactly 11 base64url characters into a 64-bit big-endian NID.
-/// Returns false unless all 11 are valid alphabet characters.
+///
+/// The alphabet in the PRX is STANDARD base64, not base64url: mono-ps4.prx
+/// really contains tokens like "O4ZcR+K4CUE" and "+6h47p15FxM". Rejecting '+'
+/// and '/' silently dropped 99 of mono-ps4's 556 exports and would equally
+/// drop any import whose NID uses those two characters, which is a plausible
+/// source of unresolved imports. '+' is the standard spelling of base64url's
+/// '-' (both are 62) and '/' of '_' (both 63), so accept both spellings.
 bool decode_nid_token(const char* tok11, Nid* out) {
     if (tok11 == nullptr) return false;
     u64 val = 0;
     u8 bits = 0;
     u64 acc = 0;
     for (int i = 0; i < 11; ++i) {
-        const auto pos = kBase64Url.find(tok11[i]);
-        if (pos == std::string_view::npos) return false;
+        std::string_view::size_type pos = kBase64Url.find(tok11[i]);
+        if (pos == std::string_view::npos) {
+            if (tok11[i] == '+') pos = 62;
+            else if (tok11[i] == '/') pos = 63;
+            else return false;
+        }
         acc = (acc << 6) | static_cast<u64>(pos);
         bits += 6;
         if (bits >= 8) {
@@ -802,12 +812,19 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
 
     // st_name indexes the string table, so the token sits at
     // PROGLIB + strtab_off + st_name -- at byte 0, not partway in.
+    // Split the four reasons token_at() returns 0, so a benign "st_name==0"
+    // is not confused with a strtab indexing bug that would also corrupt import
+    // resolution.
+    u64 c_no_strtab = 0, c_name0 = 0, c_past_end = 0, c_decode_fail = 0;
     auto token_at = [&](u32 st_name) -> Nid {
-        if (strtab_off == 0 || st_name == 0) return 0;
+        if (strtab_off == 0) { ++c_no_strtab; return 0; }
+        if (st_name == 0) { ++c_name0; return 0; }
         const usize at = strtab_off + st_name;
-        if (at + 11 > proglib_size) return 0;
+        if (at + 11 > proglib_size) { ++c_past_end; return 0; }
         Nid nid = 0;
-        if (!decode_nid_token(reinterpret_cast<const char*>(proglib + at), &nid)) return 0;
+        if (!decode_nid_token(reinterpret_cast<const char*>(proglib + at), &nid)) {
+            ++c_decode_fail; return 0;
+        }
         return nid;
     };
 
@@ -889,6 +906,15 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
                  (unsigned long long)base, (unsigned long long)span,
                  (unsigned long long)(base + span),
                  total, defined, (unsigned long long)init, (unsigned long long)fini);
+    if (s_dump_exports) {
+        std::fprintf(stderr,
+            "[tokfail] handle=0x%x strtab_off=0x%zx proglib_size=0x%zx | "
+            "no_strtab=%llu st_name==0=%llu past_proglib_end=%llu decode_fail=%llu total=%llu\n",
+            handle, strtab_off, proglib_size,
+            (unsigned long long)c_no_strtab, (unsigned long long)c_name0,
+            (unsigned long long)c_past_end, (unsigned long long)c_decode_fail,
+            (unsigned long long)(c_no_strtab + c_name0 + c_past_end + c_decode_fail));
+    }
 }
 
 bool DynamicLinker::map_segments(std::span<const u8> file_data, const ElfLoader& loader,
