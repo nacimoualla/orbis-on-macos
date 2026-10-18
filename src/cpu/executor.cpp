@@ -4220,8 +4220,10 @@ StepResult CpuExecutor::step() {
             }
             case 0xDD: {
                 switch (regf) {
-                    case 0: if (!load_float(8)) handled = false; break;             // FLD m64fp
-                    case 2: if (!store_double(8)) handled = false; break;            // FST m64fp
+                    case 0: if (!load_float(8)) handled = false; break;             // DD /0 FLD m64fp
+                    case 1: if (store_int(8, true)) f.top = static_cast<u8>((f.top + 1) & 7);
+                            else handled = false; break;                           // DD /1 FISTTP m64int
+                    case 2: if (!store_double(8)) handled = false; break;            // DD /2 FST m64fp
                     case 3: if (!store_double(8)) handled = false;
                             f.top = static_cast<u8>((f.top + 1) & 7); break;         // FSTP m64fp
                     default: handled = false;
@@ -4233,9 +4235,8 @@ StepResult CpuExecutor::step() {
                 switch (regf) {
                     case 0: if (load_mem(4, &raw)) push_double(static_cast<double>(raw));
                             else handled = false; break;                            // DB /0 FILD m32int
-                    // DB /1 is not assigned in the SDM. It is deliberately absent
-                    // here so it falls through to the unhandled-opcode report rather
-                    // than silently executing the wrong instruction.
+                    case 1: if (store_int(4, true)) f.top = static_cast<u8>((f.top + 1) & 7);
+                            else handled = false; break;                           // DB /1 FISTTP m32int
                     case 2: store_int(4); break;                                    // DB /2 FIST m32int (no pop)
                     case 3: if (store_int(4)) f.top = static_cast<u8>((f.top + 1) & 7);
                             else handled = false; break;                           // DB /3 FISTP m32int
@@ -4301,14 +4302,14 @@ StepResult CpuExecutor::step() {
                     case 2: store_int(2); break;                                    // DF /2 FIST m16int (no pop)
                     case 3: if (store_int(2)) f.top = static_cast<u8>((f.top + 1) & 7);
                             else handled = false; break;                           // DF /3 FISTP m16int
-                    case 5: if (load_mem(4, &raw)) push_double(static_cast<double>(raw));
-                            else handled = false; break;                            // DF /5 FILD m32int
+                    case 5: if (load_mem(8, &raw)) push_double(static_cast<double>(raw));
+                            else handled = false; break;                            // DF /5 FILD m64int
                     // DF /6 is FBSTP m80 (packed-BCD store), not FISTTP m32int.
                     // It is not implemented; leaving it out makes it fault loudly
                     // instead of storing a binary integer in place of BCD.
                     case 6: handled = false; break;                                // DF /6 FBSTP m80 (unimplemented)
-                    case 7: if (store_int(4)) f.top = static_cast<u8>((f.top + 1) & 7);
-                            else handled = false; break;                           // DF /7 FISTP m32int (there is no FISTP m64 encoding)
+                    case 7: if (store_int(8)) f.top = static_cast<u8>((f.top + 1) & 7);
+                            else handled = false; break;                           // DF /7 FISTP m64int
                     default: handled = false;
                 }
                 break;

@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
                     (int)r1, ctx.fpu.top, st0);
         std::printf("  pre-IE=%u sw=0x%04x\n", (unsigned)((ctx.fpu.sw & 1u)), ctx.fpu.sw);
         ctx.rbp = DATA + 0x200;
-        put_code(CODE, {0xDF, 0x7D, 0x20});          // DF /7 FISTP m32int
+        put_code(CODE, {0xDB, 0x5D, 0x20});          // DB /3 FISTP m32int
         const StepResult r2 = step_at(CODE);
         u64 got64 = 0; mem.read_value(DATA + 0x220, got64);
         std::printf("  FISTP step=%d got=0x%08x want=0x80000000  IE=%u\n",
@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
         step_at(CODE);
         ctx.rbp = DATA + 0x200;
         ctx.fpu.cw = static_cast<u16>((ctx.fpu.cw & ~0x0C00) | (c.rc_bits << 10));
-        put_code(CODE, {0xDF, 0x7D, 0x20});           // FISTP dword ptr [rbp+0x20]
+        put_code(CODE, {0xDB, 0x5D, 0x20});           // DB /3 FISTP m32int [rbp+0x20]
         step_at(CODE);
         u64 got64 = 0;
         mem.read_value(DATA + 0x220, got64);
@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
               std::printf("  [diag]   st[%d]=0x%016llx\n", k,
                           (unsigned long long)ctx.fpu.st[k]); }
         ctx.rbp = DATA + 0x200;
-        put_code(CODE, {0xDF, 0x7D, 0x20});           // DF /7 FISTP m32int
+        put_code(CODE, {0xDB, 0x5D, 0x20});           // DB /3 FISTP m32int
         const u16 sw_before = ctx.fpu.sw;
         if ((sw_before & 0x0001) != 0) {
             ++g_failures;
@@ -346,32 +346,92 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- DF /7 is FISTP m32int, NOT m64. 2^40 must therefore overflow. ----
-    // There is no FISTP m64 encoding in the SDM, so a 64-bit store of 2^40 is
-    // impossible; this pins the width so a regression to m64 would be caught.
-    std::printf("[x87] DF /7 width check (FISTP m32int, no m64 form exists):\n");
+    // ---- DF /7 is FISTP m64int (verified against GNU objdump's copy of the
+    // Intel map: "df 7d 10  fistp QWORD PTR [rbp+0x10]"). ----
+    std::printf("[x87] DF /7 = FISTP m64int (8-byte store):\n");
     {
-        for (double val : {1099511627776.0, -1099511627776.0}) {  // 2^40, -2^40
+        struct W64 { double in; const char* label; u64 want; bool want_ie; };
+        const W64 ws[] = {
+            { 1099511627776.0, "+2^40", 0x0000010000000000ULL, false},
+            {-1099511627776.0, "-2^40", 0xFFFFFF0000000000ULL, false},
+            { 9223372036854775808.0, "2^63", 0x8000000000000000ULL, true},
+        };
+        for (const auto& w : ws) {
             reset_fpu();
             mem.zero_memory(DATA, 0x400);
-            double one = 1.0; u64 b; std::memcpy(&b, &one, 8);
-            mem.write_value(DATA + 0x200, b);
-            ctx.rbp = DATA + 0x200;
-            put_code(CODE, {0xD9, 0x45, 0x00}); step_at(CODE);   // FLD m64 [rbp+0] = 1.0
-            // multiply by 2^40 using the existing register form: D9 C1 is not
-            // implemented, so build the constant directly in memory instead.
-            u64 bits = 0; std::memcpy(&bits, &val, 8);
-            mem.write_value(DATA + 0x200, bits);
-            put_code(CODE, {0xDD, 0x45, 0x00}); step_at(CODE);   // FLD m64 [rbp+0] = 2^40
+            u64 bits = 0; std::memcpy(&bits, &w.in, 8);
+            mem.write_value(DATA, bits);
             ctx.rbp = DATA;
-            put_code(CODE, {0xDF, 0x7D, 0x20}); step_at(CODE);   // DF /7 FISTP m32int
-            u64 got64 = 0; mem.read_value(DATA + 0x20, got64);
-            const u32 got = static_cast<u32>(got64);
-            const bool ok = (got == 0x80000000u) && ((ctx.fpu.sw & 1u) == 1u);
+            put_code(CODE, {0xDD, 0x45, 0x00}); step_at(CODE);  // DD /0 FLD m64fp
+            put_code(CODE, {0xDF, 0x7D, 0x20}); step_at(CODE);  // DF /7 FISTP m64int
+            u64 got = 0; mem.read_value(DATA + 0x20, got);
+            const u16 ie = static_cast<u16>(ctx.fpu.sw & 1u);
+            const bool ok = (got == w.want) && ((ie != 0) == w.want_ie);
             if (!ok) ++g_failures;
-            std::printf("  FISTP m32 of %+.0f -> 0x%08x want 0x80000000 IE=%u  %s\n",
-                        val, got, (unsigned)(ctx.fpu.sw & 1u), ok ? "ok" : "FAIL");
+            std::printf("  FISTP m64 of %-5s -> 0x%016llx want 0x%016llx IE=%u %s\n",
+                        w.label, (unsigned long long)got, (unsigned long long)w.want,
+                        ie, ok ? "ok" : "FAIL");
         }
+    }
+
+    // ---- FISTTP ignores RC: truncates under all four modes, and pops ----
+    std::printf("[x87] FISTTP (DB /1, DF /1, DD /1) truncates, ignores RC, pops:\n");
+    {
+        struct TTCase { const char* nm; int width; std::vector<u8> code; };
+        // DB /1 FISTTP m32int -> modrm 0x4D ; DF /1 FISTTP m16int -> 0x4D ;
+        // DD /1 FISTTP m64int -> 0x4D
+        const TTCase tt[] = {
+            {"DB /1 m32int", 4, {0xDB, 0x4D, 0x20}},
+            {"DF /1 m16int", 2, {0xDF, 0x4D, 0x20}},
+            {"DD /1 m64int", 8, {0xDD, 0x4D, 0x20}},
+        };
+        for (const auto& t : tt) {
+            for (int rc = 0; rc < 4; ++rc) {
+                for (double v : {2.9, -2.9}) {
+                    reset_fpu();
+                    mem.zero_memory(DATA, 0x400);
+                    u64 bits = 0; std::memcpy(&bits, &v, 8);
+                    mem.write_value(DATA, bits);
+                    ctx.rbp = DATA;
+                    put_code(CODE, {0xDD, 0x45, 0x00}); step_at(CODE);   // FLD m64fp
+                    ctx.fpu.cw = static_cast<u16>((ctx.fpu.cw & ~0x0C00) | (rc << 10));
+                    const u8 before = ctx.fpu.top;
+                    put_code(CODE, t.code); step_at(CODE);
+                    u64 got = 0; mem.read_value(DATA + 0x20, got);
+                    const bool popped = ctx.fpu.top == static_cast<u8>((before + 1) & 7);
+                    const i64 want = static_cast<i64>(v);   // truncate toward zero
+                    // Sign-extend from the store width; the raw read is 8 bytes.
+                    i64 gotv;
+                    if (t.width == 2)     gotv = static_cast<i16>(got);
+                    else if (t.width == 4) gotv = static_cast<i32>(got);
+                    else                  gotv = static_cast<i64>(got);
+                    const bool ok = (gotv == want) && popped;
+                    if (!ok) ++g_failures;
+                    std::printf("  %-12s RC=%d %+.1f -> %lld want %lld pop=%d %s\n",
+                                t.nm, rc, v, (long long)gotv, (long long)want,
+                                popped ? 1 : 0, ok ? "ok" : "FAIL");
+                }
+            }
+        }
+    }
+
+    // ---- FISTP m32int (DB /3) of 2^40 still overflows ----
+    std::printf("[x87] DB /3 FISTP m32int of 2^40:\n");
+    {
+        reset_fpu();
+        mem.zero_memory(DATA, 0x400);
+        u64 b64 = 0; const double v = 1099511627776.0;
+        std::memcpy(&b64, &v, 8);
+        mem.write_value(DATA, b64);
+        ctx.rbp = DATA;
+        put_code(CODE, {0xDD, 0x45, 0x00}); step_at(CODE);      // FLD m64fp
+        put_code(CODE, {0xDB, 0x5D, 0x20}); step_at(CODE);      // DB /3 FISTP m32int
+        u64 got = 0; mem.read_value(DATA + 0x20, got);
+        const u32 g32 = static_cast<u32>(got);
+        const bool ok = (g32 == 0x80000000u) && ((ctx.fpu.sw & 1u) == 1u);
+        if (!ok) ++g_failures;
+        std::printf("  FISTP m32 of 2^40 -> 0x%08x want 0x80000000 IE=%u %s\n",
+                    g32, (unsigned)(ctx.fpu.sw & 1u), ok ? "ok" : "FAIL");
     }
 
     // ---- m80 byte round trip, with the precision loss reported ------------
