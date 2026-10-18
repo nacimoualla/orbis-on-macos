@@ -357,17 +357,10 @@ int main(int argc, char* argv[]) {
             }
         }
     }
-    if (std::getenv("PS4_DUMP_DYNAMIC")) {
-        // Walk the loader's own dynamic tables instead of re-deriving SELF file
-        // offsets by hand.
-        for (const char* m : {"mono-ps4.prx", "MonoAssembliesPS4.prx"}) {
-            const std::string p = std::string("games/flappy_bird/ED1633-NPXX51362_00-TER1520000000000/Media/Modules") + "/" + m;
-            ps4::dump_module_dynamic(p);
-        }
-    }
     memory.dump_mappings();
     ps4::dump_rip_histogram();
     ps4::dump_hle_histogram();
+    ps4::dump_export_tables();
     if (enable_jit && jit.cached_block_count() > 0) {
         std::cout << "[CPU] JIT Blocks Cached: " << jit.cached_block_count()
                   << " | Total Invocations: " << jit.total_invocations() << "\n";

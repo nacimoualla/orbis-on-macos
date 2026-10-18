@@ -3797,7 +3797,8 @@ void NidRegistry::register_default_libraries() {
         if (status_ptr != 0 && mem.is_valid_address(status_ptr, 16)) {
             mem.write_value(status_ptr + 0, static_cast<u32>(1920)); // width
             mem.write_value(status_ptr + 4, static_cast<u32>(1080)); // height
-            mem.write_value(status_ptr + 8, static_cast<u32>(60));   // fps
+            mem.write_value(status_ptr + 8, static_cast<u32>(1920)); // paneWidth
+            mem.write_value(status_ptr + 12, static_cast<u32>(1080)); // paneHeight
         }
         ctx.rax = SCE_OK;
     };

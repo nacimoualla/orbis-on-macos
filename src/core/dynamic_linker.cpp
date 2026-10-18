@@ -38,6 +38,16 @@ std::string describe_guest_addr(GuestAddr a) {
     return buf;
 }
 
+// PS4_DUMP_EXPORTS=1: record each export as the loader resolves it. Re-parsing
+// PT_DYNAMIC by hand ignores the PT_DYNAMIC p_filesz bound and mis-indexes the
+// strtab, which produced <multiple> for DT_STRTAB and a 655-vs-896 mismatch.
+struct ExportRow { Nid nid; GuestAddr addr; u64 value; const char* type; char tok[12]; };
+static std::vector<ExportRow> g_export_rows;
+static const bool s_dump_exports = [] {
+    const char* v = std::getenv("PS4_DUMP_EXPORTS");
+    return v && *v && std::string_view(v) != "0";
+}();
+
 void dump_hle_histogram() {
     if (g_hle_hist.empty()) return;
     struct Row { std::string name; u64 reg; u64 fb; u64 total; };
@@ -825,6 +835,14 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
         // MonoAssembliesPS4.prx through R_X86_64_64, so all 19 are affected.
         // Rewriting to the module address is correct for both kinds: a called
         // function now jumps straight into the module instead of trapping.
+        if (s_dump_exports) {
+            ExportRow r{};
+            r.nid = nid; r.addr = real; r.value = sym.st_value;
+            r.type = (stype == ELF64_ST_TYPE_FUNC) ? "FUNC" : "OBJECT";
+            std::snprintf(r.tok, sizeof(r.tok), "%.11s",
+                          reinterpret_cast<const char*>(proglib + strtab_off + sym.st_name));
+            g_export_rows.push_back(r);
+        }
         const auto slots = m_nid_to_slots.find(nid);
         if (slots != m_nid_to_slots.end()) {
             usize patched = 0;
@@ -1073,6 +1091,40 @@ GuestAddr module_base_allocator(GuestSize need) noexcept {
     }
     g_next_module_base = ((end + kModuleAlign - 1) & ~(kModuleAlign - 1)) + kModuleGuardGap;
     return base;
+}
+
+
+void dump_export_tables() {
+    if (g_export_rows.empty()) return;
+    std::vector<ExportRow> v = g_export_rows;
+    std::sort(v.begin(), v.end(), [](const ExportRow& a, const ExportRow& b) { return a.addr < b.addr; });
+    u64 nfun = 0, nobj = 0;
+    for (const auto& r : v) { if (std::strcmp(r.type, "FUNC") == 0) ++nfun; else ++nobj; }
+    std::fprintf(stderr, "[exports] total=%zu (FUNC=%llu OBJECT=%llu)\n",
+                 v.size(), (unsigned long long)nfun, (unsigned long long)nobj);
+    std::fprintf(stderr, "[exports] lowest 10 by address:\n");
+    for (usize i = 0; i < v.size() && i < 10; ++i)
+        std::fprintf(stderr, "[exports]   #%-2zu 0x%016llx  module+0x%06llx %-6s tok=%s\n",
+                     i, (unsigned long long)v[i].addr, (unsigned long long)v[i].value,
+                     v[i].type, v[i].tok);
+    std::fprintf(stderr, "[exports] highest 3 by address:\n");
+    for (usize i = v.size() > 3 ? v.size() - 3 : 0; i < v.size(); ++i)
+        std::fprintf(stderr, "[exports]   #%-2zu 0x%016llx  module+0x%06llx %-6s tok=%s\n",
+                     i, (unsigned long long)v[i].addr, (unsigned long long)v[i].value,
+                     v[i].type, v[i].tok);
+    struct Q { u64 nid; const char* nm; };
+    const Q qs[] = {{0x05a38a72783c83cfULL,"module_start"},
+                    {0x2a90ccacf1efb774ULL,"module_stop"},
+                    {0x44a906d9bd4bb5ddULL,"module_bootstrap"},
+                    {0x8008ef0941de01b1ULL,"_init"}};
+    for (const auto& q : qs) {
+        bool hit = false; u64 a = 0; const char* t = "";
+        for (const auto& r : v) if (r.nid == q.nid) { hit = true; a = r.addr; t = r.tok; break; }
+        if (hit) std::fprintf(stderr, "[exports] NID %#018llx %-16s HIT addr=0x%llx tok=%s\n",
+                              (unsigned long long)q.nid, q.nm, (unsigned long long)a, t);
+        else      std::fprintf(stderr, "[exports] NID %#018llx %-16s MISS\n",
+                              (unsigned long long)q.nid, q.nm);
+    }
 }
 
 } // namespace ps4
