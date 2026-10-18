@@ -64,7 +64,7 @@ static double f80_to_f64(const u8 in[10]) {
     return d;
 }
 
-int main() {
+int main(int argc, char** argv) {
     MemoryManager mem;
     if (!mem.initialize()) {
         std::printf("memory init failed\n");
@@ -90,6 +90,41 @@ int main() {
         ctx = exec.context();
         return r;
     };
+
+    auto reset_fpu = [&](void) {
+        ctx.fpu = X87State{};
+        ctx.fpu.cw = 0x037F;
+        ctx.fpu.sw = 0;
+        for (int k = 0; k < 8; ++k) { ctx.fpu.st[k] = 0; ctx.fpu.se_st[k] = 0; ctx.fpu.tag[k] = 0xFFFF; }
+        ctx.fpu.top = 0;
+    };
+
+    // ---- STEP 0a: the overflow vector ALONE, fresh context, no prior vectors ----
+    if (argc > 1 && std::strcmp(argv[1], "overflow-only") == 0) {
+        std::printf("[0a] overflow vector alone, fresh CpuContext\n");
+        reset_fpu();
+        mem.zero_memory(DATA, 0x400);
+        u32 bits = 0;
+        const float d = 3e10f;
+        std::memcpy(&bits, &d, 4);
+        mem.write_value(DATA, static_cast<u64>(bits));
+        ctx.rbp = DATA;
+        put_code(CODE, {0xD9, 0x45, 0x00});          // D9 /0 FLD m32fp
+        const StepResult r1 = step_at(CODE);
+        double st0 = 0; std::memcpy(&st0, &ctx.fpu.st[ctx.fpu.top], 8);
+        std::printf("  FLD  step=%d top=%u ST0=%g  (want 3e10)\n",
+                    (int)r1, ctx.fpu.top, st0);
+        std::printf("  pre-IE=%u sw=0x%04x\n", (unsigned)((ctx.fpu.sw & 1u)), ctx.fpu.sw);
+        ctx.rbp = DATA + 0x200;
+        put_code(CODE, {0xDF, 0x7D, 0x20});          // DF /7 FISTP m32int
+        const StepResult r2 = step_at(CODE);
+        u64 got64 = 0; mem.read_value(DATA + 0x220, got64);
+        std::printf("  FISTP step=%d got=0x%08x want=0x80000000  IE=%u\n",
+                    (int)r2, static_cast<u32>(got64), (unsigned)(ctx.fpu.sw & 1u));
+        const bool ok = (static_cast<u32>(got64) == 0x80000000u) && ((ctx.fpu.sw & 1u) == 1u);
+        std::printf("  [0a] %s\n", ok ? "ok" : "FAIL");
+        return ok ? 0 : 1;
+    }
 
     // --- fnstcw / fldcw round trip -----------------------------------------
     // D9 /7 FNSTCW word ptr [disp8]  -> D9 E7 is FNSTCW AX, so use memory form.
@@ -133,6 +168,7 @@ int main() {
     };
     std::printf("[x87] fistp m32 rounding (RC = cw bits 10-11):\n");
     for (const auto& c : cases) {
+        reset_fpu();                                   // 0b: per-vector reset
         // FLD1 (D9 E8), then replace ST0 via FLD m64? Use FILD-free path:
         // D9 E8 fld1 pushes 1.0; we instead load the constant with FILD m32 (DF /0).
         u32 bits;
@@ -163,7 +199,12 @@ int main() {
     // --- overflow -> integer indefinite ------------------------------------
     std::printf("[x87] overflow:\n");
     {
-        ctx.fpu.cw = 0x037F;                          // RC=00 nearest-even
+        std::printf("  [pre] inherited from previous vectors: cw=0x%04x sw=0x%04x top=%u\n",
+                    ctx.fpu.cw, ctx.fpu.sw, ctx.fpu.top);
+        for (int k = 0; k < 8; ++k)
+            std::printf("  [pre]   st[%d]=0x%016llx tag=0x%04x\n", k,
+                        (unsigned long long)ctx.fpu.st[k], ctx.fpu.tag[k]);
+        reset_fpu();                                   // 0b: per-vector reset
         mem.zero_memory(DATA, 0x400);
         u32 bits;
         const float d = 3e10f;
@@ -183,8 +224,15 @@ int main() {
               std::printf("  [diag]   st[%d]=0x%016llx\n", k,
                           (unsigned long long)ctx.fpu.st[k]); }
         ctx.rbp = DATA + 0x200;
-        put_code(CODE, {0xDF, 0x7D, 0x20});           // FISTP m32
+        put_code(CODE, {0xDF, 0x7D, 0x20});           // DF /7 FISTP m32int
         const u16 sw_before = ctx.fpu.sw;
+        if ((sw_before & 0x0001) != 0) {
+            ++g_failures;
+            std::printf("  %-40s IE was ALREADY set before the store: FAIL\n",
+                        "precondition IE==0");
+        } else {
+            std::printf("  %-40s sw=0x%04x ok\n", "precondition IE==0", sw_before);
+        }
         step_at(CODE);
         u64 got64 = 0;
         mem.read_value(DATA + 0x220, got64);
@@ -213,6 +261,131 @@ int main() {
         std::printf("  cw=0x%04x  PC=%d (10 = 53-bit)  RC=%d (00 = nearest-even) %s\n",
                     ctx.fpu.cw, pc, rc, (pc == 2 && rc == 0) ? "ok" : "FAIL");
         if (pc != 2 || rc != 0) ++g_failures;
+    }
+
+    // ---- stack discipline: push / no-pop / pop for every memory-store form ----
+    std::printf("[x87] stack discipline (TOP is physical index; push dec, pop inc):\n");
+    {
+        struct PopCase { const char* name; std::vector<u8> code; int rc; };
+        const PopCase pops[] = {
+            {"FLD m64   DD /0  (push, expect -1)", {0xDD, 0x45, 0x00}, -1},
+            {"FST  m64  DD /2  (no pop, expect 0)", {0xDD, 0x55, 0x00}, 0},
+            {"FSTP m64  DD /3  (pop, expect +1)",   {0xDD, 0x5D, 0x00}, 1},
+            {"FIST m32  DB /2  (no pop, expect 0)", {0xDB, 0x55, 0x00}, 0},
+            {"FISTP m32 DB /3  (pop, expect +1)",   {0xDB, 0x5D, 0x00}, 1},
+            {"FIST m16  DF /2  (no pop, expect 0)", {0xDF, 0x55, 0x00}, 0},
+            {"FISTP m16 DF /3  (pop, expect +1)",   {0xDF, 0x5D, 0x00}, 1},
+            {"FISTP m32 DF /7  (pop, expect +1)",   {0xDF, 0x7D, 0x00}, 1},
+        };
+        for (const auto& pc : pops) {
+            reset_fpu();
+            mem.zero_memory(DATA, 0x400);
+            double one = 1.0; u64 b; std::memcpy(&b, &one, 8);
+            mem.write_value(DATA, b); mem.write_value(DATA + 0x20, b);
+            ctx.rbp = DATA;
+            put_code(CODE, {0xD9, 0xE8});                 // FLD1 so ST0 is valid
+            step_at(CODE);
+            put_code(CODE, pc.code);
+            const u8 before = ctx.fpu.top;
+            step_at(CODE);
+            // TOP is a 3-bit physical index, so a pop from 7 reads as 0.
+            const int delta = ((static_cast<int>(ctx.fpu.top) - static_cast<int>(before) + 4) & 7) - 4;
+            const bool ok = (delta == pc.rc);
+            if (!ok) ++g_failures;
+            std::printf("  %-40s top %u->%u delta=%+d  %s\n", pc.name, before,
+                        ctx.fpu.top, delta, ok ? "ok" : "FAIL");
+        }
+    }
+
+    // ---- fld1; fld1; faddp; fstp m64 = 2.0, TOP restored -------------------
+    std::printf("[x87] fld1; fld1; faddp; fstp m64:\n");
+    {
+        reset_fpu();
+        mem.zero_memory(DATA, 0x400);
+        const u8 top0 = ctx.fpu.top;
+        put_code(CODE, {0xD9, 0xE8});   step_at(CODE);   // FLD1
+        put_code(CODE, {0xD9, 0xE8});   step_at(CODE);   // FLD1
+        put_code(CODE, {0xDE, 0xC1});   step_at(CODE);   // FADDP ST(1),ST(0)
+        ctx.rbp = DATA;
+        put_code(CODE, {0xDD, 0x5D, 0x20}); step_at(CODE);  // FSTP m64 [rbp+0x20] = DATA+0x20
+        u64 bits = 0; mem.read_value(DATA + 0x20, bits);
+        double v = 0; std::memcpy(&v, &bits, 8);
+        const bool ok = (v == 2.0) && (ctx.fpu.top == top0);
+        if (!ok) ++g_failures;
+        std::printf("  %-40s got=%g want=2  top %u->%u  %s\n", "fld1;fld1;faddp;fstp m64",
+                    v, top0, ctx.fpu.top, ok ? "ok" : "FAIL");
+    }
+
+    // ---- fcomip ZF/PF/CF --------------------------------------------------
+    std::printf("[x87] fcomip flags (ST0 cmp ST1):\n");
+    {
+        struct FC { const char* name; double st0; double st1; int zf; int pf; int cf; };
+        const FC fcs[] = {
+            {"greater  (1 > 0)",   1.0,  0.0, 0, 0, 0},
+            {"less     (0 < 1)",   0.0,  1.0, 0, 0, 1},
+            {"equal    (2 == 2)",  2.0,  2.0, 1, 0, 0},
+            {"unordered(NaN, 1)",  NAN,  1.0, 1, 1, 1},
+        };
+        for (const auto& fc : fcs) {
+            reset_fpu();
+            mem.zero_memory(DATA, 0x400);
+            u64 a = 0, b = 0; std::memcpy(&a, &fc.st1, 8); std::memcpy(&b, &fc.st0, 8);
+            mem.write_value(DATA, a);      // ST(i) operand
+            mem.write_value(DATA + 0x20, b); // ST0 operand
+            ctx.rbp = DATA;
+            put_code(CODE, {0xDD, 0x45, 0x00}); step_at(CODE);  // FLD m64 [rbp+0]  -> ST0 = ST(i) val
+            put_code(CODE, {0xDD, 0x45, 0x20}); step_at(CODE);  // FLD m64 [rbp+0x20]-> ST0 = b
+            put_code(CODE, {0xDF, 0xF1});     step_at(CODE);    // FCOMIP ST(1), pop
+            const int zf = (ctx.rflags & 0x40) ? 1 : 0;
+            const int pf = (ctx.rflags & 0x04) ? 1 : 0;
+            const int cf = (ctx.rflags & 0x01) ? 1 : 0;
+            const bool ok = (zf == fc.zf) && (pf == fc.pf) && (cf == fc.cf);
+            if (!ok) ++g_failures;
+            std::printf("  %-40s ZF=%d PF=%d CF=%d  want %d/%d/%d  %s\n", fc.name,
+                        zf, pf, cf, fc.zf, fc.pf, fc.cf, ok ? "ok" : "FAIL");
+        }
+    }
+
+    // ---- m80 byte round trip, with the precision loss reported ------------
+    std::printf("[x87] m80 FLD/FSTP byte round trip:\n");
+    {
+        struct M80 { const char* name; u8 b[10]; };
+        // 1.0                       : mantissa 0x8000000000000000, exp 0x3FFF, sign 0
+        const M80 v_exact = {"1.0", {0,0,0,0,0,0,0,0x80, 0xFF, 0x3F}};
+        // 1.0 + 2^-54               : bit 54 of the mantissa, beyond a double's 53
+        const M80 v_lossy = {"1.0+2^-54", {0x00,0x02,0,0,0,0,0,0x80, 0xFF, 0x3F}};
+        for (const M80* v : {&v_exact, &v_lossy}) {
+            reset_fpu();
+            mem.zero_memory(DATA, 0x400);
+            mem.write_bytes(DATA, v->b, 10);
+            ctx.rbp = DATA;
+            put_code(CODE, {0xDB, 0x6D, 0x00}); step_at(CODE);   // DB /5 FLD m80
+            put_code(CODE, {0xDB, 0x7D, 0x20}); step_at(CODE);   // DB /7 FSTP m80 -> DATA+0x20
+            u8 out[10]; mem.read_bytes(DATA + 0x20, out, 10);
+            const bool same = (std::memcmp(v->b, out, 10) == 0);
+            const bool expect_same = (v->b[1] == 0x00);  // 1.0 round-trips; 1.0+2^-54 may not
+            std::printf("  in  %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x\n",
+                        v->b[7],v->b[6],v->b[5],v->b[4],v->b[3],v->b[2],v->b[1],v->b[0],
+                        v->b[8],v->b[9]);
+            std::printf("  out %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x  %s\n",
+                        out[7],out[6],out[5],out[4],out[3],out[2],out[1],out[0],
+                        out[8],out[9], same ? "byte-identical" : "DIFFERS");
+            const bool ok = (same == expect_same);
+            if (!ok) ++g_failures;
+            std::printf("    expect %-22s -> %s\n", expect_same ? "byte-identical" : "may differ",
+                        ok ? "ok" : "FAIL");
+        }
+        // declare which one is expected to survive a 53-bit host double
+        u8 o[10]; reset_fpu(); mem.zero_memory(DATA, 0x400);
+        mem.write_bytes(DATA, v_lossy.b, 10); ctx.rbp = DATA;
+        put_code(CODE, {0xDB, 0x6D, 0x00}); step_at(CODE);
+        put_code(CODE, {0xDB, 0x7D, 0x20}); step_at(CODE);
+        mem.read_bytes(DATA + 0x20, o, 10);
+        const bool lossy_lost = (o[1] == 0x00);
+        if (!lossy_lost) ++g_failures;
+        std::printf("  %-40s mantissa byte[1] %02x -> %02x  %s\n",
+                    "1.0+2^-54 (needs 54 mantissa bits)", v_lossy.b[1], o[1],
+                    lossy_lost ? "lost, as expected (host double = 53 bits)" : "unexpectedly kept");
     }
 
     std::printf("[x87] failures=%d\n", g_failures);

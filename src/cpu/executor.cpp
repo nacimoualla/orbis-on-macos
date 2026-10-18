@@ -327,9 +327,17 @@ double f80_to_double(const u8 in[10]) {
         if (!is_nan) return sign ? -INFINITY : INFINITY;
         return sign ? -NAN : NAN;
     }
-    // Unbias: extended bias 16383, double bias 1023.
-    const u64 be = exp80 - 0x3800 + 1023;
-    const u64 frac = (mant & 0x000FFFFFFFFFFFFFULL) | 0x0008000000000000ULL;
+    // Unbias: extended bias 16383, double bias 1023, so the biased double
+    // exponent is (exp80 - 16383) + 1023 = exp80 - 15360 = exp80 - 0x3C00.
+    // (Subtracting 0x3800 alone left 2047 too large and every normal value
+    // overflowed to infinity.)
+    const u64 be = exp80 - 0x3C00;
+    // Extended mantissa bit k has weight 2^(k-63). The binary64 fraction field
+    // holds bits 62..11 of the extended mantissa, so shift right by 11 and keep
+    // 52 bits. Dropping only the explicit integer bit and re-ORing a low 1 was
+    // wrong twice over: it kept 52 bits but at the wrong exponents, and it
+    // fabricated a fraction bit.
+    const u64 frac = (mant >> 11) & 0x000FFFFFFFFFFFFFULL;
     u64 bits = (sign << 63) | (be << 52) | frac;
     double d;
     std::memcpy(&d, &bits, 8);
@@ -350,8 +358,14 @@ void double_to_f80(double d, u8 out[10]) {
         se = static_cast<u16>((sign << 15) | 0x7FFF);
         out[8] = out[9] = 0xFF;
     } else {
-        se = static_cast<u16>((sign << 15) | (be - 1023 + 0x3800));
-        const u64 mant = frac | 0x8000000000000000ULL;
+        // Extended bias is 16383 and double bias is 1023, so the extended
+        // exponent is (be - 1023) + 16383 = be + 15360 = be + 0x3C00.
+        // (Subtracting 1023 and adding only 0x3800 left 1.0 at 0x3800, the
+        // smallest normal exponent, instead of 0x3FFF.)
+        se = static_cast<u16>((sign << 15) | (be + 0x3C00));
+        // Inverse of the >>11 shift above: restore bits 62..11 and re-attach the
+        // explicit integer bit at bit 63.
+        const u64 mant = ((frac & 0x000FFFFFFFFFFFFFULL) << 11) | 0x8000000000000000ULL;
         for (int i = 0; i < 8; ++i) out[i] = static_cast<u8>((mant >> (8 * i)) & 0xFF);
     }
     out[8] = static_cast<u8>(se & 0xFF);
@@ -3972,13 +3986,15 @@ StepResult CpuExecutor::step() {
             if (diff < 0.5) return fl;
             return (std::fmod(fl, 2.0) == 0.0) ? fl : (fl + 1.0);
         };
-        auto store_int = [&](usize n) -> bool {
+        // trunc=true is FISTTP: the instruction rounds toward zero and ignores
+        // the control word's rounding control, per the SDM.
+        auto store_int = [&](usize n, bool trunc = false) -> bool {
             if (!have_ea) return false;
             double d; std::memcpy(&d, &f.st[f.top], sizeof(d));
 
             // RC = bits 10-11: 00 nearest-even, 01 down(-inf), 10 up(+inf),
             // 11 truncate(toward zero).
-            const int rc = (f.cw >> 10) & 3;
+            const int rc = trunc ? 3 : ((f.cw >> 10) & 3);
             double adj;
             switch (rc) {
                 case 0:  adj = nearest_even(d); break;
@@ -4025,24 +4041,41 @@ StepResult CpuExecutor::step() {
                 if (mod == 3) {
                     if ((modrm & 0xC0) == 0xC0) {           // D9 C0+i / C8+i / D0+i / E0+i
                         const u8 i = rmf;
+                        // SDM, D9 register form (mod=11): the reg field selects the
+                        // operation and rm selects the operand/constant.
+                        //   000 FLD ST(i)   001 FXCH ST(i)   010 FST ST(i)   011 FSTP ST(i)
+                        //   100 FCHS(rm=0) FABS(rm=1) FTST(rm=4) FXAM(rm=5)
+                        //   101 constants: FLD1(rm=0) ... FLDZ(rm=6)
+                        // Previously reg=101 executed FABS, so every FLD1/FLDZ in the
+                        // guest silently took the absolute value instead of pushing a
+                        // constant.
+                        auto peek = [&](u8 slot) { double v; std::memcpy(&v, &f.st[slot], sizeof(v)); return v; };
+                        auto poke = [&](u8 slot, double v) { std::memcpy(&f.st[slot], &v, sizeof(v)); };
+                        auto pop1 = [&] { f.top = static_cast<u8>((f.top + 1) & 7); };
+                        // rmf is a LOGICAL stack index: ST(i) lives in physical
+                        // slot (TOP + i) & 7. Indexing st[rmf] directly addressed
+                        // the wrong register whenever TOP + i wrapped.
+                        const u8 phys = static_cast<u8>((f.top + i) & 7);
                         switch (regf) {
-                            case 0: { double d; std::memcpy(&d, &f.st[i], sizeof(d));
-                                      push_double(d); } break;                    // FLD ST(i)
-                            case 1: store_double(8); break;                        // FST ST(0)
-                            case 2: { double d; std::memcpy(&d, &f.st[i], sizeof(d));
-                                      double s; std::memcpy(&s, &f.st[f.top], sizeof(s));
-                                      std::memcpy(&f.st[f.top], &s, 8);
-                                      std::memcpy(&f.st[i], &d, 8); } break;       // FXCH
-                            case 4: { double d; std::memcpy(&d, &f.st[f.top], sizeof(d));
-                                      push_double(-d); } break;                    // FCHS
-                            case 5: { double d; std::memcpy(&d, &f.st[f.top], sizeof(d));
-                                      push_double(std::abs(d)); } break;          // FABS
-                            case 7: store_double(8); break;                        // FSTP ST(0)
+                            case 0: push_double(peek(phys)); break;                  // FLD ST(i)
+                            case 1: { const double t = peek(f.top);
+                                      poke(f.top, peek(phys)); poke(phys, t); } break; // FXCH ST(i)
+                            case 2: poke(phys, peek(f.top)); break;                  // FST ST(i)
+                            case 3: poke(phys, peek(f.top)); pop1(); break;         // FSTP ST(i)
+                            case 4:
+                                if (i == 0) push_double(-peek(f.top));             // FCHS
+                                else if (i == 1) push_double(std::abs(peek(f.top))); // FABS
+                                else handled = false;                              // FTST/FXAM unimplemented
+                                break;
+                            case 5:
+                                if (i == 0) push_double(1.0);                      // D9 E8 FLD1
+                                else if (i == 6) push_double(0.0);                 // D9 EE FLDZ
+                                else handled = false;                              // other constants
+                                break;
                             default: handled = false;
                         }
                     } else { handled = false; }
                 } else {
-                    i64 raw = 0;
                     switch (regf) {
                         case 0: if (!load_float(4)) handled = false; break;        // FLD m32fp
                         case 2: if (!store_double(4)) handled = false; break;       // FST m32fp
@@ -4063,7 +4096,6 @@ StepResult CpuExecutor::step() {
                 break;
             }
             case 0xDD: {
-                i64 raw = 0;
                 switch (regf) {
                     case 0: if (!load_float(8)) handled = false; break;             // FLD m64fp
                     case 2: if (!store_double(8)) handled = false; break;            // FST m64fp
@@ -4076,11 +4108,13 @@ StepResult CpuExecutor::step() {
             case 0xDB: {
                 i64 raw = 0;
                 switch (regf) {
-                    case 0: if (load_mem(2, &raw)) push_double(static_cast<double>(raw));
-                            else handled = false; break;                            // FILD m16int
-                    case 2: store_int(2); break;                                    // FIST m16int (no pop)
-                    case 3: if (store_int(2)) f.top = static_cast<u8>((f.top + 1) & 7);
-                            else handled = false; break;                           // FISTP m16int
+                    case 0: if (load_mem(4, &raw)) push_double(static_cast<double>(raw));
+                            else handled = false; break;                            // DB /0 FILD m32int
+                    case 1: if (store_int(4, true)) f.top = static_cast<u8>((f.top + 1) & 7);
+                            else handled = false; break;                           // DB /1 FISTTP m32int
+                    case 2: store_int(4); break;                                    // DB /2 FIST m32int (no pop)
+                    case 3: if (store_int(4)) f.top = static_cast<u8>((f.top + 1) & 7);
+                            else handled = false; break;                           // DB /3 FISTP m32int
                     case 5: if (!load_float(10)) handled = false; break;             // FLD m80
                     case 7: {                                                       // FSTP m80
                         if (!have_ea) { handled = false; break; }
@@ -4094,15 +4128,61 @@ StepResult CpuExecutor::step() {
                 }
                 break;
             }
+            case 0xDE: {
+                // DE C0+i = FADDP ST(i), ST(0), then pop. No memory form for DE.
+                if (mod == 3 && regf == 0) {
+                    // ST(i) is logical; its physical slot is (TOP + i) & 7.
+                    const u8 phys = static_cast<u8>((f.top + rmf) & 7);
+                    double a; std::memcpy(&a, &f.st[f.top], sizeof(a));   // ST(0)
+                    double b; std::memcpy(&b, &f.st[phys], sizeof(b));    // ST(i)
+                    const double r = b + a;
+                    std::memcpy(&f.st[phys], &r, sizeof(r));
+                    f.top = static_cast<u8>((f.top + 1) & 7);             // pop
+                } else {
+                    handled = false;
+                }
+                break;
+            }
             case 0xDF: {
                 i64 raw = 0;
+                if (mod == 3) {
+                    // DF F0+i = FCOMIP ST(i): set ZF/PF/CF then pop.
+                    if (regf == 6) {
+                        const u8 phys = static_cast<u8>((f.top + rmf) & 7);  // ST(i)
+                        double a; std::memcpy(&a, &f.st[f.top], sizeof(a));    // ST(0)
+                        double b; std::memcpy(&b, &f.st[phys], sizeof(b));
+                        u64 fl = m_context.rflags & ~static_cast<u64>(0x8D); // ZF|PF|CF
+                        if (std::isnan(a) || std::isnan(b)) {
+                            fl |= 0x8D;                     // ZF=PF=CF=1, unordered
+                            f.sw |= 0x0100;
+                        } else if (a > b) {
+                            /* ZF=PF=CF=0 */
+                        } else if (a < b) {
+                            fl |= 0x1;                      // CF=1
+                        } else {
+                            fl |= 0x40;                     // ZF=1
+                        }
+                        m_context.rflags = fl;
+                        f.top = static_cast<u8>((f.top + 1) & 7);   // pop
+                    } else {
+                        handled = false;
+                    }
+                    break;
+                }
                 switch (regf) {
-                    case 0: if (load_mem(4, &raw)) push_double(static_cast<double>(raw));
-                            else handled = false; break;                            // FILD m32
-                    case 5: if (load_mem(8, &raw)) push_double(static_cast<double>(raw));
-                            else handled = false; break;                            // FILD m64
+                    case 0: if (load_mem(2, &raw)) push_double(static_cast<double>(raw));
+                            else handled = false; break;                            // DF /0 FILD m16int
+                    case 1: if (store_int(2, true)) f.top = static_cast<u8>((f.top + 1) & 7);
+                            else handled = false; break;                           // DF /1 FISTTP m16int
+                    case 2: store_int(2); break;                                    // DF /2 FIST m16int (no pop)
+                    case 3: if (store_int(2)) f.top = static_cast<u8>((f.top + 1) & 7);
+                            else handled = false; break;                           // DF /3 FISTP m16int
+                    case 5: if (load_mem(4, &raw)) push_double(static_cast<double>(raw));
+                            else handled = false; break;                            // DF /5 FILD m32int
+                    case 6: if (store_int(4, true)) f.top = static_cast<u8>((f.top + 1) & 7);
+                            else handled = false; break;                           // DF /6 FISTTP m32int
                     case 7: if (store_int(4)) f.top = static_cast<u8>((f.top + 1) & 7);
-                            else handled = false; break;                           // FISTP m32int
+                            else handled = false; break;                           // DF /7 FISTP m32int
                     default: handled = false;
                 }
                 break;
