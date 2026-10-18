@@ -1771,6 +1771,68 @@ void NidRegistry::register_default_libraries() {
             if (formatted.size() > 1 && formatted != "/app0/media/boot.config") {
                 std::fprintf(stderr, "[Unity Log] %s", formatted.c_str());
                 if (formatted.back() != '\n') std::fprintf(stderr, "\n");
+
+                if (formatted.find("Error assigning") != std::string::npos) {
+                    std::fprintf(stderr, "\n=== [DIAGNOSTIC] Material::SetTexture Error Detected ===\n");
+                    std::fprintf(stderr, "  Message: %s\n", formatted.c_str());
+                    // Stack backtrace
+                    GuestAddr cur_rbp = ctx.rbp;
+                    for (int f = 0; f < 10 && cur_rbp > 0x1000 && mem.is_valid_address(cur_rbp, 16); ++f) {
+                        GuestAddr rip = 0, next_rbp = 0;
+                        mem.read_value(cur_rbp + 8, rip);
+                        mem.read_value(cur_rbp + 0, next_rbp);
+                        std::fprintf(stderr, "  Frame #%d: RIP=0x%llx, RBP=0x%llx\n", f, (unsigned long long)rip, (unsigned long long)cur_rbp);
+
+                        // Frame inside 0x644320..0x64444c (SetTextureProperty)
+                        if (rip >= 0x644320 && rip <= 0x64444c) {
+                            GuestAddr rbx_val = 0;
+                            // In 0x644320: push rbp; push r15; push r14; push r13; push r12; push rbx; sub rsp, 0x78.
+                            // Saved rbx is at cur_rbp - 0x28.
+                            mem.read_value(cur_rbp - 0x28, rbx_val);
+                            std::fprintf(stderr, "    Found SetTextureProperty frame! Saved rbx (PropertyEntry*)=0x%llx\n", (unsigned long long)rbx_val);
+                            if (rbx_val > 0x1000 && mem.is_valid_address(rbx_val, 24)) {
+                                GuestAddr tex_obj = 0;
+                                u32 tex_dim = 0, prop_dim = 0, flag = 0;
+                                mem.read_value(rbx_val + 0x00, tex_obj);
+                                mem.read_value(rbx_val + 0x08, tex_dim);
+                                mem.read_value(rbx_val + 0x0c, prop_dim);
+                                mem.read_value(rbx_val + 0x10, flag);
+                                std::fprintf(stderr, "    PropertyEntry: Texture*=0x%llx, texDim=%u, prop.texDim=%u, flag=%u\n",
+                                             (unsigned long long)tex_obj, tex_dim, prop_dim, flag);
+                                if (tex_obj > 0x1000 && mem.is_valid_address(tex_obj, 256)) {
+                                    std::fprintf(stderr, "    Dumping Texture* object (256 bytes at 0x%llx):\n", (unsigned long long)tex_obj);
+                                    for (int off = 0; off < 256; off += 16) {
+                                        u32 w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+                                        mem.read_value(tex_obj + off + 0, w0);
+                                        mem.read_value(tex_obj + off + 4, w1);
+                                        mem.read_value(tex_obj + off + 8, w2);
+                                        mem.read_value(tex_obj + off + 12, w3);
+                                        std::fprintf(stderr, "      [+0x%02x]: 0x%08x 0x%08x 0x%08x 0x%08x\n", off, w0, w1, w2, w3);
+                                    }
+                                }
+                            }
+                        }
+                        cur_rbp = next_rbp;
+                    }
+                    // Also inspect g_DefaultTextures at 0x1560cf0
+                    if (mem.is_valid_address(0x1560cf0, 128)) {
+                        GuestAddr tex2d_ptr = 0;
+                        mem.read_value(0x1560cf0 + 0x50, tex2d_ptr);
+                        std::fprintf(stderr, "  g_DefaultTextures (0x1560cf0) + 0x50 = 0x%llx\n", (unsigned long long)tex2d_ptr);
+                        if (tex2d_ptr > 0x1000 && mem.is_valid_address(tex2d_ptr, 256)) {
+                            std::fprintf(stderr, "  Dumping Default Texture2D (256 bytes at 0x%llx):\n", (unsigned long long)tex2d_ptr);
+                            for (int off = 0; off < 256; off += 16) {
+                                u32 w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+                                mem.read_value(tex2d_ptr + off + 0, w0);
+                                mem.read_value(tex2d_ptr + off + 4, w1);
+                                mem.read_value(tex2d_ptr + off + 8, w2);
+                                mem.read_value(tex2d_ptr + off + 12, w3);
+                                std::fprintf(stderr, "    [+0x%02x]: 0x%08x 0x%08x 0x%08x 0x%08x\n", off, w0, w1, w2, w3);
+                            }
+                        }
+                    }
+                    std::fprintf(stderr, "========================================================\n\n");
+                }
             }
 
             ctx.rax = formatted.size();

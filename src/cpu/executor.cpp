@@ -29,6 +29,11 @@ std::string_view step_result_to_string(StepResult result) {
 
 namespace {
 
+// VEX.L for the instruction currently being decoded. The 0F38/0F3A handlers
+// sit in a different scope from the VEX prefix parse, so the bit is published
+// at file scope rather than threaded through as a local.
+static bool g_vex_L = false;
+
 inline u64& get_gpr64(CpuContext& ctx, u8 reg_idx) {
     switch (reg_idx & 0x0F) {
         case 0:  return ctx.rax;
@@ -1266,6 +1271,7 @@ StepResult CpuExecutor::step() {
         u8 vex_map = 1;
         bool vex_l = false;
 
+
         if (op0 == 0xC5) {
             if (cursor + 1 >= 15) return StepResult::IllegalInstruction;
             const u8 b1 = raw_code[cursor++];
@@ -1289,6 +1295,7 @@ StepResult CpuExecutor::step() {
         }
 
         if (cursor >= 15) return StepResult::IllegalInstruction;
+        g_vex_L = vex_l;
         const u8 vex_op = raw_code[cursor++];
         const GuestAddr next_ip_base_vex = start_rip + cursor;
 
@@ -2153,6 +2160,47 @@ StepResult CpuExecutor::step() {
         if (op1 == 0x38 && m_memory.is_valid_address(start_rip + cursor, 1)) {
             const u8 op2 = raw_code[cursor++];
             const GuestAddr next_ip_base_0f38 = start_rip + cursor;
+
+            // VEX.66/0F38 broadcast group. mono-ps4's allocator initialises a
+            // 1024-entry bucket table with `vbroadcastsd ymm0, [r14+0xfce8]`
+            // followed by four 32-byte `vmovups`. With the broadcast missing,
+            // ymm0 kept whatever was in it and the table was filled with stale
+            // lanes: the allocator's empty-list guard (bucket head == sentinel)
+            // then never matched and it spun dereferencing a NULL head.
+            //   0x18 VBROADCASTSS   m32  -> 4/8 dwords
+            //   0x19 VBROADCASTSD   m64  -> 2/4 qwords
+            //   0x1A VBROADCASTF128 m128 -> 256-bit duplicate
+            //   0x58 VPBROADCASTD   m32  (integer form of 0x18)
+            //   0x59 VPBROADCASTQ   m64  (integer form of 0x19)
+            if (op2 == 0x18 || op2 == 0x58 || op2 == 0x19 || op2 == 0x59 || op2 == 0x1A) {
+                auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f38,
+                                      rex_r, rex_x, rex_b, seg_override, m_context);
+                if (!m.valid || m.is_reg) return StepResult::IllegalInstruction;
+                const u8 dest = m.reg_id & 15;
+                CpuContext::YmmReg src{};
+                const usize nbytes = (op2 == 0x18 || op2 == 0x58) ? 4
+                                   : (op2 == 0x1A) ? 16 : 8;
+                if (!m_memory.read_bytes(m.mem_addr, src.b, nbytes))
+                    return StepResult::MemoryFault;
+                CpuContext::YmmReg res{};
+                if (op2 == 0x18 || op2 == 0x58) {
+                    const u32 v = static_cast<u32>(src.b[0]) | (static_cast<u32>(src.b[1]) << 8)
+                                | (static_cast<u32>(src.b[2]) << 16) | (static_cast<u32>(src.b[3]) << 24);
+                    const int n = g_vex_L ? 8 : 4;
+                    for (int i = 0; i < n; ++i) res.q[i] = v;
+                } else if (op2 == 0x19 || op2 == 0x59) {
+                    u64 v = 0;
+                    std::memcpy(&v, src.b, 8);
+                    const int n = g_vex_L ? 4 : 2;
+                    for (int i = 0; i < n; ++i) std::memcpy(&res.b[i * 8], &v, 8);
+                } else { // 0x1A VBROADCASTF128
+                    std::memcpy(&res.b[0], src.b, 16);
+                    if (g_vex_L) std::memcpy(&res.b[16], src.b, 16);
+                }
+                m_context.ymm[dest] = res;
+                m_context.rip = start_rip + cursor + m.bytes_consumed;
+                return StepResult::Ok;
+            }
 
             // 0x0F 0x38 0xF0: MOVBE reg, m
             if (op2 == 0xF0) {

@@ -361,6 +361,7 @@ int main(int argc, char* argv[]) {
     ps4::dump_rip_histogram();
     ps4::dump_hle_histogram();
     ps4::dump_export_tables();
+    ps4::dump_prx_calls();
     if (enable_jit && jit.cached_block_count() > 0) {
         std::cout << "[CPU] JIT Blocks Cached: " << jit.cached_block_count()
                   << " | Total Invocations: " << jit.total_invocations() << "\n";

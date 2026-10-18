@@ -17,6 +17,9 @@ namespace ps4 {
 // dispatcher below. Keyed by NID; the name is filled in on first sight.
 struct HleCounts { u64 registered = 0; u64 fallback = 0; };
 static std::map<std::string, HleCounts> g_hle_hist;
+// Per-NID call counts for trampolines that route into a loaded PRX export.
+static std::map<Nid, u64> g_prx_call_count;
+static u64 g_prx_total = 0;
 
 // "mono-ps4+0x120ed0" style attribution for a raw guest address, or "?" when no
 // loaded module contains it. Used by diagnostics that must not assume module
@@ -51,6 +54,20 @@ static const bool s_dump_exports = [] {
     const char* v = std::getenv("PS4_DUMP_EXPORTS");
     return v && *v && std::string_view(v) != "0";
 }();
+
+void dump_prx_calls() {
+    if (g_prx_call_count.empty()) return;
+    std::vector<std::pair<u64, Nid>> v;
+    u64 tot = 0;
+    for (const auto& e : g_prx_call_count) { v.emplace_back(e.second, e.first); tot += e.second; }
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "[PRX CALL] distinct=%zu total_calls=%llu\n", v.size(),
+                 (unsigned long long)tot);
+    const usize show = v.size() < 40 ? v.size() : 40;
+    for (usize i = 0; i < show; ++i)
+        std::fprintf(stderr, "[PRX CALL] %10llu  NID=0x%016llx\n",
+                     (unsigned long long)v[i].first, (unsigned long long)v[i].second);
+}
 
 void dump_hle_histogram() {
     if (g_hle_hist.empty()) return;
@@ -214,6 +231,23 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             // already points past the `syscall`, so the stub's `ret` never runs.
             if (sctx.cpu != nullptr) {
                 sctx.cpu->rip = exported;
+            }
+            // PRX export call tracking: which loaded-module entry points the
+            // guest actually reaches, and with what arguments.
+            {
+                GuestAddr caller = 0;
+                m_memory.read_value(sctx.rsp, caller);
+                const u64 cnt = ++g_prx_call_count[nid];
+                if (cnt <= 50) {
+                    std::fprintf(stderr,
+                        "[PRX CALL] %s -> 0x%llx (rdi=0x%llx rsi=0x%llx rdx=0x%llx) "
+                        "caller=0x%llx count=%llu\n",
+                        nid >= 0x100000000ull ? "" : "?", (unsigned long long)exported,
+                        (unsigned long long)sctx.args[0], (unsigned long long)sctx.args[1],
+                        (unsigned long long)sctx.args[2], (unsigned long long)caller,
+                        (unsigned long long)cnt);
+                }
+                ++g_prx_total;
             }
             return SCE_OK;
         }

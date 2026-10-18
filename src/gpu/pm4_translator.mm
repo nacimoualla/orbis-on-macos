@@ -87,10 +87,28 @@ struct Pm4Translator::Impl {
     u32 ps_texture_width{0};
     u32 ps_texture_height{0};
     u32 ps_texture_format{0};
+    u32 ps_texture_w0{0};
+    u32 ps_texture_w1{0};
+    u32 ps_texture_w2{0};
+    u32 ps_texture_w3{0};
+    bool ps_texture_has_nonzero{false};
+    usize ps_texture_nonzero_bytes{0};
+    std::string ps_texture_status{"none"};
+
+    u32 vs_user_sgprs[16]{};
+    GuestAddr last_idx_addr{0};
+    u32 last_idx_count{0};
 
     void init_mesh_pipeline();
     MeshUniforms compute_uniforms();
     id<MTLTexture> prepare_texture(id<MTLDevice> device);
+    void log_draw_diagnostics(const char* draw_type, u32 count,
+                              const MeshUniforms& uniforms,
+                              id<MTLTexture> active_tex,
+                              bool use_guest_vtx,
+                              const void* vtx_data,
+                              usize vtx_stride,
+                              u32 num_vtx);
     bool render_indexed_mesh(GuestAddr idx_addr, u32 idx_count, PrimitiveType prim_type,
                              MTLIndexType idx_type = MTLIndexTypeUInt16,
                              i32 base_vertex = 0, u32 instance_count = 1);
@@ -294,19 +312,28 @@ MeshUniforms Pm4Translator::Impl::compute_uniforms() {
 }
 
 id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
-    if (!device || !memory) return default_white_texture;
+    if (!device || !memory) {
+        ps_texture_status = "hit white fallback (no device or memory manager)";
+        return default_white_texture;
+    }
     if (ps_texture_base <= 0x1000 || ps_texture_width == 0 || ps_texture_height == 0 ||
         ps_texture_width > 4096 || ps_texture_height > 4096) {
+        ps_texture_status = "hit white fallback (invalid base 0x" + std::to_string(ps_texture_base) + " or dim " +
+                            std::to_string(ps_texture_width) + "x" + std::to_string(ps_texture_height) + ")";
         return default_white_texture;
     }
 
     const usize byte_size = static_cast<usize>(ps_texture_width) * ps_texture_height * 4;
     if (!memory->is_valid_address(ps_texture_base, byte_size)) {
+        ps_texture_status = "hit white fallback (invalid memory range for 0x" + std::to_string(ps_texture_base) + ")";
         return default_white_texture;
     }
 
     const void* host_pixels = memory->to_host_ptr<void>(ps_texture_base);
-    if (!host_pixels) return default_white_texture;
+    if (!host_pixels) {
+        ps_texture_status = "hit white fallback (null host pointer)";
+        return default_white_texture;
+    }
 
     if (!active_metal_texture ||
         active_metal_texture.width != ps_texture_width ||
@@ -320,21 +347,26 @@ id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
     }
 
     const u8* u8_ptr = static_cast<const u8*>(host_pixels);
-    bool has_nonzero = false;
+    usize nonzero_count = 0;
     const usize check_len = std::min<usize>(byte_size, 512);
     for (usize k = 0; k < check_len; ++k) {
         if (u8_ptr[k] != 0) {
-            has_nonzero = true;
-            break;
+            nonzero_count++;
         }
     }
+    ps_texture_has_nonzero = (nonzero_count > 0);
+    ps_texture_nonzero_bytes = nonzero_count;
 
-    if (has_nonzero) {
+    if (ps_texture_has_nonzero) {
+        ps_texture_status = "loaded real non-zero texels (" + std::to_string(nonzero_count) + "/" +
+                            std::to_string(check_len) + " non-zero bytes checked in guest memory)";
         [active_metal_texture replaceRegion:MTLRegionMake2D(0, 0, ps_texture_width, ps_texture_height)
                                 mipmapLevel:0
                                   withBytes:host_pixels
                                 bytesPerRow:ps_texture_width * 4];
     } else {
+        ps_texture_status = "hit white fallback (all 0x00 bytes in guest memory across " +
+                            std::to_string(check_len) + " bytes checked)";
         std::vector<u32> white_data(ps_texture_width * ps_texture_height, 0xFFFFFFFF);
         [active_metal_texture replaceRegion:MTLRegionMake2D(0, 0, ps_texture_width, ps_texture_height)
                                 mipmapLevel:0
@@ -345,8 +377,314 @@ id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
     return active_metal_texture;
 }
 
+static std::string decode_gcn_instruction(u32 dw0, u32 dw1, bool& is_64bit) {
+    is_64bit = false;
+    char b[128];
+    // SOPP (0xBF800000..0xBFFFFFFF)
+    if ((dw0 & 0xFF800000) == 0xBF800000) {
+        u32 op = (dw0 >> 16) & 0x7F;
+        u32 simm = dw0 & 0xFFFF;
+        if (op == 0x00) std::snprintf(b, sizeof(b), "s_nop 0x%04x", simm);
+        else if (op == 0x01) std::snprintf(b, sizeof(b), "s_endpgm");
+        else if (op == 0x0C) std::snprintf(b, sizeof(b), "s_waitcnt vmcnt(%u) expcnt(%u) lgkmcnt(%u)", simm & 0xF, (simm>>4)&7, (simm>>8)&0x1F);
+        else std::snprintf(b, sizeof(b), "s_sopp [op=0x%02x, simm=0x%04x]", op, simm);
+        return b;
+    }
+    // SOP1 (0xBE800000..0xBEFFFFFF)
+    if ((dw0 & 0xFF800000) == 0xBE800000) {
+        u32 sdst = (dw0 >> 16) & 0x7F;
+        u32 op = (dw0 >> 8) & 0xFF;
+        u32 ssrc0 = dw0 & 0xFF;
+        if (op == 0x00) std::snprintf(b, sizeof(b), "s_mov_b32 s%u, s%u", sdst, ssrc0);
+        else if (op == 0x01) std::snprintf(b, sizeof(b), "s_mov_b64 s[%u:%u], s[%u:%u]", sdst, sdst+1, ssrc0, ssrc0+1);
+        else if (op == 0x21 || op == 0x22) std::snprintf(b, sizeof(b), "s_swappc_b64 s[%u:%u], s[%u:%u]", sdst, sdst+1, ssrc0, ssrc0+1);
+        else std::snprintf(b, sizeof(b), "s_sop1 [op=0x%02x] s%u, s%u", op, sdst, ssrc0);
+        return b;
+    }
+    // SOPK (0xB0000000..0xB7FFFFFF)
+    if ((dw0 & 0xF8000000) == 0xB0000000) {
+        u32 op = (dw0 >> 23) & 0x1F;
+        u32 sdst = (dw0 >> 16) & 0x7F;
+        u32 simm = dw0 & 0xFFFF;
+        std::snprintf(b, sizeof(b), "s_sopk [op=0x%02x] s%u, 0x%04x", op, sdst, simm);
+        return b;
+    }
+    // SOP2 (0x80000000..0xAFFFFFFF)
+    if ((dw0 & 0xC0000000) == 0x80000000) {
+        u32 op = (dw0 >> 23) & 0x7F;
+        u32 sdst = (dw0 >> 16) & 0x7F;
+        u32 ssrc1 = (dw0 >> 8) & 0xFF;
+        u32 ssrc0 = dw0 & 0xFF;
+        std::snprintf(b, sizeof(b), "s_sop2 [op=0x%02x] s%u, s%u, s%u", op, sdst, ssrc0, ssrc1);
+        return b;
+    }
+    // SMEM (0xC0000000..0xC7FFFFFF)
+    if ((dw0 & 0xFC000000) == 0xC0000000) {
+        u32 op = (dw0 >> 21) & 0x1F;
+        u32 imm = (dw0 >> 19) & 0x1;
+        u32 sdst = (dw0 >> 12) & 0x7F;
+        u32 sbase = ((dw0 >> 6) & 0x3F) * 2;
+        u32 offset = dw0 & 0x3F;
+        const char* name = "s_smem";
+        if (op == 0x00) name = "s_load_dword";
+        else if (op == 0x01) name = "s_load_dwordx2";
+        else if (op == 0x02) name = "s_load_dwordx4";
+        else if (op == 0x08) name = "s_buffer_load_dword";
+        else if (op == 0x09) name = "s_buffer_load_dwordx2";
+        else if (op == 0x0A || op == 0x18 || op == 0x19) name = "s_buffer_load_dwordx4";
+        std::snprintf(b, sizeof(b), "%s s[%u..], s[%u..], %s0x%x", name, sdst, sbase, imm ? "imm:" : "offset:", offset);
+        return b;
+    }
+    // MUBUF (0xE0000000..0xE7FFFFFF, 64-bit)
+    if ((dw0 & 0xFC000000) == 0xE0000000) {
+        is_64bit = true;
+        u32 op = (dw0 >> 19) & 0x7F;
+        u32 offset = dw0 & 0xFFF;
+        u32 vdata = (dw1 >> 8) & 0xFF;
+        u32 vaddr = dw1 & 0xFF;
+        u32 srsrc = ((dw1 >> 18) & 0x3F) * 4;
+        u32 soffset = (dw1 >> 24) & 0xFF;
+        const char* name = "buffer_load";
+        if (op == 0x00) name = "buffer_load_format_x";
+        else if (op == 0x01) name = "buffer_load_format_xy";
+        else if (op == 0x02) name = "buffer_load_format_xyz";
+        else if (op == 0x03) name = "buffer_load_format_xyzw";
+        else if (op == 0x0C) name = "buffer_load_dword";
+        else if (op == 0x0F) name = "buffer_load_dwordx4";
+        std::snprintf(b, sizeof(b), "%s v[%u..], v%u, s[%u:%u], s%u offen off:0x%x", name, vdata, vaddr, srsrc, srsrc+3, soffset, offset);
+        return b;
+    }
+    // VOP1 (0x7E000000..0x7FFFFFFF)
+    if ((dw0 & 0xFE000000) == 0x7E000000) {
+        u32 vdst = (dw0 >> 17) & 0xFF;
+        u32 op = (dw0 >> 9) & 0xFF;
+        u32 src0 = dw0 & 0x1FF;
+        if (op == 0x01) std::snprintf(b, sizeof(b), "v_mov_b32 v%u, 0x%x", vdst, src0);
+        else std::snprintf(b, sizeof(b), "v_vop1 [op=0x%02x] v%u, 0x%x", op, vdst, src0);
+        return b;
+    }
+    // VOP2 (bit 31 = 0)
+    if ((dw0 & 0x80000000) == 0) {
+        u32 op = (dw0 >> 25) & 0x3F;
+        u32 vdst = (dw0 >> 17) & 0xFF;
+        u32 vsrc1 = (dw0 >> 9) & 0xFF;
+        u32 src0 = dw0 & 0x1FF;
+        const char* name = "v_vop2";
+        if (op == 0x03) name = "v_add_f32";
+        else if (op == 0x04) name = "v_sub_f32";
+        else if (op == 0x08) name = "v_mul_f32";
+        else if (op == 0x13) name = "v_mac_f32";
+        else if (op == 0x19) name = "v_add_i32";
+        else if (op == 0x1B) name = "v_lshlrev_b32";
+        std::snprintf(b, sizeof(b), "%s v%u, 0x%x, v%u", name, vdst, src0, vsrc1);
+        return b;
+    }
+    // VOP3 (0xD0000000..0xD3FFFFFF, 64-bit)
+    if ((dw0 & 0xFC000000) == 0xD0000000) {
+        is_64bit = true;
+        u32 op = (dw0 >> 17) & 0x1FF;
+        u32 vdst = dw0 & 0xFF;
+        const char* name = "v_vop3";
+        if (op == 0x140) name = "v_mad_f32";
+        else if (op == 0x156) name = "v_fma_f32";
+        std::snprintf(b, sizeof(b), "%s v%u, ... [op=0x%03x]", name, vdst, op);
+        return b;
+    }
+    std::snprintf(b, sizeof(b), "raw_dw (0x%08x)", dw0);
+    return b;
+}
+
+static void print_gcn_disassembly(MemoryManager* mem, GuestAddr addr, u32 max_insns, const char* prefix) {
+    if (!mem || addr < 0x1000) return;
+    u32 insn_cnt = 0;
+    u32 dw_offset = 0;
+    while (insn_cnt < max_insns && dw_offset < 100) {
+        const GuestAddr cur_addr = addr + dw_offset * 4;
+        if (!mem->is_valid_address(cur_addr, 8)) break;
+        u32 dw0 = 0, dw1 = 0;
+        mem->read_value(cur_addr, dw0);
+        mem->read_value(cur_addr + 4, dw1);
+        bool is_64 = false;
+        std::string dis = decode_gcn_instruction(dw0, dw1, is_64);
+        if (is_64) {
+            std::fprintf(stderr, "%s  [0x%llx] %08x %08x: %s\n", prefix, (unsigned long long)cur_addr, dw0, dw1, dis.c_str());
+            dw_offset += 2;
+        } else {
+            std::fprintf(stderr, "%s  [0x%llx] %08x:          %s\n", prefix, (unsigned long long)cur_addr, dw0, dis.c_str());
+            dw_offset += 1;
+        }
+        insn_cnt++;
+        if (dw0 == 0xbf810000) break; // s_endpgm
+    }
+}
+
+void Pm4Translator::Impl::log_draw_diagnostics(const char* draw_type, u32 count,
+                                               const MeshUniforms& uniforms,
+                                               id<MTLTexture> active_tex,
+                                               bool use_guest_vtx,
+                                               const void* vtx_data,
+                                               usize vtx_stride,
+                                               u32 num_vtx) {
+    (void)active_tex;
+    const u32 cur_draw = static_cast<u32>(draw_count + 1);
+    std::fprintf(stderr, "\n=== [DIAGNOSTIC DUMP] Draw #%u (%s, count=%u) ===\n", cur_draw, draw_type, count);
+    std::fprintf(stderr, "  Shaders:\n");
+    std::fprintf(stderr, "    VS ISA: 0x%llx (PGM_LO=0x%08x)\n", (unsigned long long)vs_shader_addr, vs_pgm_lo);
+    std::fprintf(stderr, "    PS ISA: 0x%llx (PGM_LO=0x%08x)\n", (unsigned long long)ps_shader_addr, ps_pgm_lo);
+
+    std::fprintf(stderr, "  VS User SGPRs (s[0..15]):\n");
+    for (int s = 0; s < 16; ++s) {
+        std::fprintf(stderr, "    s%02d: 0x%08x%s", s, vs_user_sgprs[s], (s % 4 == 3) ? "\n" : "  ");
+    }
+    const u64 fetch_shader_addr = (static_cast<u64>(vs_user_sgprs[1]) << 32) | vs_user_sgprs[0];
+    const u64 v_table_addr = (static_cast<u64>(vs_user_sgprs[3]) << 32) | vs_user_sgprs[2];
+    std::fprintf(stderr, "    s[0..1] Fetch Shader Addr:  0x%llx\n", (unsigned long long)fetch_shader_addr);
+    std::fprintf(stderr, "    s[2..3] V# Table Addr:      0x%llx\n", (unsigned long long)v_table_addr);
+
+    if (memory && vs_shader_addr > 0x1000) {
+        std::fprintf(stderr, "  Disassembly of VS Main Shader (0x%llx):\n", (unsigned long long)vs_shader_addr);
+        print_gcn_disassembly(memory, vs_shader_addr, 30, "   ");
+    }
+    if (memory && fetch_shader_addr > 0x1000) {
+        std::fprintf(stderr, "  Disassembly of VS Fetch Shader (0x%llx):\n", (unsigned long long)fetch_shader_addr);
+        print_gcn_disassembly(memory, fetch_shader_addr, 20, "   ");
+    }
+
+    if (memory && v_table_addr > 0x1000 && memory->is_valid_address(v_table_addr, 128)) {
+        std::fprintf(stderr, "  V# Descriptor Table (at 0x%llx):\n", (unsigned long long)v_table_addr);
+        for (int desc = 0; desc < 8; ++desc) {
+            u32 d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            memory->read_value(v_table_addr + desc * 16 + 0, d0);
+            memory->read_value(v_table_addr + desc * 16 + 4, d1);
+            memory->read_value(v_table_addr + desc * 16 + 8, d2);
+            memory->read_value(v_table_addr + desc * 16 + 12, d3);
+            const u64 base = (static_cast<u64>(d1 & 0xFFFF) << 32) | d0;
+            const u32 stride = (d1 >> 16) & 0x3FFF;
+            const u32 num_recs = d2;
+            const u32 dfmt = (d3 >> 20) & 0x3F;
+            const u32 nfmt = (d3 >> 26) & 0xF;
+            std::fprintf(stderr, "    V#%d: raw=[0x%08x 0x%08x 0x%08x 0x%08x] base=0x%llx stride=%u recs=%u dfmt=%u nfmt=%u\n",
+                         desc, d0, d1, d2, d3, (unsigned long long)base, stride, num_recs, dfmt, nfmt);
+            if (base > 0x1000 && num_recs > 0 && stride > 0) {
+                const u32 dump_cnt = std::min<u32>(num_recs, 4);
+                for (u32 r = 0; r < dump_cnt; ++r) {
+                    const GuestAddr rec_addr = base + r * stride;
+                    if (memory->is_valid_address(rec_addr, stride)) {
+                        std::vector<float> f(stride / sizeof(float));
+                        memory->read_bytes(rec_addr, f.data(), f.size() * sizeof(float));
+                        std::string f_str;
+                        for (usize fi = 0; fi < f.size(); ++fi) {
+                            char b[32];
+                            std::snprintf(b, sizeof(b), "%.3f ", f[fi]);
+                            f_str += b;
+                        }
+                        std::fprintf(stderr, "      rec[%u]: [ %s]\n", r, f_str.c_str());
+                    }
+                }
+            }
+        }
+    }
+
+    if (last_idx_addr > 0x1000 && memory && memory->is_valid_address(last_idx_addr, 12)) {
+        u16 idx[6] = {0};
+        memory->read_bytes(last_idx_addr, idx, sizeof(idx));
+        std::fprintf(stderr, "  Draw #2 Index Buffer (at 0x%llx, 6 indices): [%u, %u, %u, %u, %u, %u]\n",
+                     (unsigned long long)last_idx_addr, idx[0], idx[1], idx[2], idx[3], idx[4], idx[5]);
+    }
+
+    const GuestAddr cb_addr = vs_user_sgpr_buffers.count(12) ? vs_user_sgpr_buffers[12].base_addr : 0x2454cb80;
+    if (cb_addr > 0x1000 && memory && memory->is_valid_address(cb_addr, 336)) {
+        std::fprintf(stderr, "  Constant Buffer s[12..15] (at 0x%llx, 21 rows):\n", (unsigned long long)cb_addr);
+        for (int r = 0; r <= 20; ++r) {
+            float flts[4] = {0};
+            u32 hx[4] = {0};
+            memory->read_bytes(cb_addr + r * 16, flts, 16);
+            memory->read_bytes(cb_addr + r * 16, hx, 16);
+            std::fprintf(stderr, "    r%02d (off %3d): flt=[%9.3f, %9.3f, %9.3f, %9.3f] | hex=[0x%08x, 0x%08x, 0x%08x, 0x%08x]\n",
+                         r, r * 16, flts[0], flts[1], flts[2], flts[3], hx[0], hx[1], hx[2], hx[3]);
+        }
+    }
+
+    if (ps_texture_w0 != 0 || ps_texture_base != 0) {
+        const u32 dfmt_14 = (ps_texture_w1 >> 14) & 0x3F;
+        const u32 dfmt_20 = (ps_texture_w1 >> 20) & 0x3F;
+        const u32 nfmt_20 = (ps_texture_w1 >> 20) & 0xF;
+        const u32 nfmt_24 = (ps_texture_w1 >> 24) & 0xF;
+        const u32 tiling_idx = (ps_texture_w3 >> 21) & 0x1F;
+        std::fprintf(stderr, "  Decoded T# Texture Descriptor:\n");
+        std::fprintf(stderr, "    base_addr:  0x%llx\n", (unsigned long long)ps_texture_base);
+        std::fprintf(stderr, "    dimensions: %ux%u\n", ps_texture_width, ps_texture_height);
+        std::fprintf(stderr, "    dfmt:       %u (bits 19:14), %u (bits 25:20)\n", dfmt_14, dfmt_20);
+        std::fprintf(stderr, "    nfmt:       %u (bits 23:20), %u (bits 27:24)\n", nfmt_20, nfmt_24);
+        std::fprintf(stderr, "    tiling_idx: %u (bits 25:21)\n", tiling_idx);
+        std::fprintf(stderr, "    raw DWORDs: [w0=0x%08x, w1=0x%08x, w2=0x%08x, w3=0x%08x]\n",
+                     ps_texture_w0, ps_texture_w1, ps_texture_w2, ps_texture_w3);
+        std::fprintf(stderr, "    prepare_texture: %s\n", ps_texture_status.c_str());
+    } else {
+        std::fprintf(stderr, "  Decoded T# Texture Descriptor: None (prepare_texture: %s)\n", ps_texture_status.c_str());
+    }
+
+    std::fprintf(stderr, "  Uniforms & MVP Matrix:\n");
+    std::fprintf(stderr, "    use_texture: %u\n", uniforms.use_texture);
+    std::fprintf(stderr, "    tint_color:  (%.3f, %.3f, %.3f, %.3f)\n",
+                 uniforms.tint_color.x, uniforms.tint_color.y, uniforms.tint_color.z, uniforms.tint_color.w);
+    std::fprintf(stderr, "    uv_scale_off:(%.3f, %.3f, %.3f, %.3f)\n",
+                 uniforms.uv_scale_offset.x, uniforms.uv_scale_offset.y, uniforms.uv_scale_offset.z, uniforms.uv_scale_offset.w);
+    std::fprintf(stderr, "    Scale:       (%.4f, %.4f, %.4f)\n",
+                 uniforms.mvp.columns[0].x, uniforms.mvp.columns[1].y, uniforms.mvp.columns[2].z);
+    std::fprintf(stderr, "    Translation: (%.4f, %.4f, %.4f)\n",
+                 uniforms.mvp.columns[3].x, uniforms.mvp.columns[3].y, uniforms.mvp.columns[3].z);
+    std::fprintf(stderr, "    MVP 4x4:\n");
+    std::fprintf(stderr, "      Row 0: [%8.4f, %8.4f, %8.4f, %8.4f]\n",
+                 uniforms.mvp.columns[0].x, uniforms.mvp.columns[1].x, uniforms.mvp.columns[2].x, uniforms.mvp.columns[3].x);
+    std::fprintf(stderr, "      Row 1: [%8.4f, %8.4f, %8.4f, %8.4f]\n",
+                 uniforms.mvp.columns[0].y, uniforms.mvp.columns[1].y, uniforms.mvp.columns[2].y, uniforms.mvp.columns[3].y);
+    std::fprintf(stderr, "      Row 2: [%8.4f, %8.4f, %8.4f, %8.4f]\n",
+                 uniforms.mvp.columns[0].z, uniforms.mvp.columns[1].z, uniforms.mvp.columns[2].z, uniforms.mvp.columns[3].z);
+    std::fprintf(stderr, "      Row 3: [%8.4f, %8.4f, %8.4f, %8.4f]\n",
+                 uniforms.mvp.columns[0].w, uniforms.mvp.columns[1].w, uniforms.mvp.columns[2].w, uniforms.mvp.columns[3].w);
+
+    std::fprintf(stderr, "  Vertices & NDC Positions (num_vtx=%u, guest_vtx=%s):\n",
+                 num_vtx, use_guest_vtx ? "YES" : "NO");
+    const u8* vptr = static_cast<const u8*>(vtx_data);
+    for (u32 k = 0; k < num_vtx; ++k) {
+        float vx = 0.0f, vy = 0.0f, vz = 0.0f;
+        if (vptr) {
+            const float* fp = reinterpret_cast<const float*>(vptr + k * vtx_stride);
+            vx = fp[0];
+            vy = fp[1];
+            vz = fp[2];
+        }
+        simd_float4 local_pos = simd_make_float4(vx, vy, vz, 1.0f);
+        simd_float4 clip_pos = simd_mul(uniforms.mvp, local_pos);
+        simd_float4 ndc = (clip_pos.w != 0.0f) ? (clip_pos / clip_pos.w) : clip_pos;
+        const bool clipped = (ndc.x < -1.0f || ndc.x > 1.0f || ndc.y < -1.0f || ndc.y > 1.0f || ndc.z < 0.0f || ndc.z > 1.0f);
+        std::fprintf(stderr, "    V%u: local=[%6.2f, %6.2f, %6.2f] -> clip=[%8.3f, %8.3f, %8.3f, %8.3f] -> NDC=[%8.3f, %8.3f, %8.3f] %s\n",
+                     k, vx, vy, vz,
+                     clip_pos.x, clip_pos.y, clip_pos.z, clip_pos.w,
+                     ndc.x, ndc.y, ndc.z,
+                     clipped ? "[CLIPPED OUTSIDE FRUSTUM]" : "[VISIBLE IN FRUSTUM]");
+    }
+
+    if (metal) {
+        u8 cr = 0, cg = 0, cb = 0, ca = 0;
+        metal->read_pixel(960, 540, cr, cg, cb, ca);
+        u8 tr = 0, tg = 0, tb = 0, ta = 0;
+        metal->read_pixel(960, 200, tr, tg, tb, ta);
+        u8 br = 0, bg = 0, bb = 0, ba = 0;
+        metal->read_pixel(960, 900, br, bg, bb, ba);
+        std::fprintf(stderr, "  Framebuffer Pixel Readback:\n");
+        std::fprintf(stderr, "    Center(960, 540): RGBA(%3u, %3u, %3u, %3u) [hex #%02x%02x%02x%02x]\n", cr, cg, cb, ca, cr, cg, cb, ca);
+        std::fprintf(stderr, "    Top   (960, 200): RGBA(%3u, %3u, %3u, %3u) [hex #%02x%02x%02x%02x]\n", tr, tg, tb, ta, tr, tg, tb, ta);
+        std::fprintf(stderr, "    Bottom(960, 900): RGBA(%3u, %3u, %3u, %3u) [hex #%02x%02x%02x%02x]\n", br, bg, bb, ba, br, bg, bb, ba);
+    }
+    std::fprintf(stderr, "========================================================\n\n");
+}
+
 bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count, PrimitiveType prim_type,
                                               MTLIndexType idx_type, i32 base_vertex, u32 instance_count) {
+    last_idx_addr = idx_addr;
+    last_idx_count = idx_count;
     if (idx_count == 0) return true;
 
     if (!metal || !metal->is_initialized()) {
@@ -399,7 +737,7 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         uniforms.use_texture = (active_tex != default_white_texture) ? 1 : 0;
 
         bool use_guest_vtx = false;
-        if (vertex_buffer_addr != 0 && stride >= sizeof(Vertex3D) &&
+        if (vertex_buffer_addr != 0 && vertex_buffer_size > 0 && stride >= sizeof(Vertex3D) &&
             memory && memory->is_valid_address(vertex_buffer_addr, required_vtx_size)) {
             const void* vtx_check = memory->to_host_ptr<void>(vertex_buffer_addr);
             if (vtx_check) {
@@ -414,19 +752,20 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
             }
         }
 
+        // Canonical unit quad for indexed draws (indices 0, 2, 1, 1, 2, 3)
+        const MeshVertex s_default_quad[4] = {
+            {{-0.5f,  0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}, // TL
+            {{ 0.5f,  0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}, // TR
+            {{-0.5f, -0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.0f, 0.0f}}, // BL
+            {{ 0.5f, -0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 0.0f}}, // BR
+        };
+
         id<MTLBuffer> vtx_buf = nil;
         if (use_guest_vtx) {
             const void* vtx_ptr = memory->to_host_ptr<void>(vertex_buffer_addr);
             vtx_buf = [device newBufferWithBytes:vtx_ptr length:required_vtx_size options:MTLResourceStorageModeShared];
             uniforms.vertex_stride = stride;
         } else {
-            // Canonical unit quad for indexed draws (indices 0, 2, 1, 1, 2, 3)
-            const MeshVertex s_default_quad[4] = {
-                {{-0.5f,  0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}, // TL
-                {{ 0.5f,  0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}, // TR
-                {{-0.5f, -0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.0f, 0.0f}}, // BL
-                {{ 0.5f, -0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 0.0f}}, // BR
-            };
             vtx_buf = [device newBufferWithBytes:s_default_quad length:sizeof(s_default_quad) options:MTLResourceStorageModeShared];
             uniforms.vertex_stride = sizeof(MeshVertex);
         }
@@ -509,6 +848,11 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         [cmd commit];
         [cmd waitUntilCompleted];
 
+        log_draw_diagnostics("IT_DRAW_INDEX_2", idx_count, uniforms, active_tex, use_guest_vtx,
+                             use_guest_vtx ? memory->to_host_ptr<void>(vertex_buffer_addr) : s_default_quad,
+                             use_guest_vtx ? stride : sizeof(MeshVertex),
+                             use_guest_vtx ? std::min<u32>(static_cast<u32>(effective_vtx_count), 4) : 4);
+
         draw_count++;
         indexed_draw_count++;
         return true;
@@ -545,7 +889,7 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         u32 actual_vtx_count = vtx_count;
 
         bool use_guest_vtx = false;
-        if (vertex_buffer_addr != 0 && stride >= sizeof(Vertex3D) &&
+        if (vertex_buffer_addr != 0 && vertex_buffer_size > 0 && stride >= sizeof(Vertex3D) &&
             memory && memory->is_valid_address(vertex_buffer_addr, required_vtx_size)) {
             const void* vtx_check = memory->to_host_ptr<void>(vertex_buffer_addr);
             if (vtx_check) {
@@ -560,6 +904,28 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
             }
         }
 
+        const void* diag_vtx_ptr = nullptr;
+        usize diag_vtx_stride = sizeof(MeshVertex);
+        u32 diag_vtx_num = 0;
+
+        const float bg_r = (clear_color.a > 0.0f && (clear_color.r > 0 || clear_color.g > 0 || clear_color.b > 0)) ? clear_color.r : 0.40f;
+        const float bg_g = (clear_color.a > 0.0f && (clear_color.r > 0 || clear_color.g > 0 || clear_color.b > 0)) ? clear_color.g : 0.75f;
+        const float bg_b = (clear_color.a > 0.0f && (clear_color.r > 0 || clear_color.g > 0 || clear_color.b > 0)) ? clear_color.b : 0.85f;
+        const MeshVertex s_fullscreen_tri[3] = {
+            {{-1.0f, -1.0f, 0.0f}, {bg_r, bg_g, bg_b, 1.0f}, {0.0f, 0.0f}},
+            {{ 3.0f, -1.0f, 0.0f}, {bg_r, bg_g, bg_b, 1.0f}, {2.0f, 0.0f}},
+            {{-1.0f,  3.0f, 0.0f}, {bg_r, bg_g, bg_b, 1.0f}, {0.0f, 2.0f}},
+        };
+
+        const MeshVertex s_quad[4] = {
+            {{-0.5f,  0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}},
+            {{ 0.5f,  0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
+            {{-0.5f, -0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.0f, 0.0f}},
+            {{ 0.5f, -0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 0.0f}},
+        };
+
+        std::vector<MeshVertex> generic;
+
         if (use_guest_vtx) {
             const void* vtx_ptr = memory->to_host_ptr<void>(vertex_buffer_addr);
             vtx_buf = [device newBufferWithBytes:vtx_ptr length:required_vtx_size options:MTLResourceStorageModeShared];
@@ -572,38 +938,33 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
                 mtl_prim = MTLPrimitiveTypePoint;
             }
             actual_vtx_count = vtx_count;
+            diag_vtx_ptr = vtx_ptr;
+            diag_vtx_stride = stride;
+            diag_vtx_num = std::min<u32>(actual_vtx_count, 4);
         } else {
             if (vtx_count == 3) {
                 // Fullscreen background triangle
-                const float bg_r = (clear_color.a > 0.0f && (clear_color.r > 0 || clear_color.g > 0 || clear_color.b > 0)) ? clear_color.r : 0.40f;
-                const float bg_g = (clear_color.a > 0.0f && (clear_color.r > 0 || clear_color.g > 0 || clear_color.b > 0)) ? clear_color.g : 0.75f;
-                const float bg_b = (clear_color.a > 0.0f && (clear_color.r > 0 || clear_color.g > 0 || clear_color.b > 0)) ? clear_color.b : 0.85f;
-                const MeshVertex s_fullscreen_tri[3] = {
-                    {{-1.0f, -1.0f, 0.0f}, {bg_r, bg_g, bg_b, 1.0f}, {0.0f, 0.0f}},
-                    {{ 3.0f, -1.0f, 0.0f}, {bg_r, bg_g, bg_b, 1.0f}, {2.0f, 0.0f}},
-                    {{-1.0f,  3.0f, 0.0f}, {bg_r, bg_g, bg_b, 1.0f}, {0.0f, 2.0f}},
-                };
                 vtx_buf = [device newBufferWithBytes:s_fullscreen_tri length:sizeof(s_fullscreen_tri) options:MTLResourceStorageModeShared];
                 uniforms.vertex_stride = sizeof(MeshVertex);
                 uniforms.mvp = matrix_identity_float4x4;
                 uniforms.use_texture = 0;
                 mtl_prim = MTLPrimitiveTypeTriangle;
                 actual_vtx_count = 3;
+                diag_vtx_ptr = s_fullscreen_tri;
+                diag_vtx_stride = sizeof(MeshVertex);
+                diag_vtx_num = 3;
             } else if (vtx_count == 4) {
                 // Canonical unit quad in TriangleStrip order (0: TL, 1: TR, 2: BL, 3: BR)
                 // Transformed by uniforms.mvp (ModelView * Projection)
-                const MeshVertex s_quad[4] = {
-                    {{-0.5f,  0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}},
-                    {{ 0.5f,  0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
-                    {{-0.5f, -0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.0f, 0.0f}},
-                    {{ 0.5f, -0.5f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 0.0f}},
-                };
                 vtx_buf = [device newBufferWithBytes:s_quad length:sizeof(s_quad) options:MTLResourceStorageModeShared];
                 uniforms.vertex_stride = sizeof(MeshVertex);
                 mtl_prim = MTLPrimitiveTypeTriangleStrip;
                 actual_vtx_count = 4;
+                diag_vtx_ptr = s_quad;
+                diag_vtx_stride = sizeof(MeshVertex);
+                diag_vtx_num = 4;
             } else {
-                std::vector<MeshVertex> generic(vtx_count);
+                generic.resize(vtx_count);
                 for (u32 i = 0; i < vtx_count; ++i) {
                     generic[i] = {{0.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.0f, 0.0f}};
                 }
@@ -611,6 +972,9 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
                 uniforms.vertex_stride = sizeof(MeshVertex);
                 mtl_prim = (prim_type == PrimitiveType::TriangleStrip) ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle;
                 actual_vtx_count = vtx_count;
+                diag_vtx_ptr = generic.data();
+                diag_vtx_stride = sizeof(MeshVertex);
+                diag_vtx_num = std::min<u32>(vtx_count, 4);
             }
         }
 
@@ -677,6 +1041,9 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         [cmd commit];
         [cmd waitUntilCompleted];
 
+        log_draw_diagnostics("IT_DRAW_INDEX_AUTO", actual_vtx_count, uniforms, active_tex, use_guest_vtx,
+                             diag_vtx_ptr, diag_vtx_stride, diag_vtx_num);
+
         draw_count++;
         return true;
     }
@@ -738,6 +1105,13 @@ void Pm4Translator::reset_state() {
     m_impl->ps_texture_width = 0;
     m_impl->ps_texture_height = 0;
     m_impl->ps_texture_format = 0;
+    m_impl->ps_texture_w0 = 0;
+    m_impl->ps_texture_w1 = 0;
+    m_impl->ps_texture_w2 = 0;
+    m_impl->ps_texture_w3 = 0;
+    m_impl->ps_texture_has_nonzero = false;
+    m_impl->ps_texture_nonzero_bytes = 0;
+    m_impl->ps_texture_status = "none";
     m_impl->vs_user_sgpr_buffers.clear();
 }
 
@@ -1002,6 +1376,8 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                                 bind_vertex_buffer(vaddr, size, stride);
                             }
                             if (reg >= 0x004C && reg <= 0x005B) {
+                                const u32 sgpr_idx = reg - 0x004C;
+                                m_impl->vs_user_sgprs[sgpr_idx] = val;
                                 // GCN Sea Islands User SGPRs for VS (s0..s15)
                                 const u32 slot = reg - 0x004C;
                                 if (slot % 4 == 0 && i + 3 < packet.payload.size()) {
@@ -1038,6 +1414,10 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                                     m_impl->ps_texture_width = w_m1 + 1;
                                     m_impl->ps_texture_height = h_m1 + 1;
                                     m_impl->ps_texture_format = w1;
+                                    m_impl->ps_texture_w0 = w0;
+                                    m_impl->ps_texture_w1 = w1;
+                                    m_impl->ps_texture_w2 = w2;
+                                    m_impl->ps_texture_w3 = w3;
                                     std::fprintf(stderr, "[PM4 SH_REG] PS T# Texture: base=0x%llx dim=%ux%u w1=0x%08x w3=0x%08x\n",
                                                  (unsigned long long)tex_base, w_m1 + 1, h_m1 + 1, w1, w3);
                                 }
