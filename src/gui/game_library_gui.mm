@@ -84,10 +84,15 @@ using ps4::gui::scan_folder;
 @property (nonatomic, strong) NSTextField* statusLabel;
 @property (nonatomic, strong) NSTextField* folderLabel;
 @property (nonatomic, strong) NSPopUpButton* budgetPopup;
+@property (nonatomic, strong) NSButton* jitCheckbox;
+@property (nonatomic, strong) NSButton* windowCheckbox;
 @property (nonatomic, strong) NSButton* runButton;
 @property (nonatomic, strong) NSButton* stopButton;
 @property (nonatomic, strong) NSProgressIndicator* spinner;
 @property (nonatomic, strong) NSMutableArray<NSString*>* logLines;
+@property (nonatomic, strong) NSMutableArray<NSString*>* pendingLogLines;
+@property (nonatomic, strong) NSLock* pendingLogLock;
+@property (nonatomic, assign) BOOL logFlushScheduled;
 @property (nonatomic, strong) dispatch_queue_t ioQueue;
 @property (nonatomic, strong) NSTask* task;
 @property (nonatomic, strong) NSFileHandle* logFile;
@@ -102,6 +107,8 @@ using ps4::gui::scan_folder;
 - (void)scanFolder:(NSString*)path;
 - (void)setStatus:(NSString*)s;
 - (void)appendLog:(NSString*)line;
+- (void)appendLogLines:(NSArray<NSString*>*)lines;
+- (void)flushPendingLogs;
 @end
 
 @implementation GameLibraryController
@@ -110,6 +117,9 @@ using ps4::gui::scan_folder;
     self = [super init];
     if (self) {
         _logLines = [NSMutableArray array];
+        _pendingLogLines = [NSMutableArray array];
+        _pendingLogLock = [NSLock new];
+        _logFlushScheduled = NO;
         _ioQueue = dispatch_queue_create("ps4.gui.io", DISPATCH_QUEUE_SERIAL);
     }
     return self;
@@ -187,14 +197,25 @@ using ps4::gui::scan_folder;
     _stopButton.enabled = NO;
     [root addSubview:_stopButton];
 
-    _budgetPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(196, 262, 160, 26)];
-    [_budgetPopup addItemsWithTitles:@[ @"Budget 100M (quick)",
+    _budgetPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(196, 262, 175, 26)];
+    [_budgetPopup addItemsWithTitles:@[ @"Unlimited (continuous)",
+                                        @"Budget 100M (quick)",
                                         @"Budget 1G (long)",
                                         @"Budget 300G (soak)" ]];
-    [_budgetPopup selectItemAtIndex:2];
+    [_budgetPopup selectItemAtIndex:0];
     [root addSubview:_budgetPopup];
 
-    _statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(366, 266, W - 386, 18)];
+    _jitCheckbox = [NSButton checkboxWithTitle:@"JIT" target:nil action:nil];
+    _jitCheckbox.frame = NSMakeRect(381, 266, 50, 18);
+    _jitCheckbox.state = NSControlStateValueOn;
+    [root addSubview:_jitCheckbox];
+
+    _windowCheckbox = [NSButton checkboxWithTitle:@"Window" target:nil action:nil];
+    _windowCheckbox.frame = NSMakeRect(438, 266, 75, 18);
+    _windowCheckbox.state = NSControlStateValueOn;
+    [root addSubview:_windowCheckbox];
+
+    _statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(525, 266, W - 540, 18)];
     _statusLabel.stringValue = @"Idle";
     _statusLabel.editable = NO;
     _statusLabel.bordered = NO;
@@ -205,6 +226,7 @@ using ps4::gui::scan_folder;
     // --- log ---
     _logView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, W - 36, 214)];
     _logView.editable = NO;
+    _logView.allowsUndo = NO;
     _logView.font = [NSFont monospacedDigitSystemFontOfSize:10
                                                      weight:NSFontWeightRegular];
 
@@ -219,17 +241,50 @@ using ps4::gui::scan_folder;
 #pragma mark - Log
 
 - (void)appendLog:(NSString*)line {
-    // Called from the pipe's IO thread.
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self->_logLines addObject:line];
-        // Cap the buffer: a soak run produces millions of lines.
-        if (self->_logLines.count > 20000)
-            [self->_logLines removeObjectsInRange:NSMakeRange(0, 10000)];
-        NSString* joined = [self->_logLines componentsJoinedByString:@"\n"];
-        self->_logView.string = joined;
-        [self->_logView scrollRangeToVisible:
-            NSMakeRange(joined.length, 0)];
-    });
+    if (line.length) {
+        [self appendLogLines:@[line]];
+    }
+}
+
+- (void)appendLogLines:(NSArray<NSString*>*)lines {
+    if (lines.count == 0) return;
+    [_pendingLogLock lock];
+    [_pendingLogLines addObjectsFromArray:lines];
+    if (!_logFlushScheduled) {
+        _logFlushScheduled = YES;
+        [_pendingLogLock unlock];
+        __weak GameLibraryController* weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            [weakSelf flushPendingLogs];
+        });
+    } else {
+        [_pendingLogLock unlock];
+    }
+}
+
+- (void)flushPendingLogs {
+    NSArray* toAppend = nil;
+    [_pendingLogLock lock];
+    _logFlushScheduled = NO;
+    if (_pendingLogLines.count > 0) {
+        toAppend = [_pendingLogLines copy];
+        [_pendingLogLines removeAllObjects];
+    }
+    [_pendingLogLock unlock];
+
+    if (toAppend.count == 0) return;
+
+    @autoreleasepool {
+        for (NSString* line in toAppend) {
+            if (line.length) [_logLines addObject:line];
+        }
+        if (_logLines.count > 5000) {
+            [_logLines removeObjectsInRange:NSMakeRange(0, _logLines.count - 3000)];
+        }
+        NSString* joined = [_logLines componentsJoinedByString:@"\n"];
+        _logView.string = joined;
+        [_logView scrollRangeToVisible:NSMakeRange(joined.length, 0)];
+    }
 }
 
 - (void)setStatus:(NSString*)s {
@@ -286,12 +341,19 @@ using ps4::gui::scan_folder;
     t.launchPath = @(runner_path().c_str());
     t.currentDirectoryURL = [NSURL fileURLWithPath:@(g.root.c_str())];
 
-    NSMutableArray* args = [NSMutableArray arrayWithObject:@"--no-jit"];
+    NSMutableArray* args = [NSMutableArray array];
+    if (_jitCheckbox.state != NSControlStateValueOn) {
+        [args addObject:@"--no-jit"];
+    }
+    if (_windowCheckbox.state == NSControlStateValueOn) {
+        [args addObject:@"--window"];
+    }
     [args addObject:@"--budget"];
     switch (_budgetPopup.indexOfSelectedItem) {
-        case 0:  [args addObject:@"100000000"];   break;
-        case 1:  [args addObject:@"1000000000"];  break;
-        default: [args addObject:@"300000000000"]; break;
+        case 1:  [args addObject:@"100000000"];   break;
+        case 2:  [args addObject:@"1000000000"];  break;
+        case 3:  [args addObject:@"300000000000"]; break;
+        default: [args addObject:@"0"];           break; // unlimited
     }
     [args addObject:@(g.eboot.c_str())];
     t.arguments = args;
@@ -344,21 +406,23 @@ using ps4::gui::scan_folder;
 
     __weak GameLibraryController* weakSelf = self;
     out.fileHandleForReading.readabilityHandler = ^(NSFileHandle* fh) {
-        NSData* data = fh.availableData;
-        if (data.length == 0) return;
-        // Write the raw chunk first so the file keeps stdout/stderr interleaving
-        // exactly as the runner produced it, rather than the line-split view.
-        @try { [weakSelf.logFile writeData:data]; } @catch (NSException*) {}
-        NSString* s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        if (!s) return;
-        for (NSString* line in [s componentsSeparatedByString:@"\n"]) {
-            if (line.length) [weakSelf appendLog:line];
+        @autoreleasepool {
+            NSData* data = fh.availableData;
+            if (data.length == 0) return;
+            // Write the raw chunk first so the file keeps stdout/stderr interleaving
+            // exactly as the runner produced it, rather than the line-split view.
+            @try { [weakSelf.logFile writeData:data]; } @catch (NSException*) {}
+            NSString* s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (!s) return;
+            NSArray* lines = [s componentsSeparatedByString:@"\n"];
+            [weakSelf appendLogLines:lines];
         }
     };
 
     t.terminationHandler = ^(NSTask* finished) {
         GameLibraryController* strongSelf = weakSelf;
         if (!strongSelf) return;
+        [strongSelf flushPendingLogs];
         strongSelf.runButton.enabled = YES;
         strongSelf.stopButton.enabled = NO;
         [strongSelf setStatus:[NSString stringWithFormat:@"Exited (%d)%@",
@@ -366,6 +430,7 @@ using ps4::gui::scan_folder;
             strongSelf.logPath.length ? [NSString stringWithFormat:@" - log: %@",
                                                                 strongSelf.logPath] : @""]];
         [strongSelf appendLog:@"\n=== runner exited ==="];
+        [strongSelf flushPendingLogs];
         [strongSelf.logFile closeFile];
         strongSelf.logFile = nil;
     };
@@ -387,6 +452,7 @@ using ps4::gui::scan_folder;
 - (void)onStop:(id)sender {
     [_task terminate];
     _task = nil;
+    [self flushPendingLogs];
     [_logFile closeFile];
     _logFile = nil;
     _runButton.enabled = YES;

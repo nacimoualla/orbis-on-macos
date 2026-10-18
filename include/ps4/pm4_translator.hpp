@@ -42,6 +42,9 @@ public:
     /// Execute a single PM4 packet
     bool execute_packet(const Pm4Packet& packet);
 
+    /// Execute raw command buffer at guest virtual address
+    usize execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_bytes);
+
     /// Drain and execute all pending packets in ring buffer
     usize execute_ring_buffer(GpuRingBuffer& ring_buffer);
 
@@ -65,8 +68,23 @@ public:
     [[nodiscard]] GuestAddr vertex_buffer_address() const noexcept;
     [[nodiscard]] usize vertex_buffer_size() const noexcept;
 
+    /// Index buffer and indirect draw state
+    [[nodiscard]] GuestAddr index_base_address() const noexcept;
+    [[nodiscard]] u32 index_buffer_size() const noexcept;
+    [[nodiscard]] bool is_32bit_index() const noexcept;
+    [[nodiscard]] GuestAddr indirect_base_address() const noexcept;
+    [[nodiscard]] GuestAddr last_dma_dst_address() const noexcept;
+    [[nodiscard]] usize last_dma_size() const noexcept;
+
+    void set_index_base_address(GuestAddr addr) noexcept;
+    void set_indirect_base_address(GuestAddr addr) noexcept;
+    void set_index_32bit(bool is_32bit) noexcept;
+
     /// Direct 3D indexed draw submission
     bool execute_indexed_draw(GuestAddr index_buffer_addr, u32 index_count, PrimitiveType prim_type = PrimitiveType::TriangleList);
+
+    /// Direct 3D auto draw submission
+    bool execute_auto_draw(u32 vtx_count, PrimitiveType prim_type = PrimitiveType::TriangleList, i32 base_vertex = 0, u32 instance_count = 1);
 
 private:
     struct Impl;

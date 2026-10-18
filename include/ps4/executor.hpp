@@ -63,4 +63,5 @@ private:
 // Dump the calling thread's control-transfer ring (diagnostic).
 void dump_control_xfers(int tid);
 
+void dump_rip_histogram();
 } // namespace ps4

@@ -319,6 +319,8 @@ int main(int argc, char* argv[]) {
     }
     std::fprintf(stderr, "[map] final table at run exit:\n");
     memory.dump_mappings();
+    ps4::dump_rip_histogram();
+    ps4::dump_hle_histogram();
     if (enable_jit && jit.cached_block_count() > 0) {
         std::cout << "[CPU] JIT Blocks Cached: " << jit.cached_block_count()
                   << " | Total Invocations: " << jit.total_invocations() << "\n";

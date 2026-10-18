@@ -7,10 +7,35 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <map>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace ps4 {
+// HLE dispatch counts, independent of the PS4_LOG_HLE sampling in the
+// dispatcher below. Keyed by NID; the name is filled in on first sight.
+static std::map<std::string, u64> g_hle_hist;
+static u64 g_hle_fallback = 0;
+
+void dump_hle_histogram() {
+    if (g_hle_hist.empty() && g_hle_fallback == 0) return;
+    std::vector<std::pair<u64, std::string>> v;
+    u64 total = g_hle_fallback;
+    for (const auto& e : g_hle_hist) { v.emplace_back(e.second, e.first); total += e.second; }
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "[HLEHIST] distinct=%zu total_dispatches=%llu generic_fallback=%llu\n",
+                 v.size(), (unsigned long long)total, (unsigned long long)g_hle_fallback);
+    const usize show = v.size() < 30 ? v.size() : 30;
+    for (usize i = 0; i < show; ++i)
+        std::fprintf(stderr, "[HLEHIST] %10llu %5.2f%%  %s\n",
+                     (unsigned long long)v[i].first,
+                     100.0 * (double)v[i].first / (double)total, v[i].second.c_str());
+    std::fprintf(stderr, "[HLEHIST] FALLBACK generic-stub dispatches=%llu\n",
+                 (unsigned long long)g_hle_fallback);
+}
+
+
 
 DynamicLinker::DynamicLinker(MemoryManager& memory, SyscallTable& syscalls, NidRegistry& registry)
     : m_memory(memory), m_syscalls(syscalls), m_registry(registry) {
@@ -169,6 +194,7 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             // cross-run counter mismatch.
             static std::atomic<u64> s_suppressed{0};
             static std::atomic<u64> s_logged{0};
+
             static const bool s_log_hle = (std::getenv("PS4_LOG_HLE") != nullptr && std::strcmp(std::getenv("PS4_LOG_HLE"), "1") == 0);
             const bool is_gnm = (sym->name.rfind("sceGnm", 0) == 0);
             if ((s_log_hle || verbose || is_gnm) && (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" &&
@@ -189,6 +215,7 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
                 sym->name != "sceKernelSignalSema" &&
                 sym->name != "sceKernelSyncStub")) {
                 const u64 n = s_logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                g_hle_hist[sym->name] += 1;
                 // Log the head densely, then sample. Unbounded, this trace produced
                 // 16 GB of log on a 30 B-instruction run: mono_runtime_invoke alone
                 // fires ~400 M times when nothing consumes its return value, which
@@ -212,6 +239,7 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
                              (unsigned long long)s_suppressed.load(std::memory_order_relaxed));
                 }
             } else {
+                ++g_hle_fallback;
                 s_suppressed.fetch_add(1, std::memory_order_relaxed);
             }
             CpuContext* cur_cpu = sctx.cpu;

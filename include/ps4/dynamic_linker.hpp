@@ -156,4 +156,5 @@ void set_active_linker(DynamicLinker* linker) noexcept;
 /// consecutive modules cannot overlap.
 GuestAddr module_base_allocator(GuestSize need) noexcept;
 
+void dump_hle_histogram();
 } // namespace ps4

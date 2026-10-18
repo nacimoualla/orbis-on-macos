@@ -3690,14 +3690,29 @@ void NidRegistry::register_default_libraries() {
         std::fprintf(stderr, "[VideoOut] perform_flip #%llu: buffer=%u, flipArg=0x%llx\n",
                      (unsigned long long)count, buffer_index, (unsigned long long)flip_arg);
 
-        if (g_metal_backend && buffer_index < s_registered_buffers.size()) {
+        // If the GPU PM4 command processor executed draw calls, Metal already has
+        // the rendered scene in its framebuffer. Only upload from guest memory if
+        // CPU software rendering was performed (draw_count == 0) and the buffer contains non-zero data.
+        const bool gpu_rendered = (g_pm4_translator && g_pm4_translator->draw_count() > 0);
+        if (!gpu_rendered && g_metal_backend && buffer_index < s_registered_buffers.size()) {
             const GuestAddr buf_addr = s_registered_buffers[buffer_index];
             const usize pitch = g_metal_backend->width() * 4;
             const usize frame_size = pitch * g_metal_backend->height();
             if (buf_addr != 0 && mem.is_valid_address(buf_addr, frame_size)) {
                 void* pixels = mem.to_host_ptr<void>(buf_addr);
                 if (pixels) {
-                    g_metal_backend->upload_pixels(pixels, pitch);
+                    const u64* qwords = reinterpret_cast<const u64*>(pixels);
+                    const usize qword_count = frame_size / sizeof(u64);
+                    bool has_pixels = false;
+                    for (usize q = 0; q < std::min<usize>(qword_count, 1024); ++q) {
+                        if (qwords[q] != 0) {
+                            has_pixels = true;
+                            break;
+                        }
+                    }
+                    if (has_pixels) {
+                        g_metal_backend->upload_pixels(pixels, pitch);
+                    }
                 }
             }
         }

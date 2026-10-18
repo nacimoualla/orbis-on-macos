@@ -624,6 +624,35 @@ void dump_control_xfers(int tid) {
     }
 }
 
+// RIP occupancy histogram, keyed by raw guest address. Enabled with PS4_RIP_HIST=1.
+// The caller maps addresses back to module+offset; the executor does not know
+// about module ranges.
+static std::unordered_map<GuestAddr, u64> s_rip_hist;
+static bool s_rip_hist_on = [] {
+    const char* v = std::getenv("PS4_RIP_HIST");
+    return v && *v && std::string_view(v) != "0";
+}();
+
+void dump_rip_histogram() {
+    if (s_rip_hist.empty()) return;
+    std::vector<std::pair<GuestAddr, u64>> v(s_rip_hist.begin(), s_rip_hist.end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    u64 total = 0;
+    for (const auto& e : v) total += e.second;
+    std::fprintf(stderr, "[RIPHIST] distinct=%zu total=%llu\n", v.size(),
+                 (unsigned long long)total);
+    const usize show = v.size() < 40 ? v.size() : 40;
+    for (usize i = 0; i < show; ++i)
+        std::fprintf(stderr, "[RIPHIST] %6llu %5.2f%%  rip=0x%llx\n",
+                     (unsigned long long)v[i].second, 100.0 * (double)v[i].second / (double)total,
+                     (unsigned long long)v[i].first);
+    // Also emit the raw map so an external script can attribute addresses.
+    std::fprintf(stderr, "[RIPHIST] RAW\n");
+    for (const auto& e : v)
+        std::fprintf(stderr, "[RIPHIST] %llx %llu\n", (unsigned long long)e.first,
+                     (unsigned long long)e.second);
+}
+
 StepResult CpuExecutor::step() {
     // Publish the executing RIP so a MemoryManager write-watch can name the
     // instruction responsible for a clobbered address.
@@ -813,6 +842,8 @@ StepResult CpuExecutor::step() {
     }
 
     const GuestAddr start_rip = m_context.rip;
+    // Off by default: 60 M hash lookups is not free. PS4_RIP_HIST=1 turns it on.
+    if (s_rip_hist_on) ++s_rip_hist[start_rip];
     s_rip_history[s_rip_hist_idx++ % 128] = start_rip;
 
     u8 rex = 0;
