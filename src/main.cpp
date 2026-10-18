@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -27,6 +28,7 @@ int main(int argc, char* argv[]) {
     bool enable_jit = true;
     bool enable_trace = false;
     bool enable_strict_hle = false;
+    bool budget_specified = false;
     // Headless instruction budget. The default (100M) stops inside the guest's
     // static-initializer phase, well before Unity's Mono bootstrap, so soak and
     // smoke runs that need the Mono call census must raise it.
@@ -47,12 +49,13 @@ int main(int argc, char* argv[]) {
             enable_strict_hle = true;
         } else if (arg == "--budget" && i + 1 < argc) {
             instruction_budget = std::strtoull(argv[++i], nullptr, 10);
+            budget_specified = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: ps4-runner [options] <path-to-eboot.bin-or-elf>\n";
             std::cout << "Options:\n";
             std::cout << "  --window, -w     Open interactive macOS display window (60 FPS)\n";
             std::cout << "  --headless       Run headlessly in console only (default)\n";
-            std::cout << "  --budget N       Headless instruction budget (default 100000000)\n";
+            std::cout << "  --budget N       Headless instruction budget (default 100000000, 0 = unlimited)\n";
             std::cout << "  --no-jit         Disable ARM64 JIT dynamic recompiler (interpreter only)\n";
             std::cout << "  --trace, -t      Trace guest instruction execution step-by-step\n";
             std::cout << "  --strict-hle     Fail-loud strict HLE development mode (crash on missing NIDs)\n";
@@ -60,6 +63,10 @@ int main(int argc, char* argv[]) {
         } else {
             elf_path = argv[i];
         }
+    }
+
+    if (enable_window && !budget_specified) {
+        instruction_budget = 0; // Interactive windowed mode runs indefinitely until window is closed
     }
 
     if (elf_path.empty()) {
@@ -318,6 +325,30 @@ int main(int argc, char* argv[]) {
         ps4::dump_write_watch_ring(ps4::write_watch_addr());
     }
     std::fprintf(stderr, "[map] final table at run exit:\n");
+    // PS4_DUMP_CODE=<guest_addr>:<len> writes raw loaded guest bytes to a file.
+    // The SELF's phdr.p_offset values are stale and non-uniform, so llvm-objdump
+    // on the extracted inner ELF maps addresses differently from the runtime.
+    // Dumping what the emulator actually mapped is the only way to disassemble
+    // the image the guest really executed.
+    if (const char* dc = std::getenv("PS4_DUMP_CODE")) {
+        unsigned long long base = 0, len = 0;
+        if (std::sscanf(dc, "%llx:%llx", &base, &len) == 2 && len > 0 && len < (1u << 22)) {
+            std::vector<ps4::u8> buf(static_cast<size_t>(len));
+            if (memory.read_bytes(static_cast<ps4::GuestAddr>(base), buf.data(), buf.size())) {
+                char path[256];
+                std::snprintf(path, sizeof(path), "dump_code_%llx.bin", base);
+                std::FILE* f = std::fopen(path, "wb");
+                if (f) {
+                    std::fwrite(buf.data(), 1, buf.size(), f);
+                    std::fclose(f);
+                    std::fprintf(stderr, "[dumpcode] %llu bytes @ 0x%llx -> %s\n",
+                                 len, base, path);
+                }
+            } else {
+                std::fprintf(stderr, "[dumpcode] read FAILED at 0x%llx\n", base);
+            }
+        }
+    }
     memory.dump_mappings();
     ps4::dump_rip_histogram();
     ps4::dump_hle_histogram();

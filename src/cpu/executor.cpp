@@ -842,6 +842,98 @@ StepResult CpuExecutor::step() {
     }
 
     const GuestAddr start_rip = m_context.rip;
+    // ---- one-shot tracer: PS4_TRACE_AT=<guest_addr> ------------------------
+    // Prints registers and the chain walk at the first execution of <addr>.
+    // PS4_TRACE_ITER=N also re-dumps after N further hits.
+    {
+        static const GuestAddr s_at = [&] {
+            const char* v = std::getenv("PS4_TRACE_AT");
+            return v ? static_cast<GuestAddr>(std::strtoull(v, nullptr, 16)) : 0;
+        }();
+        static const u64 s_after = [] {
+            const char* v = std::getenv("PS4_TRACE_ITER");
+            return v ? std::strtoull(v, nullptr, 10) : 0;
+        }();
+        static u64 s_hits = 0;
+        if (s_at != 0 && start_rip == s_at && (s_hits <= s_after)) {
+            const CpuContext& c = m_context;
+            std::fprintf(stderr, "[TRACE] hit #%llu at rip=0x%llx\n",
+                         (unsigned long long)s_hits, (unsigned long long)start_rip);
+            std::fprintf(stderr,
+                "[TRACE] rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n"
+                "[TRACE] rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n"
+                "[TRACE] r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx\n"
+                "[TRACE] r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n"
+                "[TRACE] rip=%016llx rflags=%016llx\n",
+                (unsigned long long)c.rax,(unsigned long long)c.rbx,(unsigned long long)c.rcx,
+                (unsigned long long)c.rdx,(unsigned long long)c.rsi,(unsigned long long)c.rdi,
+                (unsigned long long)c.rbp,(unsigned long long)c.rsp,(unsigned long long)c.r8,
+                (unsigned long long)c.r9,(unsigned long long)c.r10,(unsigned long long)c.r11,
+                (unsigned long long)c.r12,(unsigned long long)c.r13,(unsigned long long)c.r14,
+                (unsigned long long)c.r15,(unsigned long long)c.rip,(unsigned long long)c.rflags);
+            auto dump = [&](const char* tag, GuestAddr a) {
+                u8 b[64];
+                if (!m_memory.read_bytes(a, b, sizeof(b))) {
+                    std::fprintf(stderr, "[TRACE]   %-6s [0x%llx] unreadable\n", tag,
+                                 (unsigned long long)a);
+                    return;
+                }
+                std::fprintf(stderr, "[TRACE]   %-6s [0x%llx]", tag, (unsigned long long)a);
+                for (int i = 0; i < 64; i += 8) {
+                    u64 v = 0; std::memcpy(&v, b + i, 8);
+                    std::fprintf(stderr, " %016llx", (unsigned long long)v);
+                }
+                std::fprintf(stderr, "\n");
+            };
+            dump("rdi", c.rdi); dump("rcx", c.rcx); dump("rax", c.rax);
+            if (s_hits == 0) {
+                // walk the chain: node -> [node+0x2018], comparing [node+0x2010] to r12
+                u64 node = c.rcx, sent = c.rax, key = c.r12, steps = 0;
+                std::fprintf(stderr, "[TRACE] chain: start rcx=0x%llx sentinel rax=0x%llx key r12=0x%llx\n",
+                             (unsigned long long)node,(unsigned long long)sent,(unsigned long long)key);
+                GuestAddr first = node;
+                for (; steps < 100000; ++steps) {
+                    u64 k = 0, nx = 0;
+                    if (!m_memory.read_bytes(node + 0x2010, &k, 8) ||
+                        !m_memory.read_bytes(node + 0x2018, &nx, 8)) {
+                        std::fprintf(stderr, "[TRACE]   unreadable at node 0x%llx\n",
+                                     (unsigned long long)node);
+                        break;
+                    }
+                    if (steps < 10)
+                        std::fprintf(stderr, "[TRACE]   node[%2llu] @0x%llx key[+0x2010]=0x%llx next[+0x2018]=0x%llx%s\n",
+                                     (unsigned long long)steps,(unsigned long long)node,
+                                     (unsigned long long)k,(unsigned long long)nx,
+                                     (k == key ? "  <== KEY MATCH" : ""));
+                    else if (nx == sent)
+                        std::fprintf(stderr, "[TRACE]   reached sentinel after %llu steps\n",
+                                     (unsigned long long)(steps + 1));
+                    if (nx == sent) break;
+                    if (nx == node) {
+                        std::fprintf(stderr, "[TRACE]   SELF-LOOP at node 0x%llx after %llu steps\n",
+                                     (unsigned long long)node,(unsigned long long)steps);
+                        break;
+                    }
+                    if (steps >= 1 && nx == (node == first ? 0 : 0)) { /* noop */ }
+                    node = nx;
+                }
+                std::fprintf(stderr, "[TRACE] chain walk ended at step %llu\n",
+                             (unsigned long long)steps);
+                // call stack via the frame pointer chain
+                std::fprintf(stderr, "[TRACE] stack (rbp chain):\n");
+                GuestAddr fp = c.rbp;
+                for (int d = 0; d < 24 && fp != 0; ++d) {
+                    u64 saved = 0, ret = 0;
+                    if (!m_memory.read_bytes(fp, &saved, 8) || !m_memory.read_bytes(fp + 8, &ret, 8)) break;
+                    std::fprintf(stderr, "[TRACE]   #%02d fp=0x%016llx ret=0x%016llx\n",
+                                 d, (unsigned long long)fp, (unsigned long long)ret);
+                    if (saved <= fp) break;
+                    fp = saved;
+                }
+            }
+            ++s_hits;
+        }
+    }
     // Off by default: 60 M hash lookups is not free. PS4_RIP_HIST=1 turns it on.
     if (s_rip_hist_on) ++s_rip_hist[start_rip];
     s_rip_history[s_rip_hist_idx++ % 128] = start_rip;
@@ -4141,8 +4233,9 @@ StepResult CpuExecutor::step() {
                 switch (regf) {
                     case 0: if (load_mem(4, &raw)) push_double(static_cast<double>(raw));
                             else handled = false; break;                            // DB /0 FILD m32int
-                    case 1: if (store_int(4, true)) f.top = static_cast<u8>((f.top + 1) & 7);
-                            else handled = false; break;                           // DB /1 FISTTP m32int
+                    // DB /1 is not assigned in the SDM. It is deliberately absent
+                    // here so it falls through to the unhandled-opcode report rather
+                    // than silently executing the wrong instruction.
                     case 2: store_int(4); break;                                    // DB /2 FIST m32int (no pop)
                     case 3: if (store_int(4)) f.top = static_cast<u8>((f.top + 1) & 7);
                             else handled = false; break;                           // DB /3 FISTP m32int
@@ -4210,10 +4303,12 @@ StepResult CpuExecutor::step() {
                             else handled = false; break;                           // DF /3 FISTP m16int
                     case 5: if (load_mem(4, &raw)) push_double(static_cast<double>(raw));
                             else handled = false; break;                            // DF /5 FILD m32int
-                    case 6: if (store_int(4, true)) f.top = static_cast<u8>((f.top + 1) & 7);
-                            else handled = false; break;                           // DF /6 FISTTP m32int
+                    // DF /6 is FBSTP m80 (packed-BCD store), not FISTTP m32int.
+                    // It is not implemented; leaving it out makes it fault loudly
+                    // instead of storing a binary integer in place of BCD.
+                    case 6: handled = false; break;                                // DF /6 FBSTP m80 (unimplemented)
                     case 7: if (store_int(4)) f.top = static_cast<u8>((f.top + 1) & 7);
-                            else handled = false; break;                           // DF /7 FISTP m32int
+                            else handled = false; break;                           // DF /7 FISTP m32int (there is no FISTP m64 encoding)
                     default: handled = false;
                 }
                 break;

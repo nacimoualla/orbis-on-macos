@@ -346,6 +346,34 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- DF /7 is FISTP m32int, NOT m64. 2^40 must therefore overflow. ----
+    // There is no FISTP m64 encoding in the SDM, so a 64-bit store of 2^40 is
+    // impossible; this pins the width so a regression to m64 would be caught.
+    std::printf("[x87] DF /7 width check (FISTP m32int, no m64 form exists):\n");
+    {
+        for (double val : {1099511627776.0, -1099511627776.0}) {  // 2^40, -2^40
+            reset_fpu();
+            mem.zero_memory(DATA, 0x400);
+            double one = 1.0; u64 b; std::memcpy(&b, &one, 8);
+            mem.write_value(DATA + 0x200, b);
+            ctx.rbp = DATA + 0x200;
+            put_code(CODE, {0xD9, 0x45, 0x00}); step_at(CODE);   // FLD m64 [rbp+0] = 1.0
+            // multiply by 2^40 using the existing register form: D9 C1 is not
+            // implemented, so build the constant directly in memory instead.
+            u64 bits = 0; std::memcpy(&bits, &val, 8);
+            mem.write_value(DATA + 0x200, bits);
+            put_code(CODE, {0xDD, 0x45, 0x00}); step_at(CODE);   // FLD m64 [rbp+0] = 2^40
+            ctx.rbp = DATA;
+            put_code(CODE, {0xDF, 0x7D, 0x20}); step_at(CODE);   // DF /7 FISTP m32int
+            u64 got64 = 0; mem.read_value(DATA + 0x20, got64);
+            const u32 got = static_cast<u32>(got64);
+            const bool ok = (got == 0x80000000u) && ((ctx.fpu.sw & 1u) == 1u);
+            if (!ok) ++g_failures;
+            std::printf("  FISTP m32 of %+.0f -> 0x%08x want 0x80000000 IE=%u  %s\n",
+                        val, got, (unsigned)(ctx.fpu.sw & 1u), ok ? "ok" : "FAIL");
+        }
+    }
+
     // ---- m80 byte round trip, with the precision loss reported ------------
     std::printf("[x87] m80 FLD/FSTP byte round trip:\n");
     {
