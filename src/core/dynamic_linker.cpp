@@ -41,7 +41,11 @@ std::string describe_guest_addr(GuestAddr a) {
 // PS4_DUMP_EXPORTS=1: record each export as the loader resolves it. Re-parsing
 // PT_DYNAMIC by hand ignores the PT_DYNAMIC p_filesz bound and mis-indexes the
 // strtab, which produced <multiple> for DT_STRTAB and a 655-vs-896 mismatch.
-struct ExportRow { Nid nid; GuestAddr addr; u64 value; const char* type; char tok[12]; };
+struct ExportRow { Nid nid; GuestAddr addr; u64 value; const char* type; char tok[12]; u32 handle; GuestAddr base; GuestSize span; };
+struct ModStats { std::string path; GuestAddr base; GuestSize span;
+                  usize total=0, undef=0, no_nid=0, dup=0, recorded=0, objs=0, funcs=0; };
+static std::vector<ModStats> g_mod_stats;
+static std::vector<const char*> g_skip_notes;
 static std::vector<ExportRow> g_export_rows;
 static const bool s_dump_exports = [] {
     const char* v = std::getenv("PS4_DUMP_EXPORTS");
@@ -807,14 +811,25 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
         return nid;
     };
 
+    ModStats* g_ms = nullptr;
+    if (s_dump_exports) {
+        const std::string nm = "handle-" + std::to_string(handle);
+        g_mod_stats.push_back({nm, base, 0});
+        g_ms = &g_mod_stats.back();
+        g_ms->span = m_modules.count(handle) ? m_modules.at(handle).size : 0;
+    }
     usize defined = 0, objs = 0, funcs = 0;
     for (usize i = 0; i < total; ++i) {
         Elf64_Sym sym{};
         std::memcpy(&sym, proglib + symtab_off + (i * sizeof(Elf64_Sym)), sizeof(sym));
+        if (g_ms) ++g_ms->total;
         // SHN_UNDEF means "imported from somewhere else" -- not ours to export.
-        if (sym.st_shndx == SHN_UNDEF_LOCAL) continue;
+        if (sym.st_shndx == SHN_UNDEF_LOCAL) {
+            if (g_ms) ++g_ms->undef;
+            continue;
+        }
         const Nid nid = token_at(sym.st_name);
-        if (nid == 0) continue;
+        if (nid == 0) { if (g_ms) ++g_ms->no_nid; continue; }
         // Take every defined symbol, not just STT_FUNC. AOT module descriptor
         // tables are STT_OBJECT data; filtering on FUNC alone is what made
         // MonoAssembliesPS4.prx look like it exported nothing.
@@ -823,7 +838,7 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
         else ++objs;
         // First definition wins, so an earlier module is not shadowed.
         const GuestAddr real = base + sym.st_value;
-        m_module_exports.emplace(nid, real);
+        if (!m_module_exports.emplace(nid, real).second && g_ms) ++g_ms->dup;
         ++defined;
 
         // Replace any trampoline already written for this NID.
@@ -839,6 +854,9 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
             ExportRow r{};
             r.nid = nid; r.addr = real; r.value = sym.st_value;
             r.type = (stype == ELF64_ST_TYPE_FUNC) ? "FUNC" : "OBJECT";
+            r.handle = handle; r.base = base;
+            r.span = m_modules.count(handle) ? m_modules.at(handle).size : 0;
+            if (g_ms) { ++g_ms->recorded; if (std::strcmp(r.type, "OBJECT") == 0) ++g_ms->objs; else ++g_ms->funcs; }
             std::snprintf(r.tok, sizeof(r.tok), "%.11s",
                           reinterpret_cast<const char*>(proglib + strtab_off + sym.st_name));
             g_export_rows.push_back(r);
@@ -1095,6 +1113,19 @@ GuestAddr module_base_allocator(GuestSize need) noexcept {
 
 
 void dump_export_tables() {
+    if (!g_mod_stats.empty()) {
+        std::fprintf(stderr, "[exports] per module (loader counters):\n");
+        for (const auto& m : g_mod_stats) {
+            std::fprintf(stderr,
+                "[exports]   %-24s base=0x%llx span=0x%llx | in_table=%zu defined=%zu "
+                "undef_skipped=%zu no_nid_skipped=%zu dup_not_recorded=%zu | recorded=%zu "
+                "(FUNC=%zu OBJECT=%zu) end=%s\n",
+                m.path.c_str(), (unsigned long long)m.base, (unsigned long long)m.span,
+                m.total, m.total - m.undef - m.no_nid, m.undef, m.no_nid, m.dup,
+                m.recorded, m.funcs, m.objs,
+                m.recorded == m.total - m.undef - m.no_nid ? "complete" : "DUPES DROPPED");
+        }
+    }
     if (g_export_rows.empty()) return;
     std::vector<ExportRow> v = g_export_rows;
     std::sort(v.begin(), v.end(), [](const ExportRow& a, const ExportRow& b) { return a.addr < b.addr; });
