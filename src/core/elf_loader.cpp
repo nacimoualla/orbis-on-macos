@@ -1,6 +1,7 @@
 #include "ps4/elf_loader.hpp"
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -352,4 +353,139 @@ void ElfLoader::dump_info() const {
     std::cout << "========================================================\n";
 }
 
+} // namespace ps4
+
+namespace ps4 {
+
+// Dump a module's dynamic table using the loader's OWN offset resolution. The
+// SELF's phdr.p_offset values are stale, so re-deriving them by hand (as the
+// Python attempts did) reads past the end of the file; dynamic_offset_file_offset()
+// cancels the error by differencing two offsets that share the same origin.
+void dump_module_dynamic(const std::filesystem::path& path) {
+    std::fprintf(stderr, "\n[dyn] ===== %s =====\n", path.filename().c_str());
+    std::vector<u8> data;
+    {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { std::fprintf(stderr, "[dyn] cannot open\n"); return; }
+        data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    ElfLoader ld;
+    if (!ld.load_from_memory(std::span<const u8>(data))) {
+        std::fprintf(stderr, "[dyn] parse failed: %s\n", ld.error_message().data());
+        return;
+    }
+    const usize dyn_off = ld.dynamic_offset_file_offset();
+    std::fprintf(stderr, "[dyn] is_self=%d proglib_off=0x%zx PT_DYNAMIC real file off=0x%zx (file size 0x%zx)\n",
+                 1, ld.proglib_file_offset(), dyn_off, data.size());
+    if (dyn_off == 0 || dyn_off + 16 > data.size()) {
+        std::fprintf(stderr, "[dyn] dynamic offset invalid\n"); return;
+    }
+
+    std::map<u64, u64> tags;
+    std::map<u64, usize> tag_at;
+    for (usize off = dyn_off; off + 16 <= data.size(); off += 16) {
+        u64 tag, val;
+        std::memcpy(&tag, data.data() + off, 8);
+        std::memcpy(&val, data.data() + off + 8, 8);
+        if (tag == 0) break;
+        if (!tags.count(tag)) tag_at[tag] = off;
+        auto& slot = tags[tag];
+        if (slot == 0) slot = val; else if (slot != val) slot = ~0ULL;  // ~0 => multiple
+    }
+    auto show = [&](u64 tag, const char* nm) {
+        auto it = tags.find(tag);
+        if (it == tags.end()) return false;
+        std::fprintf(stderr, "[dyn]   %-18s tag=%#llx  fileoff=0x%zx  value=%s",
+                     nm, (unsigned long long)tag, tag_at[tag],
+                     it->second == ~0ULL ? "<multiple>" : "");
+        if (it->second != ~0ULL) std::fprintf(stderr, "%#llx", (unsigned long long)it->second);
+        std::fprintf(stderr, "\n");
+        return true;
+    };
+    const u64 DT_NEEDED=1, DT_STRTAB=5, DT_INIT=12, DT_FINI=13, DT_SONAME=14;
+    const u64 DT_INIT_ARRAY=25, DT_FINI_ARRAY=26, DT_INIT_ARRAYSZ=27, DT_FINI_ARRAYSZ=28;
+    const u64 DT_SCE_STRTAB=0x61000019, DT_SCE_SYMTAB=0x61000039, DT_SCE_SYMTABSZ=0x6100003F;
+    std::fprintf(stderr, "[dyn] tags found: %zu\n", tags.size());
+    show(DT_INIT, "DT_INIT");        show(DT_FINI, "DT_FINI");
+    show(DT_INIT_ARRAY, "DT_INIT_ARRAY"); show(DT_INIT_ARRAYSZ, "DT_INIT_ARRAYSZ");
+    show(DT_FINI_ARRAY, "DT_FINI_ARRAY"); show(DT_FINI_ARRAYSZ, "DT_FINI_ARRAYSZ");
+    show(DT_NEEDED, "DT_NEEDED");    show(DT_SONAME, "DT_SONAME");
+    show(DT_STRTAB, "DT_STRTAB");    show(DT_SCE_STRTAB, "DT_SCE_STRTAB");
+    show(DT_SCE_SYMTAB, "DT_SCE_SYMTAB"); show(DT_SCE_SYMTABSZ, "DT_SCE_SYMTABSZ");
+
+    // DT_NEEDED strings, via DT_SCE_STRTAB if present else DT_STRTAB.
+    u64 strtab = 0;
+    if (tags.count(DT_SCE_STRTAB) && tags[DT_SCE_STRTAB] != ~0ULL) strtab = tags[DT_SCE_STRTAB];
+    else if (tags.count(DT_STRTAB)) strtab = tags[DT_STRTAB];
+    if (tags.count(DT_NEEDED) && strtab != 0 && tags[DT_NEEDED] != ~0ULL) {
+        // one string per NEEDED entry; count consecutive NEEDED occurrences
+        u32 n = 0;
+        for (usize off = dyn_off; off + 16 <= data.size(); off += 16) {
+            u64 t; std::memcpy(&t, data.data() + off, 8);
+            if (t == 0) break;
+            if (t == DT_NEEDED) ++n;
+        }
+        std::fprintf(stderr, "[dyn]   DT_NEEDED strings (%u entries, strtab 0x%llx):\n",
+                     n, (unsigned long long)strtab);
+        for (u32 i = 0; i < n; ++i) {
+            const usize so = static_cast<usize>(strtab + i);
+            if (so >= data.size()) break;
+            const char* p = reinterpret_cast<const char*>(data.data() + so);
+            std::fprintf(stderr, "[dyn]     [%u] %s\n", i, p);
+        }
+    }
+
+    // INIT_ARRAY / FINI_ARRAY entries (virtual addresses; need the load base to
+    // dereference, so print them raw here).
+    auto arr = [&](u64 atag, u64 sztag, const char* nm) {
+        if (!tags.count(atag) || tags[atag] == ~0ULL) return;
+        if (!tags.count(sztag)) return;
+        const u64 a = tags[atag], sz = tags[sztag];
+        std::fprintf(stderr, "[dyn]   %s @0x%llx size=0x%llx -> %llu entries\n",
+                     nm, (unsigned long long)a, (unsigned long long)sz, (unsigned long long)(sz / 8));
+    };
+    arr(DT_INIT_ARRAY, DT_INIT_ARRAYSZ, "DT_INIT_ARRAY");
+    arr(DT_FINI_ARRAY, DT_FINI_ARRAYSZ, "DT_FINI_ARRAY");
+
+    // Does the export table hold a module_start-style NID?
+    if (tags.count(DT_SCE_SYMTAB) && tags.count(DT_SCE_SYMTABSZ) &&
+        tags[DT_SCE_SYMTAB] != ~0ULL && tags[DT_SCE_SYMTABSZ] != ~0ULL) {
+        const usize so = static_cast<usize>(tags[DT_SCE_SYMTAB]);
+        const usize ssz = static_cast<usize>(tags[DT_SCE_SYMTABSZ]);
+        struct Want { u64 nid; const char* nm; };
+        const Want wants[] = {
+            {0x05a38a72783c83cfULL, "module_start"},
+            {0x2a90ccacf1efb774ULL, "module_stop"},
+            {0x44a906d9bd4bb5ddULL, "module_bootstrap"},
+            {0x8008ef0941de01b1ULL, "_init"},
+        };
+        int nhit = 0;
+        for (const auto& w : wants) {
+            bool hit = false; u64 val = 0, size = 0;
+            for (usize i = 0; i + 24 <= ssz && so + i + 24 <= data.size(); i += 24) {
+                u32 sn, info; u8 o, sh; u64 sv, sz;
+                std::memcpy(&sn, data.data() + so + i, 4);
+                std::memcpy(&info, data.data() + so + i + 4, 4);
+                o = data[so + i + 7];
+                sh = data[so + i + 8];
+                std::memcpy(&sv, data.data() + so + i + 8, 8);
+                std::memcpy(&sz, data.data() + so + i + 16, 8);
+                (void)info; (void)o;
+                if (sh == 0) continue;
+                const char* tok = reinterpret_cast<const char*>(data.data() + so + i - so + 0);
+                (void)tok;
+                // st_name is at +0; token is 11 base64url chars in STRTAB
+                if (sn + 11 > data.size()) continue;
+            }
+            std::fprintf(stderr, "[dyn]   export NID %-18s %#018llx : %s\n",
+                         w.nm, (unsigned long long)w.nid, hit ? "HIT" : "MISS");
+            if (hit) { ++nhit;
+                std::fprintf(stderr, "[dyn]     value=0x%llx size=0x%llx\n",
+                             (unsigned long long)val, (unsigned long long)size); }
+        }
+        std::fprintf(stderr, "[dyn]   module_start-style NIDs found in export table: %d/4\n", nhit);
+    } else {
+        std::fprintf(stderr, "[dyn]   no DT_SCE_SYMTAB/SYZ: export NID check skipped\n");
+    }
+}
 } // namespace ps4

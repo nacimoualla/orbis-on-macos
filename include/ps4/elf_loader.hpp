@@ -166,4 +166,5 @@ private:
     bool m_is_self{false};
 };
 
+void dump_module_dynamic(const std::filesystem::path& path);
 } // namespace ps4
