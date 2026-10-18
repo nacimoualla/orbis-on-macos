@@ -614,6 +614,43 @@ void debug_wake_stall_semas() {
     }
 }
 
+// Ensure Unity ScreenManagerPS4 display configuration globals and dimensions are
+// initialized to 1920x1080 (16:9), avoiding 0/0=NaN in Camera::CalculateProjectionMatrix.
+static void ensure_unity_screen_resolution(MemoryManager& mem) {
+    constexpr GuestAddr DISPLAY_CFG_ADDR = 0x3FF1000ULL;
+    if (mem.is_valid_address(DISPLAY_CFG_ADDR, 16)) {
+        mem.write_value(DISPLAY_CFG_ADDR + 0x00, static_cast<u32>(1920));
+        mem.write_value(DISPLAY_CFG_ADDR + 0x04, static_cast<u32>(1920));
+        mem.write_value(DISPLAY_CFG_ADDR + 0x08, static_cast<u32>(0));
+        mem.write_value(DISPLAY_CFG_ADDR + 0x0C, static_cast<u32>(0));
+    }
+    // Link eboot.elf RELRO GOT pointers (QBbo2kzANmQ, iEfUiWkJ3PI, 8HhxNMSnlT4, hMr0EtMYJbQ)
+    if (mem.is_valid_address(0x14fd5e8, 8)) mem.write_value(0x14fd5e8, DISPLAY_CFG_ADDR + 0x00);
+    if (mem.is_valid_address(0x14fd5f0, 8)) mem.write_value(0x14fd5f0, DISPLAY_CFG_ADDR + 0x04);
+    if (mem.is_valid_address(0x14fd580, 8)) mem.write_value(0x14fd580, DISPLAY_CFG_ADDR + 0x08);
+    if (mem.is_valid_address(0x14fd5f8, 8)) mem.write_value(0x14fd5f8, DISPLAY_CFG_ADDR + 0x0C);
+
+    // If Unity's ScreenManagerPS4 singleton is already instantiated at 0x1563a00,
+    // ensure its cached dimensions are initialized to 1920x1080.
+    GuestAddr sm_ptr = 0;
+    const bool read_ok = mem.read_value(0x1563a00, sm_ptr);
+    std::fprintf(stderr, "[ScreenManager] ensure_unity_screen_resolution: *0x1563a00 = 0x%llx (ok=%d)\n",
+                 (unsigned long long)sm_ptr, read_ok ? 1 : 0);
+    if (read_ok && sm_ptr > 0x1000 && mem.is_valid_address(sm_ptr, 0x300)) {
+        u32 old_w = 0, old_h = 0;
+        mem.read_value(sm_ptr + 0x2b0, old_w);
+        mem.read_value(sm_ptr + 0x2b4, old_h);
+        mem.write_value(sm_ptr + 0x2b0, static_cast<u32>(1920)); // m_Width
+        mem.write_value(sm_ptr + 0x2b4, static_cast<u32>(1080)); // m_Height
+        mem.write_value(sm_ptr + 0x2bc, static_cast<u32>(1920)); // m_TargetWidth
+        mem.write_value(sm_ptr + 0x2c0, static_cast<u32>(1080)); // m_TargetHeight
+        mem.write_value(sm_ptr + 0x2e4, static_cast<u32>(1920)); // m_VideoWidth
+        mem.write_value(sm_ptr + 0x2e8, static_cast<u32>(1080)); // m_VideoHeight
+        std::fprintf(stderr, "[ScreenManager] Fixed sm=0x%llx from %ux%u to 1920x1080\n",
+                     (unsigned long long)sm_ptr, old_w, old_h);
+    }
+}
+
 void NidRegistry::register_default_libraries() {
     // =========================================================================
     // libkernel: Core Orbis OS runtime services
@@ -689,6 +726,7 @@ void NidRegistry::register_default_libraries() {
     // The load is best-effort. A module that fails to map returns 0 (the real
     // failure value) rather than a fake handle, so callers can tell the
     // difference instead of jumping into an unmapped page.
+
     // sceKernelLoadStartModule
     // NID: 0xC33BEA4F852A297FULL
     register_symbol(0xC33BEA4F852A297FULL, "sceKernelLoadStartModule", "libkernel",
@@ -704,6 +742,7 @@ void NidRegistry::register_default_libraries() {
                 static u32 s_module_id = 0x2000;
                 const u32 handle = ++s_module_id;
                 std::fprintf(stderr, "[HLE] sceKernelLoadStartModule('%s') -> handle 0x%x (HLE mode)\n", path, handle);
+                ensure_unity_screen_resolution(mem);
                 ctx.rax = handle;
                 return;
             }
@@ -726,6 +765,7 @@ void NidRegistry::register_default_libraries() {
             const u32 handle = linker->load_module(host_path, base, /*run_init=*/false);
             std::fprintf(stderr, "[HLE] sceKernelLoadStartModule('%s' -> '%s') -> handle 0x%x\n",
                          path, host_path.c_str(), handle);
+            ensure_unity_screen_resolution(mem);
             ctx.rax = handle;
         });
 
@@ -3847,9 +3887,10 @@ void NidRegistry::register_default_libraries() {
 
     // sceVideoOutOpen
     // NID: 0x529DFA3D393AF3B1ULL ("Up36PTk687E")
-    auto video_open_handler = [](CpuContext& ctx, MemoryManager&) {
+    auto video_open_handler = [](CpuContext& ctx, MemoryManager& mem) {
         ctx.rax = 0x100; // valid video out handle
         std::fprintf(stderr, "[VideoOut] sceVideoOutOpen -> handle 0x100\n");
+        ensure_unity_screen_resolution(mem);
     };
     register_symbol(0x529DFA3D393AF3B1ULL, "sceVideoOutOpen", "libSceVideoOut", video_open_handler);
 
@@ -3862,6 +3903,7 @@ void NidRegistry::register_default_libraries() {
             mem.write_value(status_ptr + 8, static_cast<u32>(1920)); // paneWidth
             mem.write_value(status_ptr + 12, static_cast<u32>(1080)); // paneHeight
         }
+        ensure_unity_screen_resolution(mem);
         ctx.rax = SCE_OK;
     };
     // NID: 0xEA43E78F9D53EB66ULL ("6kPnj51T62Y")
@@ -3903,25 +3945,41 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // sceVideoOutSetBufferAttribute
+    // sceVideoOutSetBufferAttribute(SceVideoOutBufferAttribute *attr, int32_t format, uint32_t tmode, uint32_t aspect, uint32_t width, uint32_t height, uint32_t pitchInPixel)
     // NID: 0x8BAFEC47DD56B7FEULL ("i6-sR91Wt-4")
-    // Logs all regs plus a guarded dump of the rsi struct so format/tiling/pitch
-    // layout can be decoded from the log.
     register_symbol(0x8BAFEC47DD56B7FEULL, "sceVideoOutSetBufferAttribute", "libSceVideoOut",
         [](CpuContext& ctx, MemoryManager& mem) {
-            std::fprintf(stderr, "[VideoOut] SetBufferAttribute(rdi=0x%llx, rsi=0x%llx, rdx=0x%llx, rcx=0x%llx, r8=0x%llx, r9=0x%llx)\n",
-                         (unsigned long long)ctx.rdi, (unsigned long long)ctx.rsi,
-                         (unsigned long long)ctx.rdx, (unsigned long long)ctx.rcx,
-                         (unsigned long long)ctx.r8, (unsigned long long)ctx.r9);
-            const GuestAddr p_addr = ctx.rsi;
-            if (p_addr > 0x1000 && mem.is_valid_address(p_addr, 32)) {
-                const u8* p = mem.to_host_ptr<u8>(p_addr);
-                if (p) {
-                    std::fprintf(stderr, "  rsi struct: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                                 p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],
-                                 p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23],p[24],p[25],p[26],p[27],p[28],p[29],p[30],p[31]);
-                }
+            const GuestAddr attr_ptr = ctx.rdi;
+            const i32 format = static_cast<i32>(ctx.rsi);
+            const u32 tmode  = static_cast<u32>(ctx.rdx);
+            const u32 aspect = static_cast<u32>(ctx.rcx);
+            u32 width  = static_cast<u32>(ctx.r8);
+            u32 height = static_cast<u32>(ctx.r9);
+            if (width == 0 || width == 8888 || width > 7680) width = 1920;
+            if (height == 0 || height == 4999 || height > 4320) height = 1080;
+            u32 pitch = width;
+            if (ctx.rsp > 0x1000 && mem.is_valid_address(ctx.rsp + 8, sizeof(u32))) {
+                u32 p = 0;
+                mem.read_value(ctx.rsp + 8, p);
+                if (p > 0 && p <= 7680 && p != 8888) pitch = p;
+                else pitch = width;
             }
+            GuestAddr caller_rip = 0;
+            if (ctx.rsp > 0x1000 && mem.is_valid_address(ctx.rsp, sizeof(GuestAddr))) {
+                mem.read_value(ctx.rsp, caller_rip);
+            }
+            std::fprintf(stderr, "[VideoOut] SetBufferAttribute(attr=0x%llx, fmt=0x%x, tmode=%u, aspect=%u, w=%u, h=%u, pitch=%u, caller=0x%llx)\n",
+                         (unsigned long long)attr_ptr, format, tmode, aspect, width, height, pitch, (unsigned long long)caller_rip);
+            if (attr_ptr > 0x1000 && mem.is_valid_address(attr_ptr, 32)) {
+                mem.write_value(attr_ptr + 0x00, format);
+                mem.write_value(attr_ptr + 0x04, tmode);
+                mem.write_value(attr_ptr + 0x08, aspect);
+                mem.write_value(attr_ptr + 0x0C, width);
+                mem.write_value(attr_ptr + 0x10, height);
+                mem.write_value(attr_ptr + 0x14, pitch);
+                mem.write_value(attr_ptr + 0x18, static_cast<u64>(0));
+            }
+            ensure_unity_screen_resolution(mem);
             ctx.rax = SCE_OK;
         });
 
@@ -3932,6 +3990,7 @@ void NidRegistry::register_default_libraries() {
             const u32 buf_idx = static_cast<u32>(ctx.rsi);
             const i64 flip_arg = static_cast<i64>(ctx.rcx);
             perform_flip(mem, buf_idx, flip_arg);
+            ensure_unity_screen_resolution(mem);
             ctx.rax = SCE_OK;
         });
 
@@ -5003,7 +5062,8 @@ void NidRegistry::register_default_libraries() {
     // submit-completion wait (imported by eboot.bin, libSceJobManager.prx and
     // libSceS3DConversion.prx). Body unchanged: sleep instead of spin so the
     // guest yields the host thread at ~60 FPS VBlank cadence.
-    auto vblank_wait_handler = [](CpuContext& ctx, MemoryManager&) {
+    auto vblank_wait_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        ensure_unity_screen_resolution(mem);
         std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS VBlank
         ctx.rax = SCE_OK;
     };
@@ -5036,6 +5096,7 @@ void NidRegistry::register_default_libraries() {
     // present garbage.
     register_symbol(0xC5BC4D6AD6B0A217ULL, "sceGnmSubmitAndFlipCommandBuffers", "libSceGnmDriver",
         [perform_flip](CpuContext& ctx, MemoryManager& mem) {
+            ensure_unity_screen_resolution(mem);
             const u32 count = static_cast<u32>(ctx.rdi);
             const GuestAddr dcb_addrs_ptr = ctx.rsi;
             const GuestAddr dcb_sizes_ptr = ctx.rdx;

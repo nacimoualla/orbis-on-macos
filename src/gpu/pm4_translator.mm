@@ -152,13 +152,23 @@ void Pm4Translator::Impl::init_mesh_pipeline() {
             "    float3 pos = *(constant packed_float3*)v_ptr;\n"
             "    float4 col = float4(1.0, 1.0, 1.0, 1.0);\n"
             "    float2 uv = float2(0.0, 0.0);\n"
-            "    if (uniforms.vertex_stride >= 28) {\n"
+            "    if (uniforms.vertex_stride == 88) {\n"
+            "        pos = *(constant packed_float3*)v_ptr;\n"
+            "        col = *(constant packed_float4*)(v_ptr + 24);\n"
+            "        uv  = *(constant packed_float2*)(v_ptr + 40);\n"
+            "    } else if (uniforms.vertex_stride == 24) {\n"
+            "        pos = *(constant packed_float3*)v_ptr;\n"
+            "        col = float4(1.0, 1.0, 1.0, 1.0);\n"
+            "        uv  = *(constant packed_float2*)(v_ptr + 16);\n"
+            "    } else if (uniforms.vertex_stride == 16) {\n"
+            "        pos = *(constant packed_float3*)v_ptr;\n"
+            "        col = float4(1.0, 1.0, 1.0, 1.0);\n"
+            "        uv  = *(constant packed_float2*)(v_ptr + 8);\n"
+            "    } else if (uniforms.vertex_stride >= 28) {\n"
             "        col = *(constant packed_float4*)(v_ptr + 12);\n"
             "        if (uniforms.vertex_stride >= 36) {\n"
             "            uv = *(constant packed_float2*)(v_ptr + 28);\n"
             "        }\n"
-            "    } else if (uniforms.vertex_stride == 16) {\n"
-            "        uv = *(constant packed_float2*)(v_ptr + 8);\n"
             "    }\n"
             "    out.position = uniforms.mvp * float4(pos, 1.0);\n"
             "    out.color = col * uniforms.tint_color;\n"
@@ -275,12 +285,51 @@ MeshUniforms Pm4Translator::Impl::compute_uniforms() {
     // 3. Projection Matrix (buffer with num_records >= 21 at offset 17*16 = 272)
     simd_float4x4 proj = matrix_identity_float4x4;
     bool has_proj = false;
+
+    // Ensure Unity's ScreenManagerPS4 dimensions are initialized to 1920x1080
+    if (memory) {
+        GuestAddr sm_ptr = 0;
+        if (memory->read_value(0x1563a00, sm_ptr) && sm_ptr > 0x1000 && memory->is_valid_address(sm_ptr, 0x300)) {
+            u32 cur_w = 0, cur_h = 0;
+            memory->read_value(sm_ptr + 0x2b0, cur_w);
+            memory->read_value(sm_ptr + 0x2b4, cur_h);
+            if (cur_w != 1920 || cur_h != 1080) {
+                memory->write_value(sm_ptr + 0x2b0, static_cast<u32>(1920));
+                memory->write_value(sm_ptr + 0x2b4, static_cast<u32>(1080));
+                memory->write_value(sm_ptr + 0x2bc, static_cast<u32>(1920));
+                memory->write_value(sm_ptr + 0x2c0, static_cast<u32>(1080));
+                memory->write_value(sm_ptr + 0x2e4, static_cast<u32>(1920));
+                memory->write_value(sm_ptr + 0x2e8, static_cast<u32>(1080));
+            }
+        }
+    }
+
     for (const auto& [slot, buf] : vs_user_sgpr_buffers) {
         if (buf.num_records >= 21 && buf.base_addr > 0x1000) {
             const GuestAddr proj_addr = buf.base_addr + 272;
             if (memory->is_valid_address(proj_addr, 64)) {
                 float p[16] = {0};
                 memory->read_bytes(proj_addr, p, 64);
+                // Sanitize NaN values resulting from 0/0 screen dimension divisions
+                if (std::isnan(p[0]) || std::isnan(p[5])) {
+                    p[0]  = 2.0f / 1920.0f;
+                    p[1]  = 0.0f;
+                    p[2]  = 0.0f;
+                    p[3]  = 0.0f;
+                    p[4]  = 0.0f;
+                    p[5]  = -2.0f / 1080.0f;
+                    p[6]  = 0.0f;
+                    p[7]  = 0.0f;
+                    p[8]  = 0.0f;
+                    p[9]  = 0.0f;
+                    p[10] = 0.9901f;
+                    p[11] = 0.0f;
+                    p[12] = -1.0f;
+                    p[13] = 1.0f;
+                    p[14] = 0.0f;
+                    p[15] = 1.0f;
+                    memory->write_bytes(proj_addr, p, 64);
+                }
                 bool valid = true;
                 for (int i = 0; i < 16; ++i) {
                     if (std::isnan(p[i]) || std::isinf(p[i])) { valid = false; break; }
@@ -712,7 +761,6 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         const void* idx_ptr = memory->to_host_ptr<void>(idx_addr);
         if (!idx_ptr) return false;
 
-        usize required_vtx_size = vertex_buffer_size;
         u32 max_idx = 0;
         if (idx_type == MTLIndexTypeUInt32) {
             const u32* u32_ptr = static_cast<const u32*>(idx_ptr);
@@ -725,9 +773,33 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
                 if (u16_ptr[i] > max_idx) max_idx = u16_ptr[i];
             }
         }
-        const usize stride = vertex_stride > 0 ? vertex_stride : sizeof(Vertex3D);
+
+        // Discover guest vertex buffer from V#0 in vs_user_sgprs[2:3]
+        GuestAddr eff_vtx_addr = vertex_buffer_addr;
+        usize eff_vtx_stride = vertex_stride > 0 ? vertex_stride : sizeof(Vertex3D);
+        usize eff_vtx_size = vertex_buffer_size;
+
+        const u64 v_table_addr = (static_cast<u64>(vs_user_sgprs[3]) << 32) | vs_user_sgprs[2];
+        if (memory && v_table_addr > 0x1000 && memory->is_valid_address(v_table_addr, 16)) {
+            u32 d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            memory->read_value(v_table_addr + 0, d0);
+            memory->read_value(v_table_addr + 4, d1);
+            memory->read_value(v_table_addr + 8, d2);
+            memory->read_value(v_table_addr + 12, d3);
+            const u64 b = (static_cast<u64>(d1 & 0xFFFF) << 32) | d0;
+            const u32 s = (d1 >> 16) & 0x3FFF;
+            const u32 r = d2;
+            if (b > 0x1000 && s > 0 && r > 0) {
+                eff_vtx_addr = b;
+                eff_vtx_stride = s;
+                eff_vtx_size = static_cast<usize>(r) * s;
+            }
+        }
+
+        const usize stride = eff_vtx_stride;
         const u64 effective_vtx_count = static_cast<u64>(max_idx) + 1 + (base_vertex > 0 ? base_vertex : 0);
         const usize min_needed = static_cast<usize>(effective_vtx_count) * stride;
+        usize required_vtx_size = eff_vtx_size;
         if (required_vtx_size == 0 || min_needed > required_vtx_size) {
             required_vtx_size = min_needed;
         }
@@ -737,9 +809,9 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         uniforms.use_texture = (active_tex != default_white_texture) ? 1 : 0;
 
         bool use_guest_vtx = false;
-        if (vertex_buffer_addr != 0 && vertex_buffer_size > 0 && stride >= sizeof(Vertex3D) &&
-            memory && memory->is_valid_address(vertex_buffer_addr, required_vtx_size)) {
-            const void* vtx_check = memory->to_host_ptr<void>(vertex_buffer_addr);
+        if (eff_vtx_addr != 0 && stride >= 16 &&
+            memory && memory->is_valid_address(eff_vtx_addr, required_vtx_size)) {
+            const void* vtx_check = memory->to_host_ptr<void>(eff_vtx_addr);
             if (vtx_check) {
                 const float* f = static_cast<const float*>(vtx_check);
                 const usize check_count = std::min<usize>(required_vtx_size / sizeof(float), 28);
@@ -762,7 +834,7 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
 
         id<MTLBuffer> vtx_buf = nil;
         if (use_guest_vtx) {
-            const void* vtx_ptr = memory->to_host_ptr<void>(vertex_buffer_addr);
+            const void* vtx_ptr = memory->to_host_ptr<void>(eff_vtx_addr);
             vtx_buf = [device newBufferWithBytes:vtx_ptr length:required_vtx_size options:MTLResourceStorageModeShared];
             uniforms.vertex_stride = stride;
         } else {
@@ -849,7 +921,7 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         [cmd waitUntilCompleted];
 
         log_draw_diagnostics("IT_DRAW_INDEX_2", idx_count, uniforms, active_tex, use_guest_vtx,
-                             use_guest_vtx ? memory->to_host_ptr<void>(vertex_buffer_addr) : s_default_quad,
+                             use_guest_vtx ? memory->to_host_ptr<void>(eff_vtx_addr) : s_default_quad,
                              use_guest_vtx ? stride : sizeof(MeshVertex),
                              use_guest_vtx ? std::min<u32>(static_cast<u32>(effective_vtx_count), 4) : 4);
 
@@ -877,8 +949,31 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         id<MTLTexture> framebuffer = (__bridge id<MTLTexture>)metal->raw_framebuffer();
         if (!device || !queue || !framebuffer) return false;
 
-        const usize stride = vertex_stride > 0 ? vertex_stride : sizeof(Vertex3D);
-        const usize required_vtx_size = static_cast<usize>(vtx_count + (base_vertex > 0 ? base_vertex : 0)) * stride;
+        // Discover guest vertex buffer from V#0 in vs_user_sgprs[2:3]
+        GuestAddr eff_vtx_addr = vertex_buffer_addr;
+        usize eff_vtx_stride = vertex_stride > 0 ? vertex_stride : sizeof(Vertex3D);
+        usize eff_vtx_size = vertex_buffer_size;
+
+        const u64 v_table_addr = (static_cast<u64>(vs_user_sgprs[3]) << 32) | vs_user_sgprs[2];
+        if (memory && v_table_addr > 0x1000 && memory->is_valid_address(v_table_addr, 16)) {
+            u32 d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            memory->read_value(v_table_addr + 0, d0);
+            memory->read_value(v_table_addr + 4, d1);
+            memory->read_value(v_table_addr + 8, d2);
+            memory->read_value(v_table_addr + 12, d3);
+            const u64 b = (static_cast<u64>(d1 & 0xFFFF) << 32) | d0;
+            const u32 s = (d1 >> 16) & 0x3FFF;
+            const u32 r = d2;
+            if (b > 0x1000 && s > 0 && r > 0) {
+                eff_vtx_addr = b;
+                eff_vtx_stride = s;
+                eff_vtx_size = static_cast<usize>(r) * s;
+            }
+        }
+
+        const usize stride = eff_vtx_stride;
+        const usize min_needed = static_cast<usize>(vtx_count + (base_vertex > 0 ? base_vertex : 0)) * stride;
+        const usize required_vtx_size = std::max<usize>(eff_vtx_size, min_needed);
 
         MeshUniforms uniforms = compute_uniforms();
         id<MTLTexture> active_tex = prepare_texture(device);
@@ -889,9 +984,9 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         u32 actual_vtx_count = vtx_count;
 
         bool use_guest_vtx = false;
-        if (vertex_buffer_addr != 0 && vertex_buffer_size > 0 && stride >= sizeof(Vertex3D) &&
-            memory && memory->is_valid_address(vertex_buffer_addr, required_vtx_size)) {
-            const void* vtx_check = memory->to_host_ptr<void>(vertex_buffer_addr);
+        if (eff_vtx_addr != 0 && stride >= 16 &&
+            memory && memory->is_valid_address(eff_vtx_addr, required_vtx_size)) {
+            const void* vtx_check = memory->to_host_ptr<void>(eff_vtx_addr);
             if (vtx_check) {
                 const float* f = static_cast<const float*>(vtx_check);
                 const usize check_count = std::min<usize>(required_vtx_size / sizeof(float), 28);
@@ -927,7 +1022,7 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         std::vector<MeshVertex> generic;
 
         if (use_guest_vtx) {
-            const void* vtx_ptr = memory->to_host_ptr<void>(vertex_buffer_addr);
+            const void* vtx_ptr = memory->to_host_ptr<void>(eff_vtx_addr);
             vtx_buf = [device newBufferWithBytes:vtx_ptr length:required_vtx_size options:MTLResourceStorageModeShared];
             uniforms.vertex_stride = stride;
             if (prim_type == PrimitiveType::TriangleStrip) {
