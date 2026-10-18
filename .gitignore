@@ -48,3 +48,6 @@ __pycache__/
 
 # GUI run logs
 Logs/
+
+# scratch run logs from ps4-runner invocations
+*.log
