@@ -871,6 +871,12 @@ StepResult CpuExecutor::step() {
                 (unsigned long long)c.r9,(unsigned long long)c.r10,(unsigned long long)c.r11,
                 (unsigned long long)c.r12,(unsigned long long)c.r13,(unsigned long long)c.r14,
                 (unsigned long long)c.r15,(unsigned long long)c.rip,(unsigned long long)c.rflags);
+            auto q = [&](GuestAddr a) { u64 v = 0; m_memory.read_bytes(a, &v, 8); return v; };
+            std::fprintf(stderr, "[TRACE] sentinel[0x160246468]=0x%016llx  "
+                         "bucket[0x160246470]=0x%016llx  bucket[0x160246468+rax]=0x%016llx\n",
+                         (unsigned long long)q(0x160246468ULL),
+                         (unsigned long long)q(0x160246470ULL),
+                         (unsigned long long)q(0x160246468ULL + c.rax));
             auto dump = [&](const char* tag, GuestAddr a) {
                 u8 b[64];
                 if (!m_memory.read_bytes(a, b, sizeof(b))) {

@@ -210,7 +210,13 @@ int main(int argc, char* argv[]) {
         const std::size_t wsz = std::getenv("PS4_WATCH_SIZE")
                               ? std::strtoull(std::getenv("PS4_WATCH_SIZE"), nullptr, 0)
                               : 8;
-        ps4::set_write_watch(std::strtoull(w, nullptr, 0), static_cast<ps4::usize>(wsz));
+        // base 0: "0x..." is hex, a bare "123" is decimal. Printing the parsed
+        // value matters because a bare decimal string for a module address is a
+        // silently wrong watch (160246468 == 0x98d2ac4, not 0x160246468).
+        const ps4::GuestAddr waddr = std::strtoull(w, nullptr, 0);
+        std::fprintf(stderr, "[watch] PS4_WATCH_ADDR=\"%s\" parsed as 0x%llx (base 0)\n",
+                     w, (unsigned long long)waddr);
+        ps4::set_write_watch(waddr, static_cast<ps4::usize>(wsz));
     }
     if (enable_jit) {
         cpu.set_jit_compiler(&jit);
@@ -322,7 +328,9 @@ int main(int argc, char* argv[]) {
     // which is exactly the case where you want to know whether the watched slot
     // was written at all.
     if (ps4::write_watch_addr() != 0) {
-        ps4::dump_write_watch_ring(ps4::write_watch_addr());
+        const char* wf = std::getenv("PS4_WATCH_FILTER");
+        ps4::dump_write_watch_ring(wf ? std::strtoull(wf, nullptr, 0)
+                                      : ps4::write_watch_addr(), &memory);
     }
     std::fprintf(stderr, "[map] final table at run exit:\n");
     // PS4_DUMP_CODE=<guest_addr>:<len> writes raw loaded guest bytes to a file.

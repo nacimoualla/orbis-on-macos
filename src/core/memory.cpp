@@ -1,4 +1,5 @@
 #include "ps4/memory.hpp"
+#include "ps4/dynamic_linker.hpp"
 #include <sys/mman.h>
 #include <cstring>
 #include <iostream>
@@ -165,7 +166,7 @@ GuestAddr write_watch_end() noexcept {
            g_watch_size.load(std::memory_order_relaxed);
 }
 
-void dump_write_watch_ring(u64 filter_addr) {
+void dump_write_watch_ring(u64 filter_addr, const MemoryManager* mem) {
     const usize n = g_watch_count.load(std::memory_order_relaxed);
     std::fprintf(stderr, "[watch] ring: %zu writes recorded, capacity %zu, addr filter=0x%llx\n",
                  n, kWatchRing, (unsigned long long)filter_addr);
@@ -181,14 +182,28 @@ void dump_write_watch_ring(u64 filter_addr) {
         }
         ++shown;
         std::fprintf(stderr,
-                     "[watch] #%-3zu rip=0x%016llx rsp=0x%llx rbp=0x%llx rbx=0x%llx TID=%d %-3s "
+                     "[watch] #%-3zu rip=%s (0x%llx) rsp=0x%llx rbp=0x%llx rbx=0x%llx TID=%d %-3s "
                      "-> 0x%llx (%zu B)  sampled@0x%llx  old=0x%016llx new=0x%016llx%s\n",
-                     i, (unsigned long long)h.rip, (unsigned long long)h.rsp,
+                     i, describe_guest_addr(h.rip).c_str(), (unsigned long long)h.rip, (unsigned long long)h.rsp,
                      (unsigned long long)h.rbp, (unsigned long long)h.rbx, h.tid, h.from_hle ? "HLE" : "dec",
                      (unsigned long long)h.guest_addr, h.size,
                      (unsigned long long)h.sample_addr,
                      (unsigned long long)h.old_value, (unsigned long long)h.new_value,
                      (h.old_value != h.new_value) ? "  <-- CHANGED" : "");
+        // Guest call stack via the frame-pointer chain. rbp is captured at store
+        // time; walking it here is cheaper than recording it per store.
+        if (mem != nullptr) {
+            std::fprintf(stderr, "[watch]   stack:");
+            GuestAddr fp = h.rbp;
+            for (int d = 0; d < 8 && fp != 0; ++d) {
+                u64 saved = 0, ret = 0;
+                if (!mem->read_bytes(fp, &saved, 8) || !mem->read_bytes(fp + 8, &ret, 8)) break;
+                std::fprintf(stderr, " 0x%llx", (unsigned long long)ret);
+                if (saved <= fp) break;
+                fp = saved;
+            }
+            std::fprintf(stderr, "\n");
+        }
     }
     std::fprintf(stderr, "[watch] ring: %zu writes matched filter\n", shown);
 }

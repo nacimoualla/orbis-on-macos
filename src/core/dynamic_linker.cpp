@@ -18,6 +18,26 @@ namespace ps4 {
 struct HleCounts { u64 registered = 0; u64 fallback = 0; };
 static std::map<std::string, HleCounts> g_hle_hist;
 
+// "mono-ps4+0x120ed0" style attribution for a raw guest address, or "?" when no
+// loaded module contains it. Used by diagnostics that must not assume module
+// ranges.
+std::string describe_guest_addr(GuestAddr a) {
+    if (auto* dl = active_linker()) {
+        GuestAddr off = 0;
+        if (const LoadedModule* m = dl->module_for_addr(a, &off)) {
+            const std::string base_name =
+                m->path.size() ? m->path.substr(m->path.find_last_of('/') + 1) : std::string("?");
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "%s+0x%llx", base_name.c_str(),
+                          (unsigned long long)off);
+            return buf;
+        }
+    }
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)a);
+    return buf;
+}
+
 void dump_hle_histogram() {
     if (g_hle_hist.empty()) return;
     struct Row { std::string name; u64 reg; u64 fb; u64 total; };

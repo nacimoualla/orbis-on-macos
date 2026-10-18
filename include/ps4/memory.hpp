@@ -190,7 +190,7 @@ void set_write_watch(GuestAddr addr, usize size = 8);
 // asked for instead of a hardcoded address left over from an earlier chase.
 GuestAddr write_watch_addr() noexcept;
 GuestAddr write_watch_end() noexcept;
-void dump_write_watch_ring(u64 filter_addr = 0);
+void dump_write_watch_ring(u64 filter_addr = 0, const MemoryManager* mem = nullptr);
 
 // Published per guest thread by the executor; read by the write-watch.
 extern thread_local GuestAddr t_guest_rip;

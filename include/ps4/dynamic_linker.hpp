@@ -157,4 +157,5 @@ void set_active_linker(DynamicLinker* linker) noexcept;
 GuestAddr module_base_allocator(GuestSize need) noexcept;
 
 void dump_hle_histogram();
+std::string describe_guest_addr(GuestAddr a);
 } // namespace ps4
