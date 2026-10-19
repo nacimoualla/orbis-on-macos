@@ -51,3 +51,5 @@ Logs/
 
 # scratch run logs from ps4-runner invocations
 *.log
+*.log
+dump_code_*.bin
