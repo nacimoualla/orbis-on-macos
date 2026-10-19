@@ -37,6 +37,7 @@ static bool g_vex_L = false;
 // VEX prefix parser, so these are published at file scope too. Passing the REX
 // bits instead made `vbroadcastsd ymm0, [r14+0xfce8]` (VEX byte c2 sets ~B=0,
 // i.e. vex_b=1, so rm=6+8=14) address [rsi+0xfce8] instead.
+static u8 g_vex_map = 1, g_vex_op = 0;
 static u8 g_vex_r = 1, g_vex_x = 1, g_vex_b = 1;
 static u8 g_vex_vvvv = 0;
 
@@ -1302,8 +1303,10 @@ StepResult CpuExecutor::step() {
 
         if (cursor >= 15) return StepResult::IllegalInstruction;
         g_vex_L = vex_l;
+        g_vex_map = vex_map;
         g_vex_r = vex_r; g_vex_x = vex_x; g_vex_b = vex_b; g_vex_vvvv = vex_vvvv;
         const u8 vex_op = raw_code[cursor++];
+        g_vex_op = vex_op;
         const GuestAddr next_ip_base_vex = start_rip + cursor;
 
         // VMOVUPS / VMOVUPD / VMOVSS / VMOVSD (0x10 load, 0x11 store)
@@ -2202,6 +2205,20 @@ StepResult CpuExecutor::step() {
     if (op0 == 0x0F && m_memory.is_valid_address(start_rip + cursor, 1)) {
         const u8 op1 = raw_code[cursor++];
         const GuestAddr next_ip_base_0f = start_rip + cursor;
+
+        // Any VEX opcode with no handler above falls through here. Without this
+        // the instruction would be silently ignored and the guest would run on
+        // with stale registers -- exactly how the missing VBROADCASTSD hid for
+        // so long. Warn once per (map, op) so the volume stays bounded.
+        {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr, "[CPU UNIMPL VEX] map=%u op=0x%02x at RIP=0x%llx\n",
+                             (unsigned)g_vex_map, (unsigned)g_vex_op,
+                             (unsigned long long)start_rip);
+            }
+        }
 
         // 0x0F 0x38: 3-byte escape prefix
         if (op1 == 0x38 && m_memory.is_valid_address(start_rip + cursor, 1)) {
