@@ -77,6 +77,17 @@ struct Pm4Translator::Impl {
     usize draw_count{0};
     usize indexed_draw_count{0};
     usize context_reg_writes{0};
+    usize unsupported_packets{0};
+    usize malformed_packets{0};
+    enum DirtyBits : u32 {
+        DirtyPipeline = 1u << 0,
+        DirtyVertexLayout = 1u << 1,
+        DirtyTexture = 1u << 2,
+        DirtyUniform = 1u << 3,
+        DirtyRenderTarget = 1u << 4,
+        DirtyScissor = 1u << 5,
+    };
+    u32 dirty_bits{0};
     GpuFrameStats frame_stats{};
     bool frame_draw_encoded{false};
     u64 frame_submission_start{0};
@@ -117,6 +128,19 @@ struct Pm4Translator::Impl {
                              i32 base_vertex = 0, u32 instance_count = 1);
     bool render_auto_mesh(u32 vtx_count, PrimitiveType prim_type,
                           i32 base_vertex = 0, u32 instance_count = 1);
+
+    bool require_payload(const Pm4Packet& packet, usize count, const char* operation) {
+        if (packet.payload.size() >= count) return true;
+        ++malformed_packets;
+        std::fprintf(stderr, "[PM4] Malformed %s packet: expected at least %zu payload DWORDs, got %zu\n",
+                     operation, count, packet.payload.size());
+        return false;
+    }
+
+    void mark_pipeline_dirty() noexcept { dirty_bits |= DirtyPipeline; }
+    void mark_resource_dirty() noexcept {
+        dirty_bits |= DirtyVertexLayout | DirtyTexture | DirtyUniform | DirtyRenderTarget;
+    }
 };
 
 void Pm4Translator::Impl::init_mesh_pipeline() {
@@ -1230,6 +1254,8 @@ void Pm4Translator::reset_state() {
     m_impl->ps_texture_nonzero_bytes = 0;
     m_impl->ps_texture_status = "none";
     m_impl->vs_user_sgpr_buffers.clear();
+    m_impl->dirty_bits = Impl::DirtyPipeline | Impl::DirtyVertexLayout | Impl::DirtyTexture |
+                         Impl::DirtyUniform | Impl::DirtyRenderTarget | Impl::DirtyScissor;
 }
 
 void Pm4Translator::set_memory_manager(MemoryManager* memory) noexcept {
@@ -1327,40 +1353,39 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             }
 
             case IT_SET_BASE: {
-                if (packet.payload.size() >= 3) {
-                    const u32 base_type = packet.payload[0];
-                    const u32 base_lo = packet.payload[1];
-                    const u32 base_hi = packet.payload[2];
-                    const GuestAddr base_addr = (static_cast<u64>(base_hi) << 32) | base_lo;
-                    std::fprintf(stderr, "[PM4] IT_SET_BASE: type=%u, addr=0x%llx\n",
-                                 base_type, (unsigned long long)base_addr);
-                    m_impl->indirect_base_addr = base_addr;
-                }
+                if (!m_impl->require_payload(packet, 3, "IT_SET_BASE")) return false;
+                const u32 base_type = packet.payload[0];
+                const u32 base_lo = packet.payload[1];
+                const u32 base_hi = packet.payload[2];
+                const GuestAddr base_addr = (static_cast<u64>(base_hi) << 32) | base_lo;
+                std::fprintf(stderr, "[PM4] IT_SET_BASE: type=%u, addr=0x%llx\n",
+                             base_type, (unsigned long long)base_addr);
+                m_impl->indirect_base_addr = base_addr;
                 return true;
             }
 
             case IT_CLEAR_STATE:
+                if (!m_impl->require_payload(packet, 1, "IT_CLEAR_STATE")) return false;
                 reset_state();
                 return true;
 
             case IT_INDEX_BUFFER_SIZE: {
-                if (!packet.payload.empty()) {
-                    m_impl->index_buffer_size = packet.payload[0];
-                    std::fprintf(stderr, "[PM4] IT_INDEX_BUFFER_SIZE: %u\n", packet.payload[0]);
-                }
+                if (!m_impl->require_payload(packet, 1, "IT_INDEX_BUFFER_SIZE")) return false;
+                m_impl->index_buffer_size = packet.payload[0];
+                std::fprintf(stderr, "[PM4] IT_INDEX_BUFFER_SIZE: %u\n", packet.payload[0]);
                 return true;
             }
 
             case IT_INDEX_TYPE: {
-                if (!packet.payload.empty()) {
-                    m_impl->index_type = (packet.payload[0] & 1) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
-                    std::fprintf(stderr, "[PM4] IT_INDEX_TYPE: %s (0x%x)\n",
-                                 (packet.payload[0] & 1) ? "UInt32" : "UInt16", packet.payload[0]);
-                }
+                if (!m_impl->require_payload(packet, 1, "IT_INDEX_TYPE")) return false;
+                m_impl->index_type = (packet.payload[0] & 1) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
+                std::fprintf(stderr, "[PM4] IT_INDEX_TYPE: %s (0x%x)\n",
+                             (packet.payload[0] & 1) ? "UInt32" : "UInt16", packet.payload[0]);
                 return true;
             }
 
             case IT_INDEX_BASE: {
+                if (!m_impl->require_payload(packet, 1, "IT_INDEX_BASE")) return false;
                 std::string p_str;
                 for (size_t p = 0; p < packet.payload.size(); ++p) {
                     char b[32];
@@ -1385,7 +1410,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             }
 
             case IT_SET_CONTEXT_REG: {
-                if (packet.payload.empty()) return false;
+                if (!m_impl->require_payload(packet, 2, "IT_SET_CONTEXT_REG")) return false;
                 const u16 base_reg = static_cast<u16>(packet.payload[0] & 0xFFFF);
                 std::string cb_vals;
                 for (size_t d = 1; d < packet.payload.size() && d < 10; ++d) {
@@ -1410,37 +1435,47 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                     } else if (reg == PA_CL_VPORT_YOFFSET) {
                         m_impl->viewport.y = fval;
                     } else if (reg == PA_SC_SCREEN_SCISSOR_TL) {
+                        m_impl->dirty_bits |= Impl::DirtyScissor;
                         m_impl->scissor.x = val & 0x7FFF;
                         m_impl->scissor.y = (val >> 16) & 0x7FFF;
                     } else if (reg == PA_SC_SCREEN_SCISSOR_BR) {
+                        m_impl->dirty_bits |= Impl::DirtyScissor;
                         const u32 br_x = val & 0x7FFF;
                         const u32 br_y = (val >> 16) & 0x7FFF;
                         m_impl->scissor.width = (br_x > m_impl->scissor.x) ? (br_x - m_impl->scissor.x) : 0;
                         m_impl->scissor.height = (br_y > m_impl->scissor.y) ? (br_y - m_impl->scissor.y) : 0;
                     } else if (reg == CB_COLOR_CLEAR_WORD0 || reg == CB_COLOR0_CLEAR_WORD0_GFX7) {
+                        m_impl->dirty_bits |= Impl::DirtyRenderTarget;
                         m_impl->clear_color.r = static_cast<f32>(val & 0xFF) / 255.0f;
                         m_impl->clear_color.g = static_cast<f32>((val >> 8) & 0xFF) / 255.0f;
                     } else if (reg == CB_COLOR_CLEAR_WORD1 || reg == CB_COLOR0_CLEAR_WORD1_GFX7) {
+                        m_impl->dirty_bits |= Impl::DirtyRenderTarget;
                         m_impl->clear_color.b = static_cast<f32>(val & 0xFF) / 255.0f;
                         m_impl->clear_color.a = static_cast<f32>((val >> 8) & 0xFF) / 255.0f;
                     } else if (reg == CB_COLOR0_BASE || reg == CB_COLOR0_BASE_GFX7) {
+                        m_impl->dirty_bits |= Impl::DirtyRenderTarget;
                         m_impl->cb_color0_base = static_cast<GuestAddr>(val) << 8;
                         std::fprintf(stderr, "[PM4 Context] CB_COLOR0_BASE: 0x%llx (raw=0x%08x)\n",
                                      (unsigned long long)m_impl->cb_color0_base, val);
                     } else if (reg == CB_COLOR0_VIEW || reg == CB_COLOR0_VIEW_GFX7) {
+                        m_impl->dirty_bits |= Impl::DirtyRenderTarget;
                         m_impl->cb_color0_view = val;
                         std::fprintf(stderr, "[PM4 Context] CB_COLOR0_VIEW: 0x%08x\n", val);
                     } else if (reg == CB_COLOR0_INFO || reg == CB_COLOR0_INFO_GFX7) {
+                        m_impl->dirty_bits |= Impl::DirtyRenderTarget;
                         m_impl->cb_color0_info = val;
                         std::fprintf(stderr, "[PM4 Context] CB_COLOR0_INFO: 0x%08x\n", val);
                     } else if (reg == VGT_DMA_MAX_SIZE_REG) {
+                        m_impl->dirty_bits |= Impl::DirtyVertexLayout;
                         m_impl->index_buffer_size = val;
                         std::fprintf(stderr, "[PM4 Context] VGT_DMA_MAX_SIZE: %u\n", val);
                     } else if (reg == VGT_DMA_INDEX_TYPE_REG) {
+                        m_impl->dirty_bits |= Impl::DirtyVertexLayout;
                         m_impl->index_type = (val & 1) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
                         std::fprintf(stderr, "[PM4 Context] VGT_DMA_INDEX_TYPE: %s (%u)\n",
                                      (val & 1) ? "UInt32" : "UInt16", val);
                     } else if (reg == VGT_PRIMITIVE_TYPE_REG) {
+                        m_impl->dirty_bits |= Impl::DirtyPipeline;
                         m_impl->primitive_type = static_cast<PrimitiveType>(val & 0x3F);
                     }
                 }
@@ -1449,7 +1484,8 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             }
 
             case IT_SET_SH_REG: {
-                if (packet.payload.size() >= 2) {
+                if (!m_impl->require_payload(packet, 2, "IT_SET_SH_REG")) return false;
+                {
                     const u16 base_reg = static_cast<u16>(packet.payload[0] & 0xFFFF);
                     std::string vals_str;
                     for (size_t d = 1; d < packet.payload.size() && d < 9; ++d) {
@@ -1545,11 +1581,14 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                         }
                     }
                 }
+                m_impl->mark_pipeline_dirty();
+                m_impl->mark_resource_dirty();
                 return true;
             }
 
             case IT_DRAW_INDEX_AUTO: {
-                const u32 count = !packet.payload.empty() ? packet.payload[0] : 0;
+                if (!m_impl->require_payload(packet, 1, "IT_DRAW_INDEX_AUTO")) return false;
+                const u32 count = packet.payload[0];
                 const u32 initiator = packet.payload.size() > 1 ? packet.payload[1] : 0;
                 std::fprintf(stderr, "[PM4 Draw #%zu] IT_DRAW_INDEX_AUTO: count=%u initiator=0x%08x\n",
                              m_impl->draw_count + 1, count, initiator);
@@ -1622,7 +1661,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
 
             case IT_DRAW_INDEX:
             case IT_DRAW_INDEX_2: {
-                if (packet.payload.size() >= 4) {
+                if (m_impl->require_payload(packet, 4, "IT_DRAW_INDEX")) {
                     const u32 idx_lo = packet.payload[1];
                     const u32 idx_hi = packet.payload[2];
                     const GuestAddr idx_addr = (static_cast<u64>(idx_hi) << 32) | idx_lo;
@@ -1734,15 +1773,15 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             }
 
             case IT_NUM_INSTANCES: {
-                if (!packet.payload.empty()) {
-                    m_impl->num_instances = packet.payload[0];
-                    std::fprintf(stderr, "[PM4] IT_NUM_INSTANCES: %u (raw=0x%08x)\n",
-                                 m_impl->num_instances, packet.payload[0]);
-                }
+                if (!m_impl->require_payload(packet, 1, "IT_NUM_INSTANCES")) return false;
+                m_impl->num_instances = packet.payload[0];
+                std::fprintf(stderr, "[PM4] IT_NUM_INSTANCES: %u (raw=0x%08x)\n",
+                             m_impl->num_instances, packet.payload[0]);
                 return true;
             }
 
             case IT_DRAW_INDEX_INDIRECT: {
+                if (!m_impl->require_payload(packet, 1, "IT_DRAW_INDEX_INDIRECT")) return false;
                 std::string p_str;
                 for (size_t p = 0; p < packet.payload.size(); ++p) {
                     char b[32];
@@ -1840,7 +1879,8 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             }
 
             case IT_WRITE_DATA: {
-                if (packet.payload.size() >= 4 && m_impl->memory) {
+                if (!m_impl->require_payload(packet, 4, "IT_WRITE_DATA")) return false;
+                if (m_impl->memory) {
                     const u32 addr_lo = packet.payload[1];
                     const u32 addr_hi = packet.payload[2];
                     const GuestAddr dst_addr = (static_cast<u64>(addr_hi) << 32) | addr_lo;
@@ -1861,7 +1901,8 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 return true;
 
             case IT_RELEASE_MEM: {
-                if (packet.payload.size() >= 5 && m_impl->memory) {
+                if (!m_impl->require_payload(packet, 5, "IT_RELEASE_MEM")) return false;
+                if (m_impl->memory) {
                     const u32 addr_lo = packet.payload[2];
                     const u32 addr_hi = packet.payload[3];
                     const GuestAddr label_addr = (static_cast<u64>(addr_hi) << 32) | addr_lo;
@@ -1876,7 +1917,8 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             }
 
             case IT_DMA_DATA: {
-                if (packet.payload.size() >= 6 && m_impl->memory) {
+                if (!m_impl->require_payload(packet, 6, "IT_DMA_DATA")) return false;
+                if (m_impl->memory) {
                     const u32 control = packet.payload[0];
                     const u32 src_lo = packet.payload[1];
                     const u32 src_hi = packet.payload[2];
@@ -1940,7 +1982,8 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 if (m_impl->metal && m_impl->metal->frame_in_progress()) {
                     m_impl->frame_stats.unsupported_packets++;
                 }
-                return true;
+                ++m_impl->unsupported_packets;
+                return false;
         }
     }
 
@@ -2050,6 +2093,14 @@ usize Pm4Translator::indexed_draw_count() const noexcept {
 
 usize Pm4Translator::context_reg_writes() const noexcept {
     return m_impl ? m_impl->context_reg_writes : 0;
+}
+
+usize Pm4Translator::unsupported_packet_count() const noexcept {
+    return m_impl ? m_impl->unsupported_packets : 0;
+}
+
+usize Pm4Translator::malformed_packet_count() const noexcept {
+    return m_impl ? m_impl->malformed_packets : 0;
 }
 
 GuestAddr Pm4Translator::index_base_address() const noexcept {

@@ -8,6 +8,38 @@
 #include "ps4/pm4.hpp"
 #include "ps4/pm4_translator.hpp"
 
+using namespace ps4;
+
+void test_pm4_rejects_short_payload_without_state_change() {
+    Pm4Translator translator;
+    const u32 payload[] = {PA_CL_VPORT_XSCALE};
+    Pm4Packet packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_CONTEXT_REG, 1)),
+        .payload = {payload, payload + 1},
+    };
+    const GpuViewport before = translator.viewport();
+    assert(!translator.execute_packet(packet));
+    assert(translator.malformed_packet_count() == 1);
+    assert(translator.viewport().width == before.width);
+
+    const u32 draw_payload[] = {3};
+    Pm4Packet draw_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_DRAW_INDEX_2, 1)),
+        .payload = {draw_payload, draw_payload + 1},
+    };
+    assert(!translator.execute_packet(draw_packet));
+    assert(translator.malformed_packet_count() == 2);
+    assert(translator.indexed_draw_count() == 0);
+
+    const u32 unknown_payload[] = {0};
+    Pm4Packet unknown_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(0xFF, 1)),
+        .payload = {unknown_payload, unknown_payload + 1},
+    };
+    assert(!translator.execute_packet(unknown_packet));
+    assert(translator.unsupported_packet_count() == 1);
+}
+
 int main() {
     std::cout << "[PHASE 10] Starting PS4 PM4 GPU Command Processor & Ring Buffer tests...\n";
 
@@ -235,6 +267,7 @@ int main() {
         std::cout << "  ✓ Test 6: Full PM4 batch executed from ring buffer and verified on GPU\n";
     }
 
+    test_pm4_rejects_short_payload_without_state_change();
     std::cout << "[PHASE 10] PASS: All PS4 PM4 GPU Command Processor & Ring Buffer tests passed!\n";
     return 0;
 }

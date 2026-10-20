@@ -8,6 +8,24 @@
 
 using namespace ps4;
 
+void test_pm4_rejects_malformed_and_unsupported_packets() {
+    Pm4Translator translator;
+    const u32 payload[] = {SPI_SHADER_USER_DATA_VS_0};
+    Pm4Packet short_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_SH_REG, 1)),
+        .payload = {payload, payload + 1},
+    };
+    assert(!translator.execute_packet(short_packet));
+    assert(translator.malformed_packet_count() == 1);
+
+    Pm4Packet unknown_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(0xFE, 0)),
+        .payload = {},
+    };
+    assert(!translator.execute_packet(unknown_packet));
+    assert(translator.unsupported_packet_count() == 1);
+}
+
 void test_pm4_draw_index_2_packet_decoding() {
     std::cout << "[Test 14.1] Testing PM4 IT_DRAW_INDEX_2 packet encoding and decoding...\n";
 
@@ -519,6 +537,7 @@ int main() {
     test_pm4_draw_index_indirect_execution();
     test_pm4_draw_index_auto_and_procedural_fallback();
     test_pm4_multiple_draws_use_one_frame();
+    test_pm4_rejects_malformed_and_unsupported_packets();
 
     std::cout << "=== All Phase 14 tests passed successfully! ===\n";
     return 0;

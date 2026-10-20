@@ -78,6 +78,8 @@ public:
     [[nodiscard]] usize draw_count() const noexcept;
     [[nodiscard]] usize indexed_draw_count() const noexcept;
     [[nodiscard]] usize context_reg_writes() const noexcept;
+    [[nodiscard]] usize unsupported_packet_count() const noexcept;
+    [[nodiscard]] usize malformed_packet_count() const noexcept;
 
     /// 3D Mesh pipeline: memory manager attachment and vertex buffer binding
     void set_memory_manager(MemoryManager* memory) noexcept;
