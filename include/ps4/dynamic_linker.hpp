@@ -51,6 +51,7 @@ public:
 
     /// Resolve and patch relocations (PT_DYNAMIC or PT_SCE_RELA)
     bool resolve_relocations(std::span<const u8> file_data, const ElfLoader& loader, GuestAddr base_load_addr = 0);
+    [[nodiscard]] std::string relocation_diagnostics() const;
 
     /// Patch a specific GOT jump slot directly to an NID's trampoline
     bool patch_jump_slot(GuestAddr got_slot_addr, Nid nid);
@@ -136,6 +137,8 @@ private:
 
     std::unordered_map<u32, LoadedModule> m_modules;
     std::unordered_map<Nid, GuestAddr> m_module_exports;
+    std::vector<Nid> m_unresolved_nids;
+    std::string m_last_error;
     u32 m_next_module_handle{0x2000};
 };
 

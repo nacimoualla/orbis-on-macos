@@ -119,6 +119,8 @@ bool DynamicLinker::is_whitelisted(Nid nid) const noexcept {
 }
 
 bool DynamicLinker::initialize(GuestAddr trampoline_base) {
+    m_last_error.clear();
+    m_unresolved_nids.clear();
     m_trampoline_base = trampoline_base;
     m_next_trampoline_id = 0;
     m_nid_to_trampoline.clear();
@@ -127,12 +129,32 @@ bool DynamicLinker::initialize(GuestAddr trampoline_base) {
     // Reserve 64KB space for trampolines
     constexpr GuestSize TRAMPOLINE_POOL_SIZE = 0x10000;
     if (!m_memory.is_valid_address(m_trampoline_base, TRAMPOLINE_POOL_SIZE)) {
+        m_last_error = "trampoline pool outside guest memory";
         return false;
     }
 
     m_memory.zero_memory(m_trampoline_base, TRAMPOLINE_POOL_SIZE);
     m_registry.set_syscall_table(&m_syscalls);
     return true;
+}
+
+std::string DynamicLinker::relocation_diagnostics() const {
+    std::string result = "trampolines=" + std::to_string(m_nid_to_trampoline.size()) +
+                         ", loaded_modules=" + std::to_string(m_modules.size());
+    if (!m_last_error.empty()) result += ", error=" + m_last_error;
+    if (!m_unresolved_nids.empty()) {
+        result += ", unresolved NIDs=";
+        const usize limit = std::min<usize>(m_unresolved_nids.size(), 8);
+        for (usize i = 0; i < limit; ++i) {
+            if (i != 0) result += ",";
+            char nid[32];
+            std::snprintf(nid, sizeof(nid), "0x%016llx",
+                          static_cast<unsigned long long>(m_unresolved_nids[i]));
+            result += nid;
+        }
+        if (m_unresolved_nids.size() > limit) result += ",...";
+    }
+    return result;
 }
 
 namespace {
@@ -665,6 +687,9 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                                 ++synthetic_imports;
                                 nid = 0x8000000000000000ULL | static_cast<u64>(sym_idx);
                             }
+                            if (!m_registry.find_by_nid(nid) && !m_module_exports.contains(nid)) {
+                                m_unresolved_nids.push_back(nid);
+                            }
 
                             if (std::string_view(sym_str).find("f7uOxY9mM1U") != std::string_view::npos ||
                                 nid == 0x7fbb8ec58f663355ULL || nid == 0x5533668fc58ebb7fULL) {
@@ -699,6 +724,9 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                         if (nid == 0) {
                             ++synthetic_imports;
                             nid = 0x8000000000000000ULL | static_cast<u64>(sym_idx);
+                        }
+                        if (!m_registry.find_by_nid(nid) && !m_module_exports.contains(nid)) {
+                            m_unresolved_nids.push_back(nid);
                         }
                         if (std::string_view(sym_str).find("f7uOxY9mM1U") != std::string_view::npos ||
                             nid == 0x7fbb8ec58f663355ULL || nid == 0x5533668fc58ebb7fULL) {

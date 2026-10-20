@@ -14,6 +14,9 @@ Implementation is complete. The harness, CMake/CTest registration, GPU translato
   - Fails clearly for missing target/dependencies, guest execution dependency failures, no packets/draws, or black output.
 - Registered `test_flappy_gpu` and `Flappy_GpuSmoke` in `CMakeLists.txt`.
 - Added `NidRegistry::gpu_translator()` so the smoke harness reports the same PM4 translator used by GNM HLE handlers.
+- Added dynamic-linker relocation diagnostics to failure paths, including
+  loaded-module/trampoline state and unresolved NIDs, plus CPU/HLE/GPU runtime
+  counters on bounded guest execution failures.
 - Added the smoke command, validated counters, and shader-signature/unsupported-PM4 evidence queue to `ROADMAP.md`.
 
 ## Validation
@@ -24,9 +27,25 @@ Implementation is complete. The harness, CMake/CTest registration, GPU translato
   - Harness result: guest execution stopped at frame 1 with `Illegal or unimplemented instruction`; no synthetic framebuffer or counter pass was accepted.
 - `git diff --check` — **passed**.
 
+## Review fix validation
+
+The harness now names dynamic-linker failures as initialization versus
+relocation failures and includes unresolved NIDs when available. Guest runtime
+dependency failures retain the preceding CPU/HLE/GPU diagnostics and append
+linker state plus PM4 packet/draw/unsupported counters. The focused CTest still
+fails explicitly on the known unsupported VEX operation (`map=1 op=0x7c`).
+
 ## Concerns / follow-up queue
 
-The current blocker is CPU instruction coverage (`VEX` map 1, opcode `0x7c`), before video-out/PM4 can produce a draw. Once that dependency is implemented, rerun the same CMake/CTest commands and use the emitted shader signatures and unsupported PM4 count to prioritize Flappy fidelity work. Existing unrelated changes in `src/cpu/executor.cpp` and `tests/test_phase5.cpp` were preserved and not staged.
+The current blocker is CPU instruction coverage (`VEX` map 1, opcode `0x7c` at
+RIP `0x1061969`), before video-out/PM4 can produce a draw. The updated failure
+also reports `trampolines=808`, `loaded_modules=0`, unresolved NIDs beginning
+`0x3f7df43f774517af` and `0xcebd3de04437f56c`, and GPU
+`packets=0 draws=0 unsupported=0`. Once that dependency is implemented, rerun
+the same CMake/CTest commands and use the emitted shader signatures and
+unsupported PM4 count to prioritize Flappy fidelity work. Existing unrelated
+changes in `src/cpu/executor.cpp` and `tests/test_phase5.cpp` were preserved
+and not staged.
 
 ## Commit
 

@@ -61,8 +61,10 @@ int main() {
     registry.register_default_libraries();
     ps4::DynamicLinker linker(memory, syscalls, registry);
     ps4::set_active_linker(&linker);
-    if (!linker.initialize() || !linker.resolve_relocations(data, loader))
-        return fail("dynamic linker initialization/relocation failed");
+    if (!linker.initialize())
+        return fail("dynamic linker initialization failed: " + linker.relocation_diagnostics());
+    if (!linker.resolve_relocations(data, loader))
+        return fail("dynamic linker relocation failed: " + linker.relocation_diagnostics());
 
     ps4::MetalBackend metal;
     if (!metal.initialize()) return fail("Metal dependency unavailable");
@@ -102,7 +104,12 @@ int main() {
                         " before the smoke interval completed (status=" +
                         std::string(ps4::step_result_to_string(result.status)) +
                         "; guest execution dependency missing; inspect the preceding "
-                        "CPU/HLE diagnostic for the exact unsupported operation)");
+                        "CPU/HLE diagnostic for the exact unsupported operation; "
+                        "runtime: " + linker.relocation_diagnostics() +
+                        "; GPU packets=" + std::to_string(translator->packets_processed()) +
+                        " draws=" + std::to_string(translator->draw_count()) +
+                        " unsupported=" + std::to_string(translator->unsupported_packet_count()) +
+                        ". Relevant CPU/HLE/GPU diagnostics above are intentionally preserved.)");
     }
 
     if (!metal.wait_for_last_frame()) return fail("last GPU frame did not complete");
