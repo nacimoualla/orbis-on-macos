@@ -52,3 +52,10 @@ Validation rerun:
 - `ctest --test-dir build -R Phase14_MeshPipeline --output-on-failure` — **passed** (1/1, 0.07s)
 
 The attempted Metal texture integration test was not retained because the current diagnostic path blocks indefinitely during the first textured draw on this environment; the non-textured Phase 14 suite remains green. This is recorded as a validation concern rather than hidden as a passing test.
+
+Final focused rerun after review-fix cleanup:
+
+- `cmake --build build --target test_phase14` — **passed**
+- `./build/test_phase14 >/dev/null 2>&1` — **passed** (exit code 0)
+- `ctest --test-dir build -R Phase14_MeshPipeline --output-on-failure` — **passed** (1/1, 0.06s)
+- `git diff --check` — **passed**
