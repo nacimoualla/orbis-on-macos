@@ -21,6 +21,9 @@ Implementation is complete. The harness, CMake/CTest registration, GPU translato
 - Dynamic-linker relocation table read and guest-memory patch failures now
   propagate `false` with table name, table address, first failing address, and
   unread count in `m_last_error`.
+- `load_module()` now checks relocation success, reports the diagnostics, and
+  rolls back the module record, segment mappings, and import-slot bookkeeping
+  before returning failure; exports and init are not reached.
 - Added the smoke command, validated counters, and shader-signature/unsupported-PM4 evidence queue to `ROADMAP.md`.
 
 ## Validation
@@ -42,6 +45,7 @@ dependency failures retain the preceding CPU/HLE/GPU diagnostics and append
 linker state plus PM4 packet/draw/unsupported counters. The focused CTest still
 fails explicitly on the known unsupported VEX operation (`map=1 op=0x7c`).
 Smoke output now uses `unsupported_packets=` and `upload_bytes=` exactly.
+Phase 7 regression coverage was rerun after the module rollback fix.
 
 ## Concerns / follow-up queue
 

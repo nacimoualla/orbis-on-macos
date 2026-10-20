@@ -532,6 +532,7 @@ inline Nid decode_nid_from_string(const char* s) {
 } // namespace
 
 bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const ElfLoader& loader, GuestAddr base_load_addr) {
+    m_last_error.clear();
     GuestAddr rela_addr = 0;
     GuestSize rela_size = 0;
     GuestAddr jmprel_addr = 0;
@@ -1130,9 +1131,28 @@ u32 DynamicLinker::load_module(const std::string& path, GuestAddr base, bool run
     mod.base = base;
     m_modules.emplace(handle, mod);
 
+    const auto rollback_mapping = [&]() {
+        for (const auto& ph : loader.program_headers()) {
+            if (ph.p_type == PT_LOAD || ph.p_type == PT_SCE_RELRO) {
+                m_memory.release_mapping(base + ph.p_vaddr);
+            }
+        }
+        m_modules.erase(handle);
+        for (auto it = m_nid_to_slots.begin(); it != m_nid_to_slots.end();) {
+            auto& slots = it->second;
+            slots.erase(std::remove_if(slots.begin(), slots.end(),
+                                       [&](GuestAddr slot) {
+                                           return slot >= base && slot < base + needed;
+                                       }),
+                        slots.end());
+            if (slots.empty()) it = m_nid_to_slots.erase(it);
+            else ++it;
+        }
+    };
+
     GuestSize span = 0;
     if (!map_segments(data, loader, base, &span, handle)) {
-        m_modules.erase(handle);
+        rollback_mapping();
         return 0;
     }
     m_modules.find(handle)->second.size = span;
@@ -1140,7 +1160,12 @@ u32 DynamicLinker::load_module(const std::string& path, GuestAddr base, bool run
     // Relocate before reading exports: the symbol values we record are the
     // pre-relocation ones, but the import bindings written here are what make
     // the module's own calls land somewhere sane.
-    resolve_relocations(data, loader, base);
+    if (!resolve_relocations(data, loader, base)) {
+        std::fprintf(stderr, "[module] 0x%x %s: relocation failed: %s\n",
+                     handle, path.c_str(), relocation_diagnostics().c_str());
+        rollback_mapping();
+        return 0;
+    }
     build_export_table(data, loader, base, handle, span);
 
     if (run_init) run_module_init(handle);
