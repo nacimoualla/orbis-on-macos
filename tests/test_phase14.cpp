@@ -555,6 +555,60 @@ void test_pm4_multiple_draws_use_one_frame() {
     assert(metal.submitted_frame_count() == 2);
 }
 
+void test_pm4_guest_resource_cache_and_invalidation() {
+    std::cout << "[Test 14.9] Testing bounded guest resource caches...\n";
+    MetalBackend metal;
+    assert(metal.initialize());
+    assert(metal.create_framebuffer(256, 256));
+    MemoryManager memory;
+    assert(memory.initialize());
+
+    const GuestAddr vertices = 0x130000;
+    const GuestAddr indices = 0x131000;
+    Vertex3D triangle[3] = {
+        {{-0.8f, -0.8f, 0.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
+        {{ 0.0f,  0.8f, 0.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+        {{ 0.8f, -0.8f, 0.0f}, {0.0f, 0.0f, 1.0f, 1.0f}},
+    };
+    const u16 triangle_indices[3] = {0, 1, 2};
+    memory.write_bytes(vertices, triangle, sizeof(triangle));
+    memory.write_bytes(indices, triangle_indices, sizeof(triangle_indices));
+
+    Pm4Translator translator(&metal);
+    translator.set_memory_manager(&memory);
+    translator.bind_vertex_buffer(vertices, sizeof(triangle));
+
+    assert(translator.begin_frame());
+    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.submit_frame(true));
+    const GpuFrameStats first = translator.frame_stats();
+    assert(first.resource_cache_misses >= 2);
+    const usize first_uploads = first.upload_bytes;
+
+    assert(translator.begin_frame());
+    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.submit_frame(true));
+    const GpuFrameStats second = translator.frame_stats();
+    assert(second.resource_cache_hits >= first.resource_cache_hits + 2);
+    assert(second.upload_bytes == first_uploads);
+
+    triangle[0].position[0] = -0.7f;
+    memory.write_bytes(vertices, triangle, sizeof(triangle));
+    translator.invalidate_guest_resources(vertices, sizeof(triangle));
+    assert(translator.begin_frame());
+    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.submit_frame(true));
+    const GpuFrameStats third = translator.frame_stats();
+    assert(third.resource_cache_misses >= second.resource_cache_misses + 1);
+    assert(third.upload_bytes > second.upload_bytes);
+
+    translator.set_resource_cache_budget(1);
+    assert(translator.begin_frame());
+    assert(!translator.execute_indexed_draw(indices, 3));
+    assert(translator.submit_frame(true));
+    std::cout << "  -> Guest resource cache and invalidation passed!\n";
+}
+
 int main() {
     std::cout << "=== Phase 14: 3D Graphics Mesh Pipeline & Sample Demo Tests ===\n";
 
@@ -567,6 +621,7 @@ int main() {
     test_pm4_draw_index_indirect_execution();
     test_pm4_draw_index_auto_and_procedural_fallback();
     test_pm4_multiple_draws_use_one_frame();
+    test_pm4_guest_resource_cache_and_invalidation();
     test_pm4_rejects_malformed_and_unsupported_packets();
 
     std::cout << "=== All Phase 14 tests passed successfully! ===\n";

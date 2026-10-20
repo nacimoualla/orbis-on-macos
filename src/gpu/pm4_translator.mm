@@ -6,6 +6,8 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <algorithm>
+#include <tuple>
 #include <vector>
 
 namespace ps4 {
@@ -89,6 +91,35 @@ struct Pm4Translator::Impl {
     };
     u32 dirty_bits{0};
     GpuFrameStats frame_stats{};
+    static constexpr usize kDefaultResourceCacheBudget = 64 * 1024 * 1024;
+    struct ResourceKey {
+        GuestAddr address{0};
+        usize size{0};
+        u32 format{0};
+        u32 width{0};
+        u32 height{0};
+        u64 generation{0};
+        bool operator<(const ResourceKey& o) const noexcept {
+            return std::tie(address, size, format, width, height, generation) <
+                   std::tie(o.address, o.size, o.format, o.width, o.height, o.generation);
+        }
+    };
+    struct BufferCacheEntry {
+        id<MTLBuffer> buffer{nil};
+        usize bytes{0};
+        u64 last_used{0};
+    };
+    struct TextureCacheEntry {
+        id<MTLTexture> texture{nil};
+        usize bytes{0};
+        u64 last_used{0};
+    };
+    std::map<ResourceKey, BufferCacheEntry> buffer_cache;
+    std::map<ResourceKey, TextureCacheEntry> texture_cache;
+    usize resource_cache_budget{kDefaultResourceCacheBudget};
+    usize resource_cache_bytes{0};
+    u64 resource_generation{0};
+    u64 resource_use_clock{0};
     bool frame_draw_encoded{false};
     u64 frame_submission_start{0};
 
@@ -128,6 +159,10 @@ struct Pm4Translator::Impl {
                              i32 base_vertex = 0, u32 instance_count = 1);
     bool render_auto_mesh(u32 vtx_count, PrimitiveType prim_type,
                           i32 base_vertex = 0, u32 instance_count = 1);
+    id<MTLBuffer> cached_buffer(id<MTLDevice> device, GuestAddr address, usize size,
+                                const void* bytes, u32 format = 0);
+    void evict_resource_cache(usize requested);
+    void invalidate_resources(GuestAddr address, usize size) noexcept;
 
     bool require_payload(const Pm4Packet& packet, usize count, const char* operation) {
         if (packet.payload.size() >= count) return true;
@@ -387,6 +422,86 @@ MeshUniforms Pm4Translator::Impl::compute_uniforms() {
     return u;
 }
 
+void Pm4Translator::Impl::evict_resource_cache(usize requested) {
+    while (resource_cache_bytes + requested > resource_cache_budget &&
+           (!buffer_cache.empty() || !texture_cache.empty())) {
+        bool evict_buffer = texture_cache.empty();
+        ResourceKey oldest_key{};
+        u64 oldest = UINT64_MAX;
+        if (!buffer_cache.empty()) {
+            const auto it = std::min_element(buffer_cache.begin(), buffer_cache.end(),
+                [](const auto& a, const auto& b) { return a.second.last_used < b.second.last_used; });
+            oldest_key = it->first;
+            oldest = it->second.last_used;
+        }
+        if (!texture_cache.empty()) {
+            const auto it = std::min_element(texture_cache.begin(), texture_cache.end(),
+                [](const auto& a, const auto& b) { return a.second.last_used < b.second.last_used; });
+            if (it->second.last_used < oldest) {
+                evict_buffer = false;
+                oldest_key = it->first;
+            }
+        }
+        if (evict_buffer) {
+            resource_cache_bytes -= buffer_cache[oldest_key].bytes;
+            buffer_cache.erase(oldest_key);
+        } else {
+            resource_cache_bytes -= texture_cache[oldest_key].bytes;
+            texture_cache.erase(oldest_key);
+        }
+    }
+}
+
+id<MTLBuffer> Pm4Translator::Impl::cached_buffer(id<MTLDevice> device, GuestAddr address,
+                                                  usize size, const void* bytes, u32 format) {
+    if (!device || !memory || size == 0 || !memory->is_valid_address(address, size) || !bytes) {
+        return nil;
+    }
+    if (size > resource_cache_budget) return nil;
+    const ResourceKey key{address, size, format, 0, 0, resource_generation};
+    auto hit = buffer_cache.find(key);
+    if (hit != buffer_cache.end()) {
+        hit->second.last_used = ++resource_use_clock;
+        ++frame_stats.resource_cache_hits;
+        return hit->second.buffer;
+    }
+    evict_resource_cache(size);
+    if (resource_cache_bytes + size > resource_cache_budget) return nil;
+    id<MTLBuffer> buffer = [device newBufferWithBytes:bytes length:size options:MTLResourceStorageModeShared];
+    if (!buffer) return nil;
+    buffer_cache.emplace(key, BufferCacheEntry{buffer, size, ++resource_use_clock});
+    resource_cache_bytes += size;
+    frame_stats.upload_bytes += size;
+    ++frame_stats.resource_cache_misses;
+    return buffer;
+}
+
+void Pm4Translator::Impl::invalidate_resources(GuestAddr address, usize size) noexcept {
+    if (size == 0) return;
+    const GuestAddr end = address > UINT64_MAX - size ? UINT64_MAX : address + size;
+    auto overlaps = [address, end](const ResourceKey& key) {
+        const GuestAddr key_end = key.address > UINT64_MAX - key.size ? UINT64_MAX : key.address + key.size;
+        return key.address < end && address < key_end;
+    };
+    for (auto it = buffer_cache.begin(); it != buffer_cache.end();) {
+        if (overlaps(it->first)) {
+            resource_cache_bytes -= it->second.bytes;
+            it = buffer_cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = texture_cache.begin(); it != texture_cache.end();) {
+        if (overlaps(it->first)) {
+            resource_cache_bytes -= it->second.bytes;
+            it = texture_cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    ++resource_generation;
+}
+
 id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
     if (!device || !memory) {
         ps_texture_status = "hit white fallback (no device or memory manager)";
@@ -411,6 +526,23 @@ id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
         return default_white_texture;
     }
 
+    const usize texture_bytes = byte_size;
+    const ResourceKey key{ps_texture_base, texture_bytes, ps_texture_format,
+                          ps_texture_width, ps_texture_height, resource_generation};
+    auto cached = texture_cache.find(key);
+    if (cached != texture_cache.end()) {
+        cached->second.last_used = ++resource_use_clock;
+        ++frame_stats.resource_cache_hits;
+        active_metal_texture = cached->second.texture;
+        ps_texture_status = "cache hit";
+        return active_metal_texture;
+    }
+    if (texture_bytes > resource_cache_budget) {
+        ps_texture_status = "resource exceeds cache budget";
+        return nil;
+    }
+    evict_resource_cache(texture_bytes);
+    if (resource_cache_bytes + texture_bytes > resource_cache_budget) return nil;
     if (!active_metal_texture ||
         active_metal_texture.width != ps_texture_width ||
         active_metal_texture.height != ps_texture_height) {
@@ -450,6 +582,10 @@ id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
                                 bytesPerRow:ps_texture_width * 4];
     }
 
+    texture_cache.emplace(key, TextureCacheEntry{active_metal_texture, texture_bytes, ++resource_use_clock});
+    resource_cache_bytes += texture_bytes;
+    frame_stats.upload_bytes += texture_bytes;
+    ++frame_stats.resource_cache_misses;
     return active_metal_texture;
 }
 
@@ -832,6 +968,12 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         if (required_vtx_size == 0 || min_needed > required_vtx_size) {
             required_vtx_size = min_needed;
         }
+        if (eff_vtx_addr != 0 && (!memory || required_vtx_size == 0 ||
+                                  !memory->is_valid_address(eff_vtx_addr, required_vtx_size))) {
+            std::fprintf(stderr, "[PM4] render_indexed_mesh: invalid vertex range 0x%llx (size=%zu)\n",
+                         (unsigned long long)eff_vtx_addr, required_vtx_size);
+            return false;
+        }
 
         MeshUniforms uniforms = compute_uniforms();
         id<MTLTexture> active_tex = prepare_texture(device);
@@ -864,14 +1006,16 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         id<MTLBuffer> vtx_buf = nil;
         if (use_guest_vtx) {
             const void* vtx_ptr = memory->to_host_ptr<void>(eff_vtx_addr);
-            vtx_buf = [device newBufferWithBytes:vtx_ptr length:required_vtx_size options:MTLResourceStorageModeShared];
+            vtx_buf = cached_buffer(device, eff_vtx_addr, required_vtx_size, vtx_ptr);
+            if (!vtx_buf) return false;
             uniforms.vertex_stride = stride;
         } else {
             vtx_buf = [device newBufferWithBytes:s_default_quad length:sizeof(s_default_quad) options:MTLResourceStorageModeShared];
             uniforms.vertex_stride = sizeof(MeshVertex);
         }
 
-        id<MTLBuffer> idx_buf = [device newBufferWithBytes:idx_ptr length:required_idx_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> idx_buf = cached_buffer(device, idx_addr, required_idx_size, idx_ptr);
+        if (!idx_buf) return false;
 
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
         id<MTLRenderCommandEncoder> enc =
@@ -998,6 +1142,12 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         const usize stride = eff_vtx_stride;
         const usize min_needed = static_cast<usize>(vtx_count + (base_vertex > 0 ? base_vertex : 0)) * stride;
         const usize required_vtx_size = std::max<usize>(eff_vtx_size, min_needed);
+        if (eff_vtx_addr != 0 && (!memory || required_vtx_size == 0 ||
+                                  !memory->is_valid_address(eff_vtx_addr, required_vtx_size))) {
+            std::fprintf(stderr, "[PM4] render_auto_mesh: invalid vertex range 0x%llx (size=%zu)\n",
+                         (unsigned long long)eff_vtx_addr, required_vtx_size);
+            return false;
+        }
 
         MeshUniforms uniforms = compute_uniforms();
         id<MTLTexture> active_tex = prepare_texture(device);
@@ -1047,7 +1197,8 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
 
         if (use_guest_vtx) {
             const void* vtx_ptr = memory->to_host_ptr<void>(eff_vtx_addr);
-            vtx_buf = [device newBufferWithBytes:vtx_ptr length:required_vtx_size options:MTLResourceStorageModeShared];
+            vtx_buf = cached_buffer(device, eff_vtx_addr, required_vtx_size, vtx_ptr);
+            if (!vtx_buf) return false;
             uniforms.vertex_stride = stride;
             if (prim_type == PrimitiveType::TriangleStrip) {
                 mtl_prim = MTLPrimitiveTypeTriangleStrip;
@@ -1176,7 +1327,13 @@ bool Pm4Translator::begin_frame() {
     if (!m_impl->metal) return true;
     if (!m_impl->metal->begin_frame()) return false;
     m_impl->frame_draw_encoded = false;
+    const usize upload_bytes = m_impl->frame_stats.upload_bytes;
+    const usize cache_hits = m_impl->frame_stats.resource_cache_hits;
+    const usize cache_misses = m_impl->frame_stats.resource_cache_misses;
     m_impl->frame_stats = GpuFrameStats{};
+    m_impl->frame_stats.upload_bytes = upload_bytes;
+    m_impl->frame_stats.resource_cache_hits = cache_hits;
+    m_impl->frame_stats.resource_cache_misses = cache_misses;
     m_impl->frame_submission_start = m_impl->metal->submitted_frame_count();
     m_impl->frame_stats.frame_index = m_impl->frame_submission_start + 1;
     return true;
@@ -1260,8 +1417,24 @@ void Pm4Translator::reset_state() {
 
 void Pm4Translator::set_memory_manager(MemoryManager* memory) noexcept {
     if (m_impl) {
+        if (m_impl->memory != memory) {
+            m_impl->buffer_cache.clear();
+            m_impl->texture_cache.clear();
+            m_impl->resource_cache_bytes = 0;
+            ++m_impl->resource_generation;
+        }
         m_impl->memory = memory;
     }
+}
+
+void Pm4Translator::set_resource_cache_budget(usize bytes) noexcept {
+    if (!m_impl) return;
+    m_impl->resource_cache_budget = bytes;
+    m_impl->evict_resource_cache(0);
+}
+
+void Pm4Translator::invalidate_guest_resources(GuestAddr address, usize size) noexcept {
+    if (m_impl) m_impl->invalidate_resources(address, size);
 }
 
 void Pm4Translator::bind_vertex_buffer(GuestAddr vaddr, usize size, usize stride) {
