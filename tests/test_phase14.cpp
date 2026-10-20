@@ -175,6 +175,25 @@ void test_metal_3d_indexed_triangle_rendering() {
     std::cout << "  -> 3D indexed mesh rasterization on Metal 3 passed!\n";
 }
 
+void test_metal_frame_submission_batches_clear() {
+    MetalBackend metal;
+    assert(metal.initialize());
+    assert(metal.create_framebuffer(64, 64));
+    assert(metal.begin_frame());
+    assert(metal.frame_in_progress());
+    assert(metal.encode_clear(ColorRGBA{0.1f, 0.2f, 0.3f, 1.0f}));
+    assert(metal.submit_frame(true));
+    assert(!metal.frame_in_progress());
+    assert(metal.submitted_frame_count() == 1);
+
+    u8 r = 0, g = 0, b = 0, a = 0;
+    assert(metal.read_pixel(32, 32, r, g, b, a));
+    assert(r >= 24 && r <= 27);
+    assert(g >= 50 && g <= 53);
+    assert(b >= 75 && b <= 78);
+    assert(a == 255);
+}
+
 void test_pm4_index_base_and_dma_data() {
     std::cout << "[Test 14.4] Testing PM4 IT_INDEX_BASE and IT_DMA_DATA (immediate fill and memcopy)...\n";
 
@@ -445,6 +464,7 @@ int main() {
     test_pm4_draw_index_2_packet_decoding();
     test_vertex_buffer_binding_via_sh_reg();
     test_metal_3d_indexed_triangle_rendering();
+    test_metal_frame_submission_batches_clear();
     test_pm4_index_base_and_dma_data();
     test_pm4_type0_index_configuration();
     test_pm4_draw_index_indirect_execution();
