@@ -7,6 +7,7 @@
 #include <iostream>
 #include <map>
 #include <algorithm>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -25,6 +26,20 @@ struct MeshUniforms {
     u32 vertex_stride;
     u32 use_texture;
     u32 pad[2];
+};
+
+struct ShaderSignature {
+    GuestAddr vertex_program{0};
+    GuestAddr fragment_program{0};
+    u32 vertex_resource_signature{0};
+    u32 fragment_resource_signature{0};
+
+    bool operator<(const ShaderSignature& other) const noexcept {
+        return std::tie(vertex_program, fragment_program, vertex_resource_signature,
+                        fragment_resource_signature) <
+               std::tie(other.vertex_program, other.fragment_program,
+                        other.vertex_resource_signature, other.fragment_resource_signature);
+    }
 };
 
 struct Pm4Translator::Impl {
@@ -125,6 +140,9 @@ struct Pm4Translator::Impl {
     u64 frame_submission_start{0};
 
     id<MTLRenderPipelineState> mesh_pipeline_state{nil};
+    std::map<ShaderSignature, id<MTLRenderPipelineState>> shader_pipelines;
+    std::set<ShaderSignature> shader_fallbacks;
+    std::string shader_pipeline_error;
     id<MTLTexture> default_white_texture{nil};
     id<MTLSamplerState> sampler_state{nil};
     id<MTLTexture> active_metal_texture{nil};
@@ -145,7 +163,9 @@ struct Pm4Translator::Impl {
     GuestAddr last_idx_addr{0};
     u32 last_idx_count{0};
 
-    void init_mesh_pipeline();
+    bool init_mesh_pipeline();
+    id<MTLRenderPipelineState> pipeline_for_current_shader();
+    ShaderSignature current_shader_signature() const noexcept;
     MeshUniforms compute_uniforms();
     id<MTLTexture> prepare_texture(id<MTLDevice> device);
     void log_draw_diagnostics(const char* draw_type, u32 count,
@@ -179,13 +199,13 @@ struct Pm4Translator::Impl {
     }
 };
 
-void Pm4Translator::Impl::init_mesh_pipeline() {
-    if (!metal || !metal->is_initialized()) return;
-    if (mesh_pipeline_state) return;
+bool Pm4Translator::Impl::init_mesh_pipeline() {
+    if (!metal || !metal->is_initialized()) return false;
+    if (mesh_pipeline_state) return true;
 
     @autoreleasepool {
         id<MTLDevice> device = (__bridge id<MTLDevice>)metal->raw_device();
-        if (!device) return;
+        if (!device) return false;
 
         NSString* shader_source = @""
             "#include <metal_stdlib>\n"
@@ -256,7 +276,8 @@ void Pm4Translator::Impl::init_mesh_pipeline() {
         if (!library) {
             std::cerr << "[PM4] Failed to compile MSL 3D mesh shader: "
                       << (error ? [[error localizedDescription] UTF8String] : "unknown error") << "\n";
-            return;
+            shader_pipeline_error = error ? [[error localizedDescription] UTF8String] : "unknown shader library error";
+            return false;
         }
 
         id<MTLFunction> vs = [library newFunctionWithName:@"vs_mesh"];
@@ -276,6 +297,8 @@ void Pm4Translator::Impl::init_mesh_pipeline() {
         if (!mesh_pipeline_state) {
             std::cerr << "[PM4] Failed to create 3D mesh render pipeline state: "
                       << (error ? [[error localizedDescription] UTF8String] : "unknown error") << "\n";
+            shader_pipeline_error = error ? [[error localizedDescription] UTF8String] : "unknown pipeline error";
+            return false;
         }
 
         if (!default_white_texture) {
@@ -298,6 +321,38 @@ void Pm4Translator::Impl::init_mesh_pipeline() {
             sampler_state = [device newSamplerStateWithDescriptor:sampDesc];
         }
     }
+    return mesh_pipeline_state != nil;
+}
+
+ShaderSignature Pm4Translator::Impl::current_shader_signature() const noexcept {
+    const auto resource_signature = [](u32 first, u32 second) noexcept {
+        return first ^ ((second << 13) | (second >> 19));
+    };
+    return ShaderSignature{
+        .vertex_program = vs_shader_addr,
+        .fragment_program = ps_shader_addr,
+        .vertex_resource_signature = resource_signature(vs_rsrc1, vs_rsrc2),
+        .fragment_resource_signature = resource_signature(ps_rsrc1, ps_rsrc2),
+    };
+}
+
+id<MTLRenderPipelineState> Pm4Translator::Impl::pipeline_for_current_shader() {
+    const ShaderSignature signature = current_shader_signature();
+    const auto cached = shader_pipelines.find(signature);
+    if (cached != shader_pipelines.end()) return cached->second;
+
+    if (!init_mesh_pipeline()) return nil;
+    shader_pipelines.emplace(signature, mesh_pipeline_state);
+    shader_fallbacks.insert(signature);
+    std::fprintf(stderr,
+                 "[PM4] Shader compatibility fallback: VS=0x%llx PS=0x%llx "
+                 "VS_RES=0x%08x PS_RES=0x%08x (fallbacks=%zu)\n",
+                 static_cast<unsigned long long>(signature.vertex_program),
+                 static_cast<unsigned long long>(signature.fragment_program),
+                 signature.vertex_resource_signature,
+                 signature.fragment_resource_signature,
+                 shader_fallbacks.size());
+    return mesh_pipeline_state;
 }
 
 MeshUniforms Pm4Translator::Impl::compute_uniforms() {
@@ -908,8 +963,8 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
     }
 
     @autoreleasepool {
-        init_mesh_pipeline();
-        if (!mesh_pipeline_state) return false;
+        id<MTLRenderPipelineState> pipeline = pipeline_for_current_shader();
+        if (!pipeline) return false;
 
         id<MTLDevice> device = (__bridge id<MTLDevice>)metal->raw_device();
         if (!device) return false;
@@ -1024,7 +1079,7 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
             (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
         if (!enc) return false;
 
-        [enc setRenderPipelineState:mesh_pipeline_state];
+        [enc setRenderPipelineState:pipeline];
         [enc setCullMode:MTLCullModeNone];
 
         const u32 fb_w = metal->width() > 0 ? metal->width() : 1920;
@@ -1115,8 +1170,8 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
     }
 
     @autoreleasepool {
-        init_mesh_pipeline();
-        if (!mesh_pipeline_state) return false;
+        id<MTLRenderPipelineState> pipeline = pipeline_for_current_shader();
+        if (!pipeline) return false;
 
         id<MTLDevice> device = (__bridge id<MTLDevice>)metal->raw_device();
         if (!device) return false;
@@ -1261,7 +1316,7 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
             (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
         if (!enc) return false;
 
-        [enc setRenderPipelineState:mesh_pipeline_state];
+        [enc setRenderPipelineState:pipeline];
         [enc setCullMode:MTLCullModeNone];
 
         const u32 fb_w = metal->width() > 0 ? metal->width() : 1920;
@@ -1366,6 +1421,20 @@ bool Pm4Translator::frame_in_progress() const noexcept {
 
 GpuFrameStats Pm4Translator::frame_stats() const noexcept {
     return m_impl ? m_impl->frame_stats : GpuFrameStats{};
+}
+
+usize Pm4Translator::shader_fallback_count() const noexcept {
+    return m_impl ? m_impl->shader_fallbacks.size() : 0;
+}
+
+std::string Pm4Translator::shader_status() const {
+    if (!m_impl) return "shader pipeline unavailable";
+    if (!m_impl->shader_pipeline_error.empty()) {
+        return "shader pipeline error: " + m_impl->shader_pipeline_error;
+    }
+    return "shader compatibility fallback signatures=" +
+           std::to_string(m_impl->shader_fallbacks.size()) +
+           " cached_pipelines=" + std::to_string(m_impl->shader_pipelines.size());
 }
 
 void Pm4Translator::reset_state() {

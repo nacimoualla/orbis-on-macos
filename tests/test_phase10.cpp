@@ -47,6 +47,12 @@ void test_pm4_rejects_short_payload_without_state_change() {
     assert(translator.malformed_packet_count() == 3);
 }
 
+void test_shader_diagnostics_start_empty() {
+    Pm4Translator translator;
+    assert(translator.shader_fallback_count() == 0);
+    assert(translator.shader_status().find("cached_pipelines=0") != std::string::npos);
+}
+
 int main() {
     std::cout << "[PHASE 10] Starting PS4 PM4 GPU Command Processor & Ring Buffer tests...\n";
 
@@ -275,6 +281,7 @@ int main() {
     }
 
     test_pm4_rejects_short_payload_without_state_change();
+    test_shader_diagnostics_start_empty();
     std::cout << "[PHASE 10] PASS: All PS4 PM4 GPU Command Processor & Ring Buffer tests passed!\n";
     return 0;
 }

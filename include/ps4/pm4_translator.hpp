@@ -5,6 +5,7 @@
 #include "ps4/metal_backend.hpp"
 #include "ps4/pm4.hpp"
 #include <memory>
+#include <string>
 
 namespace ps4 {
 
@@ -80,6 +81,8 @@ public:
     [[nodiscard]] usize context_reg_writes() const noexcept;
     [[nodiscard]] usize unsupported_packet_count() const noexcept;
     [[nodiscard]] usize malformed_packet_count() const noexcept;
+    [[nodiscard]] usize shader_fallback_count() const noexcept;
+    [[nodiscard]] std::string shader_status() const;
 
     /// 3D Mesh pipeline: memory manager attachment and vertex buffer binding
     void set_memory_manager(MemoryManager* memory) noexcept;

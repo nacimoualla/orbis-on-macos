@@ -392,7 +392,7 @@ _Phases 1–15 built the runtime and are verified against synthetic `samples/*.e
 - The **ARM64 JIT (`Arm64Emitter`) is connected** — `cpu.set_jit_compiler(&jit)` active by default with seamless interpreter fallback and W^X support.
 - **Input does not exist yet** — no `libScePad` HLE, no GameController backend, and no keyboard/mouse capture in `DisplayWindow`, despite ADR 0009.
 - **HLE breadth is thin** — only `libSceFios2` (done) and `libSceCommonDialog` are substantially implemented; `libSceVideoOut`, `libSceUserService`, `libSceSysmodule`, `libSceNgs2` and media decoders are missing. (`libaudioout` symbols are registered.)
-- **Graphics uses a fixed inline MSL mesh shader** — ADR 0007's two-tier GCN→MSL translation and texture/sampler binding are not yet implemented.
+- **Graphics uses a target-aware compatibility pipeline** — frame batching, resource caching, and explicit per-signature shader fallback are complete for this milestone. Arbitrary GCN-to-MSL translation and complete video-out remain future work; ADR 0007's full shader translation and texture/sampler binding are not yet implemented.
 
 ## 📌 Phase 16: Input — GameController Framework (closes ADR 0009)
 
@@ -483,5 +483,4 @@ _Phases 1–15 built the runtime and are verified against synthetic `samples/*.e
 ---
 
 *These phases are candidates; reorder based on which real titles you target first.*
-
 

@@ -513,6 +513,42 @@ void test_pm4_draw_index_auto_and_procedural_fallback() {
     std::cout << "  -> IT_DRAW_INDEX_AUTO and procedural fallback passed!\n";
 }
 
+void test_pm4_shader_signature_fallback_is_cached() {
+    std::cout << "[Test 14.8] Testing target shader signature fallback caching...\n";
+
+    MetalBackend metal;
+    assert(metal.initialize());
+    assert(metal.create_framebuffer(256, 256));
+    MemoryManager memory;
+    assert(memory.initialize());
+
+    Pm4Translator translator(&metal);
+    translator.set_memory_manager(&memory);
+    assert(translator.begin_frame());
+
+    const u32 vs_regs[] = {SPI_SHADER_PGM_LO_VS, 0x00001000, 0x00000002, 0x11111111, 0x22222222};
+    const u32 ps_regs[] = {SPI_SHADER_PGM_LO_PS, 0x00002000, 0x00000003, 0x33333333, 0x44444444};
+    Pm4Packet vs_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_SH_REG, 5)),
+        .payload = {vs_regs, vs_regs + 5},
+    };
+    Pm4Packet ps_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_SH_REG, 5)),
+        .payload = {ps_regs, ps_regs + 5},
+    };
+    assert(translator.execute_packet(vs_packet));
+    assert(translator.execute_packet(ps_packet));
+
+    assert(translator.execute_auto_draw(3));
+    assert(translator.shader_fallback_count() == 1);
+    assert(translator.execute_auto_draw(3));
+    assert(translator.shader_fallback_count() == 1);
+    assert(translator.shader_status().find("fallback") != std::string::npos);
+    assert(translator.submit_frame(true));
+
+    std::cout << "  -> Repeated unknown shader signatures share one compatibility fallback!\n";
+}
+
 void test_pm4_multiple_draws_use_one_frame() {
     MetalBackend metal;
     assert(metal.initialize());
@@ -709,6 +745,7 @@ int main() {
     test_pm4_type0_index_configuration();
     test_pm4_draw_index_indirect_execution();
     test_pm4_draw_index_auto_and_procedural_fallback();
+    test_pm4_shader_signature_fallback_is_cached();
     test_pm4_multiple_draws_use_one_frame();
     test_pm4_guest_resource_cache_and_invalidation();
     test_pm4_texture_cache_and_cross_resource_lru();
