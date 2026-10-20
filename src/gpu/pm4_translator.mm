@@ -31,14 +31,16 @@ struct MeshUniforms {
 struct ShaderSignature {
     GuestAddr vertex_program{0};
     GuestAddr fragment_program{0};
-    u32 vertex_resource_signature{0};
-    u32 fragment_resource_signature{0};
+    u32 vertex_resource_1{0};
+    u32 vertex_resource_2{0};
+    u32 fragment_resource_1{0};
+    u32 fragment_resource_2{0};
 
     bool operator<(const ShaderSignature& other) const noexcept {
-        return std::tie(vertex_program, fragment_program, vertex_resource_signature,
-                        fragment_resource_signature) <
-               std::tie(other.vertex_program, other.fragment_program,
-                        other.vertex_resource_signature, other.fragment_resource_signature);
+        return std::tie(vertex_program, fragment_program, vertex_resource_1, vertex_resource_2,
+                        fragment_resource_1, fragment_resource_2) <
+               std::tie(other.vertex_program, other.fragment_program, other.vertex_resource_1,
+                        other.vertex_resource_2, other.fragment_resource_1, other.fragment_resource_2);
     }
 };
 
@@ -325,14 +327,13 @@ bool Pm4Translator::Impl::init_mesh_pipeline() {
 }
 
 ShaderSignature Pm4Translator::Impl::current_shader_signature() const noexcept {
-    const auto resource_signature = [](u32 first, u32 second) noexcept {
-        return first ^ ((second << 13) | (second >> 19));
-    };
     return ShaderSignature{
         .vertex_program = vs_shader_addr,
         .fragment_program = ps_shader_addr,
-        .vertex_resource_signature = resource_signature(vs_rsrc1, vs_rsrc2),
-        .fragment_resource_signature = resource_signature(ps_rsrc1, ps_rsrc2),
+        .vertex_resource_1 = vs_rsrc1,
+        .vertex_resource_2 = vs_rsrc2,
+        .fragment_resource_1 = ps_rsrc1,
+        .fragment_resource_2 = ps_rsrc2,
     };
 }
 
@@ -346,11 +347,13 @@ id<MTLRenderPipelineState> Pm4Translator::Impl::pipeline_for_current_shader() {
     shader_fallbacks.insert(signature);
     std::fprintf(stderr,
                  "[PM4] Shader compatibility fallback: VS=0x%llx PS=0x%llx "
-                 "VS_RES=0x%08x PS_RES=0x%08x (fallbacks=%zu)\n",
+                 "VS_RES=(0x%08x,0x%08x) PS_RES=(0x%08x,0x%08x) (fallbacks=%zu)\n",
                  static_cast<unsigned long long>(signature.vertex_program),
                  static_cast<unsigned long long>(signature.fragment_program),
-                 signature.vertex_resource_signature,
-                 signature.fragment_resource_signature,
+                 signature.vertex_resource_1,
+                 signature.vertex_resource_2,
+                 signature.fragment_resource_1,
+                 signature.fragment_resource_2,
                  shader_fallbacks.size());
     return mesh_pipeline_state;
 }

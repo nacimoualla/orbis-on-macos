@@ -544,9 +544,21 @@ void test_pm4_shader_signature_fallback_is_cached() {
     assert(translator.execute_auto_draw(3));
     assert(translator.shader_fallback_count() == 1);
     assert(translator.shader_status().find("fallback") != std::string::npos);
+
+    // Resource registers are part of the cache key, not a lossy hash.
+    const u32 distinct_vs_regs[] = {
+        SPI_SHADER_PGM_LO_VS, 0x00001000, 0x00000002, 0x11111112, 0x22222222
+    };
+    Pm4Packet distinct_vs_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_SH_REG, 5)),
+        .payload = {distinct_vs_regs, distinct_vs_regs + 5},
+    };
+    assert(translator.execute_packet(distinct_vs_packet));
+    assert(translator.execute_auto_draw(3));
+    assert(translator.shader_fallback_count() == 2);
     assert(translator.submit_frame(true));
 
-    std::cout << "  -> Repeated unknown shader signatures share one compatibility fallback!\n";
+    std::cout << "  -> Repeated signatures share one fallback and distinct resource pairs remain distinct!\n";
 }
 
 void test_pm4_multiple_draws_use_one_frame() {
