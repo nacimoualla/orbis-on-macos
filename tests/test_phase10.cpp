@@ -38,6 +38,13 @@ void test_pm4_rejects_short_payload_without_state_change() {
     };
     assert(!translator.execute_packet(unknown_packet));
     assert(translator.unsupported_packet_count() == 1);
+
+    Pm4Packet mismatched_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_CONTEXT_REG, 2)),
+        .payload = {payload, payload + 1},
+    };
+    assert(!translator.execute_packet(mismatched_packet));
+    assert(translator.malformed_packet_count() == 3);
 }
 
 int main() {

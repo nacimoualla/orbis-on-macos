@@ -10,6 +10,17 @@ using namespace ps4;
 
 void test_pm4_rejects_malformed_and_unsupported_packets() {
     Pm4Translator translator;
+    const u32 valid_payload[] = {
+        SPI_SHADER_USER_DATA_VS_0, 0x50000, 0x00001, 1024, sizeof(Vertex3D)
+    };
+    Pm4Packet valid_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_SH_REG, 5)),
+        .payload = {valid_payload, valid_payload + 5},
+    };
+    assert(translator.execute_packet(valid_packet));
+    const GuestAddr vertex_before = translator.vertex_buffer_address();
+    const usize vertex_size_before = translator.vertex_buffer_size();
+
     const u32 payload[] = {SPI_SHADER_USER_DATA_VS_0};
     Pm4Packet short_packet{
         .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_SH_REG, 1)),
@@ -17,10 +28,29 @@ void test_pm4_rejects_malformed_and_unsupported_packets() {
     };
     assert(!translator.execute_packet(short_packet));
     assert(translator.malformed_packet_count() == 1);
+    assert(translator.vertex_buffer_address() == vertex_before);
+    assert(translator.vertex_buffer_size() == vertex_size_before);
+
+    Pm4Packet indirect_empty{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_DRAW_INDEX_INDIRECT, 0)),
+        .payload = {},
+    };
+    assert(!translator.execute_packet(indirect_empty));
+    assert(translator.malformed_packet_count() == 2);
+
+    const u32 indirect_short_payload[] = {0, 0};
+    Pm4Packet indirect_short{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_DRAW_INDEX_INDIRECT, 2)),
+        .payload = {indirect_short_payload, indirect_short_payload + 2},
+    };
+    assert(!translator.execute_packet(indirect_short));
+    assert(translator.malformed_packet_count() == 3);
+    assert(translator.vertex_buffer_address() == vertex_before);
+    assert(translator.vertex_buffer_size() == vertex_size_before);
 
     Pm4Packet unknown_packet{
-        .header = decode_pm4_header(encode_pm4_type3_header(0xFE, 0)),
-        .payload = {},
+        .header = decode_pm4_header(encode_pm4_type3_header(0xFE, 1)),
+        .payload = {payload, payload + 1},
     };
     assert(!translator.execute_packet(unknown_packet));
     assert(translator.unsupported_packet_count() == 1);

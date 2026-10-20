@@ -1294,6 +1294,12 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
     if (m_impl->metal && m_impl->metal->frame_in_progress()) {
         m_impl->frame_stats.packets++;
     }
+    if (packet.header.count != packet.payload.size()) {
+        ++m_impl->malformed_packets;
+        std::fprintf(stderr, "[PM4] Malformed packet: header declares %u payload DWORDs, got %zu\n",
+                     packet.header.count, packet.payload.size());
+        return false;
+    }
 
     if (packet.header.type == Pm4PacketType::Type2) {
         // NOP packet
@@ -1781,7 +1787,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             }
 
             case IT_DRAW_INDEX_INDIRECT: {
-                if (!m_impl->require_payload(packet, 1, "IT_DRAW_INDEX_INDIRECT")) return false;
+                if (!m_impl->require_payload(packet, 3, "IT_DRAW_INDEX_INDIRECT")) return false;
                 std::string p_str;
                 for (size_t p = 0; p < packet.payload.size(); ++p) {
                     char b[32];
