@@ -79,6 +79,7 @@ struct Pm4Translator::Impl {
     usize context_reg_writes{0};
     GpuFrameStats frame_stats{};
     bool frame_draw_encoded{false};
+    u64 frame_submission_start{0};
 
     id<MTLRenderPipelineState> mesh_pipeline_state{nil};
     id<MTLTexture> default_white_texture{nil};
@@ -1152,7 +1153,8 @@ bool Pm4Translator::begin_frame() {
     if (!m_impl->metal->begin_frame()) return false;
     m_impl->frame_draw_encoded = false;
     m_impl->frame_stats = GpuFrameStats{};
-    m_impl->frame_stats.frame_index = m_impl->metal->submitted_frame_count() + 1;
+    m_impl->frame_submission_start = m_impl->metal->submitted_frame_count();
+    m_impl->frame_stats.frame_index = m_impl->frame_submission_start + 1;
     return true;
 }
 
@@ -1162,7 +1164,8 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
     if (!m_impl->metal->frame_in_progress()) return false;
     m_impl->metal->end_render_encoder();
     const bool submitted = m_impl->metal->submit_frame(wait_for_completion);
-    m_impl->frame_stats.command_buffers_submitted = m_impl->metal->submitted_frame_count();
+    m_impl->frame_stats.command_buffers_submitted =
+        m_impl->metal->submitted_frame_count() - m_impl->frame_submission_start;
     return submitted;
 }
 

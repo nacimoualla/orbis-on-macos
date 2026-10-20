@@ -25,3 +25,13 @@ tests were updated to use the required translator frame lifecycle.
 
 The working tree retains unrelated pre-existing CPU/test changes and an untracked
 `docs/superpowers/plans/` directory; they were not staged or modified by Task 2.
+
+## Stats Fix Follow-up
+
+Fixed `command_buffers_submitted` to report the per-frame delta by recording
+`submitted_frame_count()` at `begin_frame()` and subtracting that baseline at
+`submit_frame()`. Extended the multi-draw regression to submit a second frame and
+assert that both frame stats report one command buffer while the backend total is two.
+
+* `cmake --build build --target test_phase10 test_phase14` — passed.
+* `ctest --test-dir build -R 'Phase10_GpuCommandProcessor|Phase14_MeshPipeline' --output-on-failure` — passed; 2/2 tests passed.

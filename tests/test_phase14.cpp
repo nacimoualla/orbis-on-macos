@@ -498,6 +498,13 @@ void test_pm4_multiple_draws_use_one_frame() {
     u8 r = 0, g = 0, b = 0, a = 0;
     assert(metal.read_pixel(128, 128, r, g, b, a));
     assert(r > 0 || g > 0 || b > 0);
+
+    assert(translator.begin_frame());
+    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.submit_frame(true));
+    assert(translator.frame_stats().frame_index == 2);
+    assert(translator.frame_stats().command_buffers_submitted == 1);
+    assert(metal.submitted_frame_count() == 2);
 }
 
 int main() {
