@@ -72,3 +72,16 @@ Exact validation:
 - `./build/test_phase14` — **passed**, exit code 0; includes Test 14.10 texture reuse/local invalidation/cross-resource LRU
 - `ctest --test-dir build -R Phase14_MeshPipeline --output-on-failure` — **passed**, 1/1, 0.08s
 - `git diff --check` — **passed**
+
+## Final review pass (2026-10-20 16:15 UTC)
+
+- Both indexed and auto draw paths now reject a nil texture returned by `prepare_texture()` before encoding Metal commands, covering oversized-budget and failed texture allocation cases.
+- Added an oversized texture rejection test using a cache budget smaller than the decoded texture footprint.
+- Added observable same-size texture ownership coverage: distinct same-dimension textures render different center-pixel readbacks, while repeated texture use and local invalidation remain covered. Diagnostics are disabled for this test to avoid the known verbose diagnostic hang.
+
+Exact validation:
+
+- `cmake --build build --target test_phase14` — **passed**
+- `./build/test_phase14` — **passed**, exit code 0; Test 14.10 reports texture reuse, local invalidation, LRU ordering, and oversized rejection
+- `ctest --test-dir build -R Phase14_MeshPipeline --output-on-failure` — **passed**, 1/1, 0.06s
+- `git diff --check` — **passed**

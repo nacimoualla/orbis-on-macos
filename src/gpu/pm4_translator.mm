@@ -975,6 +975,10 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
 
         MeshUniforms uniforms = compute_uniforms();
         id<MTLTexture> active_tex = prepare_texture(device);
+        if (!active_tex) {
+            std::fprintf(stderr, "[PM4] indexed draw rejected: texture allocation failed\n");
+            return false;
+        }
         uniforms.use_texture = (active_tex != default_white_texture) ? 1 : 0;
 
         bool use_guest_vtx = false;
@@ -1151,6 +1155,10 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
 
         MeshUniforms uniforms = compute_uniforms();
         id<MTLTexture> active_tex = prepare_texture(device);
+        if (!active_tex) {
+            std::fprintf(stderr, "[PM4] auto draw rejected: texture allocation failed\n");
+            return false;
+        }
         uniforms.use_texture = (active_tex != default_white_texture) ? 1 : 0;
 
         id<MTLBuffer> vtx_buf = nil;

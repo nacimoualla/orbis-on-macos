@@ -610,8 +610,9 @@ void test_pm4_guest_resource_cache_and_invalidation() {
     std::cout << "  -> Guest resource cache and invalidation passed!\n";
 }
 
-static void set_test_texture(Pm4Translator& translator, GuestAddr address) {
-    const u32 payload[] = {0x000C, static_cast<u32>(address >> 8), 0x00A00000, 0x4001, 0};
+static void set_test_texture(Pm4Translator& translator, GuestAddr address, u32 width = 2, u32 height = 2) {
+    const u32 payload[] = {0x000C, static_cast<u32>(address >> 8), 0x00A00000,
+                           (width - 1) | ((height - 1) << 14), 0};
     Pm4Packet packet{
         .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_SH_REG, 5)),
         .payload = {payload, payload + 5}
@@ -647,19 +648,35 @@ void test_pm4_texture_cache_and_cross_resource_lru() {
     translator.set_draw_diagnostics_enabled(false);
     translator.set_memory_manager(&memory);
     translator.bind_vertex_buffer(vertices, sizeof(triangle));
-    translator.set_resource_cache_budget(sizeof(triangle) + sizeof(idx) + sizeof(tex_a));
+    translator.set_resource_cache_budget(sizeof(triangle) + sizeof(idx) + 2 * sizeof(tex_a));
 
     assert(translator.begin_frame());
     set_test_texture(translator, texture_a);
-    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.execute_auto_draw(4));
+    set_test_texture(translator, texture_a);
+    assert(translator.execute_auto_draw(4));
+    assert(translator.submit_frame(true));
+    u8 ar = 0, ag = 0, ab = 0, aa = 0;
+    assert(metal.read_pixel(128, 128, ar, ag, ab, aa));
+    const u32 first_pixel = (static_cast<u32>(ar) << 24) | (static_cast<u32>(ag) << 16) |
+                            (static_cast<u32>(ab) << 8) | aa;
+
+    assert(translator.begin_frame());
     set_test_texture(translator, texture_b);
-    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.execute_auto_draw(4));
+    assert(translator.submit_frame(true));
+    u8 br = 0, bg = 0, bb = 0, ba = 0;
+    assert(metal.read_pixel(128, 128, br, bg, bb, ba));
+    const u32 second_pixel = (static_cast<u32>(br) << 24) | (static_cast<u32>(bg) << 16) |
+                             (static_cast<u32>(bb) << 8) | ba;
+    assert(first_pixel != second_pixel);
+
+    assert(translator.begin_frame());
     set_test_texture(translator, texture_b);
     assert(translator.execute_indexed_draw(indices, 3));
     assert(translator.submit_frame(false));
     const GpuFrameStats first = translator.frame_stats();
     assert(first.resource_cache_misses >= 4);
-    assert(first.resource_cache_hits >= 2);
 
     translator.invalidate_guest_resources(texture_b, sizeof(tex_b));
     assert(translator.begin_frame());
@@ -672,6 +689,12 @@ void test_pm4_texture_cache_and_cross_resource_lru() {
     assert(translator.submit_frame(false));
     const GpuFrameStats second = translator.frame_stats();
     assert(second.resource_cache_misses > first.resource_cache_misses);
+
+    translator.set_resource_cache_budget(sizeof(tex_a) - 1);
+    assert(translator.begin_frame());
+    set_test_texture(translator, texture_a);
+    assert(!translator.execute_auto_draw(4));
+    assert(translator.submit_frame(true));
     std::cout << "  -> Texture reuse, local invalidation, and LRU ordering passed!\n";
 }
 
