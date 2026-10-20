@@ -435,6 +435,21 @@ _Phases 1–15 built the runtime and are verified against synthetic `samples/*.e
 
 ## 📌 Phase 19: Real GCN → MSL Shader Translation (closes ADR 0007)
 
+### Flappy GPU smoke evidence
+
+Run the bounded retail smoke harness with:
+
+```bash
+cmake --build build --target test_flappy_gpu
+ctest --test-dir build -R Flappy_GpuSmoke --output-on-failure
+```
+
+The harness validates exactly 120 guest frame iterations and records
+`frames`, `draws`, `packets`, `unsupported_packets`, `upload_bytes`, and
+elapsed milliseconds, including a completed non-black framebuffer readback.
+Shader signatures and unsupported PM4 counts remain the evidence-driven queue
+for subsequent Flappy fidelity work.
+
 - [ ] **Step 19.1: Parse GCN/AMDGPU shader ISA**
   - Decode vertex/fragment/compute shaders (leveraging SPIRV-Tools/Slang where appropriate).
 
@@ -483,4 +498,3 @@ _Phases 1–15 built the runtime and are verified against synthetic `samples/*.e
 ---
 
 *These phases are candidates; reorder based on which real titles you target first.*
-

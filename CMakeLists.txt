@@ -142,6 +142,12 @@ add_executable(test_phase15 tests/test_phase15.cpp)
 target_link_libraries(test_phase15 PRIVATE ps4_core)
 add_test(NAME Phase15_JitExecutorIntegration COMMAND test_phase15)
 
+add_executable(test_flappy_gpu tests/test_flappy_gpu.cpp)
+target_link_libraries(test_flappy_gpu PRIVATE ps4_core)
+target_compile_definitions(test_flappy_gpu PRIVATE CMAKE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME Flappy_GpuSmoke COMMAND test_flappy_gpu)
+set_tests_properties(Flappy_GpuSmoke PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 
 
 

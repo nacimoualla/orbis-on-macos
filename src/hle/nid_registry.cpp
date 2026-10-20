@@ -484,6 +484,10 @@ u64 NidRegistry::get_flip_count() const noexcept {
     return s_flip_state.flip_count.load(std::memory_order_relaxed);
 }
 
+Pm4Translator* NidRegistry::gpu_translator() const noexcept {
+    return g_pm4_translator.get();
+}
+
 void NidRegistry::register_symbol(Nid nid, std::string_view name, std::string_view module_name, HleFunction handler) {
     HleSymbol sym;
     sym.nid = nid;
@@ -5192,4 +5196,3 @@ void NidRegistry::register_default_libraries() {
 }
 
 } // namespace ps4
-

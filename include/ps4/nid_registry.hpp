@@ -72,6 +72,9 @@ public:
     /// Get total number of video flips performed
     [[nodiscard]] u64 get_flip_count() const noexcept;
 
+    /// Return the translator used by the registered GNM handlers.
+    [[nodiscard]] class Pm4Translator* gpu_translator() const noexcept;
+
 private:
     std::unordered_map<Nid, HleSymbol> m_symbols_by_nid;
     std::unordered_map<std::string, Nid> m_nids_by_name;
