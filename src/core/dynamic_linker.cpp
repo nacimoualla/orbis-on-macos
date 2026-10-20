@@ -650,16 +650,28 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
         return false;
     };
 
-    auto process_rela_table = [&](GuestAddr table_addr, GuestSize table_size, const char* what) {
-        if (table_addr == 0 || table_size == 0) return;
+    auto process_rela_table = [&](GuestAddr table_addr, GuestSize table_size, const char* what) -> bool {
+        if (table_addr == 0 || table_size == 0) return true;
         const usize count = static_cast<usize>(table_size / sizeof(Elf64_Rela));
         usize applied = 0, unread = 0;
+        GuestAddr first_failure = 0;
+        auto read_failed = [&](GuestAddr address) {
+            ++unread;
+            if (first_failure == 0) first_failure = address;
+        };
+        auto patch_failed = [&](GuestAddr address) {
+            ++unread;
+            if (first_failure == 0) first_failure = address;
+        };
         // Undefined symbols whose name did not decode to a real NID get a
         // synthetic one. Counted so a module's import table can be audited.
         for (usize i = 0; i < count; ++i) {
             const GuestAddr entry_addr = table_addr + (i * sizeof(Elf64_Rela));
             Elf64_Rela rela{};
-            if (!read_data(entry_addr, &rela, sizeof(rela))) { ++unread; continue; }
+            if (!read_data(entry_addr, &rela, sizeof(rela))) {
+                read_failed(entry_addr);
+                continue;
+            }
             ++applied;
 
             const u32 type = ELF64_R_TYPE(rela.r_info);
@@ -668,45 +680,46 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
 
             if (type == R_X86_64_RELATIVE) {
                 const GuestAddr value = base_load_addr + rela.r_addend;
-                m_memory.write_value(patch_location, value);
+                if (!m_memory.write_value(patch_location, value)) patch_failed(patch_location);
             } else if (type == R_X86_64_64) {
-                if (symtab_addr != 0) {
-                    Elf64_Sym sym{};
-                    const GuestAddr sym_entry_addr = symtab_addr + (sym_idx * sizeof(Elf64_Sym));
-                    if (read_data(sym_entry_addr, &sym, sizeof(sym))) {
-                        if (sym.st_value != 0) {
-                            const GuestAddr value = base_load_addr + sym.st_value + rela.r_addend;
-                            m_memory.write_value(patch_location, value);
-                        } else {
-                            char sym_str[128]{0};
-                            if (strtab_addr != 0 && sym.st_name != 0) {
-                                read_data(strtab_addr + sym.st_name, sym_str, sizeof(sym_str) - 1);
-                            }
-                            Nid nid = decode_nid_from_string(sym_str);
-                            if (nid == 0) {
-                                ++synthetic_imports;
-                                nid = 0x8000000000000000ULL | static_cast<u64>(sym_idx);
-                            }
-                            if (!m_registry.find_by_nid(nid) && !m_module_exports.contains(nid)) {
-                                m_unresolved_nids.push_back(nid);
-                            }
-
-                            if (std::string_view(sym_str).find("f7uOxY9mM1U") != std::string_view::npos ||
-                                nid == 0x7fbb8ec58f663355ULL || nid == 0x5533668fc58ebb7fULL) {
-                                constexpr GuestAddr STACK_CANARY_ADDR = 0x3FF0000ULL;
-                                constexpr u64 CANARY_VALUE = 0x595E9FBD94FDA766ULL;
-                                m_memory.write_value(STACK_CANARY_ADDR, CANARY_VALUE);
-                                m_memory.write_value(patch_location, STACK_CANARY_ADDR);
-                            } else {
-                                const GuestAddr tramp = get_or_create_trampoline(nid);
-                                m_memory.write_value(patch_location, tramp + rela.r_addend);
-                                // Remember the slot: this symbol may be DATA, in
-                                // which case a trampoline address is wrong and must
-                                // be replaced once a module provides the real one.
-                                m_nid_to_slots[nid].push_back(patch_location);
-                            }
-                        }
-                    }
+                if (symtab_addr == 0) {
+                    read_failed(symtab_addr);
+                    continue;
+                }
+                Elf64_Sym sym{};
+                const GuestAddr sym_entry_addr = symtab_addr + (sym_idx * sizeof(Elf64_Sym));
+                if (!read_data(sym_entry_addr, &sym, sizeof(sym))) {
+                    read_failed(sym_entry_addr);
+                    continue;
+                }
+                if (sym.st_value != 0) {
+                    const GuestAddr value = base_load_addr + sym.st_value + rela.r_addend;
+                    if (!m_memory.write_value(patch_location, value)) patch_failed(patch_location);
+                    continue;
+                }
+                char sym_str[128]{0};
+                if (strtab_addr != 0 && sym.st_name != 0)
+                    read_data(strtab_addr + sym.st_name, sym_str, sizeof(sym_str) - 1);
+                Nid nid = decode_nid_from_string(sym_str);
+                if (nid == 0) {
+                    ++synthetic_imports;
+                    nid = 0x8000000000000000ULL | static_cast<u64>(sym_idx);
+                }
+                if (!m_registry.find_by_nid(nid) && !m_module_exports.contains(nid))
+                    m_unresolved_nids.push_back(nid);
+                if (std::string_view(sym_str).find("f7uOxY9mM1U") != std::string_view::npos ||
+                    nid == 0x7fbb8ec58f663355ULL || nid == 0x5533668fc58ebb7fULL) {
+                    constexpr GuestAddr STACK_CANARY_ADDR = 0x3FF0000ULL;
+                    constexpr u64 CANARY_VALUE = 0x595E9FBD94FDA766ULL;
+                    if (!m_memory.write_value(STACK_CANARY_ADDR, CANARY_VALUE))
+                        patch_failed(STACK_CANARY_ADDR);
+                    if (!m_memory.write_value(patch_location, STACK_CANARY_ADDR))
+                        patch_failed(patch_location);
+                } else {
+                    const GuestAddr tramp = get_or_create_trampoline(nid);
+                    if (!m_memory.write_value(patch_location, tramp + rela.r_addend))
+                        patch_failed(patch_location);
+                    m_nid_to_slots[nid].push_back(patch_location);
                 }
             } else if (type == R_X86_64_JUMP_SLOT || type == R_X86_64_GLOB_DAT) {
                 if (symtab_addr != 0) {
@@ -732,13 +745,20 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                             nid == 0x7fbb8ec58f663355ULL || nid == 0x5533668fc58ebb7fULL) {
                             constexpr GuestAddr STACK_CANARY_ADDR = 0x3FF0000ULL;
                             constexpr u64 CANARY_VALUE = 0x595E9FBD94FDA766ULL;
-                            m_memory.write_value(STACK_CANARY_ADDR, CANARY_VALUE);
-                            m_memory.write_value(patch_location, STACK_CANARY_ADDR);
+                            if (!m_memory.write_value(STACK_CANARY_ADDR, CANARY_VALUE))
+                                patch_failed(STACK_CANARY_ADDR);
+                            if (!m_memory.write_value(patch_location, STACK_CANARY_ADDR))
+                                patch_failed(patch_location);
                         } else {
-                            patch_jump_slot(patch_location, nid);
+                            if (!patch_jump_slot(patch_location, nid))
+                                patch_failed(patch_location);
                             m_nid_to_slots[nid].push_back(patch_location);
                         }
+                    } else {
+                        read_failed(sym_entry_addr);
                     }
+                } else {
+                    read_failed(symtab_addr);
                 }
             }
         }
@@ -746,10 +766,21 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
             std::fprintf(stderr, "[module] %s: %zu relocs, %zu read, %zu unread\n",
                          what, count, applied, unread);
         }
+        if (unread != 0) {
+            char detail[256];
+            std::snprintf(detail, sizeof(detail),
+                          "%s relocation table read/patch failure at 0x%llx "
+                          "(table=0x%llx, unread=%zu)",
+                          what, static_cast<unsigned long long>(first_failure),
+                          static_cast<unsigned long long>(table_addr), unread);
+            m_last_error = detail;
+            return false;
+        }
+        return true;
     };
 
-    process_rela_table(rela_addr, rela_size, "RELA");
-    process_rela_table(jmprel_addr, pltrel_size, "JMPREL");
+    if (!process_rela_table(rela_addr, rela_size, "RELA")) return false;
+    if (!process_rela_table(jmprel_addr, pltrel_size, "JMPREL")) return false;
     if (synthetic_imports != 0) {
         std::fprintf(stderr,
                      "[module] relocation: %zu imported symbols had no decodable NID and "

@@ -123,8 +123,8 @@ int main() {
     const auto unsupported = translator->unsupported_packet_count();
     std::cout << "Flappy GPU smoke: frames=" << kFrames
               << " draws=" << draws << " packets=" << packets
-              << " unsupported=" << unsupported
-              << " uploads=" << stats.upload_bytes
+              << " unsupported_packets=" << unsupported
+              << " upload_bytes=" << stats.upload_bytes
               << " elapsed_ms=" << elapsed << "\n";
     registry.shutdown();
     if (draws == 0 || packets == 0)
