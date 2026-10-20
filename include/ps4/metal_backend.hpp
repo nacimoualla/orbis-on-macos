@@ -53,6 +53,12 @@ public:
 
     /// Submit the active frame, optionally waiting for completion
     bool submit_frame(bool wait_for_completion);
+    /// Ensure the active frame has a render encoder, clearing only on its first pass.
+    bool ensure_render_encoder(bool clear, ColorRGBA color);
+    /// Return the active render encoder as an opaque Objective-C pointer.
+    [[nodiscard]] void* active_render_encoder() const noexcept;
+    /// End the active render encoder without submitting the frame.
+    void end_render_encoder();
 
     /// Wait for the most recently submitted frame when it is incomplete
     bool wait_for_last_frame();

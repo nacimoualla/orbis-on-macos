@@ -170,6 +170,7 @@ bool MetalBackend::submit_frame(bool wait_for_completion) {
         std::cerr << "[Metal] Cannot submit frame before initialization\n";
         return false;
     }
+
     if (!m_impl->active_command_buffer) {
         std::cerr << "[Metal] Cannot submit frame when no frame is active\n";
         return false;
@@ -200,6 +201,36 @@ bool MetalBackend::submit_frame(bool wait_for_completion) {
 
         return command_buffer.status != MTLCommandBufferStatusError &&
                (!wait_for_completion || m_impl->last_frame_completed);
+    }
+}
+
+bool MetalBackend::ensure_render_encoder(bool clear, ColorRGBA color) {
+    if (!is_initialized() || !m_impl->active_command_buffer || !m_impl->framebuffer) {
+        return false;
+    }
+    if (m_impl->active_render_encoder) {
+        return true;
+    }
+    @autoreleasepool {
+        MTLRenderPassDescriptor* pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass_desc.colorAttachments[0].texture = m_impl->framebuffer;
+        pass_desc.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
+        pass_desc.colorAttachments[0].clearColor = MTLClearColorMake(color.r, color.g, color.b, color.a);
+        pass_desc.colorAttachments[0].storeAction = MTLStoreActionStore;
+        m_impl->active_render_encoder =
+            [m_impl->active_command_buffer renderCommandEncoderWithDescriptor:pass_desc];
+        return m_impl->active_render_encoder != nil;
+    }
+}
+
+void* MetalBackend::active_render_encoder() const noexcept {
+    return m_impl ? (__bridge void*)m_impl->active_render_encoder : nullptr;
+}
+
+void MetalBackend::end_render_encoder() {
+    if (m_impl && m_impl->active_render_encoder) {
+        [m_impl->active_render_encoder endEncoding];
+        m_impl->active_render_encoder = nil;
     }
 }
 

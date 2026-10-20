@@ -110,6 +110,7 @@ void test_metal_3d_indexed_triangle_rendering() {
     Pm4Translator translator(&metal);
     translator.set_memory_manager(&memory);
     translator.bind_vertex_buffer(vtx_addr, sizeof(triangle_vertices));
+    assert(translator.begin_frame());
 
     // Setup GPU ring buffer and submit draw commands
     GpuRingBuffer ring_buffer(64 * 1024);
@@ -151,6 +152,7 @@ void test_metal_3d_indexed_triangle_rendering() {
 
     // Execute ring buffer
     const usize processed = translator.execute_ring_buffer(ring_buffer);
+    assert(translator.submit_frame(true));
     assert(processed == 3);
     assert(translator.draw_count() == 1);
     assert(translator.indexed_draw_count() == 1);
@@ -351,6 +353,7 @@ void test_pm4_draw_index_indirect_execution() {
 
     // Bind vertex buffer
     translator.bind_vertex_buffer(vtx_addr, sizeof(vertices));
+    assert(translator.begin_frame());
 
     // 1. IT_INDEX_BASE
     const u32 base_payload[] = {
@@ -381,6 +384,7 @@ void test_pm4_draw_index_indirect_execution() {
     assert(translator.execute_packet(draw_pkt));
     assert(translator.draw_count() == 1);
     assert(translator.indexed_draw_count() == 1);
+    assert(translator.submit_frame(true));
 
     // Verify rasterization
     u8 r = 0, g = 0, b = 0, a = 0;
@@ -389,6 +393,7 @@ void test_pm4_draw_index_indirect_execution() {
     assert(g > 0);
 
     // 4. Test execute_command_buffer
+    assert(translator.begin_frame());
     const GuestAddr dcb_addr = 0x600000;
     std::vector<u32> dcb_data;
     // NOP packet
@@ -404,6 +409,7 @@ void test_pm4_draw_index_indirect_execution() {
     const usize pkts = translator.execute_command_buffer(dcb_addr, dcb_data.size() * sizeof(u32));
     assert(pkts == 2);
     assert(translator.draw_count() == 2);
+    assert(translator.submit_frame(true));
 
     std::cout << "  -> IT_DRAW_INDEX_INDIRECT and execute_command_buffer passed!\n";
 }
@@ -421,6 +427,7 @@ void test_pm4_draw_index_auto_and_procedural_fallback() {
 
     Pm4Translator translator(&metal);
     translator.set_memory_manager(&memory);
+    assert(translator.begin_frame());
 
     // 1. Test IT_DRAW_INDEX_AUTO with count=3 (fullscreen background triangle)
     const u32 auto_payload_3[] = {3, 2}; // count=3, initiator=2
@@ -430,12 +437,6 @@ void test_pm4_draw_index_auto_and_procedural_fallback() {
     };
     assert(translator.execute_packet(auto_pkt_3));
     assert(translator.draw_count() == 1);
-
-    // Center pixel should be colored by the procedural sky background
-    u8 r = 0, g = 0, b = 0, a = 0;
-    assert(metal.read_pixel(960, 540, r, g, b, a));
-    assert(r > 0 || g > 0 || b > 0);
-    assert(a > 0);
 
     // 2. Test IT_DRAW_INDEX_AUTO with count=4 (procedural quad)
     const u32 auto_payload_4[] = {4, 2}; // count=4, initiator=2
@@ -454,8 +455,49 @@ void test_pm4_draw_index_auto_and_procedural_fallback() {
     translator.bind_vertex_buffer(0, 0); // No vertex buffer bound!
     assert(translator.execute_indexed_draw(idx_addr, 6, PrimitiveType::TriangleList));
     assert(translator.draw_count() == 3);
+    assert(translator.submit_frame(true));
+
+    u8 r = 0, g = 0, b = 0, a = 0;
+    assert(metal.read_pixel(960, 540, r, g, b, a));
+    assert(r > 0 || g > 0 || b > 0);
+    assert(a > 0);
 
     std::cout << "  -> IT_DRAW_INDEX_AUTO and procedural fallback passed!\n";
+}
+
+void test_pm4_multiple_draws_use_one_frame() {
+    MetalBackend metal;
+    assert(metal.initialize());
+    assert(metal.create_framebuffer(256, 256));
+    MemoryManager memory;
+    assert(memory.initialize());
+
+    const GuestAddr vertices = 0x120000;
+    const GuestAddr indices = 0x121000;
+    const Vertex3D quad[3] = {
+        {{-0.8f, -0.8f, 0.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
+        {{ 0.0f,  0.8f, 0.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+        {{ 0.8f, -0.8f, 0.0f}, {0.0f, 0.0f, 1.0f, 1.0f}},
+    };
+    const u16 triangle[3] = {0, 1, 2};
+    memory.write_bytes(vertices, quad, sizeof(quad));
+    memory.write_bytes(indices, triangle, sizeof(triangle));
+
+    Pm4Translator translator(&metal);
+    translator.set_memory_manager(&memory);
+    translator.bind_vertex_buffer(vertices, sizeof(quad));
+    assert(translator.begin_frame());
+    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.submit_frame(true));
+    assert(translator.draw_count() == 2);
+    assert(translator.indexed_draw_count() == 2);
+    assert(translator.frame_stats().command_buffers_submitted == 1);
+    assert(metal.submitted_frame_count() == 1);
+
+    u8 r = 0, g = 0, b = 0, a = 0;
+    assert(metal.read_pixel(128, 128, r, g, b, a));
+    assert(r > 0 || g > 0 || b > 0);
 }
 
 int main() {
@@ -469,6 +511,7 @@ int main() {
     test_pm4_type0_index_configuration();
     test_pm4_draw_index_indirect_execution();
     test_pm4_draw_index_auto_and_procedural_fallback();
+    test_pm4_multiple_draws_use_one_frame();
 
     std::cout << "=== All Phase 14 tests passed successfully! ===\n";
     return 0;

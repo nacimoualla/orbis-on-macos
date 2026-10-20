@@ -146,6 +146,7 @@ int main() {
         assert(metal.create_framebuffer(1920, 1080));
 
         ps4::Pm4Translator translator(&metal);
+        assert(translator.begin_frame());
 
         // Set clear color to Red (255, 0, 0, 255)
         // Word 0: R (0xFF) | G (0x00 << 8) = 0x00FF
@@ -178,6 +179,7 @@ int main() {
 
         assert(translator.execute_packet(draw_pkt));
         assert(translator.draw_count() == 1);
+        assert(translator.submit_frame(true));
 
         // Verify pixel readback from Metal framebuffer (should be cleared with Red)
         ps4::u8 r = 0, g = 0, b = 0, a = 0;
@@ -197,6 +199,7 @@ int main() {
 
         ps4::Pm4Translator translator(&metal);
         ps4::GpuRingBuffer ring(256);
+        assert(translator.begin_frame());
 
         // Push:
         // 1. CLEAR_STATE (takes 1 dummy DWORD in PM4)
@@ -220,6 +223,7 @@ int main() {
         const ps4::usize executed = translator.execute_ring_buffer(ring);
         assert(executed == 4);
         assert(translator.draw_count() == 1);
+        assert(translator.submit_frame(true));
         assert(ring.available_dwords() == 0);
 
         // Read pixel to verify Blue clear

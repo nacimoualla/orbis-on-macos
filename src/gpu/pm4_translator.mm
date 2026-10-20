@@ -77,6 +77,8 @@ struct Pm4Translator::Impl {
     usize draw_count{0};
     usize indexed_draw_count{0};
     usize context_reg_writes{0};
+    GpuFrameStats frame_stats{};
+    bool frame_draw_encoded{false};
 
     id<MTLRenderPipelineState> mesh_pipeline_state{nil};
     id<MTLTexture> default_white_texture{nil};
@@ -741,15 +743,17 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         indexed_draw_count++;
         return true;
     }
+    if (!metal->frame_in_progress()) {
+        std::fprintf(stderr, "[PM4] draw outside frame\n");
+        return false;
+    }
 
     @autoreleasepool {
         init_mesh_pipeline();
         if (!mesh_pipeline_state) return false;
 
         id<MTLDevice> device = (__bridge id<MTLDevice>)metal->raw_device();
-        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metal->raw_command_queue();
-        id<MTLTexture> framebuffer = (__bridge id<MTLTexture>)metal->raw_framebuffer();
-        if (!device || !queue || !framebuffer) return false;
+        if (!device) return false;
 
         const usize elem_size = (idx_type == MTLIndexTypeUInt32) ? sizeof(u32) : sizeof(u16);
         const usize required_idx_size = idx_count * elem_size;
@@ -844,18 +848,10 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
 
         id<MTLBuffer> idx_buf = [device newBufferWithBytes:idx_ptr length:required_idx_size options:MTLResourceStorageModeShared];
 
-        MTLRenderPassDescriptor* pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass_desc.colorAttachments[0].texture = framebuffer;
-        if (draw_count == 0) {
-            pass_desc.colorAttachments[0].loadAction = MTLLoadActionClear;
-            pass_desc.colorAttachments[0].clearColor = MTLClearColorMake(clear_color.r, clear_color.g, clear_color.b, clear_color.a);
-        } else {
-            pass_desc.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        }
-        pass_desc.colorAttachments[0].storeAction = MTLStoreActionStore;
-
-        id<MTLCommandBuffer> cmd = [queue commandBuffer];
-        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass_desc];
+        if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
+        id<MTLRenderCommandEncoder> enc =
+            (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
+        if (!enc) return false;
 
         [enc setRenderPipelineState:mesh_pipeline_state];
         [enc setCullMode:MTLCullModeNone];
@@ -916,10 +912,6 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
                         baseVertex:use_guest_vtx ? base_vertex : 0
                       baseInstance:0];
 
-        [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
-
         log_draw_diagnostics("IT_DRAW_INDEX_2", idx_count, uniforms, active_tex, use_guest_vtx,
                              use_guest_vtx ? memory->to_host_ptr<void>(eff_vtx_addr) : s_default_quad,
                              use_guest_vtx ? stride : sizeof(MeshVertex),
@@ -927,6 +919,11 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
 
         draw_count++;
         indexed_draw_count++;
+        if (metal && metal->frame_in_progress()) {
+            frame_stats.draws++;
+            frame_stats.indexed_draws++;
+        }
+        frame_draw_encoded = true;
         return true;
     }
 }
@@ -939,15 +936,17 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         draw_count++;
         return true;
     }
+    if (!metal->frame_in_progress()) {
+        std::fprintf(stderr, "[PM4] draw outside frame\n");
+        return false;
+    }
 
     @autoreleasepool {
         init_mesh_pipeline();
         if (!mesh_pipeline_state) return false;
 
         id<MTLDevice> device = (__bridge id<MTLDevice>)metal->raw_device();
-        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metal->raw_command_queue();
-        id<MTLTexture> framebuffer = (__bridge id<MTLTexture>)metal->raw_framebuffer();
-        if (!device || !queue || !framebuffer) return false;
+        if (!device) return false;
 
         // Discover guest vertex buffer from V#0 in vs_user_sgprs[2:3]
         GuestAddr eff_vtx_addr = vertex_buffer_addr;
@@ -1073,18 +1072,10 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
             }
         }
 
-        MTLRenderPassDescriptor* pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass_desc.colorAttachments[0].texture = framebuffer;
-        if (draw_count == 0 || (!use_guest_vtx && vtx_count == 3)) {
-            pass_desc.colorAttachments[0].loadAction = MTLLoadActionClear;
-            pass_desc.colorAttachments[0].clearColor = MTLClearColorMake(clear_color.r, clear_color.g, clear_color.b, clear_color.a);
-        } else {
-            pass_desc.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        }
-        pass_desc.colorAttachments[0].storeAction = MTLStoreActionStore;
-
-        id<MTLCommandBuffer> cmd = [queue commandBuffer];
-        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass_desc];
+        if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
+        id<MTLRenderCommandEncoder> enc =
+            (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
+        if (!enc) return false;
 
         [enc setRenderPipelineState:mesh_pipeline_state];
         [enc setCullMode:MTLCullModeNone];
@@ -1132,14 +1123,14 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
                 vertexCount:actual_vtx_count
               instanceCount:std::max<u32>(1, instance_count)];
 
-        [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
-
         log_draw_diagnostics("IT_DRAW_INDEX_AUTO", actual_vtx_count, uniforms, active_tex, use_guest_vtx,
                              diag_vtx_ptr, diag_vtx_stride, diag_vtx_num);
 
         draw_count++;
+        if (metal && metal->frame_in_progress()) {
+            frame_stats.draws++;
+        }
+        frame_draw_encoded = true;
         return true;
     }
 }
@@ -1154,6 +1145,34 @@ Pm4Translator::~Pm4Translator() = default;
 
 Pm4Translator::Pm4Translator(Pm4Translator&&) noexcept = default;
 Pm4Translator& Pm4Translator::operator=(Pm4Translator&&) noexcept = default;
+
+bool Pm4Translator::begin_frame() {
+    if (!m_impl) return false;
+    if (!m_impl->metal) return true;
+    if (!m_impl->metal->begin_frame()) return false;
+    m_impl->frame_draw_encoded = false;
+    m_impl->frame_stats = GpuFrameStats{};
+    m_impl->frame_stats.frame_index = m_impl->metal->submitted_frame_count() + 1;
+    return true;
+}
+
+bool Pm4Translator::submit_frame(bool wait_for_completion) {
+    if (!m_impl) return false;
+    if (!m_impl->metal) return true;
+    if (!m_impl->metal->frame_in_progress()) return false;
+    m_impl->metal->end_render_encoder();
+    const bool submitted = m_impl->metal->submit_frame(wait_for_completion);
+    m_impl->frame_stats.command_buffers_submitted = m_impl->metal->submitted_frame_count();
+    return submitted;
+}
+
+bool Pm4Translator::frame_in_progress() const noexcept {
+    return m_impl && (!m_impl->metal || m_impl->metal->frame_in_progress());
+}
+
+GpuFrameStats Pm4Translator::frame_stats() const noexcept {
+    return m_impl ? m_impl->frame_stats : GpuFrameStats{};
+}
 
 void Pm4Translator::reset_state() {
     if (!m_impl) return;
@@ -1243,6 +1262,9 @@ bool Pm4Translator::execute_auto_draw(u32 vtx_count, PrimitiveType prim_type, i3
 bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
     if (!m_impl) return false;
     m_impl->packets_processed++;
+    if (m_impl->metal && m_impl->metal->frame_in_progress()) {
+        m_impl->frame_stats.packets++;
+    }
 
     if (packet.header.type == Pm4PacketType::Type2) {
         // NOP packet
@@ -1912,6 +1934,9 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             }
 
             default:
+                if (m_impl->metal && m_impl->metal->frame_in_progress()) {
+                    m_impl->frame_stats.unsupported_packets++;
+                }
                 return true;
         }
     }

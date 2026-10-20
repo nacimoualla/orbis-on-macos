@@ -26,6 +26,18 @@ struct GpuScissor {
     u32 height{1080};
 };
 
+struct GpuFrameStats {
+    u64 frame_index{0};
+    usize packets{0};
+    usize draws{0};
+    usize indexed_draws{0};
+    usize unsupported_packets{0};
+    usize upload_bytes{0};
+    usize resource_cache_hits{0};
+    usize resource_cache_misses{0};
+    u64 command_buffers_submitted{0};
+};
+
 class Pm4Translator {
 public:
     explicit Pm4Translator(MetalBackend* metal = nullptr);
@@ -38,6 +50,11 @@ public:
     // Non-copyable
     Pm4Translator(const Pm4Translator&) = delete;
     Pm4Translator& operator=(const Pm4Translator&) = delete;
+
+    bool begin_frame();
+    bool submit_frame(bool wait_for_completion = false);
+    [[nodiscard]] bool frame_in_progress() const noexcept;
+    [[nodiscard]] GpuFrameStats frame_stats() const noexcept;
 
     /// Execute a single PM4 packet
     bool execute_packet(const Pm4Packet& packet);
