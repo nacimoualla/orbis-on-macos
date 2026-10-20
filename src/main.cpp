@@ -267,7 +267,10 @@ int main(int argc, char* argv[]) {
             auto t_start = std::chrono::steady_clock::now();
             auto t_last = t_start;
             ps4::usize instrs_last = 0;
+            constexpr auto frame_period = std::chrono::microseconds(16667);
+            auto next_deadline = std::chrono::steady_clock::now();
             while (window->is_open() && !syscalls.has_exited() && (instruction_budget == 0 || total_instructions < instruction_budget)) {
+                next_deadline += frame_period;
                 window->poll_events();
                 nid_registry.set_pad_buttons(window->input_buttons());
 
@@ -289,7 +292,13 @@ int main(int argc, char* argv[]) {
 
                 if (nid_registry.get_flip_count() > 0) {
                     window->present_frame();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                }
+
+                const auto deadline_now = std::chrono::steady_clock::now();
+                if (deadline_now > next_deadline + frame_period * 2) {
+                    next_deadline = deadline_now;
+                } else {
+                    std::this_thread::sleep_until(next_deadline);
                 }
             }
         } else {

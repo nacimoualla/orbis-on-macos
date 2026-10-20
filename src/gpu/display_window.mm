@@ -52,6 +52,10 @@ namespace ps4 {
 struct DisplayWindow::Impl {
     WindowConfig config{};
     bool is_open{false};
+    u64 presented_frames{0};
+    u64 skipped_presentations{0};
+    std::chrono::steady_clock::time_point next_frame_deadline{};
+    MetalBackend* metal{nullptr};
     id<MTLDevice> device{nil};
     id<MTLCommandQueue> command_queue{nil};
     id<MTLTexture> framebuffer_texture{nil};
@@ -78,6 +82,10 @@ bool DisplayWindow::initialize(MetalBackend& metal, const WindowConfig& config) 
     }
 
     m_impl->config = config;
+    m_impl->metal = &metal;
+    m_impl->presented_frames = 0;
+    m_impl->skipped_presentations = 0;
+    m_impl->next_frame_deadline = std::chrono::steady_clock::now();
     m_impl->device = (__bridge id<MTLDevice>)metal.raw_device();
     m_impl->command_queue = (__bridge id<MTLCommandQueue>)metal.raw_command_queue();
     m_impl->framebuffer_texture = (__bridge id<MTLTexture>)metal.raw_framebuffer();
@@ -240,8 +248,19 @@ bool DisplayWindow::present_frame() {
 
         id<CAMetalDrawable> drawable = [m_impl->metal_layer nextDrawable];
         if (!drawable) {
+            ++m_impl->skipped_presentations;
             poll_events();
             return true;
+        }
+
+        // The guest producer and presenter share the backend command queue.
+        // If a newly submitted producer frame is still outstanding, resolve
+        // that ordering before sampling it for presentation. This is after
+        // nextDrawable so drawable starvation remains non-blocking.
+        if (m_impl->metal &&
+            m_impl->metal->submitted_frame_count() > m_impl->presented_frames &&
+            !m_impl->metal->wait_for_last_frame()) {
+            return false;
         }
 
         MTLRenderPassDescriptor* pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -268,6 +287,7 @@ bool DisplayWindow::present_frame() {
         [cmd_buffer presentDrawable:drawable];
         [cmd_buffer commit];
 
+        ++m_impl->presented_frames;
         poll_events();
         return true;
     }

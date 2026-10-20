@@ -75,15 +75,24 @@ int main() {
 
         std::cout << "  ✓ Test 5: Non-blocking event polling verified\n";
 
-        // Test 6: Clean window closure
+        // Test 6: Headless presentation remains non-blocking without a drawable.
+        for (int i = 0; i < 8; ++i) {
+            window.poll_events();
+            assert(window.present_frame());
+            assert(window.is_open());
+        }
+
+        std::cout << "  ✓ Test 6: Headless presentation pacing seam remains open without a drawable\n";
+
+        // Test 7: Clean window closure
         window.close();
         assert(!window.is_open());
         assert(!window.present_frame());
 
-        std::cout << "  ✓ Test 6: Clean window close and subsequent present rejection verified\n";
+        std::cout << "  ✓ Test 7: Clean window close and subsequent present rejection verified\n";
     }
 
-    // Test 7: Native AppKit Window creation & CAMetalLayer setup
+    // Test 8: Native AppKit Window creation & CAMetalLayer setup
     {
         ps4::DisplayWindow window;
         ps4::WindowConfig cfg{
@@ -110,7 +119,7 @@ int main() {
         window.close();
         assert(!window.is_open());
 
-        std::cout << "  ✓ Test 7: Native AppKit NSWindow + CAMetalLayer created, presented frame, and closed cleanly\n";
+        std::cout << "  ✓ Test 8: Native AppKit NSWindow + CAMetalLayer created, presented frame, and closed cleanly\n";
     }
 
     std::cout << "[PHASE 8] PASS: All DisplayWindow & Presentation tests passed!\n";
