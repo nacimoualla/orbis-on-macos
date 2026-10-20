@@ -83,6 +83,7 @@ public:
 
     /// 3D Mesh pipeline: memory manager attachment and vertex buffer binding
     void set_memory_manager(MemoryManager* memory) noexcept;
+    void set_draw_diagnostics_enabled(bool enabled) noexcept;
     void set_resource_cache_budget(usize bytes) noexcept;
     void invalidate_guest_resources(GuestAddr address, usize size) noexcept;
     void bind_vertex_buffer(GuestAddr vaddr, usize size, usize stride = sizeof(Vertex3D));

@@ -59,3 +59,16 @@ Final focused rerun after review-fix cleanup:
 - `./build/test_phase14 >/dev/null 2>&1` — **passed** (exit code 0)
 - `ctest --test-dir build -R Phase14_MeshPipeline --output-on-failure` — **passed** (1/1, 0.06s)
 - `git diff --check` — **passed**
+
+## Re-review pass (2026-10-20 16:11 UTC)
+
+- Added `set_draw_diagnostics_enabled(bool)` so cache tests can disable the pre-existing verbose shader/memory diagnostic path that hangs during textured integration draws.
+- Restored deterministic same-dimension texture tests covering distinct texture keys, reuse of the newer texture, local invalidation, and a fitting cross-resource budget that forces oldest-resource LRU eviction.
+- Strengthened vertex invalidation assertions: the non-overlapping index cache must hit exactly once, while vertex invalidation must produce exactly one miss and upload exactly `sizeof(Vertex3D[3])` additional bytes.
+
+Exact validation:
+
+- `cmake --build build --target test_phase14` — **passed**
+- `./build/test_phase14` — **passed**, exit code 0; includes Test 14.10 texture reuse/local invalidation/cross-resource LRU
+- `ctest --test-dir build -R Phase14_MeshPipeline --output-on-failure` — **passed**, 1/1, 0.08s
+- `git diff --check` — **passed**

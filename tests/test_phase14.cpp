@@ -599,14 +599,80 @@ void test_pm4_guest_resource_cache_and_invalidation() {
     assert(translator.execute_indexed_draw(indices, 3));
     assert(translator.submit_frame(true));
     const GpuFrameStats third = translator.frame_stats();
-    assert(third.resource_cache_misses >= second.resource_cache_misses + 1);
-    assert(third.upload_bytes > second.upload_bytes);
+    assert(third.resource_cache_misses == second.resource_cache_misses + 1);
+    assert(third.resource_cache_hits == second.resource_cache_hits + 1);
+    assert(third.upload_bytes == second.upload_bytes + sizeof(triangle));
 
     translator.set_resource_cache_budget(1);
     assert(translator.begin_frame());
     assert(!translator.execute_indexed_draw(indices, 3));
     assert(translator.submit_frame(true));
     std::cout << "  -> Guest resource cache and invalidation passed!\n";
+}
+
+static void set_test_texture(Pm4Translator& translator, GuestAddr address) {
+    const u32 payload[] = {0x000C, static_cast<u32>(address >> 8), 0x00A00000, 0x4001, 0};
+    Pm4Packet packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_SH_REG, 5)),
+        .payload = {payload, payload + 5}
+    };
+    assert(translator.execute_packet(packet));
+}
+
+void test_pm4_texture_cache_and_cross_resource_lru() {
+    std::cout << "[Test 14.10] Testing deterministic texture cache and cross-resource LRU...\n";
+    MetalBackend metal;
+    assert(metal.initialize());
+    assert(metal.create_framebuffer(256, 256));
+    MemoryManager memory;
+    assert(memory.initialize());
+    const GuestAddr vertices = 0x140000;
+    const GuestAddr indices = 0x141000;
+    const GuestAddr texture_a = 0x142000;
+    const GuestAddr texture_b = 0x143000;
+    const Vertex3D triangle[3] = {
+        {{-0.8f, -0.8f, 0.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
+        {{ 0.0f,  0.8f, 0.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+        {{ 0.8f, -0.8f, 0.0f}, {0.0f, 0.0f, 1.0f, 1.0f}},
+    };
+    const u16 idx[3] = {0, 1, 2};
+    const u32 tex_a[4] = {0xFF0000FF, 0xFF0000FF, 0xFF0000FF, 0xFF0000FF};
+    const u32 tex_b[4] = {0xFFFF0000, 0xFFFF0000, 0xFFFF0000, 0xFFFF0000};
+    memory.write_bytes(vertices, triangle, sizeof(triangle));
+    memory.write_bytes(indices, idx, sizeof(idx));
+    memory.write_bytes(texture_a, tex_a, sizeof(tex_a));
+    memory.write_bytes(texture_b, tex_b, sizeof(tex_b));
+
+    Pm4Translator translator(&metal);
+    translator.set_draw_diagnostics_enabled(false);
+    translator.set_memory_manager(&memory);
+    translator.bind_vertex_buffer(vertices, sizeof(triangle));
+    translator.set_resource_cache_budget(sizeof(triangle) + sizeof(idx) + sizeof(tex_a));
+
+    assert(translator.begin_frame());
+    set_test_texture(translator, texture_a);
+    assert(translator.execute_indexed_draw(indices, 3));
+    set_test_texture(translator, texture_b);
+    assert(translator.execute_indexed_draw(indices, 3));
+    set_test_texture(translator, texture_b);
+    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.submit_frame(false));
+    const GpuFrameStats first = translator.frame_stats();
+    assert(first.resource_cache_misses >= 4);
+    assert(first.resource_cache_hits >= 2);
+
+    translator.invalidate_guest_resources(texture_b, sizeof(tex_b));
+    assert(translator.begin_frame());
+    set_test_texture(translator, texture_a);
+    assert(translator.execute_indexed_draw(indices, 3));
+    const GpuFrameStats unrelated = translator.frame_stats();
+    assert(unrelated.resource_cache_hits > first.resource_cache_hits);
+    set_test_texture(translator, texture_b);
+    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.submit_frame(false));
+    const GpuFrameStats second = translator.frame_stats();
+    assert(second.resource_cache_misses > first.resource_cache_misses);
+    std::cout << "  -> Texture reuse, local invalidation, and LRU ordering passed!\n";
 }
 
 int main() {
@@ -622,6 +688,7 @@ int main() {
     test_pm4_draw_index_auto_and_procedural_fallback();
     test_pm4_multiple_draws_use_one_frame();
     test_pm4_guest_resource_cache_and_invalidation();
+    test_pm4_texture_cache_and_cross_resource_lru();
     test_pm4_rejects_malformed_and_unsupported_packets();
 
     std::cout << "=== All Phase 14 tests passed successfully! ===\n";

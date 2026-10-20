@@ -121,6 +121,7 @@ struct Pm4Translator::Impl {
     u64 resource_generation{0};
     u64 resource_use_clock{0};
     bool frame_draw_encoded{false};
+    bool draw_diagnostics_enabled{true};
     u64 frame_submission_start{0};
 
     id<MTLRenderPipelineState> mesh_pipeline_state{nil};
@@ -1078,10 +1079,12 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
                         baseVertex:use_guest_vtx ? base_vertex : 0
                       baseInstance:0];
 
-        log_draw_diagnostics("IT_DRAW_INDEX_2", idx_count, uniforms, active_tex, use_guest_vtx,
-                             use_guest_vtx ? memory->to_host_ptr<void>(eff_vtx_addr) : s_default_quad,
-                             use_guest_vtx ? stride : sizeof(MeshVertex),
-                             use_guest_vtx ? std::min<u32>(static_cast<u32>(effective_vtx_count), 4) : 4);
+        if (draw_diagnostics_enabled) {
+            log_draw_diagnostics("IT_DRAW_INDEX_2", idx_count, uniforms, active_tex, use_guest_vtx,
+                                 use_guest_vtx ? memory->to_host_ptr<void>(eff_vtx_addr) : s_default_quad,
+                                 use_guest_vtx ? stride : sizeof(MeshVertex),
+                                 use_guest_vtx ? std::min<u32>(static_cast<u32>(effective_vtx_count), 4) : 4);
+        }
 
         draw_count++;
         indexed_draw_count++;
@@ -1296,8 +1299,10 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
                 vertexCount:actual_vtx_count
               instanceCount:std::max<u32>(1, instance_count)];
 
-        log_draw_diagnostics("IT_DRAW_INDEX_AUTO", actual_vtx_count, uniforms, active_tex, use_guest_vtx,
-                             diag_vtx_ptr, diag_vtx_stride, diag_vtx_num);
+        if (draw_diagnostics_enabled) {
+            log_draw_diagnostics("IT_DRAW_INDEX_AUTO", actual_vtx_count, uniforms, active_tex, use_guest_vtx,
+                                 diag_vtx_ptr, diag_vtx_stride, diag_vtx_num);
+        }
 
         draw_count++;
         if (metal && metal->frame_in_progress()) {
@@ -1420,8 +1425,13 @@ void Pm4Translator::set_memory_manager(MemoryManager* memory) noexcept {
             m_impl->resource_cache_bytes = 0;
             ++m_impl->resource_generation;
         }
+
         m_impl->memory = memory;
     }
+}
+
+void Pm4Translator::set_draw_diagnostics_enabled(bool enabled) noexcept {
+    if (m_impl) m_impl->draw_diagnostics_enabled = enabled;
 }
 
 void Pm4Translator::set_resource_cache_budget(usize bytes) noexcept {
