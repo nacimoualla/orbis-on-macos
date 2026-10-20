@@ -16,6 +16,11 @@ struct MetalBackend::Impl {
     bool last_frame_completed{true};
     u32 width{0};
     u32 height{0};
+
+    void abort_active_frame() noexcept {
+        active_render_encoder = nil;
+        active_command_buffer = nil;
+    }
 };
 
 MetalBackend::MetalBackend() : m_impl(std::make_unique<Impl>()) {}
@@ -93,6 +98,7 @@ bool MetalBackend::clear_screen(ColorRGBA color) {
     }
 
     if (!encode_clear(color)) {
+        m_impl->abort_active_frame();
         return false;
     }
 
@@ -149,6 +155,7 @@ bool MetalBackend::encode_clear(ColorRGBA color) {
             [m_impl->active_command_buffer renderCommandEncoderWithDescriptor:pass_desc];
         if (!m_impl->active_render_encoder) {
             std::cerr << "[Metal] Failed to create clear render encoder\n";
+            m_impl->abort_active_frame();
             return false;
         }
 
