@@ -499,7 +499,6 @@ void Pm4Translator::Impl::invalidate_resources(GuestAddr address, usize size) no
             ++it;
         }
     }
-    ++resource_generation;
 }
 
 id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
@@ -543,16 +542,14 @@ id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
     }
     evict_resource_cache(texture_bytes);
     if (resource_cache_bytes + texture_bytes > resource_cache_budget) return nil;
-    if (!active_metal_texture ||
-        active_metal_texture.width != ps_texture_width ||
-        active_metal_texture.height != ps_texture_height) {
-        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                                        width:ps_texture_width
-                                                                                       height:ps_texture_height
-                                                                                    mipmapped:NO];
-        desc.usage = MTLTextureUsageShaderRead;
-        active_metal_texture = [device newTextureWithDescriptor:desc];
-    }
+    // A cache miss must allocate a texture for this complete key. Reusing a
+    // same-dimension active texture would alias distinct guest addresses.
+    MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                    width:ps_texture_width
+                                                                                   height:ps_texture_height
+                                                                                mipmapped:NO];
+    desc.usage = MTLTextureUsageShaderRead;
+    active_metal_texture = [device newTextureWithDescriptor:desc];
 
     const u8* u8_ptr = static_cast<const u8*>(host_pixels);
     usize nonzero_count = 0;
