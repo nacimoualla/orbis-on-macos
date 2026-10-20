@@ -32,14 +32,14 @@ namespace {
 // VEX.L for the instruction currently being decoded. The 0F38/0F3A handlers
 // sit in a different scope from the VEX prefix parse, so the bit is published
 // at file scope rather than threaded through as a local.
-static bool g_vex_L = false;
+static thread_local bool g_vex_L = false;
 // VEX R/X/B extension bits. The 0F38 handlers are in a different scope from the
 // VEX prefix parser, so these are published at file scope too. Passing the REX
 // bits instead made `vbroadcastsd ymm0, [r14+0xfce8]` (VEX byte c2 sets ~B=0,
 // i.e. vex_b=1, so rm=6+8=14) address [rsi+0xfce8] instead.
-static u8 g_vex_map = 1, g_vex_op = 0;
-static u8 g_vex_r = 1, g_vex_x = 1, g_vex_b = 1;
-static u8 g_vex_vvvv = 0;
+static thread_local u8 g_vex_map = 1, g_vex_op = 0;
+static thread_local u8 g_vex_r = 1, g_vex_x = 1, g_vex_b = 1;
+static thread_local u8 g_vex_vvvv = 0;
 
 inline u64& get_gpr64(CpuContext& ctx, u8 reg_idx) {
     switch (reg_idx & 0x0F) {
@@ -780,11 +780,9 @@ StepResult CpuExecutor::step() {
                                          (unsigned)(sv & 0xFFFFFFFF), (unsigned)(sv >> 32));
                             // Walk back from the PLT entry to the owning symbol table
                             // by dumping the raw bytes for offline disassembly.
-                            GuestAddr symoff = 0;
                             if (DynamicLinker* lk = active_linker()) {
                                 GuestAddr e2 = 0;
                                 if (const LoadedModule* em = lk->module_for_addr(slot, &e2)) {
-                                    symoff = e2;
                                     std::fprintf(stderr, "[CPU FAULT]   slot is in %s at module+0x%llx\n",
                                                  em->path.c_str(), (unsigned long long)e2);
                                 }
@@ -1673,6 +1671,73 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
+        // VHADDPS (VEX.128/256.0F 7C): horizontal packed single-precision
+        // addition, independently within each 128-bit lane.
+        if (vex_map == 1 && vex_op == 0x7C) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex,
+                                  vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) {
+                src2 = m_context.ymm[m.rm_id & 15];
+            } else if (!m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16)) {
+                return StepResult::MemoryFault;
+            }
+            CpuContext::YmmReg result{};
+            const usize lanes = vex_l ? 2 : 1;
+            for (usize lane = 0; lane < lanes; ++lane) {
+                const usize base = lane * 4;
+                const auto& a = m_context.ymm[src1].f;
+                const auto& b = src2.f;
+                result.f[base + 0] = a[base + 0] + a[base + 1];
+                result.f[base + 1] = a[base + 2] + a[base + 3];
+                result.f[base + 2] = b[base + 0] + b[base + 1];
+                result.f[base + 3] = b[base + 2] + b[base + 3];
+            }
+            m_context.ymm[dest] = result;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // VPACKSSDW: pack signed dwords from the two source operands into
+        // signed saturated words, independently for each 128-bit lane.
+        if (vex_map == 1 && vex_op == 0x6B) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2_val{};
+            if (m.is_reg) {
+                src2_val = m_context.ymm[m.rm_id & 15];
+            } else if (!m_memory.read_bytes(m.mem_addr, &src2_val, vex_l ? 32 : 16)) {
+                return StepResult::MemoryFault;
+            }
+
+            const auto& src1_val = m_context.ymm[src1];
+            CpuContext::YmmReg res{};
+            const usize lanes = vex_l ? 2 : 1;
+            for (usize lane = 0; lane < lanes; ++lane) {
+                const usize d = lane * 4;
+                const usize w = lane * 8;
+                for (usize i = 0; i < 4; ++i) {
+                    const i64 a = static_cast<i32>(src1_val.d[d + i]);
+                    const i64 b = static_cast<i32>(src2_val.d[d + i]);
+                    const auto saturate = [](i64 value) -> u16 {
+                        if (value > 32767) return 0x7FFF;
+                        if (value < -32768) return 0x8000;
+                        return static_cast<u16>(static_cast<i16>(value));
+                    };
+                    res.w[w + i] = saturate(a);
+                    res.w[w + 4 + i] = saturate(b);
+                }
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
         // VPUNPCKLBW (0x60), VPUNPCKLWD (0x61), VPUNPCKLDQ (0x62),
         // VPUNPCKHBW (0x68), VPUNPCKHWD (0x69), VPUNPCKHDQ (0x6A),
         // VPUNPCKLQDQ (0x6C), VPUNPCKHQDQ (0x6D)
@@ -2182,7 +2247,9 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // Generic fallback for any other VEX instruction: decode ModR/M and advance
+        // Do not treat an unsupported VEX instruction as a successful no-op.
+        // Advancing RIP here leaves destination registers stale and can corrupt
+        // guest control flow long after the original instruction.
         {
             usize extra_imm = 0;
             if (vex_map == 3) {
@@ -2194,10 +2261,11 @@ StepResult CpuExecutor::step() {
                 }
             }
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, extra_imm);
-            if (m.valid) {
-                m_context.rip = start_rip + cursor + m.bytes_consumed + extra_imm;
-                return StepResult::Ok;
-            }
+            std::fprintf(stderr, "[CPU UNIMPL VEX] map=%u op=0x%02x at RIP=0x%llx\n",
+                         static_cast<unsigned>(vex_map), static_cast<unsigned>(vex_op),
+                         static_cast<unsigned long long>(start_rip));
+            (void)m;
+            return StepResult::IllegalInstruction;
         }
     }
 
@@ -2205,20 +2273,6 @@ StepResult CpuExecutor::step() {
     if (op0 == 0x0F && m_memory.is_valid_address(start_rip + cursor, 1)) {
         const u8 op1 = raw_code[cursor++];
         const GuestAddr next_ip_base_0f = start_rip + cursor;
-
-        // Any VEX opcode with no handler above falls through here. Without this
-        // the instruction would be silently ignored and the guest would run on
-        // with stale registers -- exactly how the missing VBROADCASTSD hid for
-        // so long. Warn once per (map, op) so the volume stays bounded.
-        {
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                std::fprintf(stderr, "[CPU UNIMPL VEX] map=%u op=0x%02x at RIP=0x%llx\n",
-                             (unsigned)g_vex_map, (unsigned)g_vex_op,
-                             (unsigned long long)start_rip);
-            }
-        }
 
         // 0x0F 0x38: 3-byte escape prefix
         if (op1 == 0x38 && m_memory.is_valid_address(start_rip + cursor, 1)) {
@@ -2317,15 +2371,10 @@ StepResult CpuExecutor::step() {
                 return StepResult::Ok;
             }
 
-            // Fallback for unhandled 0x0F 0x38
-            {
-                auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f38, rex_r, rex_x, rex_b, seg_override, m_context);
-                if (m.valid) {
-                    m_context.rip = start_rip + cursor + m.bytes_consumed;
-                    return StepResult::Ok;
-                }
-                return StepResult::IllegalInstruction;
-            }
+            std::fprintf(stderr, "[CPU UNIMPL 0F38] opcode=0x%02x at RIP=0x%llx\n",
+                         static_cast<unsigned>(op2),
+                         static_cast<unsigned long long>(start_rip));
+            return StepResult::IllegalInstruction;
         }
 
         // 0x0F 0x3A: 3-byte escape prefix with imm8
@@ -2359,15 +2408,10 @@ StepResult CpuExecutor::step() {
                 return StepResult::Ok;
             }
 
-            // Fallback for unhandled 0x0F 0x3A (consumes ModR/M + 1 byte imm)
-            {
-                auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f3a, rex_r, rex_x, rex_b, seg_override, m_context, 1);
-                if (m.valid) {
-                    m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
-                    return StepResult::Ok;
-                }
-                return StepResult::IllegalInstruction;
-            }
+            std::fprintf(stderr, "[CPU UNIMPL 0F3A] opcode=0x%02x at RIP=0x%llx\n",
+                         static_cast<unsigned>(op2),
+                         static_cast<unsigned long long>(start_rip));
+            return StepResult::IllegalInstruction;
         }
 
         // 0x0F 0x0B: UD2 (Undefined instruction / abort / trap)

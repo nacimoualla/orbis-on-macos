@@ -640,16 +640,26 @@ void test_pm4_guest_resource_cache_and_invalidation() {
     assert(second.resource_cache_hits >= first.resource_cache_hits + 2);
     assert(second.upload_bytes == first_uploads);
 
+    // Production caches must notice guest writes even when the caller does
+    // not explicitly issue an invalidation notification.
     triangle[0].position[0] = -0.7f;
+    memory.write_bytes(vertices, triangle, sizeof(triangle));
+    assert(translator.begin_frame());
+    assert(translator.execute_indexed_draw(indices, 3));
+    assert(translator.submit_frame(true));
+    const GpuFrameStats observed_write = translator.frame_stats();
+    assert(observed_write.resource_cache_misses == second.resource_cache_misses + 1);
+    assert(observed_write.upload_bytes == second.upload_bytes + sizeof(triangle));
+
+    triangle[0].position[0] = -0.6f;
     memory.write_bytes(vertices, triangle, sizeof(triangle));
     translator.invalidate_guest_resources(vertices, sizeof(triangle));
     assert(translator.begin_frame());
     assert(translator.execute_indexed_draw(indices, 3));
     assert(translator.submit_frame(true));
     const GpuFrameStats third = translator.frame_stats();
-    assert(third.resource_cache_misses == second.resource_cache_misses + 1);
-    assert(third.resource_cache_hits == second.resource_cache_hits + 1);
-    assert(third.upload_bytes == second.upload_bytes + sizeof(triangle));
+    assert(third.resource_cache_misses == observed_write.resource_cache_misses + 1);
+    assert(third.upload_bytes == observed_write.upload_bytes + sizeof(triangle));
 
     translator.set_resource_cache_budget(1);
     assert(translator.begin_frame());

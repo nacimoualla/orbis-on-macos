@@ -253,15 +253,10 @@ bool DisplayWindow::present_frame() {
             return true;
         }
 
-        // The guest producer and presenter share the backend command queue.
-        // If a newly submitted producer frame is still outstanding, resolve
-        // that ordering before sampling it for presentation. This is after
-        // nextDrawable so drawable starvation remains non-blocking.
-        if (m_impl->metal &&
-            m_impl->metal->submitted_frame_count() > m_impl->presented_frames &&
-            !m_impl->metal->wait_for_last_frame()) {
-            return false;
-        }
+        // The producer and presenter use the same command queue. Metal
+        // preserves queue ordering, so this presentation command buffer will
+        // sample the framebuffer after the guest's submitted work without a
+        // CPU-side wait. If no drawable is available, defer this frame.
 
         MTLRenderPassDescriptor* pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
         pass_desc.colorAttachments[0].texture = drawable.texture;

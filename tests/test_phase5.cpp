@@ -17,6 +17,29 @@ int main() {
     syscalls.register_default_handlers();
     syscalls.set_terminate_on_exit(false);
 
+    // VHADDPS xmm0, xmm1, xmm2 (VEX.128.0F 7C /r)
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x403000ULL;
+        const ps4::u8 code[] = {0xC5, 0xF4, 0x7C, 0xC2, 0xF4};
+        assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        cpu.context().ymm[1].f[0] = 1.0f;
+        cpu.context().ymm[1].f[1] = 2.0f;
+        cpu.context().ymm[1].f[2] = 3.0f;
+        cpu.context().ymm[1].f[3] = 4.0f;
+        cpu.context().ymm[2].f[0] = 5.0f;
+        cpu.context().ymm[2].f[1] = 6.0f;
+        cpu.context().ymm[2].f[2] = 7.0f;
+        cpu.context().ymm[2].f[3] = 8.0f;
+        cpu.set_entry_point(code_addr);
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().ymm[0].f[0] == 3.0f);
+        assert(cpu.context().ymm[0].f[1] == 7.0f);
+        assert(cpu.context().ymm[0].f[2] == 11.0f);
+        assert(cpu.context().ymm[0].f[3] == 15.0f);
+        std::cout << "  ✓ VHADDPS VEX map=1 opcode 0x7c verified\n";
+    }
+
     // Test 1: Stack initialization
     {
         ps4::CpuExecutor cpu(memory, syscalls);
@@ -404,6 +427,41 @@ int main() {
             assert(cpu.context().ymm[1].d[i] == 0xFFFFFFFFU);
         }
         std::cout << "  ✓ Test 11: VPCMPEQD and VINSERTF128 all-ones mask verified\n";
+    }
+
+    // Test 12: VPACKSSDW signed saturation and unsupported SIMD failure.
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x409000ULL;
+        const ps4::u8 code[] = {
+            // VPACKSSDW xmm0, xmm1, xmm1
+            0xC5, 0xF1, 0x6B, 0xC1,
+            // VPACKUSWB is a distinct unsupported VEX opcode and must fail
+            // explicitly.
+            0xC5, 0xF9, 0x67, 0xC0
+        };
+        assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        cpu.context().ymm[1].d[0] = 0x00010000U;
+        cpu.context().ymm[1].d[1] = 0xFFFFFFFFU;
+        cpu.context().ymm[1].d[2] = 0x00000002U;
+        cpu.context().ymm[1].d[3] = 0x80000000U;
+        cpu.set_entry_point(code_addr);
+
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().ymm[0].w[0] == 0x7FFF);
+        assert(cpu.context().ymm[0].w[1] == 0xFFFF);
+        assert(cpu.context().ymm[0].w[2] == 2);
+        assert(cpu.context().ymm[0].w[3] == 0x8000);
+        assert(cpu.context().ymm[0].w[4] == 0x7FFF);
+        assert(cpu.context().ymm[0].w[5] == 0xFFFF);
+        assert(cpu.context().ymm[0].w[6] == 2);
+        assert(cpu.context().ymm[0].w[7] == 0x8000);
+
+        const ps4::GuestAddr unsupported_rip = cpu.context().rip;
+        assert(cpu.step() == ps4::StepResult::IllegalInstruction);
+        assert(cpu.context().rip == unsupported_rip);
+
+        std::cout << "  ✓ Test 12: VPACKSSDW and unsupported VEX handling verified\n";
     }
 
     std::cout << "[PHASE 5] PASS: All CPU Execution and Instruction Dispatch tests passed!\n";

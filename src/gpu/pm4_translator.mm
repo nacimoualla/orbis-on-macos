@@ -125,11 +125,13 @@ struct Pm4Translator::Impl {
         id<MTLBuffer> buffer{nil};
         usize bytes{0};
         u64 last_used{0};
+        std::vector<u8> snapshot;
     };
     struct TextureCacheEntry {
         id<MTLTexture> texture{nil};
         usize bytes{0};
         u64 last_used{0};
+        std::vector<u8> snapshot;
     };
     std::map<ResourceKey, BufferCacheEntry> buffer_cache;
     std::map<ResourceKey, TextureCacheEntry> texture_cache;
@@ -152,6 +154,7 @@ struct Pm4Translator::Impl {
     GuestAddr ps_texture_base{0};
     u32 ps_texture_width{0};
     u32 ps_texture_height{0};
+    usize ps_texture_pitch{0};
     u32 ps_texture_format{0};
     u32 ps_texture_w0{0};
     u32 ps_texture_w1{0};
@@ -520,15 +523,24 @@ id<MTLBuffer> Pm4Translator::Impl::cached_buffer(id<MTLDevice> device, GuestAddr
     const ResourceKey key{address, size, format, 0, 0, resource_generation};
     auto hit = buffer_cache.find(key);
     if (hit != buffer_cache.end()) {
-        hit->second.last_used = ++resource_use_clock;
-        ++frame_stats.resource_cache_hits;
-        return hit->second.buffer;
+        if (hit->second.snapshot.size() != size ||
+            std::memcmp(hit->second.snapshot.data(), bytes, size) != 0) {
+            resource_cache_bytes -= hit->second.bytes;
+            buffer_cache.erase(hit);
+        } else {
+            hit->second.last_used = ++resource_use_clock;
+            ++frame_stats.resource_cache_hits;
+            return hit->second.buffer;
+        }
     }
     evict_resource_cache(size);
     if (resource_cache_bytes + size > resource_cache_budget) return nil;
     id<MTLBuffer> buffer = [device newBufferWithBytes:bytes length:size options:MTLResourceStorageModeShared];
     if (!buffer) return nil;
-    buffer_cache.emplace(key, BufferCacheEntry{buffer, size, ++resource_use_clock});
+    std::vector<u8> snapshot(static_cast<const u8*>(bytes),
+                             static_cast<const u8*>(bytes) + size);
+    buffer_cache.emplace(key, BufferCacheEntry{buffer, size, ++resource_use_clock,
+                                               std::move(snapshot)});
     resource_cache_bytes += size;
     frame_stats.upload_bytes += size;
     ++frame_stats.resource_cache_misses;
@@ -572,7 +584,28 @@ id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
         return default_white_texture;
     }
 
-    const usize byte_size = static_cast<usize>(ps_texture_width) * ps_texture_height * 4;
+    const u32 dfmt = (ps_texture_w1 >> 14) & 0x3F;
+    const u32 nfmt = (ps_texture_w1 >> 20) & 0xF;
+    enum class TextureLayout { RGBA8, BGRA8 };
+    TextureLayout layout;
+    if (dfmt == 10 || nfmt == 10 || (dfmt == 0 && nfmt == 0)) {
+        layout = TextureLayout::RGBA8;
+    } else if (dfmt == 11 || nfmt == 11) {
+        layout = TextureLayout::BGRA8;
+    } else {
+        ps_texture_status = "unsupported texture format dfmt=" + std::to_string(dfmt) +
+                            " nfmt=" + std::to_string(nfmt);
+        return nil;
+    }
+    const usize row_bytes = static_cast<usize>(ps_texture_width) * 4;
+    // The observed descriptor stores pitch in bytes in the low word. A zero
+    // pitch means the documented tightly-packed layout.
+    const usize pitch = ps_texture_pitch != 0 ? ps_texture_pitch : row_bytes;
+    if (pitch < row_bytes) {
+        ps_texture_status = "invalid texture pitch";
+        return nil;
+    }
+    const usize byte_size = pitch * ps_texture_height;
     if (!memory->is_valid_address(ps_texture_base, byte_size)) {
         ps_texture_status = "hit white fallback (invalid memory range for 0x" + std::to_string(ps_texture_base) + ")";
         return default_white_texture;
@@ -589,11 +622,16 @@ id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
                           ps_texture_width, ps_texture_height, resource_generation};
     auto cached = texture_cache.find(key);
     if (cached != texture_cache.end()) {
-        cached->second.last_used = ++resource_use_clock;
-        ++frame_stats.resource_cache_hits;
-        active_metal_texture = cached->second.texture;
-        ps_texture_status = "cache hit";
-        return active_metal_texture;
+        if (cached->second.snapshot.size() == byte_size &&
+            std::memcmp(cached->second.snapshot.data(), host_pixels, byte_size) == 0) {
+            cached->second.last_used = ++resource_use_clock;
+            ++frame_stats.resource_cache_hits;
+            active_metal_texture = cached->second.texture;
+            ps_texture_status = "cache hit";
+            return active_metal_texture;
+        }
+        resource_cache_bytes -= cached->second.bytes;
+        texture_cache.erase(cached);
     }
     if (texture_bytes > resource_cache_budget) {
         ps_texture_status = "resource exceeds cache budget";
@@ -611,6 +649,21 @@ id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
     active_metal_texture = [device newTextureWithDescriptor:desc];
 
     const u8* u8_ptr = static_cast<const u8*>(host_pixels);
+    std::vector<u8> packed(row_bytes * ps_texture_height);
+    for (u32 y = 0; y < ps_texture_height; ++y) {
+        const u8* src = u8_ptr + static_cast<usize>(y) * pitch;
+        u8* dst = packed.data() + static_cast<usize>(y) * row_bytes;
+        if (layout == TextureLayout::RGBA8) {
+            std::memcpy(dst, src, row_bytes);
+        } else {
+            for (u32 x = 0; x < ps_texture_width; ++x) {
+                dst[x * 4 + 0] = src[x * 4 + 2];
+                dst[x * 4 + 1] = src[x * 4 + 1];
+                dst[x * 4 + 2] = src[x * 4 + 0];
+                dst[x * 4 + 3] = src[x * 4 + 3];
+            }
+        }
+    }
     usize nonzero_count = 0;
     const usize check_len = std::min<usize>(byte_size, 512);
     for (usize k = 0; k < check_len; ++k) {
@@ -626,8 +679,8 @@ id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
                             std::to_string(check_len) + " non-zero bytes checked in guest memory)";
         [active_metal_texture replaceRegion:MTLRegionMake2D(0, 0, ps_texture_width, ps_texture_height)
                                 mipmapLevel:0
-                                  withBytes:host_pixels
-                                bytesPerRow:ps_texture_width * 4];
+                                  withBytes:packed.data()
+                                bytesPerRow:row_bytes];
     } else {
         ps_texture_status = "hit white fallback (all 0x00 bytes in guest memory across " +
                             std::to_string(check_len) + " bytes checked)";
@@ -638,7 +691,9 @@ id<MTLTexture> Pm4Translator::Impl::prepare_texture(id<MTLDevice> device) {
                                 bytesPerRow:ps_texture_width * 4];
     }
 
-    texture_cache.emplace(key, TextureCacheEntry{active_metal_texture, texture_bytes, ++resource_use_clock});
+    std::vector<u8> snapshot(u8_ptr, u8_ptr + byte_size);
+    texture_cache.emplace(key, TextureCacheEntry{active_metal_texture, texture_bytes, ++resource_use_clock,
+                                                 std::move(snapshot)});
     resource_cache_bytes += texture_bytes;
     frame_stats.upload_bytes += texture_bytes;
     ++frame_stats.resource_cache_misses;
@@ -1484,6 +1539,7 @@ void Pm4Translator::reset_state() {
     m_impl->ps_texture_base = 0;
     m_impl->ps_texture_width = 0;
     m_impl->ps_texture_height = 0;
+    m_impl->ps_texture_pitch = 0;
     m_impl->ps_texture_format = 0;
     m_impl->ps_texture_w0 = 0;
     m_impl->ps_texture_w1 = 0;
@@ -1835,6 +1891,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                                     m_impl->ps_texture_base = tex_base;
                                     m_impl->ps_texture_width = w_m1 + 1;
                                     m_impl->ps_texture_height = h_m1 + 1;
+                                    m_impl->ps_texture_pitch = (w3 & 0xFFFFu);
                                     m_impl->ps_texture_format = w1;
                                     m_impl->ps_texture_w0 = w0;
                                     m_impl->ps_texture_w1 = w1;

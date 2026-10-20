@@ -8,6 +8,7 @@
 #include "ps4/common.hpp"
 #include "ps4/cpu_context.hpp"
 #include "ps4/display_window.hpp"
+#include "ps4/pm4_translator.hpp"
 #include "ps4/dynamic_linker.hpp"
 #include "ps4/elf_loader.hpp"
 #include "ps4/executor.hpp"
@@ -274,8 +275,24 @@ int main(int argc, char* argv[]) {
                 window->poll_events();
                 nid_registry.set_pad_buttons(window->input_buttons());
 
+                ps4::Pm4Translator* gpu = nid_registry.gpu_translator();
+                if (gpu && !gpu->begin_frame()) {
+                    std::cerr << "[GPU] Failed to begin translator frame; stopping guest execution.\n";
+                    run_res.status = ps4::StepResult::MemoryFault;
+                    break;
+                }
                 run_res = cpu.run(frame_slice);
                 total_instructions += run_res.instructions_executed;
+                if (gpu) {
+                    const bool submitted = gpu->submit_frame(false);
+                    if (!submitted) {
+                        std::cerr << "[GPU] Failed to submit translator frame; stopping guest execution.\n";
+                        if (run_res.status == ps4::StepResult::Ok ||
+                            run_res.status == ps4::StepResult::Syscall) {
+                            run_res.status = ps4::StepResult::MemoryFault;
+                        }
+                    }
+                }
                 if (run_res.status != ps4::StepResult::Ok) break;
 
                 const auto now = std::chrono::steady_clock::now();
