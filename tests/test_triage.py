@@ -457,5 +457,58 @@ DWORD[1000][10]=0x22222222
         self.assertIn("F#1", timeout_findings[0].message)
 
 
+class TestStage6HotLoopAndThreads(unittest.TestCase):
+    def test_hot_loop_from_histogram(self):
+        log_content = """[module] 0x1 eboot.bin: base=0x500000 span=0x200000
+=== RIP Histogram ===
+0x588df6: 6000
+0x58d28e: 3000
+0x58d550: 1000
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        loader = triage_crash.LoaderAnalyzer(log)
+        hot = triage_crash.HotLoopAnalyzer(log, modules=loader.modules)
+        self.assertTrue(hot.hot_loop_detected)
+        self.assertEqual(hot.total_samples, 10000)
+        # Top 1 address (0x588df6) has 6000/10000 = 60% (>50%)
+        self.assertEqual(len(hot.hot_addrs), 1)
+        self.assertAlmostEqual(hot.hot_share, 0.60)
+        self.assertEqual(len(hot.findings), 1)
+        self.assertIn("eboot.bin+0x88DF6", hot.findings[0].message)
+        self.assertIn("60.0%", hot.findings[0].message)
+
+    def test_hot_loop_from_trace_lines(self):
+        trace_lines = ["[CPU TRACE] RIP=0x1000\n"] * 60 + ["[CPU TRACE] RIP=0x2000\n"] * 40
+        log = Log(trace_lines)
+        hot = triage_crash.HotLoopAnalyzer(log)
+        self.assertTrue(hot.hot_loop_detected)
+        self.assertEqual(len(hot.hot_addrs), 1)
+        self.assertAlmostEqual(hot.hot_share, 0.60)
+        self.assertIn("0x1000", hot.findings[0].message)
+
+    def test_thread_activity_and_semaphore_balance(self):
+        log_content = """[Thread] Created guest thread 'main' (TID 1): entry=0x100, stack=0x1000-0x2000, rsp=0x1fff, fs_base=0x0, arg=0x0
+[HLE TID=1] sceKernelCreateSema('sema1')
+[Sema] CreateSema -> id=1 name='sema1' attr=0x1 init=0 max=1
+[Sema] CreateSema -> id=2 name='sema2' attr=0x1 init=0 max=1
+[Sema] SignalSema(1, 1) -> count=1
+=== Thread States Dump (Total active: 2) ===
+  [Thread 1] 'main' state=WaitingSync, RIP=0x8d2720, instrs=100
+  [Thread 2] 'worker' state=WaitingSync, RIP=0x8d2720, instrs=200
+[shutdown] watchdog: threads still parked after 2s, hard-exiting
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        threads = triage_crash.ThreadAnalyzer(log)
+        self.assertEqual(threads.sema_created_count, 2)
+        self.assertEqual(threads.sema_released_count, 1)
+        sema_findings = [f for f in threads.findings if "Semaphore balance" in f.message]
+        self.assertEqual(len(sema_findings), 1)
+        self.assertIn("unreleased balance=1", sema_findings[0].message)
+
+        deadlock_findings = [f for f in threads.findings if "Potential deadlock" in f.message]
+        self.assertEqual(len(deadlock_findings), 1)
+        self.assertEqual(deadlock_findings[0].kind, "INFERRED")
+
+
 if __name__ == "__main__":
     unittest.main()

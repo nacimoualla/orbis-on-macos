@@ -1683,6 +1683,219 @@ class GpuPm4Analyzer:
             ))
 
 
+class HotLoopAnalyzer:
+    """
+    STAGE 6: HotLoopAnalyzer
+    - RIP histogram: parses existing histogram or builds one from per-RIP trace lines
+    - Flags any set of <= 16 addresses holding > 50% of instructions
+    - Prints addresses as module+offset, the share, and register values logged at loop entry
+    """
+
+    def __init__(self, log: Log, modules: Optional[List[ModuleSpan]] = None, registers: Optional[Dict[str, int]] = None):
+        self.log = log
+        self.modules = modules or []
+        self.registers = registers or {}
+        self.rip_counts: Dict[int, int] = {}
+        self.rip_lines: Dict[int, List[int]] = {}
+        self.total_samples: int = 0
+
+        self.hot_loop_detected: bool = False
+        self.hot_addrs: List[Tuple[int, int, float]] = []
+        self.hot_share: float = 0.0
+
+        self.findings: List[Finding] = []
+        self._analyze()
+
+    def _format_addr(self, rip: int) -> str:
+        for m in sorted(self.modules, key=lambda x: x.base, reverse=True):
+            if m.base <= rip < m.base + m.span:
+                return f"{m.path}+0x{rip - m.base:X}"
+        return f"0x{rip:X}"
+
+    def _analyze(self) -> None:
+        re_hist = re.compile(r"(?:\[hist\]\s+)?(?:RIP=)?0x([0-9a-fA-F]+)[:=]\s*(\d+)", re.IGNORECASE)
+        re_trace = re.compile(r"\[CPU TRACE\]\s+RIP=0x([0-9a-fA-F]+)", re.IGNORECASE)
+        re_last_rips = re.compile(r"^\s*#\d+:\s*0x([0-9a-fA-F]+)", re.IGNORECASE)
+        re_rip_hist_num = re.compile(r"^\s*\[\d+\]\s+RIP=0x([0-9a-fA-F]+)", re.IGNORECASE)
+
+        has_explicit_hist = False
+        in_hist_section = False
+        for line_no, line in self.log.trace_lines:
+            if "Histogram" in line or "[hist]" in line:
+                in_hist_section = True
+            m_h = re_hist.search(line)
+            if m_h and (in_hist_section or "[hist]" in line or "Histogram" in line):
+                rip = int(m_h.group(1), 16)
+                cnt = int(m_h.group(2))
+                self.rip_counts[rip] = cnt
+                self.rip_lines.setdefault(rip, []).append(line_no)
+                has_explicit_hist = True
+            elif line.startswith("[") and not line.startswith("[hist]"):
+                in_hist_section = False
+
+        if not has_explicit_hist:
+            for line_no, line in self.log.trace_lines:
+                m_t = re_trace.search(line) or re_last_rips.search(line) or re_rip_hist_num.search(line)
+                if m_t:
+                    rip = int(m_t.group(1), 16)
+                    self.rip_counts[rip] = self.rip_counts.get(rip, 0) + 1
+                    self.rip_lines.setdefault(rip, []).append(line_no)
+
+        self.total_samples = sum(self.rip_counts.values())
+        if self.total_samples > 0:
+            sorted_rips = sorted(self.rip_counts.items(), key=lambda x: x[1], reverse=True)
+            running_cnt = 0
+            selected = []
+            for rip, cnt in sorted_rips[:16]:
+                running_cnt += cnt
+                selected.append((rip, cnt, cnt / self.total_samples))
+                if running_cnt / self.total_samples > 0.50:
+                    self.hot_loop_detected = True
+                    self.hot_addrs = selected
+                    self.hot_share = running_cnt / self.total_samples
+                    break
+
+        self._evaluate()
+
+    def _evaluate(self) -> None:
+        if self.hot_loop_detected:
+            addrs_desc = []
+            ev_lines = []
+            for rip, cnt, sh in self.hot_addrs:
+                addrs_desc.append(f"{self._format_addr(rip)} ({cnt} hits, {sh*100:.1f}%)")
+                ev_lines.extend(self.rip_lines.get(rip, []))
+
+            regs_str = ""
+            if self.registers:
+                regs_sample = ", ".join(f"{k}=0x{v:X}" for k, v in list(self.registers.items())[:6])
+                regs_str = f" [Registers at entry: {regs_sample}]"
+
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message=(
+                    f"Hot loop detected: {len(self.hot_addrs)} address(es) account for "
+                    f"{self.hot_share*100:.1f}% of instructions: {'; '.join(addrs_desc)}{regs_str}"
+                ),
+                lines=ev_lines
+            ))
+
+
+class ThreadAnalyzer:
+    """
+    STAGE 6: ThreadAnalyzer
+    - Tracks per-TID last HLE call and call counts
+    - Tracks parked / timeout lines
+    - Computes semaphores created minus released (only if both appear in the log)
+    - Reports facts, labels any deadlock reading as INFERRED with the rule
+    """
+
+    def __init__(self, log: Log):
+        self.log = log
+        self.tid_call_counts: Dict[int, int] = {}
+        self.tid_last_call: Dict[int, str] = {}
+        self.tid_states: Dict[int, str] = {}
+
+        self.parked_lines: List[Tuple[int, str]] = []
+
+        self.sema_created_count: int = 0
+        self.sema_created_lines: List[int] = []
+        self.sema_released_count: int = 0
+        self.sema_released_lines: List[int] = []
+
+        self.findings: List[Finding] = []
+        self._analyze()
+
+    def _analyze(self) -> None:
+        re_hle_tid = re.compile(r"\[HLE\s+(?:WARNING\s+#[0-9a-fA-F]+\s+)?TID=(\d+).*?\]\s*(.*)", re.IGNORECASE)
+        re_thread_state = re.compile(r"\[Thread\s+(\d+)\]\s+.*?\s+state=([A-Za-z0-9_]+)", re.IGNORECASE)
+        re_parked = re.compile(r"threads still parked after|watchdog: threads still parked|parked", re.IGNORECASE)
+
+        re_sema_create = re.compile(r"\[Sema\]\s+CreateSema", re.IGNORECASE)
+        re_sema_release = re.compile(r"\[Sema\]\s+(?:SignalSema|DeleteSema)", re.IGNORECASE)
+
+        for line_no, line in self.log.thread_lines + self.log.hle_lines:
+            m_t = re_hle_tid.search(line)
+            if m_t:
+                tid = int(m_t.group(1))
+                desc = m_t.group(2).strip()
+                self.tid_call_counts[tid] = self.tid_call_counts.get(tid, 0) + 1
+                self.tid_last_call[tid] = desc
+
+            m_st = re_thread_state.search(line)
+            if m_st:
+                tid = int(m_st.group(1))
+                st = m_st.group(2).strip()
+                self.tid_states[tid] = st
+
+            if re_parked.search(line):
+                self.parked_lines.append((line_no, line))
+
+            if re_sema_create.search(line):
+                self.sema_created_count += 1
+                self.sema_created_lines.append(line_no)
+
+            if re_sema_release.search(line):
+                self.sema_released_count += 1
+                self.sema_released_lines.append(line_no)
+
+        self._evaluate()
+
+    def _evaluate(self) -> None:
+        if self.tid_call_counts:
+            tid_descs = []
+            for tid, count in sorted(self.tid_call_counts.items()):
+                last = self.tid_last_call.get(tid, "none")
+                state = self.tid_states.get(tid, "unknown")
+                tid_descs.append(f"TID {tid} (calls={count}, state={state}, last='{last[:30]}')")
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message=f"Thread activity: {'; '.join(tid_descs[:8])}",
+                lines=[]
+            ))
+
+        if self.parked_lines:
+            lines = [p[0] for p in self.parked_lines]
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message=f"Parked thread events detected: '{self.parked_lines[0][1]}'",
+                lines=lines
+            ))
+
+        if self.sema_created_count > 0 and self.sema_released_count > 0:
+            diff = self.sema_created_count - self.sema_released_count
+            lines = self.sema_created_lines[:2] + self.sema_released_lines[:2]
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message=(
+                    f"Semaphore balance: created={self.sema_created_count}, "
+                    f"released/deleted={self.sema_released_count}, unreleased balance={diff}"
+                ),
+                lines=lines
+            ))
+        elif self.sema_created_count > 0:
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message=f"Semaphores created={self.sema_created_count} (semaphore releases not present in log)",
+                lines=self.sema_created_lines[:2]
+            ))
+        elif self.sema_released_count > 0:
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message=f"Semaphores released={self.sema_released_count} (semaphore creations not present in log)",
+                lines=self.sema_released_lines[:2]
+            ))
+
+        waiting_count = sum(1 for st in self.tid_states.values() if "wait" in st.lower())
+        if self.parked_lines or (waiting_count > 0 and waiting_count >= len(self.tid_states) - 1 and len(self.tid_states) > 1):
+            rule_msg = "threads parked at termination or all worker threads in wait state"
+            self.findings.append(Finding(
+                kind="INFERRED",
+                message=f"Potential deadlock: {len(self.parked_lines)} parked event(s), {waiting_count} thread(s) in wait states",
+                rule=rule_msg,
+                lines=[p[0] for p in self.parked_lines] if self.parked_lines else []
+            ))
+
+
 class Log:
     """
     Single-pass streaming parser for PS4 emulator logs.
@@ -1846,7 +2059,11 @@ class Log:
                 self.mem_fault_raw_lines.append((line_no, line))
                 recognized = True
 
-            if line.startswith("[CPU TRACE]") or line.startswith("[CPU Progress]"):
+            if (line.startswith("[CPU TRACE]") or line.startswith("[CPU Progress]") or
+                    line.startswith("[hist]") or "RIP Histogram" in line or
+                    line.startswith("Last RIPs:") or re.match(r"^\s*#\d+:\s*0x[0-9a-fA-F]+", line) or
+                    re.match(r"^\s*\[\d+\]\s+RIP=0x[0-9a-fA-F]+", line) or
+                    re.match(r"^0x[0-9a-fA-F]+:\s*\d+", line)):
                 self.trace_lines.append((line_no, line))
                 recognized = True
 
@@ -1948,10 +2165,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_dcb.add_argument("log", help="Path to log file")
     p_dcb.add_argument("--frame", type=int, default=None, help="Frame / DCB index (1-based)")
 
+    # hot
+    p_hot = subparsers.add_parser("hot", help="Analyze hot loops and RIP distribution")
+    p_hot.add_argument("log", help="Path to log file")
+
     args = parser.parse_args(argv)
 
     if not args.subcommand:
         parser.print_help()
+        return 0
+
+    if args.subcommand == "hot":
+        log = Log(args.log)
+        loader = LoaderAnalyzer(log)
+        cfa = CpuFaultAnalyzer(log)
+        hot = HotLoopAnalyzer(log, modules=loader.modules, registers=cfa.registers)
+        if hot.findings:
+            for f in hot.findings:
+                print(str(f))
+        else:
+            print("No hot loop (>50% instructions in <=16 addresses) detected.")
         return 0
 
     if args.subcommand == "dcb":
@@ -2000,6 +2233,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         if gpu.findings:
             print("\n=== GPU PM4 & DCB ANALYSIS ===")
             for f in gpu.findings:
+                print(str(f))
+
+        hot = HotLoopAnalyzer(log, modules=loader.modules, registers=cfa.registers)
+        if hot.findings:
+            print("\n=== HOT LOOP ANALYSIS ===")
+            for f in hot.findings:
+                print(str(f))
+
+        threads = ThreadAnalyzer(log)
+        if threads.findings:
+            print("\n=== THREADING ANALYSIS ===")
+            for f in threads.findings:
                 print(str(f))
 
         return 0
