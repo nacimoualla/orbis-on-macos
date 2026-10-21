@@ -168,5 +168,90 @@ class TestStage2CpuFaultAnalyzer(unittest.TestCase):
         self.assertIn("Guest out-of-bounds", str(cfa_oob.findings[-1]))
 
 
+class TestStage3HleAnalyzer(unittest.TestCase):
+    def test_nid_self_check(self):
+        self.assertFalse(triage_crash.RESOLVER_BROKEN)
+        le, _ = triage_crash.compute_sony_nid("scePthreadCondInit")
+        self.assertEqual(le, 0xd936fddaaba9ae5d)
+
+    def test_known_nid_match(self):
+        resolver = triage_crash.NidResolver()
+        status, details, name = resolver.resolve(0xd936fddaaba9ae5d)
+        self.assertEqual(status, "MATCH")
+        self.assertEqual(name, "scePthreadCondInit")
+        self.assertTrue("repo_registry" in details or "salted_sha1_le" in details)
+
+    def test_hash_match_from_names_file(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("custom_game_func\n")
+            names_path = f.name
+
+        try:
+            le, _ = triage_crash.compute_sony_nid("custom_game_func")
+            resolver = triage_crash.NidResolver(names_file=names_path)
+            status, details, name = resolver.resolve(le)
+            self.assertEqual(status, "MATCH")
+            self.assertEqual(name, "custom_game_func")
+            self.assertIn("names_file", details)
+            self.assertIn("salted_sha1_le", details)
+        finally:
+            if os.path.isfile(names_path):
+                os.remove(names_path)
+
+    def test_unknown_nid_unidentified(self):
+        resolver = triage_crash.NidResolver()
+        unknown_nid = 0x1111222233334444
+        status, details, name = resolver.resolve(unknown_nid)
+        self.assertEqual(status, "UNIDENTIFIED")
+        self.assertIsNone(name)
+        self.assertIn("UNIDENTIFIED", details)
+        self.assertIn("candidates", details)
+
+    def test_hle_fallback_parsing(self):
+        log_content = """[HLE] sceKernelLoadStartModule('/app0/test.prx') -> handle 0x2001
+[HLE WARNING #13 TID=1 rip=0x101f95] Unimplemented stub called: NID=0xacfa3ab55f03f5b3 (caller RIP=0x10674e6, rdi=0x1603e88, rsi=0x0, rdx=0x800000) returning 0 (0x0)
+[HLE WARNING #14 TID=1 rip=0x101f95] Unimplemented stub called: NID=0xacfa3ab55f03f5b3 (caller RIP=0x10674e6, rdi=0x1603e88, rsi=0x0, rdx=0x800000) returning 0 (0x0)
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        resolver = triage_crash.NidResolver()
+        hle = triage_crash.HleAnalyzer(log, resolver)
+        self.assertIn(0xacfa3ab55f03f5b3, hle.fallback_stubs)
+        rec = hle.fallback_stubs[0xacfa3ab55f03f5b3]
+        self.assertEqual(rec.count, 2)
+        self.assertEqual(rec.first_hit_caller_rip, 0x10674e6)
+        self.assertEqual(rec.first_hit_args.get("rdi"), "0x1603e88")
+
+    def test_inferred_state_waiting_vs_running(self):
+        # Waiting state
+        log_wait = Log(["[HLE] sceKernelWaitSema(1, 1)\n"])
+        hle_wait = triage_crash.HleAnalyzer(log_wait, triage_crash.NidResolver())
+        inferred_findings = [f for f in hle_wait.findings if f.kind == "INFERRED"]
+        self.assertTrue(len(inferred_findings) >= 1)
+        self.assertIn("waiting", inferred_findings[0].message)
+
+        # Running state
+        log_run = Log(["[HLE] sceKernelLoadStartModule('/app0/eboot.bin')\n"])
+        hle_run = triage_crash.HleAnalyzer(log_run, triage_crash.NidResolver())
+        inferred_findings = [f for f in hle_run.findings if f.kind == "INFERRED"]
+        self.assertTrue(len(inferred_findings) >= 1)
+        self.assertIn("actively running", inferred_findings[0].message)
+
+    def test_benign_stub_allowlist(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+            f.write('[benign]\n0x6f3404c72d7cf592 = "Known benign stub"\n')
+            allow_path = f.name
+
+        try:
+            log_content = """[HLE WHITELIST] Benign stub executed: NID=0x6f3404c72d7cf592 (caller RIP=0x99)
+"""
+            log = Log(log_content.splitlines(keepends=True))
+            hle = triage_crash.HleAnalyzer(log, triage_crash.NidResolver(), allowlist_file=allow_path)
+            self.assertEqual(len(hle.known_benign_findings), 1)
+            self.assertEqual(hle.known_benign_findings[0][2], "Known benign stub")
+        finally:
+            if os.path.isfile(allow_path):
+                os.remove(allow_path)
+
+
 if __name__ == "__main__":
     unittest.main()
