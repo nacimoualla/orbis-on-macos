@@ -327,5 +327,135 @@ class TestStage4LoaderAnalyzer(unittest.TestCase):
         self.assertIn("changed from 0x0000000000000001 to 0x0000000000000005", anomaly_findings[0].message)
 
 
+class TestStage5GpuPm4Analyzer(unittest.TestCase):
+    def test_pm4_header_decoding(self):
+        # 0xC0001000: Type 3, count=0 (body=1, total=2), opcode 0x10 (NOP)
+        t, count, op, total_len = triage_crash.decode_pm4_header(0xC0001000)
+        self.assertEqual(t, 3)
+        self.assertEqual(count, 0)
+        self.assertEqual(op, 0x10)
+        self.assertEqual(total_len, 2)
+        self.assertIn("NOP", triage_crash.get_pm4_opcode_name(op))
+
+        # 0xC0012D00: Type 3, count=1 (body=2, total=3), opcode 0x2D (DRAW_INDEX_AUTO)
+        t, count, op, total_len = triage_crash.decode_pm4_header(0xC0012D00)
+        self.assertEqual(t, 3)
+        self.assertEqual(count, 1)
+        self.assertEqual(op, 0x2D)
+        self.assertEqual(total_len, 3)
+        self.assertIn("DRAW_INDEX_AUTO", triage_crash.get_pm4_opcode_name(op))
+
+    def test_zero_gap_detection_excludes_nop_bodies(self):
+        # DCB with a NOP packet of 4 dwords where body has 0s:
+        # DWORD 0: 0xC0021000 (Type 3 NOP, count=2 -> 4 dwords total)
+        # DWORD 1: 0x00000000 (NOP body word 1)
+        # DWORD 2: 0x00000000 (NOP body word 2)
+        # DWORD 3: 0x00000000 (NOP body word 3)
+        # Followed by a real packet:
+        # DWORD 4: 0xC0002D00 (DRAW_INDEX_AUTO, 2 dwords)
+        # DWORD 5: 0x12345678
+        # Followed by unpadded zeroes (gap):
+        # DWORD 6: 0x00000000
+        # DWORD 7: 0x00000000
+        # Followed by another packet:
+        # DWORD 8: 0xC0001000 (NOP, 2 dwords)
+        # DWORD 9: 0x00000000
+        # Followed by trailing zeroes:
+        # DWORD 10: 0x00000000
+        # DWORD 11: 0x00000000
+        log_content = """[DCB FULL DUMP START 0x1000 count=12]
+DWORD[1000][0]=0xc0021000
+DWORD[1000][1]=0x00000000
+DWORD[1000][2]=0x00000000
+DWORD[1000][3]=0x00000000
+DWORD[1000][4]=0xc0002d00
+DWORD[1000][5]=0x12345678
+DWORD[1000][6]=0x00000000
+DWORD[1000][7]=0x00000000
+DWORD[1000][8]=0xc0001000
+DWORD[1000][9]=0x00000000
+DWORD[1000][10]=0x00000000
+DWORD[1000][11]=0x00000000
+[DCB FULL DUMP END 0x1000]
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        gpu = triage_crash.GpuPm4Analyzer(log)
+        self.assertEqual(len(gpu.dcb_results), 1)
+        res = gpu.dcb_results[0]
+        # Only the gap at DWORD index 6 (length 2) should be reported, NOT the NOP body at indices 1..3
+        self.assertEqual(len(res.zero_runs_unpadded), 1)
+        self.assertEqual(res.zero_runs_unpadded[0], (6, 2))
+        # Trailing zero run at index 10 (length 2)
+        self.assertEqual(res.trailing_zero_run, (10, 2))
+
+    def test_slice_matching(self):
+        # DCB starting at 0x1000:
+        # Slot 0 (addr 0x1000, 4 dwords): NOP padded
+        # Slot 1 (addr 0x1010, 4 dwords): all-zero
+        # Slot 2 (addr 0x1020, 3 dwords): real DRAW_INDEX_AUTO packet
+        log_content = """[DCB FULL DUMP START 0x1000 count=11]
+DWORD[1000][0]=0xc0021000
+DWORD[1000][1]=0x00000000
+DWORD[1000][2]=0x00000000
+DWORD[1000][3]=0x00000000
+DWORD[1000][4]=0x00000000
+DWORD[1000][5]=0x00000000
+DWORD[1000][6]=0x00000000
+DWORD[1000][7]=0x00000000
+DWORD[1000][8]=0xc0012d00
+DWORD[1000][9]=0x11111111
+DWORD[1000][10]=0x22222222
+[DCB FULL DUMP END 0x1000]
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        gpu = triage_crash.GpuPm4Analyzer(log)
+        dcb = log.dcb_dumps[0]
+
+        # Slot 0: NOP padded
+        status, desc = gpu.match_slice(dcb, rdi=0x1000, rsi=4)
+        self.assertEqual(status, "ok")
+        self.assertIn("NOP of exactly 4 DWORDs (stub padded)", desc)
+
+        # Slot 1: all-zero
+        status, desc = gpu.match_slice(dcb, rdi=0x1010, rsi=4)
+        self.assertEqual(status, "ok")
+        self.assertIn("all-zero (stub never wrote)", desc)
+
+        # Slot 2: real packets
+        status, desc = gpu.match_slice(dcb, rdi=0x1020, rsi=3)
+        self.assertEqual(status, "ok")
+        self.assertIn("real packets", desc)
+        self.assertIn("DRAW_INDEX_AUTO", desc)
+
+        # Out of bounds or rsi > 65536
+        status, desc = gpu.match_slice(dcb, rdi=0x9000, rsi=4)
+        self.assertEqual(status, "not_a_slot")
+        status, desc = gpu.match_slice(dcb, rdi=0x1000, rsi=70000)
+        self.assertEqual(status, "not_a_slot")
+
+    def test_pm4_label_mismatch_detection(self):
+        log_content = """[PM4] IT_LOAD_CONFIG_REG (0x79)
+[PM4] IT_RELEASE_MEM (0x47)
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        gpu = triage_crash.GpuPm4Analyzer(log)
+        self.assertEqual(len(gpu.label_mismatches), 2)
+        mismatch_findings = [f for f in gpu.findings if "PM4 label mismatch" in f.message]
+        self.assertEqual(len(mismatch_findings), 2)
+        self.assertIn("SET_UCONFIG_REG", mismatch_findings[0].message)
+        self.assertIn("EVENT_WRITE_EOP", mismatch_findings[1].message)
+
+    def test_timeout_and_stall_detection(self):
+        log_content = """[Gnm] SubmitAndFlip(count=1, dcbAddrs=0x1000, dcbSizes=0x100)
+[shutdown] watchdog: threads still parked after 2s, timeout stall detected
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        gpu = triage_crash.GpuPm4Analyzer(log)
+        self.assertEqual(len(gpu.timeout_lines), 1)
+        timeout_findings = [f for f in gpu.findings if "Flip/wait/timeout/stall events" in f.message]
+        self.assertEqual(len(timeout_findings), 1)
+        self.assertIn("F#1", timeout_findings[0].message)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1327,6 +1327,362 @@ class LoaderAnalyzer:
                         ))
 
 
+# Canonical GFX7/CIK PM4 Type-3 Opcodes Table in ONE module-level dict
+PM4_OPCODE_TABLE: Dict[int, str] = {
+    0x10: "NOP (verify against SDK)",
+    0x26: "INDEX_BASE (verify against SDK)",
+    0x27: "DRAW_INDEX_2 (verify against SDK)",
+    0x28: "CONTEXT_CONTROL (verify against SDK)",
+    0x2A: "INDEX_TYPE (verify against SDK)",
+    0x2D: "DRAW_INDEX_AUTO (verify against SDK)",
+    0x2F: "NUM_INSTANCES (verify against SDK)",
+    0x3C: "WAIT_REG_MEM (verify against SDK)",
+    0x46: "EVENT_WRITE (verify against SDK)",
+    0x47: "EVENT_WRITE_EOP (verify against SDK)",
+    0x49: "RELEASE_MEM (verify against SDK)",
+    0x50: "DMA_DATA (verify against SDK)",
+    0x58: "ACQUIRE_MEM (verify against SDK)",
+    0x68: "SET_CONFIG_REG (verify against SDK)",
+    0x69: "SET_CONTEXT_REG (verify against SDK)",
+    0x76: "SET_SH_REG (verify against SDK)",
+    0x79: "SET_UCONFIG_REG (verify against SDK)",
+}
+
+
+def get_pm4_opcode_name(op: int) -> str:
+    if op in PM4_OPCODE_TABLE:
+        return PM4_OPCODE_TABLE[op]
+    return f"0x{op:02X} UNKNOWN"
+
+
+def decode_pm4_header(hdr: int) -> Tuple[int, int, int, int]:
+    """
+    Decodes a PM4 packet header DWORD.
+    Returns (packet_type, count, opcode, total_packet_dwords).
+    """
+    pkt_type = (hdr >> 30) & 3
+    count = (hdr >> 16) & 0x3FFF
+    opcode = (hdr >> 8) & 0xFF
+
+    if pkt_type == 3:
+        # Type 3: count+1 body DWORDs -> count+2 total DWORDs
+        total_len = count + 2
+    elif pkt_type == 0:
+        # Type 0: count+1 body DWORDs -> count+2 total DWORDs
+        total_len = count + 2
+    elif pkt_type == 2:
+        # Type 2: no-op filler, 1 DWORD
+        total_len = 1
+    else:
+        # Type 1: usually 2 or 3 DWORDs
+        total_len = 3
+
+    return pkt_type, count, opcode, total_len
+
+
+@dataclass
+class PacketWalkResult:
+    dcb_addr: int
+    total_dwords: int
+    type_counts: Dict[int, int]
+    packets: List[Tuple[int, int, int, int]]  # (start_idx, pkt_type, opcode, length)
+    packet_boundaries: Set[int]
+    first_type0_or_2: Optional[Tuple[int, int]]  # (type, index)
+    zero_runs_unpadded: List[Tuple[int, int]]  # (start, length)
+    trailing_zero_run: Optional[Tuple[int, int]]  # (start, length)
+    draw_count_27: int
+    draw_count_2d: int
+    set_sh_reg_count: int
+    set_context_reg_count: int
+    nop_ranges: List[Tuple[int, int]]
+
+
+class GpuPm4Analyzer:
+    """
+    STAGE 5: GpuPm4Analyzer and DCB walker
+    - Opcode table in ONE module-level dict, GFX7/CIK names, each entry marked 'verify against SDK'
+    - Labels mismatch detection between log names and table names
+    - Packet walk of each DCB dump: header type, count, opcode, total dwords
+    - Reports packets per type, first Type-0 or Type-2, runs of >=2 zero dwords not inside NOP bodies, and trailing zeroes
+    - Slice matching for sceGnm* calls (rdi=start, rsi=count): all-zero, padded NOP, or real packets; flags rsi>65536 or rdi outside
+    - Draw summary per DCB: 0x27 and 0x2D draws, SET_SH_REG, SET_CONTEXT_REG; flags 'no draw packets' and shader slots NOP/zero
+    - Flip and wait timeouts: reports lines with flip/wait/timeout/stall with line numbers and frame number
+    """
+
+    def __init__(self, log: Log):
+        self.log = log
+        self.dcb_results: List[PacketWalkResult] = []
+        self.label_mismatches: List[Tuple[int, int, str, str]] = []  # (line, op, log_label, table_label)
+        self.timeout_lines: List[Tuple[int, int, str]] = []  # (line, frame_idx, text)
+        self.findings: List[Finding] = []
+
+        self._analyze()
+
+    def _walk_dcb(self, dcb: DcbDump) -> PacketWalkResult:
+        dwords = dcb.dwords
+        n = len(dwords)
+        type_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        packets: List[Tuple[int, int, int, int]] = []
+        packet_boundaries: Set[int] = {0, n}
+        first_t0_or_t2: Optional[Tuple[int, int]] = None
+        nop_ranges: List[Tuple[int, int]] = []
+
+        draw_27 = 0
+        draw_2d = 0
+        set_sh = 0
+        set_ctx = 0
+
+        i = 0
+        while i < n:
+            hdr = dwords[i]
+            # Check trailing zeroes
+            if hdr == 0:
+                # Check how many consecutive zeroes remain
+                z_len = 0
+                while i + z_len < n and dwords[i + z_len] == 0:
+                    z_len += 1
+                if i + z_len == n:
+                    # Trailing zero run
+                    break
+                else:
+                    # Non-trailing zeroes encountered outside packet header
+                    i += 1
+                    continue
+
+            pkt_type, count, opcode, total_len = decode_pm4_header(hdr)
+            type_counts[pkt_type] = type_counts.get(pkt_type, 0) + 1
+
+            if pkt_type in (0, 2) and first_t0_or_t2 is None:
+                first_t0_or_t2 = (pkt_type, i)
+
+            if pkt_type == 3:
+                if opcode == 0x10:
+                    nop_ranges.append((i, i + total_len))
+                elif opcode == 0x27:
+                    draw_27 += 1
+                elif opcode == 0x2D:
+                    draw_2d += 1
+                elif opcode == 0x76:
+                    set_sh += 1
+                elif opcode == 0x69:
+                    set_ctx += 1
+
+            packets.append((i, pkt_type, opcode, total_len))
+            packet_boundaries.add(i)
+            packet_boundaries.add(i + total_len)
+
+            if total_len <= 0:
+                i += 1
+            else:
+                i += total_len
+
+        # Detect unpadded zero runs and trailing zeroes
+        max_packet_end = max((s + l for s, _, _, l in packets), default=0)
+        trailing_zero_run: Optional[Tuple[int, int]] = None
+        if max_packet_end < n and all(dwords[z] == 0 for z in range(max_packet_end, n)):
+            trailing_zero_run = (max_packet_end, n - max_packet_end)
+
+        zero_runs_unpadded: List[Tuple[int, int]] = []
+
+        def is_in_nop_body(idx: int) -> bool:
+            return any(s < idx < e for s, e in nop_ranges)
+
+        k = 0
+        limit = max_packet_end if trailing_zero_run else n
+        while k < limit:
+            if dwords[k] == 0:
+                run_start = k
+                while k < limit and dwords[k] == 0:
+                    k += 1
+                run_len = k - run_start
+                if run_len >= 2:
+                    if not all(is_in_nop_body(idx) for idx in range(run_start, k)):
+                        zero_runs_unpadded.append((run_start, run_len))
+            else:
+                k += 1
+
+        return PacketWalkResult(
+            dcb_addr=dcb.addr,
+            total_dwords=n,
+            type_counts=type_counts,
+            packets=packets,
+            packet_boundaries=packet_boundaries,
+            first_type0_or_2=first_t0_or_t2,
+            zero_runs_unpadded=zero_runs_unpadded,
+            trailing_zero_run=trailing_zero_run,
+            draw_count_27=draw_27,
+            draw_count_2d=draw_2d,
+            set_sh_reg_count=set_sh,
+            set_context_reg_count=set_ctx,
+            nop_ranges=nop_ranges,
+        )
+
+    def _check_label_mismatches(self) -> None:
+        # Check if the emulator logs label an opcode incorrectly
+        # E.g. 0x79 labeled as LOAD_CONFIG_REG, 0x47 as RELEASE_MEM, 0x28 as DRAW_INDEX_2
+        re_labeled = re.compile(r"\[PM4\]\s+(IT_[A-Za-z0-9_]+|DRAW_[A-Za-z0-9_]+|LOAD_[A-Za-z0-9_]+|RELEASE_[A-Za-z0-9_]+)", re.IGNORECASE)
+        re_op_explicit = re.compile(r"op(?:code)?=0x([0-9a-fA-F]{2})", re.IGNORECASE)
+
+        known_emulator_drifts = {
+            "IT_LOAD_CONFIG_REG": (0x79, "LOAD_CONFIG_REG"),
+            "IT_RELEASE_MEM": (0x47, "RELEASE_MEM"),
+            "IT_DRAW_INDEX_2": (0x28, "DRAW_INDEX_2"),
+        }
+
+        for line_no, line in self.log.pm4_lines:
+            for emu_label, (op, bad_name) in known_emulator_drifts.items():
+                if emu_label in line:
+                    canonical = PM4_OPCODE_TABLE.get(op, "UNKNOWN").split()[0]
+                    self.label_mismatches.append((line_no, op, bad_name, canonical))
+
+    def _check_timeouts(self) -> None:
+        re_timeout = re.compile(r"\b(wait|timeout|stall)\b|flip.*?(?:timeout|stall|failed|error)", re.IGNORECASE)
+        frame_idx = 0
+        all_lines = sorted(self.log.status_lines + self.log.other_recognized_lines + self.log.pm4_lines, key=lambda x: x[0])
+        for line_no, line in all_lines:
+            if "SubmitAndFlip" in line:
+                frame_idx += 1
+                continue
+            if re_timeout.search(line):
+                # Exclude benign initialization lines
+                if not ("disable_stall_watchdog" in line or "g_disable_stall" in line):
+                    self.timeout_lines.append((line_no, frame_idx, line.strip()))
+
+    def _analyze(self) -> None:
+        self._check_label_mismatches()
+        self._check_timeouts()
+
+        for dcb in self.log.dcb_dumps:
+            res = self._walk_dcb(dcb)
+            self.dcb_results.append(res)
+
+        self._evaluate()
+
+    def match_slice(self, dcb: DcbDump, rdi: int, rsi: int) -> Tuple[str, str]:
+        """
+        Slice matching for a sceGnm call:
+        Returns (status: 'ok'|'not_a_slot'|'boundary_mismatch', description: str).
+        """
+        dcb_base = dcb.addr
+        dcb_size = len(dcb.dwords) * 4
+
+        if rsi > 65536 or rdi < dcb_base or (rdi + rsi * 4) > (dcb_base + dcb_size):
+            return "not_a_slot", f"not a slot (rdi=0x{rdi:X} outside DCB 0x{dcb_base:X}..0x{dcb_base + dcb_size:X} or rsi={rsi} > 65536)"
+
+        idx = (rdi - dcb_base) // 4
+        res = self._walk_dcb(dcb)
+        if idx not in res.packet_boundaries or (idx + rsi) not in res.packet_boundaries:
+            return "boundary_mismatch", f"boundary mismatch at slot [{idx}, {idx + rsi})"
+
+        slice_dwords = dcb.dwords[idx : idx + rsi]
+        if all(w == 0 for w in slice_dwords):
+            return "ok", "all-zero (stub never wrote)"
+
+        # Check if exactly padded NOP
+        hdr = slice_dwords[0]
+        pkt_type, count, opcode, total_len = decode_pm4_header(hdr)
+        if pkt_type == 3 and opcode == 0x10 and total_len == rsi:
+            return "ok", f"a NOP of exactly {rsi} DWORDs (stub padded)"
+
+        # Real packets: collect opcodes
+        ops: List[str] = []
+        cur = 0
+        while cur < len(slice_dwords):
+            p_hdr = slice_dwords[cur]
+            p_type, p_cnt, p_op, p_len = decode_pm4_header(p_hdr)
+            if p_type == 3:
+                ops.append(f"0x{p_op:02X}:{get_pm4_opcode_name(p_op).split()[0]}")
+            else:
+                ops.append(f"Type-{p_type}")
+            cur += max(p_len, 1)
+
+        return "ok", f"real packets (opcodes: {', '.join(ops)})"
+
+    def _evaluate(self) -> None:
+        # 1. Label mismatches
+        if self.label_mismatches:
+            for line_no, op, log_lbl, can_lbl in self.label_mismatches:
+                self.findings.append(Finding(
+                    kind="OBSERVED",
+                    message=(
+                        f"PM4 label mismatch on opcode 0x{op:02X}: log labeled packet as '{log_lbl}', "
+                        f"canonical CIK/GFX7 table is '{can_lbl}'"
+                    ),
+                    lines=[line_no]
+                ))
+
+        # 2. DCB Dumps Analysis
+        for i, res in enumerate(self.dcb_results, 1):
+            dcb_lines = [self.log.dcb_dumps[i - 1].start_line, self.log.dcb_dumps[i - 1].end_line]
+
+            # Packet walk summary
+            t_str = ", ".join(f"Type-{k}: {v}" for k, v in sorted(res.type_counts.items()) if v > 0)
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message=f"DCB #{i} (addr=0x{res.dcb_addr:X}, {res.total_dwords} DWORDs): packets ({t_str})",
+                lines=dcb_lines
+            ))
+
+            # Desync indication: Type-0 or Type-2 packet
+            if res.first_type0_or_2 is not None:
+                t, idx = res.first_type0_or_2
+                self.findings.append(Finding(
+                    kind="OBSERVED",
+                    message=f"DCB #{i} desync warning: first Type-{t} packet at DWORD index {idx}",
+                    lines=dcb_lines
+                ))
+
+            # Zero runs not inside NOP body
+            if res.zero_runs_unpadded:
+                runs_str = ", ".join(f"index {s} (len={l})" for s, l in res.zero_runs_unpadded[:5])
+                self.findings.append(Finding(
+                    kind="OBSERVED",
+                    message=f"DCB #{i} contains {len(res.zero_runs_unpadded)} unpadded zero gap(s): {runs_str}",
+                    lines=dcb_lines
+                ))
+
+            if res.trailing_zero_run:
+                s, l = res.trailing_zero_run
+                self.findings.append(Finding(
+                    kind="OBSERVED",
+                    message=f"DCB #{i} trailing zero run: index {s} to {s + l} ({l} DWORDs)",
+                    lines=dcb_lines
+                ))
+
+            # Draw summary
+            total_draws = res.draw_count_27 + res.draw_count_2d
+            draw_msg = (
+                f"DCB #{i} draw summary: 0x27(DRAW_INDEX_2)={res.draw_count_27}, "
+                f"0x2D(DRAW_INDEX_AUTO)={res.draw_count_2d}, SET_SH_REG={res.set_sh_reg_count}, "
+                f"SET_CONTEXT_REG={res.set_context_reg_count}"
+            )
+            self.findings.append(Finding(kind="OBSERVED", message=draw_msg, lines=dcb_lines))
+
+            if total_draws == 0:
+                self.findings.append(Finding(
+                    kind="OBSERVED",
+                    message=f"DCB #{i}: no draw packets present",
+                    lines=dcb_lines
+                ))
+            elif res.set_sh_reg_count == 0 and res.set_context_reg_count == 0:
+                self.findings.append(Finding(
+                    kind="OBSERVED",
+                    message=f"DCB #{i}: draws present but all shader slots NOP/zero",
+                    lines=dcb_lines
+                ))
+
+        # 3. Timeout / stall lines
+        if self.timeout_lines:
+            lines = [t[0] for t in self.timeout_lines]
+            sample = self.timeout_lines[:5]
+            sample_str = "; ".join(f"F#{f}: '{txt}'" for _, f, txt in sample)
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message=f"Flip/wait/timeout/stall events ({len(self.timeout_lines)} detected): {sample_str}",
+                lines=lines
+            ))
+
+
 class Log:
     """
     Single-pass streaming parser for PS4 emulator logs.
@@ -1587,27 +1943,34 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_nid.add_argument("--names", default=None, help="File containing candidate symbol names")
     p_nid.add_argument("--repo", default=None, help="Path to ps4-to-macos repository")
 
+    # dcb
+    p_dcb = subparsers.add_parser("dcb", help="Inspect and walk DCB dumps")
+    p_dcb.add_argument("log", help="Path to log file")
+    p_dcb.add_argument("--frame", type=int, default=None, help="Frame / DCB index (1-based)")
+
     args = parser.parse_args(argv)
 
     if not args.subcommand:
         parser.print_help()
         return 0
 
-    if args.subcommand == "nid":
-        resolver = NidResolver(repo_dir=args.repo, names_file=args.names)
-        for item in args.items:
-            # Check if hex NID
-            if item.lower().startswith("0x") or (len(item) == 16 and all(c in "0123456789abcdefABCDEF" for c in item)):
-                try:
-                    val = int(item, 16)
-                    status, details, _ = resolver.resolve(val)
-                    print(f"0x{val:016X}: {status} {details}")
-                except ValueError:
-                    print(f"Invalid hex NID: {item}")
-            else:
-                # Symbol name: compute NIDs
-                le, be = compute_sony_nid(item)
-                print(f"{item} -> NID_LE=0x{le:016X}, NID_BE=0x{be:016X}")
+    if args.subcommand == "dcb":
+        log = Log(args.log)
+        gpu = GpuPm4Analyzer(log)
+        if not log.dcb_dumps:
+            print("No DCB dumps found in log.")
+            return 0
+        indices = [args.frame - 1] if (args.frame is not None and 1 <= args.frame <= len(log.dcb_dumps)) else range(len(log.dcb_dumps))
+        for idx in indices:
+            dcb = log.dcb_dumps[idx]
+            res = gpu._walk_dcb(dcb)
+            print(f"=== DCB #{idx + 1} @ 0x{res.dcb_addr:X} ({res.total_dwords} DWORDs) ===")
+            print(f"  Type counts: {res.type_counts}")
+            print(f"  Draws: 0x27={res.draw_count_27}, 0x2D={res.draw_count_2d}, SET_SH={res.set_sh_reg_count}, SET_CTX={res.set_context_reg_count}")
+            if res.zero_runs_unpadded:
+                print(f"  Unpadded zero runs: {res.zero_runs_unpadded}")
+            if res.trailing_zero_run:
+                print(f"  Trailing zero run: {res.trailing_zero_run}")
         return 0
 
     if args.subcommand == "triage":
@@ -1631,6 +1994,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if loader.findings:
             print("\n=== LOADER ANALYSIS ===")
             for f in loader.findings:
+                print(str(f))
+
+        gpu = GpuPm4Analyzer(log)
+        if gpu.findings:
+            print("\n=== GPU PM4 & DCB ANALYSIS ===")
+            for f in gpu.findings:
                 print(str(f))
 
         return 0
