@@ -1896,6 +1896,163 @@ class ThreadAnalyzer:
             ))
 
 
+class DiffAnalyzer:
+    """
+    STAGE 7: DiffAnalyzer
+    Compares OLD and NEW logs:
+    - mode
+    - final instruction count
+    - stop reason
+    - fault RIP module+offset
+    - fallback NID set (added/removed with counts)
+    - HLE call count changes > 20%
+    - DCB draw counts
+    - overlap findings
+    - hot-loop share
+    Outputs a short table of changes.
+    If stop reason is unchanged and fault RIP is identical, reports 'no behavioural change'.
+    """
+
+    def __init__(self, old_log: Log, new_log: Log, repo_dir: Optional[str] = None):
+        self.old_log = old_log
+        self.new_log = new_log
+        self.repo_dir = repo_dir
+
+        self.old_cfa = CpuFaultAnalyzer(old_log, repo_dir=repo_dir)
+        self.new_cfa = CpuFaultAnalyzer(new_log, repo_dir=repo_dir)
+
+        resolver = NidResolver(repo_dir=repo_dir)
+        self.old_hle = HleAnalyzer(old_log, resolver)
+        self.new_hle = HleAnalyzer(new_log, resolver)
+
+        self.old_loader = LoaderAnalyzer(old_log, fault_rip=self.old_cfa.rip)
+        self.new_loader = LoaderAnalyzer(new_log, fault_rip=self.new_cfa.rip)
+
+        self.old_gpu = GpuPm4Analyzer(old_log)
+        self.new_gpu = GpuPm4Analyzer(new_log)
+
+        self.old_hot = HotLoopAnalyzer(old_log, modules=self.old_loader.modules, registers=self.old_cfa.registers)
+        self.new_hot = HotLoopAnalyzer(new_log, modules=self.new_loader.modules, registers=self.new_cfa.registers)
+
+        self.diff_data: Dict[str, Any] = {}
+        self.no_behavioural_change: bool = False
+        self._compute_diff()
+
+    def _format_rip(self, cfa: CpuFaultAnalyzer, loader: LoaderAnalyzer) -> str:
+        if cfa.rip is None:
+            return "none"
+        for m in sorted(loader.modules, key=lambda x: x.base, reverse=True):
+            if m.base <= cfa.rip < m.base + m.span:
+                return f"{m.path}+0x{cfa.rip - m.base:X}"
+        return f"0x{cfa.rip:X}"
+
+    def _compute_diff(self) -> None:
+        # 1. Mode
+        old_mode = self.old_log.mode
+        new_mode = self.new_log.mode
+
+        # 2. Final instruction count
+        old_ins = self.old_log.final_instructions
+        new_ins = self.new_log.final_instructions
+
+        # 3. Stop reason
+        old_stop = self.old_log.stop_reason or "not present in log"
+        new_stop = self.new_log.stop_reason or "not present in log"
+
+        # 4. Fault RIP
+        old_rip_str = self._format_rip(self.old_cfa, self.old_loader)
+        new_rip_str = self._format_rip(self.new_cfa, self.new_loader)
+
+        # Behavioral check: stop reason unchanged and fault RIP identical
+        if (old_stop == new_stop) and (self.old_cfa.rip == self.new_cfa.rip):
+            self.no_behavioural_change = True
+
+        # 5. Fallback NIDs
+        old_nids = set(self.old_hle.fallback_stubs.keys())
+        new_nids = set(self.new_hle.fallback_stubs.keys())
+
+        added_nids = [
+            {"nid": f"0x{nid:016X}", "count": self.new_hle.fallback_stubs[nid].count}
+            for nid in sorted(new_nids - old_nids)
+        ]
+        removed_nids = [
+            {"nid": f"0x{nid:016X}", "count": self.old_hle.fallback_stubs[nid].count}
+            for nid in sorted(old_nids - new_nids)
+        ]
+
+        # 6. HLE call count changes > 20%
+        all_call_names = set(self.old_hle.call_counts.keys()) | set(self.new_hle.call_counts.keys())
+        hle_changes = []
+        for name in sorted(all_call_names):
+            cnt_old = self.old_hle.call_counts.get(name, 0)
+            cnt_new = self.new_hle.call_counts.get(name, 0)
+            if cnt_old > 0 and cnt_new > 0:
+                pct = ((cnt_new - cnt_old) / cnt_old) * 100.0
+                if abs(pct) > 20.0:
+                    hle_changes.append({"call": name, "old": cnt_old, "new": cnt_new, "pct_change": round(pct, 1)})
+            elif cnt_old == 0 and cnt_new > 0:
+                hle_changes.append({"call": name, "old": 0, "new": cnt_new, "pct_change": "+new"})
+            elif cnt_old > 0 and cnt_new == 0:
+                hle_changes.append({"call": name, "old": cnt_old, "new": 0, "pct_change": "-100.0%"})
+
+        # 7. DCB draw counts
+        old_draws = sum(res.draw_count_27 + res.draw_count_2d for res in self.old_gpu.dcb_results)
+        new_draws = sum(res.draw_count_27 + res.draw_count_2d for res in self.new_gpu.dcb_results)
+
+        # 8. Overlaps
+        old_overlaps = len(self.old_loader.overlap_pairs)
+        new_overlaps = len(self.new_loader.overlap_pairs)
+
+        # 9. Hot-loop share
+        old_hot_share = round(self.old_hot.hot_share * 100.0, 1)
+        new_hot_share = round(self.new_hot.hot_share * 100.0, 1)
+
+        self.diff_data = {
+            "mode": {"old": old_mode, "new": new_mode, "changed": old_mode != new_mode},
+            "instructions": {
+                "old": old_ins if old_ins is not None else "not present in log",
+                "new": new_ins if new_ins is not None else "not present in log",
+                "delta": (new_ins - old_ins) if (old_ins is not None and new_ins is not None) else "unknown"
+            },
+            "stop_reason": {"old": old_stop, "new": new_stop, "changed": old_stop != new_stop},
+            "fault_rip": {"old": old_rip_str, "new": new_rip_str, "identical": old_rip_str == new_rip_str},
+            "fallback_nids": {"added": added_nids, "removed": removed_nids},
+            "hle_call_changes_gt_20pct": hle_changes,
+            "dcb_draws": {"old": old_draws, "new": new_draws, "delta": new_draws - old_draws},
+            "overlap_findings": {"old": old_overlaps, "new": new_overlaps},
+            "hot_loop_share": {"old_pct": old_hot_share, "new_pct": new_hot_share},
+            "no_behavioural_change": self.no_behavioural_change,
+        }
+
+    def format_table(self) -> str:
+        d = self.diff_data
+        lines = [
+            "=== DIFF SUMMARY ===",
+            f"{'Metric':<24} {'OLD':<28} {'NEW':<28} {'Change'}",
+            "-" * 90,
+            f"{'Mode':<24} {str(d['mode']['old']):<28} {str(d['mode']['new']):<28} {'changed' if d['mode']['changed'] else 'unchanged'}",
+            f"{'Instructions':<24} {str(d['instructions']['old']):<28} {str(d['instructions']['new']):<28} {str(d['instructions']['delta'])}",
+            f"{'Stop Reason':<24} {str(d['stop_reason']['old'])[:26]:<28} {str(d['stop_reason']['new'])[:26]:<28} {'changed' if d['stop_reason']['changed'] else 'unchanged'}",
+            f"{'Fault RIP':<24} {str(d['fault_rip']['old']):<28} {str(d['fault_rip']['new']):<28} {'identical' if d['fault_rip']['identical'] else 'changed'}",
+            f"{'Fallback NIDs':<24} {len(self.old_hle.fallback_stubs):<28} {len(self.new_hle.fallback_stubs):<28} +{len(d['fallback_nids']['added'])}, -{len(d['fallback_nids']['removed'])}",
+            f"{'DCB Draws':<24} {d['dcb_draws']['old']:<28} {d['dcb_draws']['new']:<28} {d['dcb_draws']['delta']:+d}",
+            f"{'Overlap Findings':<24} {d['overlap_findings']['old']:<28} {d['overlap_findings']['new']:<28} {d['overlap_findings']['new'] - d['overlap_findings']['old']:+d}",
+            f"{'Hot-loop Share':<24} {str(d['hot_loop_share']['old_pct']) + '%':<28} {str(d['hot_loop_share']['new_pct']) + '%':<28} {d['hot_loop_share']['new_pct'] - d['hot_loop_share']['old_pct']:+.1f}%",
+            "-" * 90,
+        ]
+
+        if d["hle_call_changes_gt_20pct"]:
+            lines.append("HLE Call Changes (>20%):")
+            for chg in d["hle_call_changes_gt_20pct"][:10]:
+                lines.append(f"  {chg['call']}: {chg['old']} -> {chg['new']} ({chg['pct_change']}%)")
+            lines.append("-" * 90)
+
+        if self.no_behavioural_change:
+            lines.append("RESULT: no behavioural change")
+
+        return "\n".join(lines)
+
+
 class Log:
     """
     Single-pass streaming parser for PS4 emulator logs.
@@ -2154,6 +2311,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_triage.add_argument("--map", dest="map_file", default=None, help="Mapping table TOML file")
     p_triage.add_argument("--repo", default=None, help="Path to ps4-to-macos repository")
 
+    # diff
+    p_diff = subparsers.add_parser("diff", help="Diff two crash logs")
+    p_diff.add_argument("old_log", help="Path to OLD log file")
+    p_diff.add_argument("new_log", help="Path to NEW log file")
+    p_diff.add_argument("--json", action="store_true", help="Emit JSON output")
+    p_diff.add_argument("--repo", default=None, help="Path to ps4-to-macos repository")
+
     # nid
     p_nid = subparsers.add_parser("nid", help="Resolve Sony NIDs or compute NID for symbol names")
     p_nid.add_argument("items", nargs="+", help="NID (hex) or symbol name(s)")
@@ -2173,6 +2337,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not args.subcommand:
         parser.print_help()
+        return 0
+
+    if args.subcommand == "diff":
+        old_log = Log(args.old_log)
+        new_log = Log(args.new_log)
+        differ = DiffAnalyzer(old_log, new_log, repo_dir=args.repo)
+        if args.json:
+            import json
+            print(json.dumps(differ.diff_data, indent=2))
+        else:
+            print(differ.format_table())
         return 0
 
     if args.subcommand == "hot":

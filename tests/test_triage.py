@@ -510,5 +510,69 @@ class TestStage6HotLoopAndThreads(unittest.TestCase):
         self.assertEqual(deadlock_findings[0].kind, "INFERRED")
 
 
+class TestStage7DiffMode(unittest.TestCase):
+    def test_diff_no_behavioural_change(self):
+        log_old_content = """[prx] mode=real
+[CPU FAULT] RIP=0x123456, RSP=0x1ffffb000 (return=0x106840b)
+[CPU] Execution Status: Memory fault / invalid instruction pointer
+[CPU] Instructions Executed: 1000000
+"""
+        log_new_content = """[prx] mode=real
+[CPU FAULT] RIP=0x123456, RSP=0x1ffffb000 (return=0x106840b)
+[CPU] Execution Status: Memory fault / invalid instruction pointer
+[CPU] Instructions Executed: 1200000
+"""
+        old_log = Log(log_old_content.splitlines(keepends=True))
+        new_log = Log(log_new_content.splitlines(keepends=True))
+        differ = triage_crash.DiffAnalyzer(old_log, new_log)
+        self.assertTrue(differ.no_behavioural_change)
+        table = differ.format_table()
+        self.assertIn("no behavioural change", table)
+
+    def test_diff_with_changes(self):
+        log_old_content = """[prx] mode=hle
+[CPU FAULT] RIP=0x111111, RSP=0x1ffffb000
+[CPU] Execution Status: Instruction executed successfully
+[CPU] Instructions Executed: 1000000
+[HLE WARNING #1 TID=1 rip=0x100] Unimplemented stub called: NID=0xaaaaaaaaaaaaaaaa
+[HLE] sceKernelUsleep(100)
+[HLE] sceKernelUsleep(100)
+"""
+        log_new_content = """[prx] mode=real
+[CPU FAULT] RIP=0x222222, RSP=0x1ffffb000
+[CPU] Execution Status: Memory fault / invalid instruction pointer
+[CPU] Instructions Executed: 2000000
+[HLE WARNING #1 TID=1 rip=0x100] Unimplemented stub called: NID=0xbbbbbbbbbbbbbbbb
+[HLE] sceKernelUsleep(100)
+[HLE] sceKernelUsleep(100)
+[HLE] sceKernelUsleep(100)
+[HLE] sceKernelUsleep(100)
+[DCB FULL DUMP START 0x1000 count=3]
+DWORD[1000][0]=0xc0012d00
+DWORD[1000][1]=0x00000000
+DWORD[1000][2]=0x00000000
+[DCB FULL DUMP END 0x1000]
+"""
+        old_log = Log(log_old_content.splitlines(keepends=True))
+        new_log = Log(log_new_content.splitlines(keepends=True))
+        differ = triage_crash.DiffAnalyzer(old_log, new_log)
+        self.assertFalse(differ.no_behavioural_change)
+
+        d = differ.diff_data
+        self.assertTrue(d["mode"]["changed"])
+        self.assertEqual(d["instructions"]["delta"], 1000000)
+        self.assertEqual(len(d["fallback_nids"]["added"]), 1)
+        self.assertEqual(d["fallback_nids"]["added"][0]["nid"], "0xBBBBBBBBBBBBBBBB")
+        self.assertEqual(len(d["fallback_nids"]["removed"]), 1)
+        self.assertEqual(d["fallback_nids"]["removed"][0]["nid"], "0xAAAAAAAAAAAAAAAA")
+        self.assertEqual(d["dcb_draws"]["delta"], 1)
+
+        # HLE call count change: sceKernelUsleep changed from 2 to 4 (+100.0% > 20%)
+        usleep_chgs = [c for c in d["hle_call_changes_gt_20pct"] if "sceKernelUsleep" in c["call"]]
+        self.assertEqual(len(usleep_chgs), 1)
+        self.assertEqual(usleep_chgs[0]["old"], 2)
+        self.assertEqual(usleep_chgs[0]["new"], 4)
+
+
 if __name__ == "__main__":
     unittest.main()
