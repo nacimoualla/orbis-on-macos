@@ -964,6 +964,369 @@ class HleAnalyzer:
                 ))
 
 
+@dataclass
+class MappingEntry:
+    owner: str
+    start: int
+    end: int
+    size: int
+    line: int
+
+
+@dataclass
+class ModuleSpan:
+    path: str
+    base: int
+    span: int
+    line: int
+
+
+@dataclass
+class ModuleExportStats:
+    path: str
+    base: int
+    span: int
+    in_table: int
+    defined: int
+    undef_skipped: int
+    no_nid_skipped: int
+    dup_not_recorded: int
+    recorded: int
+    line: int
+
+
+@dataclass
+class SegmentEntry:
+    idx: int
+    type_name: str
+    offset: int
+    vaddr: int
+    filesz: int
+    memsz: int
+    flags: str
+    line: int
+
+
+@dataclass
+class WatchRecord:
+    idx: int
+    rip: int
+    addr: int
+    size: int
+    old_val: int
+    new_val: int
+    line: int
+
+
+class LoaderAnalyzer:
+    """
+    STAGE 4: LoaderAnalyzer
+    - Parses mapping table lines and detects overlaps (both ranges and both owners)
+    - Parses module base/span lines and checks base[i]+span[i] <= base[i+1]
+    - Parses per-module counters (in_table, defined, undef_skipped, no_nid_skipped, dup_not_recorded)
+      and flags no_nid_skipped > 0 as a possible hole (INFERRED)
+    - Imports per module by class (resolved to export, registered HLE, fallback, unresolved);
+      if absent, explicitly reports 'not present in log' and clarifies '0 unread' is not resolution success
+    - Segment info: flags faulting or hot address that is in BSS (memsz > filesz region)
+    - Detects write-watch records and timeline; flags watched value changes with no recorded write (INFERRED)
+    """
+
+    def __init__(self, log: Log, fault_rip: Optional[int] = None):
+        self.log = log
+        self.fault_rip = fault_rip
+
+        self.mappings: List[MappingEntry] = []
+        self.modules: List[ModuleSpan] = []
+        self.export_stats: List[ModuleExportStats] = []
+        self.segments: List[SegmentEntry] = []
+        self.watch_records: List[WatchRecord] = []
+
+        self.overlap_pairs: List[Tuple[MappingEntry, MappingEntry]] = []
+        self.layout_violations: List[Tuple[ModuleSpan, ModuleSpan]] = []
+        self.import_counts: Optional[Dict[str, int]] = None
+
+        self.findings: List[Finding] = []
+        self._analyze()
+
+    def _analyze(self) -> None:
+        self._parse_loader_and_map_lines()
+        self._parse_watch_lines()
+        self._parse_segments()
+        self._evaluate()
+
+    def _parse_loader_and_map_lines(self) -> None:
+        # 1. Mapping table lines
+        # Format:
+        # [map] registered guest mappings (%zu):
+        #   owner start end size
+        #   %-34s 0x%09llx 0x%09llx 0x%08llx
+        # or [map] OVERLAP: cannot map 'A' [0x...,0x...) because it intersects 'B' [0x...,0x...)
+        re_map_line = re.compile(r"^([^\s].*?)\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)")
+        re_map_overlap = re.compile(
+            r"\[map\]\s+OVERLAP:\s+cannot map '([^']+)'\s+\[0x([0-9a-fA-F]+),\s*0x([0-9a-fA-F]+)\)\s+because it intersects\s+'([^']+)'\s+\[0x([0-9a-fA-F]+),\s*0x([0-9a-fA-F]+)\)",
+            re.IGNORECASE
+        )
+
+        # 2. Module base/span lines:
+        # [module] 0x%x %s: base=0x%llx span=0x%llx (ends 0x%llx)
+        re_module_line = re.compile(
+            r"\[module\]\s+0x[0-9a-fA-F]+\s+([^:]+):\s+base=0x([0-9a-fA-F]+)\s+span=0x([0-9a-fA-F]+)",
+            re.IGNORECASE
+        )
+
+        # 3. Export counters:
+        # [exports]   %-24s base=0x%llx span=0x%llx | in_table=%zu defined=%zu undef_skipped=%zu no_nid_skipped=%zu dup_not_recorded=%zu | recorded=%zu
+        re_export_line = re.compile(
+            r"\[exports\]\s+([^\s]+)\s+base=0x([0-9a-fA-F]+)\s+span=0x([0-9a-fA-F]+)\s+\|\s+in_table=(\d+)\s+defined=(\d+)\s+undef_skipped=(\d+)\s+no_nid_skipped=(\d+)\s+dup_not_recorded=(\d+)\s+\|\s+recorded=(\d+)",
+            re.IGNORECASE
+        )
+
+        # 4. Imports classification counters:
+        re_import_class = re.compile(r"\[(?:imports|module)\]\s+(?:imports by class:)?\s*resolved_to_export=(\d+)\s+registered_hle=(\d+)\s+fallback=(\d+)\s+unresolved=(\d+)", re.IGNORECASE)
+
+        in_mapping_table = False
+        for line_no, line in self.log.loader_lines:
+            # Overlap explicit report
+            m_ov = re_map_overlap.search(line)
+            if m_ov:
+                owner1, s1, e1 = m_ov.group(1), int(m_ov.group(2), 16), int(m_ov.group(3), 16)
+                owner2, s2, e2 = m_ov.group(4), int(m_ov.group(5), 16), int(m_ov.group(6), 16)
+                self.overlap_pairs.append((
+                    MappingEntry(owner1, s1, e1, e1 - s1, line_no),
+                    MappingEntry(owner2, s2, e2, e2 - s2, line_no)
+                ))
+                continue
+
+            if "[map] registered guest mappings" in line:
+                in_mapping_table = True
+                continue
+
+            if in_mapping_table:
+                if line.startswith("---") or line.startswith("owner") or not line:
+                    continue
+                m_m = re_map_line.match(line)
+                if m_m:
+                    owner = m_m.group(1).strip()
+                    start = int(m_m.group(2), 16)
+                    end = int(m_m.group(3), 16)
+                    sz = int(m_m.group(4), 16)
+                    self.mappings.append(MappingEntry(owner, start, end, sz, line_no))
+                    continue
+                elif line.startswith("["):
+                    in_mapping_table = False
+
+            # Module base/span
+            m_mod = re_module_line.search(line)
+            if m_mod:
+                path = m_mod.group(1).strip()
+                base = int(m_mod.group(2), 16)
+                span = int(m_mod.group(3), 16)
+                self.modules.append(ModuleSpan(path, base, span, line_no))
+
+            # Exports counters
+            m_exp = re_export_line.search(line)
+            if m_exp:
+                path = m_exp.group(1).strip()
+                base = int(m_exp.group(2), 16)
+                span = int(m_exp.group(3), 16)
+                in_table = int(m_exp.group(4))
+                defined = int(m_exp.group(5))
+                undef = int(m_exp.group(6))
+                no_nid = int(m_exp.group(7))
+                dup = int(m_exp.group(8))
+                recorded = int(m_exp.group(9))
+                self.export_stats.append(ModuleExportStats(
+                    path, base, span, in_table, defined, undef, no_nid, dup, recorded, line_no
+                ))
+                # Also record module span if not present
+                if not any(m.path == path for m in self.modules):
+                    self.modules.append(ModuleSpan(path, base, span, line_no))
+
+            # Import class
+            m_imp = re_import_class.search(line)
+            if m_imp:
+                self.import_counts = {
+                    "resolved_to_export": int(m_imp.group(1)),
+                    "registered_hle": int(m_imp.group(2)),
+                    "fallback": int(m_imp.group(3)),
+                    "unresolved": int(m_imp.group(4)),
+                }
+
+    def _parse_watch_lines(self) -> None:
+        # [watch] #%-3zu rip=%s (0x%llx) rsp=... -> 0x%llx (%zu B) ... old=0x%016llx new=0x%016llx...
+        re_watch = re.compile(
+            r"\[watch\]\s+#(\d+)\s+rip=.*?\s*\(0x([0-9a-fA-F]+)\).*?->\s*0x([0-9a-fA-F]+)\s+\((\d+)\s*B\).*?old=0x([0-9a-fA-F]+)\s+new=0x([0-9a-fA-F]+)",
+            re.IGNORECASE
+        )
+        for line_no, line in self.log.watch_lines:
+            m = re_watch.search(line)
+            if m:
+                idx = int(m.group(1))
+                rip = int(m.group(2), 16)
+                addr = int(m.group(3), 16)
+                sz = int(m.group(4))
+                old_val = int(m.group(5), 16)
+                new_val = int(m.group(6), 16)
+                self.watch_records.append(WatchRecord(idx, rip, addr, sz, old_val, new_val, line_no))
+
+    def _parse_segments(self) -> None:
+        # Format:
+        # [Idx] Type Offset VirtAddr FileSz MemSz Flags Align
+        # [0 ] PT_LOAD 0x4000 0x0 0x14b62c4 0x14b62c4 R-E 0x4000
+        re_seg = re.compile(
+            r"^\[(\d+)\s*\]\s+(PT_[A-Za-z0-9_]+)\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)\s+([RWE\s\-]{3})",
+            re.IGNORECASE
+        )
+        for line_no, line in self.log.other_recognized_lines + self.log.loader_lines:
+            m = re_seg.search(line)
+            if m:
+                idx = int(m.group(1))
+                t_name = m.group(2).strip()
+                offset = int(m.group(3), 16)
+                vaddr = int(m.group(4), 16)
+                filesz = int(m.group(5), 16)
+                memsz = int(m.group(6), 16)
+                flags = m.group(7).strip()
+                self.segments.append(SegmentEntry(idx, t_name, offset, vaddr, filesz, memsz, flags, line_no))
+
+    def _check_mapping_overlaps(self) -> None:
+        # Check computed overlaps from parsed mapping table
+        n = len(self.mappings)
+        for i in range(n):
+            for j in range(i + 1, n):
+                m1 = self.mappings[i]
+                m2 = self.mappings[j]
+                # Intersection: start1 < end2 and start2 < end1
+                if m1.start < m2.end and m2.start < m1.end:
+                    # Avoid duplicate if already reported
+                    if not any((p[0].owner == m1.owner and p[1].owner == m2.owner) for p in self.overlap_pairs):
+                        self.overlap_pairs.append((m1, m2))
+
+    def _check_module_layout(self) -> None:
+        # Sort modules by base address
+        sorted_mods = sorted(self.modules, key=lambda m: m.base)
+        for i in range(len(sorted_mods) - 1):
+            curr_mod = sorted_mods[i]
+            next_mod = sorted_mods[i + 1]
+            if curr_mod.base + curr_mod.span > next_mod.base:
+                self.layout_violations.append((curr_mod, next_mod))
+
+    def _evaluate(self) -> None:
+        self._check_mapping_overlaps()
+        self._check_module_layout()
+
+        # 1. Overlaps
+        if self.overlap_pairs:
+            for m1, m2 in self.overlap_pairs:
+                lines = [l for l in (m1.line, m2.line) if l]
+                self.findings.append(Finding(
+                    kind="OBSERVED",
+                    message=(
+                        f"Mapping overlap detected: '{m1.owner}' [0x{m1.start:09X}, 0x{m1.end:09X}) "
+                        f"intersects '{m2.owner}' [0x{m2.start:09X}, 0x{m2.end:09X})"
+                    ),
+                    lines=lines
+                ))
+
+        # 2. Module layout overlaps
+        if self.layout_violations:
+            for m1, m2 in self.layout_violations:
+                lines = [l for l in (m1.line, m2.line) if l]
+                self.findings.append(Finding(
+                    kind="OBSERVED",
+                    message=(
+                        f"Module layout overlap: {m1.path} [0x{m1.base:X}, 0x{m1.base + m1.span:X}) "
+                        f"extends past {m2.path} base 0x{m2.base:X}"
+                    ),
+                    lines=lines
+                ))
+
+        # 3. Export counters & no_nid_skipped
+        if self.export_stats:
+            for s in self.export_stats:
+                line_info = [s.line] if s.line else []
+                stat_msg = (
+                    f"Module {s.path} loader counters: base=0x{s.base:X} span=0x{s.span:X} "
+                    f"in_table={s.in_table} defined={s.defined} undef_skipped={s.undef_skipped} "
+                    f"no_nid_skipped={s.no_nid_skipped} dup_not_recorded={s.dup_not_recorded} recorded={s.recorded}"
+                )
+                self.findings.append(Finding(
+                    kind="OBSERVED",
+                    message=stat_msg,
+                    lines=line_info
+                ))
+
+                if s.no_nid_skipped > 0:
+                    self.findings.append(Finding(
+                        kind="INFERRED",
+                        message=f"Module {s.path} has no_nid_skipped={s.no_nid_skipped} > 0, possible symbol resolution hole",
+                        rule="loader skipped exported symbols with no valid NID",
+                        lines=line_info
+                    ))
+
+        # 4. Imports classification
+        if self.import_counts is not None:
+            counts_str = ", ".join(f"{k}={v}" for k, v in self.import_counts.items())
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message=f"Imports by class: {counts_str}",
+                lines=[]
+            ))
+        else:
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message="Imports per module by class: not present in log (note: '0 unread' relocation lines do not indicate resolution success)",
+                lines=[]
+            ))
+
+        # 5. Segment info (BSS check)
+        if self.fault_rip is not None:
+            for seg in self.segments:
+                if seg.memsz > seg.filesz:
+                    bss_start = seg.vaddr + seg.filesz
+                    bss_end = seg.vaddr + seg.memsz
+                    if bss_start <= self.fault_rip < bss_end:
+                        self.findings.append(Finding(
+                            kind="OBSERVED",
+                            message=(
+                                f"Faulting address RIP=0x{self.fault_rip:X} is in BSS region "
+                                f"[0x{bss_start:X}, 0x{bss_end:X}) (segment #{seg.idx} {seg.type_name} "
+                                f"vaddr=0x{seg.vaddr:X} filesz=0x{seg.filesz:X} memsz=0x{seg.memsz:X})"
+                            ),
+                            lines=[seg.line] if seg.line else []
+                        ))
+
+        # 6. Write-watch records timeline and anomaly detection
+        if self.watch_records:
+            self.watch_records.sort(key=lambda r: r.idx)
+            lines_all = [r.line for r in self.watch_records]
+            self.findings.append(Finding(
+                kind="OBSERVED",
+                message=f"Write-watch timeline: {len(self.watch_records)} records captured",
+                lines=lines_all
+            ))
+
+            # Group by watched address to detect unrecorded modifications
+            by_addr: Dict[int, List[WatchRecord]] = {}
+            for r in self.watch_records:
+                by_addr.setdefault(r.addr, []).append(r)
+
+            for addr, recs in by_addr.items():
+                for i in range(len(recs) - 1):
+                    r_curr = recs[i]
+                    r_next = recs[i + 1]
+                    if r_curr.new_val != r_next.old_val:
+                        self.findings.append(Finding(
+                            kind="INFERRED",
+                            message=(
+                                f"Watched address 0x{addr:X} changed from 0x{r_curr.new_val:016X} to 0x{r_next.old_val:016X} "
+                                f"between watch #{r_curr.idx} and #{r_next.idx} with no recorded write"
+                            ),
+                            rule="watchpoint observed old value differing from previously recorded new value (watch may miss a store path)",
+                            lines=[r_curr.line, r_next.line]
+                        ))
+
+
 class Log:
     """
     Single-pass streaming parser for PS4 emulator logs.
@@ -1021,11 +1384,19 @@ class Log:
         re_dcb_end = re.compile(r"\[DCB FULL DUMP END 0x([0-9a-fA-F]+)\]")
 
         current_dcb: Optional[DcbDump] = None
+        in_map_block = False
 
         for line_no, raw_line in enumerate(stream, 1):
             self.total_lines += 1
             line = raw_line.strip()
             recognized = False
+
+            if in_map_block:
+                if raw_line.startswith("  ") or line.startswith("owner") or line.startswith("---"):
+                    self.loader_lines.append((line_no, line))
+                    recognized = True
+                elif not line.startswith("[map]"):
+                    in_map_block = False
 
             if current_dcb is not None:
                 m_dword = re_dcb_dword.match(line)
@@ -1100,6 +1471,8 @@ class Log:
                     line.startswith("[dyn]") or line.startswith("[map]") or
                     line.startswith("[elf]")):
                 self.loader_lines.append((line_no, line))
+                if "[map] registered guest mappings" in line:
+                    in_map_block = True
                 recognized = True
 
             if line.startswith("[watch]"):
@@ -1252,6 +1625,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if hle.findings:
             print("\n=== HLE ANALYSIS ===")
             for f in hle.findings:
+                print(str(f))
+
+        loader = LoaderAnalyzer(log, fault_rip=cfa.rip)
+        if loader.findings:
+            print("\n=== LOADER ANALYSIS ===")
+            for f in loader.findings:
                 print(str(f))
 
         return 0

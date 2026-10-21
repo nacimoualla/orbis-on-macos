@@ -253,5 +253,79 @@ class TestStage3HleAnalyzer(unittest.TestCase):
                 os.remove(allow_path)
 
 
+class TestStage4LoaderAnalyzer(unittest.TestCase):
+    def test_mapping_overlap_detection(self):
+        log_content = """[map] registered guest mappings (2):
+  owner                              start            end         size
+  libkernel_code               0x000100000 0x000200000 0x000100000
+  mono_code                    0x000180000 0x000280000 0x000100000
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        loader = triage_crash.LoaderAnalyzer(log)
+        self.assertEqual(len(loader.overlap_pairs), 1)
+        m1, m2 = loader.overlap_pairs[0]
+        self.assertEqual(m1.owner, "libkernel_code")
+        self.assertEqual(m2.owner, "mono_code")
+        findings = [f for f in loader.findings if "Mapping overlap detected" in f.message]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("libkernel_code", findings[0].message)
+        self.assertIn("mono_code", findings[0].message)
+
+    def test_module_layout_span_check(self):
+        log_content = """[module] 0x1 modA: base=0x100000 span=0x200000
+[module] 0x2 modB: base=0x250000 span=0x100000
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        loader = triage_crash.LoaderAnalyzer(log)
+        self.assertEqual(len(loader.layout_violations), 1)
+        findings = [f for f in loader.findings if "Module layout overlap" in f.message]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("modA", findings[0].message)
+        self.assertIn("extends past modB", findings[0].message)
+
+    def test_export_counters_no_nid_skipped_hole(self):
+        log_content = """[exports]   eboot.bin                base=0x0 span=0x1500000 | in_table=100 defined=90 undef_skipped=5 no_nid_skipped=5 dup_not_recorded=0 | recorded=90
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        loader = triage_crash.LoaderAnalyzer(log)
+        self.assertEqual(len(loader.export_stats), 1)
+        hole_findings = [f for f in loader.findings if "possible symbol resolution hole" in f.message]
+        self.assertEqual(len(hole_findings), 1)
+        self.assertEqual(hole_findings[0].kind, "INFERRED")
+        self.assertIn("no_nid_skipped=5", hole_findings[0].message)
+
+    def test_imports_absent_explains_0_unread(self):
+        log_content = """[module] RELA: 34441 relocs, 34441 read, 0 unread
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        loader = triage_crash.LoaderAnalyzer(log)
+        imp_findings = [f for f in loader.findings if "Imports per module by class: not present in log" in f.message]
+        self.assertEqual(len(imp_findings), 1)
+        self.assertIn("0 unread", imp_findings[0].message)
+
+    def test_bss_segment_fault_address(self):
+        log_content = """[0  ] PT_LOAD           0x4000        0x1000000         0x10000       0x20000      RW-     0x4000
+"""
+        # BSS range: 0x1000000 + 0x10000 to 0x1000000 + 0x20000 = [0x1010000, 0x1020000)
+        fault_rip = 0x1015000
+        log = Log(log_content.splitlines(keepends=True))
+        loader = triage_crash.LoaderAnalyzer(log, fault_rip=fault_rip)
+        bss_findings = [f for f in loader.findings if "is in BSS region" in f.message]
+        self.assertEqual(len(bss_findings), 1)
+        self.assertIn("0x1015000", bss_findings[0].message)
+
+    def test_write_watch_unrecorded_change_anomaly(self):
+        log_content = """[watch] #0   rip=0x100 (0x100) rsp=0x200 -> 0x3000 (8 B) old=0x0000000000000000 new=0x0000000000000001
+[watch] #1   rip=0x100 (0x100) rsp=0x200 -> 0x3000 (8 B) old=0x0000000000000005 new=0x0000000000000006
+"""
+        log = Log(log_content.splitlines(keepends=True))
+        loader = triage_crash.LoaderAnalyzer(log)
+        self.assertEqual(len(loader.watch_records), 2)
+        anomaly_findings = [f for f in loader.findings if "with no recorded write" in f.message]
+        self.assertEqual(len(anomaly_findings), 1)
+        self.assertEqual(anomaly_findings[0].kind, "INFERRED")
+        self.assertIn("changed from 0x0000000000000001 to 0x0000000000000005", anomaly_findings[0].message)
+
+
 if __name__ == "__main__":
     unittest.main()
