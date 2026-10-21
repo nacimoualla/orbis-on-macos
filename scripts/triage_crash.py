@@ -8,12 +8,14 @@ Python 3.9+, standard library only (capstone optional if importable).
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import struct
 import sys
+import time
 from dataclasses import dataclass, field
-import hashlib
 from typing import Dict, List, Optional, Tuple, Any, Set
 
 # Capstone is optional and only used if importable
@@ -221,9 +223,10 @@ class CpuFaultAnalyzer:
     decodes unhandled opcodes, and checks segfault vs guest OOB.
     """
 
-    def __init__(self, log: Log, repo_dir: Optional[str] = None):
+    def __init__(self, log: Log, repo_dir: Optional[str] = None, map_file: Optional[str] = None):
         self.log = log
         self.repo_dir = repo_dir
+        self.map_file = map_file
         self.rip: Optional[int] = None
         self.rip_lines: List[int] = []
         self.rsp: Optional[int] = None
@@ -254,6 +257,7 @@ class CpuFaultAnalyzer:
         self.mem_fault_addr: Optional[int] = None
         self.mem_fault_size: Optional[int] = None
         self.mem_fault_lines: List[int] = []
+        self.classification: Optional[str] = None
 
         self.findings: List[Finding] = []
         self._analyze()
@@ -471,10 +475,10 @@ class CpuFaultAnalyzer:
                 lines=all_lines
             ))
 
-            classification = self.classify_address(self.rip)
+            self.classification = self.classify_address(self.rip)
             self.findings.append(Finding(
                 kind="OBSERVED",
-                message=f"Fault address classification: {classification}",
+                message=f"Fault address classification: {self.classification}",
                 lines=self.rip_lines
             ))
 
@@ -535,6 +539,9 @@ class CpuFaultAnalyzer:
                 lines=self.unhandled_opcode_lines
             ))
 
+        if self.classification is None and self.mem_fault_addr is not None:
+            self.classification = self.classify_address(self.mem_fault_addr)
+
         if self.segfault_detected:
             addr_str = f"0x{self.mem_fault_addr:X}" if self.mem_fault_addr is not None else "not present in log"
             size_str = f"{self.mem_fault_size} bytes" if self.mem_fault_size is not None else "not present in log"
@@ -551,7 +558,7 @@ class CpuFaultAnalyzer:
                 message=f"Memory fault type: Guest out-of-bounds (address={addr_str}, size={size_str})",
                 lines=self.mem_fault_lines
             ))
-        else:
+        elif self.rip is not None or self.log.cpu_fault_lines or self.log.mem_fault_raw_lines:
             self.findings.append(Finding(
                 kind="OBSERVED",
                 message="Memory fault type: not present in log",
@@ -728,6 +735,10 @@ class NidResolver:
                 vars_set.add(f"_{c_name}")
 
         return vars_set
+
+    def compute_nid(self, name: str, endian: str = "little") -> int:
+        le, be = compute_sony_nid(name)
+        return le if endian == "little" else be
 
     def resolve(self, nid: int) -> Tuple[str, str, Optional[str]]:
         """
@@ -1713,33 +1724,39 @@ class HotLoopAnalyzer:
         return f"0x{rip:X}"
 
     def _analyze(self) -> None:
-        re_hist = re.compile(r"(?:\[hist\]\s+)?(?:RIP=)?0x([0-9a-fA-F]+)[:=]\s*(\d+)", re.IGNORECASE)
-        re_trace = re.compile(r"\[CPU TRACE\]\s+RIP=0x([0-9a-fA-F]+)", re.IGNORECASE)
-        re_last_rips = re.compile(r"^\s*#\d+:\s*0x([0-9a-fA-F]+)", re.IGNORECASE)
-        re_rip_hist_num = re.compile(r"^\s*\[\d+\]\s+RIP=0x([0-9a-fA-F]+)", re.IGNORECASE)
+        if getattr(self.log, "rip_counts", None):
+            self.rip_counts = dict(self.log.rip_counts)
+            if getattr(self.log, "rip_lines", None):
+                self.rip_lines = dict(self.log.rip_lines)
+            has_explicit_hist = getattr(self.log, "has_explicit_hist", False)
+        else:
+            re_hist = re.compile(r"(?:\[hist\]\s+)?(?:RIP=)?0x([0-9a-fA-F]+)[:=]\s*(\d+)", re.IGNORECASE)
+            re_trace = re.compile(r"\[CPU TRACE\]\s+RIP=0x([0-9a-fA-F]+)", re.IGNORECASE)
+            re_last_rips = re.compile(r"^\s*#\d+:\s*0x([0-9a-fA-F]+)", re.IGNORECASE)
+            re_rip_hist_num = re.compile(r"^\s*\[\d+\]\s+RIP=0x([0-9a-fA-F]+)", re.IGNORECASE)
 
-        has_explicit_hist = False
-        in_hist_section = False
-        for line_no, line in self.log.trace_lines:
-            if "Histogram" in line or "[hist]" in line:
-                in_hist_section = True
-            m_h = re_hist.search(line)
-            if m_h and (in_hist_section or "[hist]" in line or "Histogram" in line):
-                rip = int(m_h.group(1), 16)
-                cnt = int(m_h.group(2))
-                self.rip_counts[rip] = cnt
-                self.rip_lines.setdefault(rip, []).append(line_no)
-                has_explicit_hist = True
-            elif line.startswith("[") and not line.startswith("[hist]"):
-                in_hist_section = False
-
-        if not has_explicit_hist:
+            has_explicit_hist = False
+            in_hist_section = False
             for line_no, line in self.log.trace_lines:
-                m_t = re_trace.search(line) or re_last_rips.search(line) or re_rip_hist_num.search(line)
-                if m_t:
-                    rip = int(m_t.group(1), 16)
-                    self.rip_counts[rip] = self.rip_counts.get(rip, 0) + 1
+                if "Histogram" in line or "[hist]" in line:
+                    in_hist_section = True
+                m_h = re_hist.search(line)
+                if m_h and (in_hist_section or "[hist]" in line or "Histogram" in line):
+                    rip = int(m_h.group(1), 16)
+                    cnt = int(m_h.group(2))
+                    self.rip_counts[rip] = cnt
                     self.rip_lines.setdefault(rip, []).append(line_no)
+                    has_explicit_hist = True
+                elif line.startswith("[") and not line.startswith("[hist]"):
+                    in_hist_section = False
+
+            if not has_explicit_hist:
+                for line_no, line in self.log.trace_lines:
+                    m_t = re_trace.search(line) or re_last_rips.search(line) or re_rip_hist_num.search(line)
+                    if m_t:
+                        rip = int(m_t.group(1), 16)
+                        self.rip_counts[rip] = self.rip_counts.get(rip, 0) + 1
+                        self.rip_lines.setdefault(rip, []).append(line_no)
 
         self.total_samples = sum(self.rip_counts.values())
         if self.total_samples > 0:
@@ -2176,6 +2193,11 @@ class Log:
         self.mem_fault_raw_lines: List[Tuple[int, str]] = []
         self.other_recognized_lines: List[Tuple[int, str]] = []
 
+        # On-the-fly streaming metrics for bounded memory
+        self.rip_counts: Dict[int, int] = {}
+        self.rip_lines: Dict[int, List[int]] = {}
+        self.has_explicit_hist: bool = False
+
         self.total_lines: int = 0
         self.unparsed_lines: int = 0
         self.unparsed_sample: List[Tuple[int, str]] = []
@@ -2203,6 +2225,11 @@ class Log:
         current_dcb: Optional[DcbDump] = None
         in_map_block = False
 
+        re_hist_stream = re.compile(r"(?:\[hist\]\s+)?(?:RIP=)?0x([0-9a-fA-F]+)[:=]\s*(\d+)", re.IGNORECASE)
+        re_trace_stream = re.compile(r"\[CPU TRACE\]\s+RIP=0x([0-9a-fA-F]+)", re.IGNORECASE)
+        re_last_stream = re.compile(r"^\s*#\d+:\s*0x([0-9a-fA-F]+)", re.IGNORECASE)
+        re_num_stream = re.compile(r"^\s*\[\d+\]\s+RIP=0x([0-9a-fA-F]+)", re.IGNORECASE)
+
         for line_no, raw_line in enumerate(stream, 1):
             self.total_lines += 1
             line = raw_line.strip()
@@ -2210,7 +2237,8 @@ class Log:
 
             if in_map_block:
                 if raw_line.startswith("  ") or line.startswith("owner") or line.startswith("---"):
-                    self.loader_lines.append((line_no, line))
+                    if len(self.loader_lines) < 10000:
+                        self.loader_lines.append((line_no, line))
                     recognized = True
                 elif not line.startswith("[map]"):
                     in_map_block = False
@@ -2266,45 +2294,53 @@ class Log:
                 recognized = True
 
             if "[CPU FAULT]" in line or "CPU FAULT" in line:
-                self.cpu_fault_lines.append((line_no, line))
+                if len(self.cpu_fault_lines) < 5000:
+                    self.cpu_fault_lines.append((line_no, line))
                 recognized = True
 
             if "unhandled opcode" in line.lower():
-                self.unhandled_opcode_lines.append((line_no, line))
+                if len(self.unhandled_opcode_lines) < 5000:
+                    self.unhandled_opcode_lines.append((line_no, line))
                 recognized = True
 
             if (line.startswith("[HLE") or line.startswith("[HLE CALL") or
                     line.startswith("[HLE WARNING") or line.startswith("[HLE WHITELIST") or
                     "Unimplemented stub called:" in line):
-                self.hle_lines.append((line_no, line))
+                if len(self.hle_lines) < 20000:
+                    self.hle_lines.append((line_no, line))
                 recognized = True
 
             if (line.startswith("[PM4") or line.startswith("[Gnm]") or
                     line.startswith("[Gnm Warning]") or line.startswith("[PM4 Warning]")):
-                self.pm4_lines.append((line_no, line))
+                if len(self.pm4_lines) < 10000:
+                    self.pm4_lines.append((line_no, line))
                 recognized = True
 
             if (line.startswith("[module]") or line.startswith("[exports]") or
                     line.startswith("[dyn]") or line.startswith("[map]") or
                     line.startswith("[elf]")):
-                self.loader_lines.append((line_no, line))
+                if len(self.loader_lines) < 10000:
+                    self.loader_lines.append((line_no, line))
                 if "[map] registered guest mappings" in line:
                     in_map_block = True
                 recognized = True
 
             if line.startswith("[watch]"):
-                self.watch_lines.append((line_no, line))
+                if len(self.watch_lines) < 5000:
+                    self.watch_lines.append((line_no, line))
                 recognized = True
 
             if (line.startswith("[Thread") or line.startswith("[Threads]") or
                     line.startswith("[Sema]") or "=== Thread States Dump" in line or
                     "=== [SEMA] table snapshot" in line):
-                self.thread_lines.append((line_no, line))
+                if len(self.thread_lines) < 5000:
+                    self.thread_lines.append((line_no, line))
                 recognized = True
 
             # Memory fault / segfault / OOB
             if re.search(r"segmentation fault|sigsegv|segfault|out-of-bounds|out of bounds", line, re.IGNORECASE):
-                self.mem_fault_raw_lines.append((line_no, line))
+                if len(self.mem_fault_raw_lines) < 5000:
+                    self.mem_fault_raw_lines.append((line_no, line))
                 recognized = True
 
             if (line.startswith("[CPU TRACE]") or line.startswith("[CPU Progress]") or
@@ -2312,13 +2348,30 @@ class Log:
                     line.startswith("Last RIPs:") or re.match(r"^\s*#\d+:\s*0x[0-9a-fA-F]+", line) or
                     re.match(r"^\s*\[\d+\]\s+RIP=0x[0-9a-fA-F]+", line) or
                     re.match(r"^0x[0-9a-fA-F]+:\s*\d+", line)):
-                self.trace_lines.append((line_no, line))
+                m_h = re_hist_stream.search(line)
+                if m_h and ("Histogram" in line or "[hist]" in line or re.match(r"^0x[0-9a-fA-F]+:\s*\d+", line)):
+                    rip = int(m_h.group(1), 16)
+                    cnt = int(m_h.group(2))
+                    self.rip_counts[rip] = cnt
+                    self.rip_lines.setdefault(rip, []).append(line_no)
+                    self.has_explicit_hist = True
+                else:
+                    m_t = re_trace_stream.search(line) or re_last_stream.search(line) or re_num_stream.search(line)
+                    if m_t:
+                        rip = int(m_t.group(1), 16)
+                        self.rip_counts[rip] = self.rip_counts.get(rip, 0) + 1
+                        if len(self.rip_lines.setdefault(rip, [])) < 5:
+                            self.rip_lines[rip].append(line_no)
+
+                if len(self.trace_lines) < 10000:
+                    self.trace_lines.append((line_no, line))
                 recognized = True
 
             if (line.startswith("[CPU]") or line.startswith("-------------------- CPU Register Context") or
                     line.startswith("RIP:") or line.startswith("RAX:") or line.startswith("RSI:") or
                     line.startswith("R8:") or line.startswith("R12:") or line.startswith("FS_BASE:")):
-                self.status_lines.append((line_no, line))
+                if len(self.status_lines) < 5000:
+                    self.status_lines.append((line_no, line))
                 recognized = True
 
             if (line.startswith("====") or line.startswith(" ps4-to-macos:") or
@@ -2332,8 +2385,15 @@ class Log:
                     line.startswith("[DEBUG]") or line.startswith("[shutdown]") or
                     line.startswith("[xfer]") or line.startswith("Forcing submitDone") or
                     not line):
-                self.other_recognized_lines.append((line_no, line))
                 recognized = True
+                # Only retain lines needed by analyzers; ignore pure empty or high-frequency debug lines
+                if ("bytes at RIP" in line or "Bytes at RIP" in line or
+                    "fault" in line.lower() or "SubmitAndFlip" in line or
+                    line.startswith("[ScreenManager]") or line.startswith("[DirectMem]")):
+                    if len(self.other_recognized_lines) < 5000:
+                        self.other_recognized_lines.append((line_no, line))
+                elif len(self.other_recognized_lines) < 1000 and line:
+                    self.other_recognized_lines.append((line_no, line))
 
             if not recognized:
                 self.unparsed_lines += 1
@@ -2383,6 +2443,374 @@ class Log:
         return "\n".join(lines)
 
 
+def compute_head_sha1(path: str, max_bytes: int = 4096) -> str:
+    try:
+        with open(path, "rb") as f:
+            data = f.read(max_bytes)
+        return hashlib.sha1(data).hexdigest()
+    except Exception:
+        return "0" * 40
+
+
+def get_history_file(repo_dir: Optional[str] = None) -> str:
+    base = repo_dir or os.getcwd()
+    return os.path.join(base, ".triage_history.jsonl")
+
+
+def read_history(repo_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+    hf = get_history_file(repo_dir)
+    records: List[Dict[str, Any]] = []
+    if os.path.exists(hf):
+        try:
+            with open(hf, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+        except Exception:
+            pass
+    return records
+
+
+def record_history_entry(entry: Dict[str, Any], repo_dir: Optional[str] = None) -> None:
+    hf = get_history_file(repo_dir)
+    try:
+        with open(hf, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def clear_history(repo_dir: Optional[str] = None) -> bool:
+    hf = get_history_file(repo_dir)
+    if os.path.exists(hf):
+        try:
+            os.remove(hf)
+            return True
+        except Exception:
+            return False
+    return True
+
+
+def _format_cfa_rip(c: CpuFaultAnalyzer) -> str:
+    if c.fault_module_name and c.fault_module_offset is not None:
+        return f"{c.fault_module_name}+0x{c.fault_module_offset:X}"
+    if c.rip is not None:
+        return f"0x{c.rip:X}"
+    return "unknown"
+
+
+def determine_verdict(
+    log: Log,
+    cfa: CpuFaultAnalyzer,
+    hle: HleAnalyzer,
+    loader: LoaderAnalyzer,
+    gpu: GpuPm4Analyzer,
+    hot: HotLoopAnalyzer,
+    threads: ThreadAnalyzer,
+) -> Tuple[str, str, List[int], str]:
+    """
+    Returns (verdict_class, confidence, key_evidence_lines, signature_rip).
+    Possible classes:
+    CPU_FAULT, UNHANDLED_OPCODE, HLE_FALLBACK, PM4, LOADER, HOT_LOOP, HANG, CLEAN
+    """
+    # 1. Unhandled opcode
+    if cfa.unhandled_opcode_raw is not None or any("unhandled opcode" in f.message.lower() for f in cfa.findings):
+        lines = list(cfa.unhandled_opcode_lines)
+        for l, _ in log.unhandled_opcode_lines:
+            if l not in lines:
+                lines.append(l)
+        rip_str = _format_cfa_rip(cfa)
+        return "UNHANDLED_OPCODE", "observed", sorted(lines), rip_str
+
+    # 2. CPU fault / segfault / OOB
+    has_cpu_fault = (cfa.rip is not None) or cfa.segfault_detected or cfa.guest_oob_detected or bool(log.mem_fault_raw_lines) or bool(log.cpu_fault_lines)
+    if has_cpu_fault:
+        lines = []
+        if cfa.rip_lines:
+            lines.extend(cfa.rip_lines)
+        for f in cfa.findings:
+            for l in f.lines:
+                if l not in lines:
+                    lines.append(l)
+        for l, _ in log.mem_fault_raw_lines:
+            if l not in lines:
+                lines.append(l)
+        rip_str = _format_cfa_rip(cfa)
+        return "CPU_FAULT", "observed", sorted(lines), rip_str
+
+    # 3. GPU PM4 / DCB defects
+    if gpu.findings:
+        lines = []
+        for f in gpu.findings:
+            for l in f.lines:
+                if l not in lines:
+                    lines.append(l)
+        return "PM4", "observed", sorted(lines), "pm4_gpu"
+
+    # 4. HLE Fallback stubs
+    if hle.fallback_stubs:
+        lines = [rec.first_hit_line for rec in hle.fallback_stubs.values() if rec.first_hit_line is not None]
+        first_nid = next(iter(hle.fallback_stubs.keys()))
+        return "HLE_FALLBACK", "observed", sorted(lines), f"nid_0x{first_nid:016X}"
+
+    # 5. Loader findings (overlaps, spans, holes)
+    loader_defects = [f for f in loader.findings if "not present in log" not in f.message]
+    if loader_defects:
+        lines = []
+        for f in loader_defects:
+            for l in f.lines:
+                if l not in lines:
+                    lines.append(l)
+        conf = "observed" if any(f.kind == "OBSERVED" for f in loader_defects) else "inferred"
+        return "LOADER", conf, sorted(lines), "loader"
+
+    # 6. Hang / Timeout / Deadlock
+    has_deadlock = any("deadlock" in f.message.lower() for f in threads.findings)
+    stop_is_hang = bool(log.stop_reason and any(w in log.stop_reason.lower() for w in ("timeout", "stall", "hang", "deadlock")))
+    if has_deadlock or stop_is_hang or gpu.timeout_lines:
+        lines = [t[0] for t in gpu.timeout_lines]
+        for f in threads.findings:
+            for l in f.lines:
+                if l not in lines:
+                    lines.append(l)
+        conf = "observed" if gpu.timeout_lines else "inferred"
+        return "HANG", conf, sorted(lines), "hang"
+
+    # 7. Hot loop without fault
+    if hot.hot_loop_detected:
+        lines = []
+        for f in hot.findings:
+            for l in f.lines:
+                if l not in lines:
+                    lines.append(l)
+        top_rip = hot.hot_addrs[0][0] if hot.hot_addrs else 0
+        rip_str = hot._format_addr(top_rip)
+        return "HOT_LOOP", "inferred", sorted(lines), rip_str
+
+    # 8. Clean
+    return "CLEAN", "observed", [], "clean"
+
+
+def generate_suggested_checks(
+    verdict_class: str,
+    log: Log,
+    cfa: CpuFaultAnalyzer,
+    hle: HleAnalyzer,
+    loader: LoaderAnalyzer,
+    gpu: GpuPm4Analyzer,
+    hot: HotLoopAnalyzer,
+    threads: ThreadAnalyzer,
+) -> List[str]:
+    checks: List[str] = []
+    if verdict_class == "UNHANDLED_OPCODE":
+        if cfa.unhandled_opcode_raw is not None:
+            decoded, _, _ = decode_unhandled_opcode_bytes(cfa.unhandled_opcode_raw)
+            raw_hex = cfa.unhandled_opcode_raw.hex(" ")
+            checks.append(f"Add decoder & emulation handler for {decoded} ({raw_hex}) in executor.cpp")
+            checks.append("Run triage_crash.py remediation template for switch-case structure")
+        else:
+            checks.append("Check unhandled opcode line and add instruction decoding support in executor.cpp")
+    elif verdict_class == "CPU_FAULT":
+        if cfa.classification and "NULL-ish" in cfa.classification:
+            checks.append("Investigate NULL pointer dereference; verify initialization of base pointer/struct")
+        elif cfa.classification and "bad indirect call" in cfa.classification:
+            checks.append("Verify PLT jump stub and dynamic GOT relocation slot table entries")
+        elif cfa.classification and "heap range" in cfa.classification:
+            checks.append("Check heap allocation lifetime and buffer bounds for memory corruption")
+        elif cfa.classification and "unmapped" in cfa.classification:
+            checks.append("Verify virtual memory mapping table and pointer calculations")
+        else:
+            checks.append("Inspect CPU register context at crash site and faulting instruction disassembly")
+    elif verdict_class == "HLE_FALLBACK":
+        if hle.fallback_stubs:
+            unresolved = [f"0x{nid:016X}" for nid in list(hle.fallback_stubs.keys())[:3]]
+            checks.append(f"Implement missing HLE stubs for NID(s): {', '.join(unresolved)}")
+            checks.append("Run `triage_crash.py nid <NID>` to resolve function symbol names")
+    elif verdict_class == "PM4":
+        if gpu.label_mismatches:
+            checks.append("Fix PM4 opcode label mappings in pm4_translator.mm")
+        if any("desync" in f.message.lower() for f in gpu.findings):
+            checks.append("Verify packet length parsing in DCB walker and inspect Type-0/2 packet occurrences")
+        checks.append("Run `triage_crash.py dcb <LOG>` to inspect individual DCB command buffers")
+    elif verdict_class == "LOADER":
+        checks.append("Review guest memory map registrations in loader to resolve overlapping virtual address ranges")
+        if any("no_nid_skipped" in f.message for f in loader.findings):
+            checks.append("Check module dynamic export table for missing NID export entries")
+    elif verdict_class == "HANG":
+        checks.append("Inspect thread states and lock wait conditions in thread dump")
+        checks.append("Check semaphore create vs release balance and stall watchdog configuration")
+    elif verdict_class == "HOT_LOOP":
+        checks.append("Analyze hot RIP addresses to confirm termination condition in guest spin loop")
+        checks.append("Run `triage_crash.py hot <LOG>` for detailed RIP distribution")
+    elif verdict_class == "CLEAN":
+        checks.append("Run finished without detected defects; verify expected output or test assertions")
+    return checks
+
+
+def build_triage_card(report: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    lines.append("=" * 80)
+    lines.append(f"TRIAGE REPORT: {report.get('log_path', 'unknown')}")
+    lines.append("=" * 80)
+
+    # Banner
+    banner = report.get("banner", {})
+    lines.append("=== BANNER ===")
+    lines.append(f"Mode:                    {banner.get('mode', 'unknown')}" +
+                 (f" (L{','.join(map(str, banner['mode_lines']))})" if banner.get("mode_lines") else ""))
+    lines.append(f"Instruction Budget:      {banner.get('instruction_budget', 'not present in log')}")
+    lines.append(f"Final Instruction Count: {banner.get('final_instruction_count', 'not present in log')}")
+    lines.append(f"Stop Reason:             {banner.get('stop_reason', 'not present in log')}")
+    lines.append(f"Wall Time:               {banner.get('wall_time', 'not present in log')}")
+    lines.append(f"Total Lines:             {banner.get('total_lines', 0)} (unparsed: {banner.get('unparsed_lines', 0)})")
+    if banner.get("note"):
+        lines.append(f"NOTE:                    {banner['note']}")
+
+    # Verdict
+    lines.append("\n=== VERDICT ===")
+    v = report.get("verdict", {})
+    v_class = v.get("class", "CLEAN")
+    conf = v.get("confidence", "observed")
+    key_lines = v.get("key_evidence_lines", [])
+    key_str = ", ".join(f"L{l}" for l in key_lines) if key_lines else "none"
+    lines.append(f"Verdict: {v_class} (confidence: {conf}, key evidence: {key_str})")
+
+    hist = report.get("history", {})
+    seen_cnt = hist.get("seen_count", 1)
+    first_seen = hist.get("first_seen")
+    if seen_cnt > 1 and first_seen:
+        lines.append(f"History: seen {seen_cnt} times, first {first_seen}")
+
+    # Findings by Analyzer
+    lines.append("\n=== FINDINGS BY ANALYZER ===")
+    findings = report.get("findings", {})
+    analyzer_sections = [
+        ("CPU Fault", findings.get("cpu_fault", [])),
+        ("HLE", findings.get("hle", [])),
+        ("Loader", findings.get("loader", [])),
+        ("GPU PM4 & DCB", findings.get("pm4", [])),
+        ("Hot Loop", findings.get("hot_loop", [])),
+        ("Threading", findings.get("threading", [])),
+    ]
+
+    has_any_finding = False
+    for title, f_list in analyzer_sections:
+        if f_list:
+            has_any_finding = True
+            lines.append(f"-- {title} --")
+            for f in f_list:
+                k = f.get("kind", "OBSERVED")
+                msg = f.get("message", "")
+                if k == "OBSERVED":
+                    l_str = ",".join(str(l) for l in sorted(f.get("lines", []))) if f.get("lines") else "not present in log"
+                    lines.append(f"  [OBSERVED L{l_str}] {msg}")
+                else:
+                    rule = f.get("rule")
+                    r_str = f" by {rule}" if rule else ""
+                    lines.append(f"  [INFERRED{r_str}] {msg}")
+
+    if not has_any_finding:
+        lines.append("  (no defects found)")
+
+    # Evidence Line Numbers
+    lines.append("\n=== EVIDENCE LINE NUMBERS ===")
+    ev_lines = report.get("evidence_line_numbers", [])
+    if ev_lines:
+        lines.append(", ".join(f"L{l}" for l in sorted(ev_lines)))
+    else:
+        lines.append("none")
+
+    # Suggested Next Checks
+    lines.append("\n=== SUGGESTED NEXT CHECKS ===")
+    checks = report.get("suggested_next_checks", [])
+    if checks:
+        for c in checks:
+            lines.append(f"- {c}")
+    else:
+        lines.append("- None")
+
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
+def triage_log(
+    log_path: str,
+    repo_dir: Optional[str] = None,
+    map_file: Optional[str] = None,
+    record_history: bool = True,
+) -> Dict[str, Any]:
+    log = Log(log_path)
+    cfa = CpuFaultAnalyzer(log, repo_dir=repo_dir, map_file=map_file)
+    resolver = NidResolver(repo_dir=repo_dir)
+    hle = HleAnalyzer(log, resolver)
+    loader = LoaderAnalyzer(log, fault_rip=cfa.rip)
+    gpu = GpuPm4Analyzer(log)
+    hot = HotLoopAnalyzer(log, modules=loader.modules, registers=cfa.registers)
+    threads = ThreadAnalyzer(log)
+
+    v_class, conf, key_lines, sig_rip = determine_verdict(log, cfa, hle, loader, gpu, hot, threads)
+    stop_reason_str = log.stop_reason or "not present in log"
+    signature = f"{v_class}:{sig_rip}:{stop_reason_str}"
+    head_sha1 = compute_head_sha1(log_path)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    history_records = read_history(repo_dir)
+    matching = [r for r in history_records if r.get("signature") == signature]
+    seen_count = len(matching) + 1
+    first_seen = matching[0].get("time") if matching else now_iso
+
+    if record_history:
+        record_history_entry({
+            "time": now_iso,
+            "log_path": os.path.abspath(log_path),
+            "sha1_head": head_sha1,
+            "signature": signature,
+        }, repo_dir=repo_dir)
+
+    all_ev_lines: Set[int] = set(key_lines)
+    for a in (cfa, hle, loader, gpu, hot, threads):
+        if hasattr(a, "evidence_lines"):
+            all_ev_lines.update(getattr(a, "evidence_lines"))
+    for f in (cfa.findings + hle.findings + loader.findings + gpu.findings + hot.findings + threads.findings):
+        all_ev_lines.update(f.lines)
+    sorted_ev_lines = sorted(all_ev_lines)
+
+    suggested = generate_suggested_checks(v_class, log, cfa, hle, loader, gpu, hot, threads)
+
+    key_str = ", ".join(f"L{l}" for l in key_lines) if key_lines else "none"
+    verdict_summary = f"Verdict: {v_class} (confidence: {conf}, key evidence: {key_str})"
+
+    report: Dict[str, Any] = {
+        "log_path": log_path,
+        "banner": log.banner_dict(),
+        "verdict": {
+            "class": v_class,
+            "confidence": conf,
+            "key_evidence_lines": key_lines,
+            "summary": verdict_summary,
+        },
+        "history": {
+            "seen_count": seen_count,
+            "first_seen": first_seen,
+            "signature": signature,
+        },
+        "findings": {
+            "cpu_fault": [f.to_dict() for f in cfa.findings],
+            "hle": [f.to_dict() for f in hle.findings],
+            "loader": [f.to_dict() for f in loader.findings],
+            "pm4": [f.to_dict() for f in gpu.findings],
+            "hot_loop": [f.to_dict() for f in hot.findings],
+            "threading": [f.to_dict() for f in threads.findings],
+        },
+        "evidence_line_numbers": sorted_ev_lines,
+        "suggested_next_checks": suggested,
+    }
+
+    report["card"] = build_triage_card(report)
+    return report
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -2424,96 +2852,140 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_hot = subparsers.add_parser("hot", help="Analyze hot loops and RIP distribution")
     p_hot.add_argument("log", help="Path to log file")
 
-    args = parser.parse_args(argv)
+    # history
+    p_history = subparsers.add_parser("history", help="Inspect or clear triage history")
+    p_history.add_argument("--clear", action="store_true", help="Clear triage history file")
+    p_history.add_argument("--repo", default=None, help="Path to ps4-to-macos repository")
+
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 2
 
     if not args.subcommand:
         parser.print_help()
         return 0
 
-    if args.subcommand == "diff":
-        old_log = Log(args.old_log)
-        new_log = Log(args.new_log)
-        differ = DiffAnalyzer(old_log, new_log, repo_dir=args.repo)
-        if args.json:
-            import json
-            print(json.dumps(differ.diff_data, indent=2))
+    if args.subcommand == "history":
+        if args.clear:
+            clear_history(args.repo)
+            print("Triage history cleared.")
+            return 0
+        records = read_history(args.repo)
+        if not records:
+            print("No triage history recorded.")
         else:
-            print(differ.format_table())
+            print(f"=== TRIAGE HISTORY ({len(records)} entries) ===")
+            for r in records:
+                print(f"{r.get('time', 'unknown')} | {r.get('signature', 'unknown')} | {r.get('log_path', 'unknown')}")
         return 0
+
+    if args.subcommand == "diff":
+        try:
+            old_log = Log(args.old_log)
+            new_log = Log(args.new_log)
+            differ = DiffAnalyzer(old_log, new_log, repo_dir=args.repo)
+            if args.json:
+                import json
+                print(json.dumps(differ.diff_data, indent=2))
+            else:
+                print(differ.format_table())
+            return 0
+        except FileNotFoundError as e:
+            sys.stderr.write(f"File not found: {e}\n")
+            return 2
+        except Exception as e:
+            sys.stderr.write(f"Script error in diff: {e}\n")
+            return 2
+
+    if args.subcommand == "nid":
+        try:
+            resolver = NidResolver(repo_dir=args.repo, names_file=args.names)
+            all_matched = True
+            for item in args.items:
+                if item.startswith("0x") or item.startswith("0X") or (len(item) == 16 and all(c in "0123456789abcdefABCDEF" for c in item)):
+                    val = int(item, 16)
+                    status, details, name = resolver.resolve(val)
+                    if status == "MATCH":
+                        print(f"0x{val:016X}: MATCH {details}")
+                    else:
+                        print(f"0x{val:016X}: UNIDENTIFIED ({details})")
+                        all_matched = False
+                else:
+                    nid_le = resolver.compute_nid(item, endian="little")
+                    nid_be = resolver.compute_nid(item, endian="big")
+                    print(f"Symbol: {item}")
+                    print(f"  NID (little-endian): 0x{nid_le:016X}")
+                    print(f"  NID (big-endian):    0x{nid_be:016X}")
+            return 0 if all_matched else 1
+        except Exception as e:
+            sys.stderr.write(f"Script error in nid: {e}\n")
+            return 2
 
     if args.subcommand == "hot":
-        log = Log(args.log)
-        loader = LoaderAnalyzer(log)
-        cfa = CpuFaultAnalyzer(log)
-        hot = HotLoopAnalyzer(log, modules=loader.modules, registers=cfa.registers)
-        if hot.findings:
-            for f in hot.findings:
-                print(str(f))
-        else:
-            print("No hot loop (>50% instructions in <=16 addresses) detected.")
-        return 0
+        try:
+            log = Log(args.log)
+            loader = LoaderAnalyzer(log)
+            cfa = CpuFaultAnalyzer(log)
+            hot = HotLoopAnalyzer(log, modules=loader.modules, registers=cfa.registers)
+            if hot.findings:
+                for f in hot.findings:
+                    print(str(f))
+                return 1
+            else:
+                print("No hot loop (>50% instructions in <=16 addresses) detected.")
+                return 0
+        except FileNotFoundError as e:
+            sys.stderr.write(f"File not found: {e}\n")
+            return 2
+        except Exception as e:
+            sys.stderr.write(f"Script error in hot: {e}\n")
+            return 2
 
     if args.subcommand == "dcb":
-        log = Log(args.log)
-        gpu = GpuPm4Analyzer(log)
-        if not log.dcb_dumps:
-            print("No DCB dumps found in log.")
+        try:
+            log = Log(args.log)
+            gpu = GpuPm4Analyzer(log)
+            if not log.dcb_dumps:
+                print("No DCB dumps found in log.")
+                return 0
+            indices = [args.frame - 1] if (args.frame is not None and 1 <= args.frame <= len(log.dcb_dumps)) else range(len(log.dcb_dumps))
+            for idx in indices:
+                dcb = log.dcb_dumps[idx]
+                res = gpu._walk_dcb(dcb)
+                print(f"=== DCB #{idx + 1} @ 0x{res.dcb_addr:X} ({res.total_dwords} DWORDs) ===")
+                print(f"  Type counts: {res.type_counts}")
+                print(f"  Draws: 0x27={res.draw_count_27}, 0x2D={res.draw_count_2d}, SET_SH={res.set_sh_reg_count}, SET_CTX={res.set_context_reg_count}")
+                if res.zero_runs_unpadded:
+                    print(f"  Unpadded zero runs: {res.zero_runs_unpadded}")
+                if res.trailing_zero_run:
+                    print(f"  Trailing zero run: {res.trailing_zero_run}")
             return 0
-        indices = [args.frame - 1] if (args.frame is not None and 1 <= args.frame <= len(log.dcb_dumps)) else range(len(log.dcb_dumps))
-        for idx in indices:
-            dcb = log.dcb_dumps[idx]
-            res = gpu._walk_dcb(dcb)
-            print(f"=== DCB #{idx + 1} @ 0x{res.dcb_addr:X} ({res.total_dwords} DWORDs) ===")
-            print(f"  Type counts: {res.type_counts}")
-            print(f"  Draws: 0x27={res.draw_count_27}, 0x2D={res.draw_count_2d}, SET_SH={res.set_sh_reg_count}, SET_CTX={res.set_context_reg_count}")
-            if res.zero_runs_unpadded:
-                print(f"  Unpadded zero runs: {res.zero_runs_unpadded}")
-            if res.trailing_zero_run:
-                print(f"  Trailing zero run: {res.trailing_zero_run}")
-        return 0
+        except FileNotFoundError as e:
+            sys.stderr.write(f"File not found: {e}\n")
+            return 2
+        except Exception as e:
+            sys.stderr.write(f"Script error in dcb: {e}\n")
+            return 2
 
     if args.subcommand == "triage":
-        log = Log(args.log)
-        print(log.banner_str())
+        try:
+            res = triage_log(args.log, repo_dir=args.repo, map_file=args.map_file, record_history=True)
+        except FileNotFoundError as e:
+            sys.stderr.write(f"File not found: {e}\n")
+            return 2
+        except Exception as e:
+            sys.stderr.write(f"Script error in triage: {e}\n")
+            return 2
 
-        cfa = CpuFaultAnalyzer(log, repo_dir=args.repo)
-        if cfa.findings:
-            print("\n=== CPU FAULT ANALYSIS ===")
-            for f in cfa.findings:
-                print(str(f))
+        if args.json:
+            clean_res = {k: v for k, v in res.items() if k != "card"}
+            print(json.dumps(clean_res, indent=2))
+        else:
+            print(res["card"])
 
-        resolver = NidResolver(repo_dir=args.repo)
-        hle = HleAnalyzer(log, resolver)
-        if hle.findings:
-            print("\n=== HLE ANALYSIS ===")
-            for f in hle.findings:
-                print(str(f))
-
-        loader = LoaderAnalyzer(log, fault_rip=cfa.rip)
-        if loader.findings:
-            print("\n=== LOADER ANALYSIS ===")
-            for f in loader.findings:
-                print(str(f))
-
-        gpu = GpuPm4Analyzer(log)
-        if gpu.findings:
-            print("\n=== GPU PM4 & DCB ANALYSIS ===")
-            for f in gpu.findings:
-                print(str(f))
-
-        hot = HotLoopAnalyzer(log, modules=loader.modules, registers=cfa.registers)
-        if hot.findings:
-            print("\n=== HOT LOOP ANALYSIS ===")
-            for f in hot.findings:
-                print(str(f))
-
-        threads = ThreadAnalyzer(log)
-        if threads.findings:
-            print("\n=== THREADING ANALYSIS ===")
-            for f in threads.findings:
-                print(str(f))
-
-        return 0
+        v_class = res["verdict"]["class"]
+        return 0 if v_class == "CLEAN" else 1
 
     return 0
 

@@ -4,6 +4,7 @@ tests/test_triage.py - Unit tests for scripts/triage_crash.py
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -632,6 +633,187 @@ class TestStage8RemediationTemplates(unittest.TestCase):
         finally:
             if os.path.isfile(map_path):
                 os.remove(map_path)
+
+
+class TestStage9OutputHistoryIntegration(unittest.TestCase):
+    def test_triage_log_dict_and_card_structure(self):
+        log_content = """[prx] mode=real budget=10000000
+Loading: eboot.bin
+[module] base=0x0000000000400000 span=0x0000000000200000 path=eboot.bin
+[CPU FAULT] Invalid memory access at RIP=0x0000000000401000 addr=0x0000000000000010
+[CPU] Execution Status: Segfault
+[CPU] Instructions Executed: 4500
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write(log_content)
+            log_path = f.name
+
+        try:
+            res = triage_crash.triage_log(log_path, record_history=False)
+            self.assertIsInstance(res, dict)
+            self.assertEqual(res["log_path"], log_path)
+            self.assertEqual(res["banner"]["mode"], "real")
+            self.assertEqual(res["verdict"]["class"], "CPU_FAULT")
+            self.assertEqual(res["verdict"]["confidence"], "observed")
+            self.assertTrue(len(res["verdict"]["key_evidence_lines"]) > 0)
+            self.assertIn("card", res)
+
+            card = res["card"]
+            self.assertIn("=== BANNER ===", card)
+            self.assertIn("=== VERDICT ===", card)
+            self.assertIn("=== FINDINGS BY ANALYZER ===", card)
+            self.assertIn("=== EVIDENCE LINE NUMBERS ===", card)
+            self.assertIn("=== SUGGESTED NEXT CHECKS ===", card)
+            self.assertIn("Verdict: CPU_FAULT (confidence: observed", card)
+            self.assertIn("-- CPU Fault --", card)
+        finally:
+            if os.path.isfile(log_path):
+                os.remove(log_path)
+
+    def test_history_tracking_and_card_seen_count(self):
+        temp_dir = tempfile.mkdtemp()
+        log_content = """[prx] mode=real
+[CPU FAULT] RIP=0x401000 addr=0x0
+[CPU] Execution Status: Segfault
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".log", dir=temp_dir, delete=False) as f:
+            f.write(log_content)
+            log_path = f.name
+
+        try:
+            res1 = triage_crash.triage_log(log_path, repo_dir=temp_dir, record_history=True)
+            self.assertEqual(res1["history"]["seen_count"], 1)
+            self.assertNotIn("seen 2 times", res1["card"])
+
+            res2 = triage_crash.triage_log(log_path, repo_dir=temp_dir, record_history=True)
+            self.assertEqual(res2["history"]["seen_count"], 2)
+            self.assertIn("History: seen 2 times, first", res2["card"])
+
+            # Verify history file content
+            history_records = triage_crash.read_history(temp_dir)
+            self.assertEqual(len(history_records), 2)
+            self.assertEqual(history_records[0]["signature"], res1["history"]["signature"])
+
+            # Test clear_history
+            cleared = triage_crash.clear_history(temp_dir)
+            self.assertTrue(cleared)
+            self.assertEqual(len(triage_crash.read_history(temp_dir)), 0)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_exit_codes(self):
+        clean_content = """[prx] mode=real budget=1000
+[CPU] Execution Status: Normal
+[CPU] Instructions Executed: 500
+"""
+        fault_content = """[prx] mode=real
+[CPU FAULT] RIP=0x401000 addr=0x0
+[CPU] Execution Status: Segfault
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f_clean:
+            f_clean.write(clean_content)
+            clean_path = f_clean.name
+
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f_fault:
+            f_fault.write(fault_content)
+            fault_path = f_fault.name
+
+        try:
+            # 0 on CLEAN
+            code_clean = triage_crash.main(["triage", clean_path])
+            self.assertEqual(code_clean, 0)
+
+            # 1 on findings present
+            code_fault = triage_crash.main(["triage", fault_path])
+            self.assertEqual(code_fault, 1)
+
+            # Bare invocation defaults to triage
+            code_bare = triage_crash.main([fault_path])
+            self.assertEqual(code_bare, 1)
+
+            # 2 on script error / missing file
+            code_err = triage_crash.main(["triage", "non_existent_log_12345.log"])
+            self.assertEqual(code_err, 2)
+        finally:
+            if os.path.isfile(clean_path):
+                os.remove(clean_path)
+            if os.path.isfile(fault_path):
+                os.remove(fault_path)
+
+    def test_100mb_log_bounded_memory(self):
+        import tracemalloc
+
+        # Create a ~105 MB synthetic log
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write("[prx] mode=real budget=100000000\n")
+            f.write("Loading: eboot.bin\n")
+            f.write("[module] base=0x0000000000400000 span=0x0000000000200000 path=eboot.bin\n")
+            # Construct ~800 byte lines; 130,000 lines = ~105 MB
+            line_pattern = ("[CPU Progress] instructions=1000000 " + ("x" * 700) + "\n" +
+                            "[CPU TRACE] RIP=0x401050 " + ("y" * 700) + "\n")
+            block = line_pattern * 1000  # ~1.4 MB block
+            for _ in range(75):
+                f.write(block)
+            f.write("[CPU] Execution Status: Normal\n")
+            f.write("[CPU] Instructions Executed: 100000000\n")
+            tmp_log = f.name
+
+        try:
+            file_size_mb = os.path.getsize(tmp_log) / (1024 * 1024)
+            self.assertGreater(file_size_mb, 100.0)
+
+            tracemalloc.start()
+            res = triage_crash.triage_log(tmp_log, record_history=False)
+            current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+            peak_mb = peak / (1024 * 1024)
+            # Rule: stream line-by-line, memory strictly bounded < 25 MB
+            self.assertLess(peak_mb, 25.0, f"Peak memory was {peak_mb:.2f} MB, exceeded 25 MB limit")
+            self.assertEqual(res["banner"]["mode"], "real")
+        finally:
+            if os.path.isfile(tmp_log):
+                os.remove(tmp_log)
+
+    def test_run_workflow_integration(self):
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sys.path.insert(0, os.path.join(root_dir, "scripts"))
+        import run_workflow
+
+        # Test TestManager._triage_log and GameRunner._triage_log
+        log_content = """[prx] mode=real
+[CPU FAULT] RIP=0x401000 addr=0x0
+[CPU] Execution Status: Segfault
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write(log_content)
+            test_log_path = f.name
+
+        try:
+            tm = run_workflow.TestManager(root_dir)
+            tm._triage_log(test_log_path, "test_integration")
+            card_path = os.path.join(root_dir, "Logs", "triage_last_test_integration.txt")
+            self.assertTrue(os.path.isfile(card_path))
+            with open(card_path, "r", encoding="utf-8") as f:
+                saved_card = f.read()
+            self.assertIn("TRIAGE REPORT", saved_card)
+            self.assertIn("CPU_FAULT", saved_card)
+
+            # Test GameRunner._triage_log
+            gr = run_workflow.GameRunner(root_dir)
+            gr._triage_log(test_log_path, "run_integration")
+            run_card_path = os.path.join(root_dir, "Logs", "triage_last_run_integration.txt")
+            self.assertTrue(os.path.isfile(run_card_path))
+            with open(run_card_path, "r", encoding="utf-8") as f:
+                saved_run_card = f.read()
+            self.assertIn("TRIAGE REPORT", saved_run_card)
+        finally:
+            if os.path.isfile(test_log_path):
+                os.remove(test_log_path)
+            for cp in [os.path.join(root_dir, "Logs", "triage_last_test_integration.txt"),
+                       os.path.join(root_dir, "Logs", "triage_last_run_integration.txt")]:
+                if os.path.isfile(cp):
+                    os.remove(cp)
 
 
 if __name__ == "__main__":

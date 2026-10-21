@@ -48,6 +48,7 @@ __pycache__/
 
 # GUI run logs
 Logs/
+.triage_history.jsonl
 
 # scratch run logs from ps4-runner invocations
 *.log
