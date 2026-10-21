@@ -574,5 +574,65 @@ DWORD[1000][2]=0x00000000
         self.assertEqual(usleep_chgs[0]["new"], 4)
 
 
+class TestStage8RemediationTemplates(unittest.TestCase):
+    def test_remediation_confirmed_nid_template(self):
+        # 0xd936fddaaba9ae5d is scePthreadCondInit
+        resolver = triage_crash.NidResolver()
+        rec = triage_crash.FallbackStubRecord(
+            nid=0xd936fddaaba9ae5d,
+            count=3,
+            first_hit_caller_rip=0x10674e6,
+            first_hit_args={"rdi": "0x2000", "rsi": "0x0"}
+        )
+        gen = triage_crash.RemediationGenerator()
+        tmpl = gen.generate_nid_stub(0xd936fddaaba9ae5d, rec, resolver)
+        self.assertTrue(tmpl.startswith("// GENERATED TEMPLATE - VERIFY BEFORE USE"))
+        self.assertIn("register_symbol(0xD936FDDAABA9AE5DULL, \"scePthreadCondInit\"", tmpl)
+        self.assertIn("// Name: scePthreadCondInit", tmpl)
+        self.assertIn("TODO: Validate input arguments and perform out-pointer writes", tmpl)
+
+    def test_remediation_unidentified_nid_template(self):
+        resolver = triage_crash.NidResolver()
+        unknown_nid = 0x9999888877776666
+        rec = triage_crash.FallbackStubRecord(
+            nid=unknown_nid,
+            count=5,
+            first_hit_caller_rip=0x500000
+        )
+        gen = triage_crash.RemediationGenerator()
+        tmpl = gen.generate_nid_stub(unknown_nid, rec, resolver)
+        self.assertTrue(tmpl.startswith("// GENERATED TEMPLATE - VERIFY BEFORE USE"))
+        self.assertIn("// UNIDENTIFIED NID 0x9999888877776666 hits=5 first caller=0x500000", tmpl)
+        self.assertNotIn("register_symbol", tmpl)
+
+    def test_remediation_pm4_template(self):
+        gen = triage_crash.RemediationGenerator()
+        tmpl = gen.generate_pm4_template(0x27)
+        self.assertTrue(tmpl.startswith("// GENERATED TEMPLATE - VERIFY BEFORE USE"))
+        self.assertIn("case 0x27: { // DRAW_INDEX_2 - verify packet layout against SDK", tmpl)
+        self.assertIn("cursor += count + 1;", tmpl)
+        self.assertIn("src/gpu/pm4_translator.mm", tmpl)
+
+    def test_remediation_opcode_template_with_map(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+            f.write('[areas]\nx87 = "src/cpu/executor.cpp:5750"\n')
+            map_path = f.name
+
+        try:
+            gen = triage_crash.RemediationGenerator(map_file=map_path)
+            raw = bytes.fromhex("d9 7d f6")
+            tmpl = gen.generate_opcode_template(raw, rip=0x400100)
+            self.assertTrue(tmpl.startswith("// GENERATED TEMPLATE - VERIFY BEFORE USE"))
+            self.assertIn("Unhandled Opcode: d9 7d f6 @ 0x400100", tmpl)
+            self.assertIn("FNSTCW word ptr [rbp-0xA] (D9 /7)", tmpl)
+            self.assertIn("src/cpu/executor.cpp:5750", tmpl)
+            # Ensure no generated emulation code is present
+            self.assertNotIn("cpu.step", tmpl)
+            self.assertNotIn("switch", tmpl)
+        finally:
+            if os.path.isfile(map_path):
+                os.remove(map_path)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2053,6 +2053,97 @@ class DiffAnalyzer:
         return "\n".join(lines)
 
 
+class RemediationGenerator:
+    """
+    STAGE 8: Remediation Templates (only after 1-7 are tested)
+    - C++ stub templates for fallback NIDs with CONFIRMED name (registration, comment with source, TODOs for out-pointers)
+    - For UNIDENTIFIED NIDs: // UNIDENTIFIED NID 0x... hits=N first caller=...
+    - For unhandled PM4 opcodes: switch-case template for src/gpu/pm4_translator.mm with header decode,
+      count-based skip so cursor stays in sync, and 'verify packet layout against SDK'
+    - For unhandled x87/other opcodes: opcode, encoding, and pointer to area via triage_map.toml (no generated emulation code)
+    - Every template starts with '// GENERATED TEMPLATE - VERIFY BEFORE USE'
+    """
+
+    def __init__(self, map_file: Optional[str] = None):
+        self.map_file = map_file
+        self.area_map: Dict[str, str] = {}
+        self._load_map()
+
+    def _load_map(self) -> None:
+        path = self.map_file or "triage_map.toml"
+        if not os.path.isfile(path):
+            cur = os.path.dirname(os.path.abspath(__file__))
+            cand = os.path.join(cur, "..", "triage_map.toml")
+            if os.path.isfile(cand):
+                path = cand
+
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if "=" in line and not line.startswith("#"):
+                            k, v = line.split("=", 1)
+                            self.area_map[k.strip().lower()] = v.strip().strip('"').strip("'")
+            except Exception:
+                pass
+
+    def get_area_pointer(self, key: str, default: str) -> str:
+        return self.area_map.get(key.lower(), default)
+
+    def generate_nid_stub(self, nid: int, rec: FallbackStubRecord, resolver: NidResolver) -> str:
+        status, details, confirmed_name = resolver.resolve(nid)
+        first_caller = f"0x{rec.first_hit_caller_rip:X}" if rec.first_hit_caller_rip is not None else "unknown"
+
+        if status == "MATCH" and confirmed_name:
+            args_comment = ", ".join(f"{k}={v}" for k, v in rec.first_hit_args.items()) or "none"
+            return (
+                "// GENERATED TEMPLATE - VERIFY BEFORE USE\n"
+                f"// Target: src/hle/nid_registry.cpp\n"
+                f"// Name: {confirmed_name} | Source: {details}\n"
+                f"// First caller: {first_caller} | Observed args: {args_comment}\n"
+                f'register_symbol(0x{nid:016X}ULL, "{confirmed_name}", "libkernel",\n'
+                "    [](ExecutionContext& ctx, MemoryManager& mem) {\n"
+                "        // TODO: Validate input arguments and perform out-pointer writes\n"
+                "        // TODO: Map error codes according to SDK documentation\n"
+                "        ctx.rax = 0; // SCE_OK\n"
+                "    });"
+            )
+        else:
+            return (
+                "// GENERATED TEMPLATE - VERIFY BEFORE USE\n"
+                f"// UNIDENTIFIED NID 0x{nid:016X} hits={rec.count} first caller={first_caller}"
+            )
+
+    def generate_pm4_template(self, opcode: int) -> str:
+        name = PM4_OPCODE_TABLE.get(opcode, "UNKNOWN").split()[0]
+        area = self.get_area_pointer("pm4", "src/gpu/pm4_translator.mm (process_packet switch)")
+        return (
+            "// GENERATED TEMPLATE - VERIFY BEFORE USE\n"
+            f"// Target: src/gpu/pm4_translator.mm (area: {area})\n"
+            f"// Opcode: 0x{opcode:02X} ({name})\n"
+            f"case 0x{opcode:02X}: {{ // {name} - verify packet layout against SDK\n"
+            "    const uint32_t count = (header >> 16) & 0x3FFF;\n"
+            "    // Count-based skip so the packet cursor stays in sync\n"
+            "    cursor += count + 1;\n"
+            "    break;\n"
+            "}"
+        )
+
+    def generate_opcode_template(self, opcode_raw: bytes, rip: Optional[int] = None) -> str:
+        decoded, encoding_label, op_class = decode_unhandled_opcode_bytes(opcode_raw)
+        first_hex = f"{opcode_raw[0]:02X}" if opcode_raw else "UNKNOWN"
+        area = self.get_area_pointer(op_class.lower(), self.get_area_pointer(first_hex.lower(), "src/cpu/executor.cpp (x87/unhandled opcode decode)"))
+        rip_str = f" @ 0x{rip:X}" if rip is not None else ""
+        return (
+            "// GENERATED TEMPLATE - VERIFY BEFORE USE\n"
+            f"// Unhandled Opcode: {opcode_raw.hex(' ')}{rip_str}\n"
+            f"// Decoding: {decoded} (class: {op_class}, encoding: {encoding_label})\n"
+            f"// Pointer to implementation area: {area}\n"
+            "// Note: verify instruction semantics against Intel 64 and IA-32 Architectures Software Developer Manual (SDM)."
+        )
+
+
 class Log:
     """
     Single-pass streaming parser for PS4 emulator logs.
