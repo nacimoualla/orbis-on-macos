@@ -48,6 +48,7 @@ add_library(ps4_core
     src/core/vfs.cpp
     src/cpu/executor.cpp
     src/cpu/jit_compiler.cpp
+    src/cpu/jit_stats.cpp
     src/gpu/metal_backend.mm
     src/gpu/display_window.mm
     src/gpu/gpu_ring_buffer.cpp
@@ -159,6 +160,10 @@ set_source_files_properties(tests/test_gcn_shader.mm PROPERTIES COMPILE_FLAGS "-
 add_test(NAME Phase19_GcnShader COMMAND test_gcn_shader)
 set_tests_properties(Flappy_GpuSmoke PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+add_executable(test_jit_stats tests/test_jit_stats.cpp)
+target_link_libraries(test_jit_stats PRIVATE ps4_core)
+add_test(NAME JitStats COMMAND test_jit_stats)
+
 
 
 
@@ -212,3 +217,11 @@ add_custom_target(ps4-gui-app ALL
     COMMENT "Assembling ps4-gui.app"
     VERBATIM
 )
+
+add_executable(test_jit_mem tests/test_jit_mem.cpp)
+target_link_libraries(test_jit_mem PRIVATE ps4_core)
+add_test(NAME JitMemOperands COMMAND test_jit_mem)
+
+add_executable(test_jit_diff tests/test_jit_diff.cpp)
+target_link_libraries(test_jit_diff PRIVATE ps4_core)
+add_test(NAME JitDifferentialFuzz COMMAND test_jit_diff)

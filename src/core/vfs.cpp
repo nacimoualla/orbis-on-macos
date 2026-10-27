@@ -6,6 +6,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// struct stat timestamps are st_*timespec on Darwin and st_*tim on Linux (the
+// Linux build only backs the QEMU CPU test harness).
+#if defined(__APPLE__)
+#define VFS_ST_ATIM st_atimespec
+#define VFS_ST_MTIM st_mtimespec
+#define VFS_ST_CTIM st_ctimespec
+#else
+#define VFS_ST_ATIM st_atim
+#define VFS_ST_MTIM st_mtim
+#define VFS_ST_CTIM st_ctim
+#endif
+
 namespace ps4 {
 
 namespace {
@@ -332,12 +344,12 @@ i32 VirtualFileSystem::fstat(i32 fd, OrbisStat& stat_out) {
     stat_out.st_size       = static_cast<i64>(st.st_size);
     stat_out.st_blocks     = static_cast<i64>(st.st_blocks);
     stat_out.st_blksize    = static_cast<u32>(st.st_blksize);
-    stat_out.st_atime_sec  = static_cast<i64>(st.st_atimespec.tv_sec);
-    stat_out.st_atimensec  = static_cast<i64>(st.st_atimespec.tv_nsec);
-    stat_out.st_mtime_sec  = static_cast<i64>(st.st_mtimespec.tv_sec);
-    stat_out.st_mtimensec  = static_cast<i64>(st.st_mtimespec.tv_nsec);
-    stat_out.st_ctime_sec  = static_cast<i64>(st.st_ctimespec.tv_sec);
-    stat_out.st_ctimensec  = static_cast<i64>(st.st_ctimespec.tv_nsec);
+    stat_out.st_atime_sec  = static_cast<i64>(st.VFS_ST_ATIM.tv_sec);
+    stat_out.st_atimensec  = static_cast<i64>(st.VFS_ST_ATIM.tv_nsec);
+    stat_out.st_mtime_sec  = static_cast<i64>(st.VFS_ST_MTIM.tv_sec);
+    stat_out.st_mtimensec  = static_cast<i64>(st.VFS_ST_MTIM.tv_nsec);
+    stat_out.st_ctime_sec  = static_cast<i64>(st.VFS_ST_CTIM.tv_sec);
+    stat_out.st_ctimensec  = static_cast<i64>(st.VFS_ST_CTIM.tv_nsec);
 
     return 0;
 }

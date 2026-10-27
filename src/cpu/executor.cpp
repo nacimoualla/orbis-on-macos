@@ -1,6 +1,7 @@
 #include "ps4/executor.hpp"
 #include "ps4/dynamic_linker.hpp"
 #include "ps4/jit_compiler.hpp"
+#include "ps4/jit_stats.hpp"
 #include <chrono>
 #include <cstring>
 #include <cmath>
@@ -259,7 +260,9 @@ inline ModRmResult decode_modrm(const u8* code, usize available, GuestAddr next_
         }
 
         const u8 base_reg = (rex_b ? 8 : 0) | base;
-        if (mod == 0 && base == 5 && !rex_b) {
+        // SIB base=101 with mod=00 means "no base, disp32" whatever REX.B
+        // says (r13 as a base needs mod=01 with disp8=0).
+        if (mod == 0 && base == 5) {
             has_base = false; // [index*scale + disp32] (no base register)
         } else {
             base_addr += get_gpr64(ctx, base_reg);
@@ -1005,7 +1008,9 @@ StepResult CpuExecutor::step() {
     // Off by default: 60 M hash lookups is not free. PS4_RIP_HIST=1 turns it on.
     if (s_rip_hist_on) ++s_rip_hist[start_rip];
     s_rip_history[s_rip_hist_idx++ % 128] = start_rip;
-
+    if (jit_stats_enabled()) {
+        jit_stats_record_interp(m_memory, start_rip);
+    }
     u8 rex = 0;
     bool has_rex = false;
     bool operand_size_16 = false;
@@ -5778,11 +5783,14 @@ RunResult CpuExecutor::run(usize max_instructions) {
 
         // Try JIT block execution if compiler attached
         if (m_jit && !m_syscalls.has_exited()) {
-            const GuestAddr prev_rip = m_context.rip;
-            if (m_jit->execute_block(m_context, m_memory)) {
-                const auto* metrics = m_jit->get_block_metrics(prev_rip);
-                const usize count = metrics ? metrics->instructions_compiled : 1;
-                result.instructions_executed += count;
+            usize retired = 0;
+            if (m_jit->execute_block(m_context, m_memory, &retired)) {
+                // A block that side-exits retires fewer instructions than it
+                // compiled; count what actually ran.
+                result.instructions_executed += retired;
+                if (jit_stats_enabled()) {
+                    jit_stats_record_jit_block(retired);
+                }
 
                 if (m_syscalls.has_exited()) {
                     result.status = StepResult::Exited;

@@ -165,6 +165,12 @@ A standalone Python suite audits the HLE NID registry (hash vectors, tag round-t
 python3 tests/test_verify_nids_adversarial.py
 ```
 
+### CPU/JIT testing off-Mac
+
+- `scripts/cpu_harness.sh [phase|tests/foo.cpp ...]` — cross-compiles the CPU sources plus the given tests to Linux/aarch64 and runs them under `qemu-aarch64` (default: phases 5, 13, 15), so JIT work can be tested on any Linux box.
+- `scripts/cpu_harness.sh tests/test_jit_diff.cpp` — differential fuzzer: random x86_64 sequences (grouped templates: `alu_rr`, `alu_imm8`, `mov_mem`, `lea`, `stack`, …) run on the interpreter (reference) and with the JIT attached from identical state; GPRs, RIP, defined flags and scratch memory must match. Mismatches are shrunk to a minimal repro with hex bytes; per-group JIT coverage is reported. Knobs: `JIT_DIFF_SEED`, `JIT_DIFF_TRIALS`, `JIT_DIFF_GROUPS=alu_rr,mov_mem`, `JIT_DIFF_LEN`, `JIT_DIFF_CHECK_FLAGS=0` (full list in the file header; `--list` prints groups).
+- `scripts/jit_fuzz.sh [seed ...]` — runs the fuzzer over several seeds and summarizes pass/fail, summed coverage and unique minimized failures.
+
 ### Debugging HLE coverage
 
 The HLE registry is checked against [ps4libdoc](https://github.com/idc/ps4libdoc), whose symbol tables make a wrong NID *label* provable rather than a matter of taste. Three corpora are cached under `data/libdoc/`:
@@ -183,6 +189,16 @@ Scripts, all stdlib-only:
 
 Why this matters: labels are load-bearing. `0x7501D612C26DA04E` was registered as `scePadInit` when it is `pthread_mutexattr_init`, which is why the trace showed a nonsensical "scePadInit ×42"; the same NID also carried a pad-state writer onto Mono's `sem_init`, overwriting guest semaphores. Run the audit after any registry edit.
 
+### Debugging JIT coverage
+
+Two tools rank the x86 instructions to implement next in the ARM64 JIT:
+
+- **Runtime telemetry** (off by default): run with `PS4_JIT_STATS=1` (writes `./jit_stats.json` at exit), `PS4_JIT_STATS=/path/x.json`, or `PS4_JIT_STATS=-` (stderr). It counts guest instructions retired by JIT blocks vs the interpreter, every interpreter-executed opcode (weighted by execution count), and where/why the block compiler stopped (`terminator` vs `unsupported`). In code: `ps4::dump_jit_stats(std::ostream&)` (`include/ps4/jit_stats.hpp`).
+- `python3 -I scripts/jit_coverage.py jit_stats.json [more.json ...] [--top N] [--markdown]` — merges runs and prints the interpreted opcodes ranked by dynamic count with mnemonic, % of interpreted instructions, cumulative %, and terminator/unsupported.
+- `python3 -I scripts/opcode_census.py <elf> [...] [--top N] [--markdown] [--assume '8B mem']` — static census of an ELF's executable segments (samples, an unpacked eboot/PRX): mnemonic histogram, JIT coverage, and unsupported opcodes ranked by static count. `--assume` answers "what if the JIT handled X?". Uses `capstone` (`pip install capstone`) or falls back to `objdump`.
+
+Opcode keys are normalized the same way in all three: prefixes/REX stripped (REX.W, fs/gs, lock reported as notes), 66/F3/F2 kept, `/n` = ModRM group extension, `reg`/`mem` = r/m form (e.g. `8B mem`, `83 /7 reg`, `66 0F 6F mem`). Off-Mac, `scripts/cpu_harness.sh tests/test_jit_stats.cpp` runs the telemetry test under qemu-aarch64.
+
 At runtime, a stall watchdog in the thread manager dumps per-thread RIP/GPRs after ~2 s of per-thread HLE silence — look for `[WATCHDOG stall-a/b]` blocks in run logs when the game stops progressing.
 
 ## 📁 Project structure
@@ -199,7 +215,7 @@ At runtime, a stall watchdog in the thread manager dumps per-thread RIP/GPRs aft
 │   └── hle/                # NID registry, threading
 ├── samples/                # Synthetic test ELF fixtures (hello/sample/dynamic/triangle)
 ├── tests/                  # test_phase1..15 (CTest)
-├── scripts/                # NID audit vs ps4libdoc, Mono NID cracker, log checker, SELF unpacker
+├── scripts/                # NID audit vs ps4libdoc, Mono NID cracker, log checker, SELF unpacker, JIT coverage tools
 ├── data/libdoc/            # ps4libdoc symbol corpora used by the NID audit
 ├── vfs_root/               # Default VFS mount points (/app0, /data, /savedata)
 ├── docs/
