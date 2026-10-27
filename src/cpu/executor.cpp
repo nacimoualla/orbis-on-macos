@@ -1,5 +1,6 @@
 #include "ps4/executor.hpp"
 #include "ps4/jit_compiler.hpp"
+#include "ps4/jit_stats.hpp"
 #include <chrono>
 #include <cstring>
 #include <cmath>
@@ -418,6 +419,9 @@ StepResult CpuExecutor::step() {
 
     const GuestAddr start_rip = m_context.rip;
     s_rip_history[s_rip_hist_idx++ % 128] = start_rip;
+    if (jit_stats_enabled()) {
+        jit_stats_record_interp(m_memory, start_rip);
+    }
     u8 rex = 0;
     bool has_rex = false;
     bool operand_size_16 = false;
@@ -3074,6 +3078,9 @@ RunResult CpuExecutor::run(usize max_instructions) {
                 const auto* metrics = m_jit->get_block_metrics(prev_rip);
                 const usize count = metrics ? metrics->instructions_compiled : 1;
                 result.instructions_executed += count;
+                if (jit_stats_enabled()) {
+                    jit_stats_record_jit_block(count);
+                }
 
                 if (m_syscalls.has_exited()) {
                     result.status = StepResult::Exited;

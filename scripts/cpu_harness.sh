@@ -30,7 +30,8 @@ command -v "$CXX" >/dev/null || { echo "missing $CXX (apt-get install g++-aarch6
 [[ -z "$QEMU" ]] || command -v "$QEMU" >/dev/null || { echo "missing $QEMU (apt-get install qemu-user)" >&2; exit 2; }
 
 SRCS=(src/core/elf_loader.cpp src/core/memory.cpp src/core/syscall_table.cpp
-      src/core/vfs.cpp src/cpu/executor.cpp src/cpu/jit_compiler.cpp)
+      src/core/vfs.cpp src/cpu/executor.cpp src/cpu/jit_compiler.cpp
+      src/cpu/jit_stats.cpp)
 
 mkdir -p "$OUT"
 objs=()

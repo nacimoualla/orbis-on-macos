@@ -9,6 +9,7 @@
 #include "ps4/elf_loader.hpp"
 #include "ps4/executor.hpp"
 #include "ps4/jit_compiler.hpp"
+#include "ps4/jit_stats.hpp"
 #include "ps4/memory.hpp"
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
@@ -273,6 +274,9 @@ int main(int argc, char* argv[]) {
 
     // Join all guest pthreads before local MemoryManager, SyscallTable, and JitCompiler go out of scope
     nid_registry.shutdown();
+
+    // PS4_JIT_STATS: JIT coverage telemetry (scripts/jit_coverage.py)
+    ps4::write_jit_stats();
 
     return 0;
 }

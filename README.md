@@ -165,6 +165,16 @@ Two stdlib-only scripts support NID work:
 - `python3 scripts/check_log_nids.py <run-log> [names.txt]` — flags every `[HLE CALL] label (NID=…)` line whose label doesn't hash to its NID, and optionally resolves the real name from a candidate list. Run it on any `ps4-runner` log to catch misregistered handlers.
 - `python3 scripts/crack_nids.py` — hashes every string in the game's `eboot.bin` and Mono PRXs against target NIDs to resolve unknown imports (extend `TARGETS` for new ones).
 
+### Debugging JIT coverage
+
+Two tools rank the x86 instructions to implement next in the ARM64 JIT:
+
+- **Runtime telemetry** (off by default): run with `PS4_JIT_STATS=1` (writes `./jit_stats.json` at exit), `PS4_JIT_STATS=/path/x.json`, or `PS4_JIT_STATS=-` (stderr). It counts guest instructions retired by JIT blocks vs the interpreter, every interpreter-executed opcode (weighted by execution count), and where/why the block compiler stopped (`terminator` vs `unsupported`). In code: `ps4::dump_jit_stats(std::ostream&)` (`include/ps4/jit_stats.hpp`).
+- `python3 -I scripts/jit_coverage.py jit_stats.json [more.json ...] [--top N] [--markdown]` — merges runs and prints the interpreted opcodes ranked by dynamic count with mnemonic, % of interpreted instructions, cumulative %, and terminator/unsupported.
+- `python3 -I scripts/opcode_census.py <elf> [...] [--top N] [--markdown] [--assume '8B mem']` — static census of an ELF's executable segments (samples, an unpacked eboot/PRX): mnemonic histogram, JIT coverage, and unsupported opcodes ranked by static count. `--assume` answers "what if the JIT handled X?". Uses `capstone` (`pip install capstone`) or falls back to `objdump`.
+
+Opcode keys are normalized the same way in all three: prefixes/REX stripped (REX.W, fs/gs, lock reported as notes), 66/F3/F2 kept, `/n` = ModRM group extension, `reg`/`mem` = r/m form (e.g. `8B mem`, `83 /7 reg`, `66 0F 6F mem`). Off-Mac, `scripts/cpu_harness.sh tests/test_jit_stats.cpp` runs the telemetry test under qemu-aarch64.
+
 At runtime, a stall watchdog in the thread manager dumps per-thread RIP/GPRs after ~2 s of per-thread HLE silence — look for `[WATCHDOG stall-a/b]` blocks in run logs when the game stops progressing.
 
 ## 📁 Project structure
@@ -181,7 +191,7 @@ At runtime, a stall watchdog in the thread manager dumps per-thread RIP/GPRs aft
 │   └── hle/                # NID registry, threading
 ├── samples/                # Synthetic test ELF fixtures (hello/sample/dynamic/triangle)
 ├── tests/                  # test_phase1..15 (CTest)
-├── scripts/                # NID verification + log checker, SELF unpacker
+├── scripts/                # NID verification + log checker, SELF unpacker, JIT coverage tools
 ├── vfs_root/               # Default VFS mount points (/app0, /data, /savedata)
 ├── docs/
 │   ├── adr/                # Architecture Decision Records (0001–0009)
