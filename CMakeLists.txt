@@ -25,6 +25,7 @@ add_library(ps4_core
     src/core/vfs.cpp
     src/cpu/executor.cpp
     src/cpu/jit_compiler.cpp
+    src/cpu/jit_stats.cpp
     src/gpu/metal_backend.mm
     src/gpu/display_window.mm
     src/gpu/gpu_ring_buffer.cpp
@@ -116,6 +117,10 @@ add_test(NAME Phase14_MeshPipeline COMMAND test_phase14)
 add_executable(test_phase15 tests/test_phase15.cpp)
 target_link_libraries(test_phase15 PRIVATE ps4_core)
 add_test(NAME Phase15_JitExecutorIntegration COMMAND test_phase15)
+
+add_executable(test_jit_stats tests/test_jit_stats.cpp)
+target_link_libraries(test_jit_stats PRIVATE ps4_core)
+add_test(NAME JitStats COMMAND test_jit_stats)
 
 
 

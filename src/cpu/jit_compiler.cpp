@@ -1,4 +1,5 @@
 #include "ps4/jit_compiler.hpp"
+#include "ps4/jit_stats.hpp"
 #include <cstring>
 #include <iostream>
 #if defined(__APPLE__)
@@ -190,6 +191,25 @@ u32 get_gpr_offset(u8 x86_reg_idx) {
   }
 }
 
+// Telemetry (PS4_JIT_STATS): attribute the block end to the instruction that
+// caused it. Terminators (incl. JMP, which is compiled) end with block_ended
+// set and are at insn_rip; otherwise the decoder bailed at current_rip, or the
+// block hit the instruction cap.
+void record_block_end_stats(const MemoryManager &memory, bool block_ended,
+                            GuestAddr insn_rip, GuestAddr current_rip,
+                            usize instructions, usize max_instructions) {
+  if (block_ended) {
+    jit_stats_record_block_end(memory, insn_rip, JitStopReason::Terminator,
+                               instructions);
+  } else if (instructions >= max_instructions) {
+    jit_stats_record_block_end(memory, current_rip, JitStopReason::Limit,
+                               instructions);
+  } else {
+    jit_stats_record_block_end(memory, current_rip, JitStopReason::Unsupported,
+                               instructions);
+  }
+}
+
 } // namespace
 
 JitCompiler::JitCompiler(usize code_cache_size)
@@ -329,8 +349,10 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
   GuestAddr current_rip = guest_rip;
   usize instructions = 0;
   bool block_ended = false;
+  GuestAddr insn_rip = guest_rip; // start of the instruction being decoded
 
   while (!block_ended && instructions < 128) {
+    insn_rip = current_rip;
     if (!memory.is_valid_address(current_rip, 1)) {
       break;
     }
@@ -728,6 +750,11 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
 
     // Unknown / unsupported instruction: stop compiling block
     break;
+  }
+
+  if (jit_stats_enabled()) {
+    record_block_end_stats(memory, block_ended, insn_rip, current_rip,
+                           instructions, 128);
   }
 
   if (instructions == 0) {
