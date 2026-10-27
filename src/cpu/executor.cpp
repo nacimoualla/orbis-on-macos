@@ -272,7 +272,9 @@ inline ModRmResult decode_modrm(const u8* code, usize available, GuestAddr next_
         }
 
         const u8 base_reg = (rex_b ? 8 : 0) | base;
-        if (mod == 0 && base == 5 && !rex_b) {
+        // SIB base=101 with mod=00 means "no base, disp32" whatever REX.B
+        // says (r13 as a base needs mod=01 with disp8=0).
+        if (mod == 0 && base == 5) {
             has_base = false; // [index*scale + disp32] (no base register)
         } else {
             base_addr += get_gpr64(ctx, base_reg);

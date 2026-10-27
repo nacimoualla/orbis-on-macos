@@ -471,6 +471,7 @@ enum class Kind : u8 {
   IncDec,    // FE/FF /0 /1
   Push,      // 50+r
   PushImm,   // 6A / 68
+  PushRm,    // FF /6
   Pop,       // 58+r
   Jmp,       // EB / E9
 };
@@ -501,6 +502,7 @@ struct JitInsn {
     case Kind::Alu:
     case Kind::AluImm:
     case Kind::IncDec:
+    case Kind::PushRm:
       return !m.is_reg;
     default:
       return false;
@@ -546,9 +548,6 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
 
   auto modrm = [&]() -> bool {
     if (!x86::decode_modrm(code + pos, avail - pos, p, d.m))
-      return false;
-    // The interpreter decodes this encoding differently (see x86_decode.hpp).
-    if (d.m.sib_nobase_with_rex_b)
       return false;
     pos += d.m.length;
     return true;
@@ -731,11 +730,18 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return finish();
   }
 
-  // INC / DEC r/m (CF preserved)
+  // INC / DEC r/m (CF preserved) ; PUSH r/m64
   if (op0 == 0xFE || op0 == 0xFF) {
     if (!modrm())
       return false;
     const u8 sub = d.m.reg & 7;
+    if (op0 == 0xFF && sub == 6) {
+      if (p.opsize16) // the interpreter always pushes 8 bytes
+        return false;
+      d.kind = Kind::PushRm;
+      d.width = 64;
+      return finish();
+    }
     if (sub > 1)
       return false;
     d.kind = Kind::IncDec;
@@ -885,12 +891,15 @@ public:
       break;
     case Kind::Push:
     case Kind::PushImm:
+    case Kind::PushRm:
+      if (d.kind == Kind::PushRm)
+        load_rm(0, 64); // source read with the old RSP (also for PUSH [rsp])
       m_e.ldr_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
       m_e.sub_imm(R_EA, R_EA, 8);
       emit_bounds_check();
       if (d.kind == Kind::Push)
         load_gpr(0, d.reg, 64);
-      else
+      else if (d.kind == Kind::PushImm)
         m_e.mov_imm64(0, d.imm);
       m_e.str_x_idx(0, R_GBASE, R_EA);
       m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));

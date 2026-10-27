@@ -83,10 +83,6 @@ struct ModRM {
   u8 scale{0};  // shift amount 0..3
   i32 disp{0};
   bool rip_relative{false};
-  // SIB base=101 with mod=00 and REX.B=1: architecturally "no base, disp32"
-  // (REX.B is ignored), but the interpreter decodes it as [r13 + index].
-  // Flagged so translators can refuse it rather than diverge.
-  bool sib_nobase_with_rex_b{false};
 
   u8 length{0}; // ModRM + SIB + displacement bytes
 
@@ -126,8 +122,7 @@ inline bool decode_modrm(const u8 *code, usize avail, const Prefixes &p,
       m.index = static_cast<i8>(idx);
     const u8 base = sib & 7;
     if (m.mod == 0 && base == 5) {
-      disp32_no_base = true;
-      m.sib_nobase_with_rex_b = p.rex_b;
+      disp32_no_base = true; // REX.B is ignored here (no r13 base)
     } else {
       m.base = static_cast<i8>(base | (p.rex_b ? 8 : 0));
     }
