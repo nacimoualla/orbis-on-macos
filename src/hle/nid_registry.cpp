@@ -374,6 +374,13 @@ static void libc_exit_handler(CpuContext& ctx, MemoryManager& mem) {
 
 } // namespace
 
+// True when an armed write-watch overlaps [addr, addr + n); host-side bulk
+// copies route through write_bytes then so the watch records them.
+static bool watch_overlaps(GuestAddr addr, GuestSize n) {
+    const GuestAddr lo = write_watch_addr(), hi = write_watch_end();
+    return lo != 0 && addr < hi && lo < addr + n;
+}
+
 NidRegistry::NidRegistry() = default;
 
 void NidRegistry::set_vfs(VirtualFileSystem* vfs) {
@@ -2214,7 +2221,8 @@ void NidRegistry::register_default_libraries() {
                     GuestAddr next = 0, rip = 0;
                     mem.read_value(fp, next);
                     mem.read_value(fp + 8, rip);
-                    std::fprintf(stderr, "[assert-bt]   #%d rip=0x%llx\n", i, (unsigned long long)rip);
+                    std::fprintf(stderr, "[assert-bt]   #%d rip=0x%llx fp=0x%llx\n", i, (unsigned long long)rip,
+                                 (unsigned long long)fp);
                     if (next <= fp) break;
                     fp = next;
                 }
@@ -2324,6 +2332,37 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager&) {
             std::cout << static_cast<char>(ctx.rdi & 0xFF) << std::flush;
             ctx.rax = ctx.rdi & 0xFF;
+        });
+
+    // getenv(name): the guest has no environment except what the host passes
+    // explicitly as PS4_GUEST_<name> (e.g. PS4_GUEST_GC_DONT_GC=1). Values are
+    // copied into guest memory once per name and stay valid, as getenv's are.
+    register_symbol(0xB266D0BA47F16093ULL, "getenv", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            static std::mutex s_env_mtx;
+            static std::unordered_map<std::string, GuestAddr> s_env;
+            std::string name;
+            for (GuestSize i = 0; i < 256; ++i) {
+                char c = 0;
+                if (!mem.read_value(ctx.rdi + i, c) || c == 0) break;
+                name.push_back(c);
+            }
+            const char* host = std::getenv(("PS4_GUEST_" + name).c_str());
+            static std::atomic<u32> s_logged{0};
+            if (s_logged.fetch_add(1) < 32)
+                std::fprintf(stderr, "[getenv] %s -> %s\n", name.c_str(), host ? host : "(unset)");
+            if (!host) {
+                ctx.rax = 0;
+                return;
+            }
+            std::lock_guard<std::mutex> lock(s_env_mtx);
+            GuestAddr& slot = s_env[name];
+            if (slot == 0) {
+                const std::string v(host);
+                slot = bump_alloc(v.size() + 1, 16);
+                if (slot != 0) mem.write_bytes(slot, v.c_str(), v.size() + 1);
+            }
+            ctx.rax = slot;
         });
 
     // fflush(FILE*): guest stdio is not buffered on our side.
@@ -2597,8 +2636,12 @@ void NidRegistry::register_default_libraries() {
             const u8 ch          = static_cast<u8>(ctx.rsi & 0xFF);
             const GuestSize n    = ctx.rdx;
             if (dest != 0 && n > 0 && mem.is_valid_address(dest, n)) {
-                void* d_ptr = mem.to_host_ptr<void>(dest);
-                if (d_ptr) {
+                if (watch_overlaps(dest, n)) {
+                    // Slow path while a write-watch covers the range, so the
+                    // store is recorded like any other guest write.
+                    const std::vector<u8> fill(n, ch);
+                    mem.write_bytes(dest, fill.data(), n);
+                } else if (void* d_ptr = mem.to_host_ptr<void>(dest)) {
                     std::memset(d_ptr, ch, n);
                 }
             }
@@ -3846,7 +3889,10 @@ void NidRegistry::register_default_libraries() {
             if (n > 0 && mem.is_valid_address(dest, n) && mem.is_valid_address(src, n)) {
                 const void* s_ptr = mem.to_host_ptr<void>(src);
                 void* d_ptr = mem.to_host_ptr<void>(dest);
-                if (s_ptr && d_ptr) {
+                if (s_ptr && d_ptr && watch_overlaps(dest, n)) {
+                    const std::vector<u8> tmp(static_cast<const u8*>(s_ptr), static_cast<const u8*>(s_ptr) + n);
+                    mem.write_bytes(dest, tmp.data(), n);
+                } else if (s_ptr && d_ptr) {
                     std::memcpy(d_ptr, s_ptr, n);
                 }
             }

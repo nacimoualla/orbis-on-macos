@@ -1102,6 +1102,16 @@ StepResult CpuExecutor::step() {
             std::fprintf(stderr, "[WRITE_ZERO] RIP=0x%llx addr=0x%llx val=0x%llx bits=%zu\n",
                          (unsigned long long)start_rip, (unsigned long long)m.mem_addr, (unsigned long long)val, bits);
         }
+        // The aligned fast paths below store through a host pointer and would
+        // bypass an armed write-watch; take the recorded path when it overlaps.
+        if (const GuestAddr wl = write_watch_addr();
+            wl != 0 && m.mem_addr < write_watch_end() && wl < m.mem_addr + bits / 8) {
+            if (bits == 64) m_memory.write_value(m.mem_addr, val);
+            else if (bits == 32) m_memory.write_value(m.mem_addr, static_cast<u32>(val));
+            else if (bits == 16) m_memory.write_value(m.mem_addr, static_cast<u16>(val));
+            else m_memory.write_value(m.mem_addr, static_cast<u8>(val));
+            return;
+        }
         if (bits == 64) {
             if ((m.mem_addr & 7) == 0) {
                 auto* p = m_memory.to_host_ptr<u64>(m.mem_addr);
@@ -4093,6 +4103,8 @@ StepResult CpuExecutor::step() {
                 m_context.set_flag(CpuContext::FLAG_CF, cf);
                 m_context.set_flag(CpuContext::FLAG_OF, ((res ^ dst) & msb) != 0);
                 write_rm(m, res, bits);
+            } else if (bits == 32 && m.is_reg) {
+                set_gpr32(m_context, m.rm_id, static_cast<u32>(get_gpr64(m_context, m.rm_id)));
             }
             m_context.rip = start_rip + cursor + m.bytes_consumed + (imm ? 1 : 0);
             return StepResult::Ok;
@@ -4274,24 +4286,36 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // Legacy SSE (0x10, 0x11, 0x28, 0x29, 0x57)
-        if (op1 == 0x10 || op1 == 0x28) { // load
+        // Legacy SSE moves (0x10/0x11 MOVUPS/MOVUPD/MOVSS/MOVSD, 0x28/0x29
+        // MOVAPS/MOVAPD). F3 (MOVSS) moves 4 bytes and F2 (MOVSD) 8: a scalar
+        // load from memory zeroes the rest of the low 128 bits, a scalar
+        // register move or store touches only the low element. Legacy SSE
+        // leaves bits 255:128 of the YMM register alone.
+        //
+        // These used to move all 16 bytes regardless of prefix: `movsd [m], xmm`
+        // wrote 8 bytes past its slot. Mono's AOT generic trampoline saves
+        // xmm0-7 with movsd right below the saved GPRs, so the store of xmm7
+        // overwrote the saved RAX -- the vtable of every lazily-resolved
+        // virtual call -- and mono_magic_trampoline asserted `vt`.
+        if (op1 == 0x10 || op1 == 0x11 || op1 == 0x28 || op1 == 0x29) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
-            const u8 dest = m.reg_id & 15;
-            if (m.is_reg) std::memcpy(&m_context.ymm[dest], &m_context.ymm[m.rm_id & 15], 16);
-            else m_memory.read_bytes(m.mem_addr, &m_context.ymm[dest], 16);
-            m_context.ymm[dest].q[2] = 0; m_context.ymm[dest].q[3] = 0;
-            m_context.rip = start_rip + cursor + m.bytes_consumed;
-            return StepResult::Ok;
-        }
-
-        if (op1 == 0x11 || op1 == 0x29) { // store
-            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
-            if (!m.valid) return StepResult::IllegalInstruction;
-            const u8 src = m.reg_id & 15;
-            if (m.is_reg) std::memcpy(&m_context.ymm[m.rm_id & 15], &m_context.ymm[src], 16);
-            else m_memory.write_bytes(m.mem_addr, &m_context.ymm[src], 16);
+            const bool scalar = (op1 == 0x10 || op1 == 0x11) && (rep_prefix == 0xF3 || rep_prefix == 0xF2);
+            const usize n = !scalar ? 16 : (rep_prefix == 0xF3 ? 4 : 8);
+            const bool load = (op1 == 0x10 || op1 == 0x28);
+            const u8 xreg = m.reg_id & 15;
+            if (load) {
+                auto& dst = m_context.ymm[xreg];
+                if (m.is_reg) {
+                    std::memcpy(&dst, &m_context.ymm[m.rm_id & 15], n);
+                } else {
+                    if (scalar) dst.q[0] = dst.q[1] = 0;
+                    if (!m_memory.read_bytes(m.mem_addr, &dst, n)) return StepResult::MemoryFault;
+                }
+            } else {
+                if (m.is_reg) std::memcpy(&m_context.ymm[m.rm_id & 15], &m_context.ymm[xreg], n);
+                else if (!m_memory.write_bytes(m.mem_addr, &m_context.ymm[xreg], n)) return StepResult::MemoryFault;
+            }
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
         }
@@ -5149,6 +5173,10 @@ StepResult CpuExecutor::step() {
                 m_context.set_flag(CpuContext::FLAG_OF, false);
             }
             write_rm(m, res, bits);
+        } else if (bits == 32 && m.is_reg) {
+            // A zero count changes nothing, but a 32-bit register destination
+            // is still written, which clears bits 63:32.
+            set_gpr32(m_context, m.rm_id, static_cast<u32>(val));
         }
 
         m_context.rip = start_rip + cursor + m.bytes_consumed + imm_sz;

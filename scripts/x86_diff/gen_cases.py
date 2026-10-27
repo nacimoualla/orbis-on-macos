@@ -84,6 +84,14 @@ for cc, nm in ((0x45, "ne"), (0x46, "be"), (0x4D, "ge")):
     add(f"cmov{nm} ax,cx", [0x66, 0x0F, cc, 0xC1])
 
 
+# ---- Legacy SSE moves. Memory forms address [rax+4*rsi+0x1ab0] (scratch).
+MEMOP = [0x84, 0xB0, 0xB0, 0x1A, 0, 0]  # modrm reg=0 (xmm0), SIB rsi*4+rax, disp32
+for pre, nm in (([], "ups"), ([0x66], "upd"), ([0xF3], "ss"), ([0xF2], "sd")):
+    add(f"mov{nm} x1,x3", pre + [0x0F, 0x10, 0xCB]); add(f"mov{nm} x3<-x1 (11)", pre + [0x0F, 0x11, 0xCB])
+    add(f"mov{nm} x0,[mem]", pre + [0x0F, 0x10] + MEMOP, mem=1)
+    add(f"mov{nm} [mem],x0", pre + [0x0F, 0x11] + MEMOP, mem=1)
+add("movaps x1,x3", [0x0F, 0x28, 0xCB]); add("movaps [mem],x0", [0x0F, 0x29] + MEMOP, mem=1)
+
 # ---- Integer ALU (interpreter paths). rax=0 dst, rcx=1 src, rdx=2. --------
 NOAF = CF | PF | ZF | SF | OF
 W = {8: ([], 0), 16: ([0x66], 1), 32: ([], 1), 64: ([0x48], 1)}

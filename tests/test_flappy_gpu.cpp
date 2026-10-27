@@ -99,6 +99,10 @@ int main() {
     cpu.set_entry_point(loader.entry_point());
     ps4::t_guest_tid = 1;
 
+    // PS4_TRACE_AFTER=addr: once that RIP executes, trace every instruction.
+    const ps4::GuestAddr trace_after =
+        std::getenv("PS4_TRACE_AFTER") ? std::strtoull(std::getenv("PS4_TRACE_AFTER"), nullptr, 0) : 0;
+    bool trace_armed = false;
     ps4::GuestAddr trace_lo = 0, trace_hi = 0;
     int traced = 0;
     if (const char* r = std::getenv("PS4_TRACE_RANGE")) {
@@ -114,13 +118,15 @@ int main() {
     for (int frame = 0; frame < kFrames; ++frame) {
         window.poll_events();
         if (!translator->begin_frame()) return fail("GPU frame begin failed");
-        if (trace_lo != 0) {
+        if (trace_lo != 0 || trace_after != 0) {
             // PS4_TRACE_RANGE=lo,hi: single-step the main thread and print every
             // RIP inside [lo, hi) (first 4000), for following guest control flow.
             result = {};
             for (int n = 0; n < 2'000'000; ++n) {
                 const ps4::GuestAddr rip = cpu.context().rip;
-                if (rip >= trace_lo && rip < trace_hi && traced < 4000) {
+                if (trace_after != 0 && rip == trace_after) trace_armed = true;
+                if (((trace_after != 0 && trace_armed) || (trace_after == 0 && rip >= trace_lo && rip < trace_hi)) &&
+                    traced < 4000) {
                     const auto& c = cpu.context();
                     ps4::u64 ret = 0;
                     memory.read_value(c.rsp, ret);
@@ -190,6 +196,8 @@ int main() {
               << " elapsed_ms=" << elapsed << "\n";
     ps4::write_jit_stats(); // PS4_JIT_STATS; the guest's exit path can skip atexit
     ps4::dump_rip_histogram(); // PS4_RIP_HIST=1 (interpreter steps only)
+    if (std::getenv("PS4_WATCH_ADDR")) ps4::dump_write_watch_ring(0, &memory);
+    if (std::getenv("PS4_HLE_HIST")) ps4::dump_hle_histogram(); // every HLE dispatch by name
     registry.shutdown();
     if (draws == 0 || packets == 0)
         return fail("retail guest produced no GPU draws or PM4 packets");

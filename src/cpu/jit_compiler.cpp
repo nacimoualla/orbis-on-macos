@@ -1301,8 +1301,15 @@ private:
   void emit_shift(const JitInsn &d, u64 flags_needed) {
     const u8 w = d.width;
     const u8 c = static_cast<u8>(d.imm);
-    if (c == 0)
+    if (c == 0) {
+      // No shift, but a 32-bit register destination is still written, which
+      // zero-extends it (as on hardware and in the interpreter).
+      if (w == 32 && d.m.is_reg) {
+        load_rm(0, 32);
+        store_rm(0, 32);
+      }
       return;
+    }
     const bool sf = w == 64;
     load_rm(0, w); // zero-extended
     if (flags_needed) {
