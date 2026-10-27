@@ -9,6 +9,7 @@
 #include "ps4/elf_loader.hpp"
 #include "ps4/executor.hpp"
 #include "ps4/jit_compiler.hpp"
+#include "ps4/jit_stats.hpp"
 #include "ps4/memory.hpp"
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
@@ -133,6 +134,7 @@ int main() {
               << " unsupported_packets=" << unsupported
               << " upload_bytes=" << stats.upload_bytes
               << " elapsed_ms=" << elapsed << "\n";
+    ps4::write_jit_stats(); // PS4_JIT_STATS; the guest's exit path can skip atexit
     registry.shutdown();
     if (draws == 0 || packets == 0)
         return fail("retail guest produced no GPU draws or PM4 packets");

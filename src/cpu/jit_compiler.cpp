@@ -1,4 +1,6 @@
 #include "ps4/jit_compiler.hpp"
+
+#include <atomic>
 #include "ps4/jit_stats.hpp"
 #include "ps4/x86_decode.hpp"
 #include <algorithm>
@@ -514,6 +516,9 @@ enum class Kind : u8 {
   PushRm,    // FF /6
   Pop,       // 58+r
   Jmp,       // EB / E9
+  Jcc,       // 70-7F rel8, 0F 80-8F rel32 (block end; reg = condition code)
+  Cmov,      // 0F 40-4F (reg = condition code)
+  Setcc,     // 0F 90-9F (reg = condition code)
 };
 
 struct JitInsn {
@@ -532,6 +537,7 @@ struct JitInsn {
   u64 imm{0};
   GuestAddr target{0};
   u64 flags_written{0};
+  u64 flags_read{0}; // must be in ctx->rflags before this instruction
 
   [[nodiscard]] bool has_mem() const noexcept {
     switch (kind) {
@@ -544,6 +550,8 @@ struct JitInsn {
     case Kind::IncDec:
     case Kind::ShiftImm:
     case Kind::PushRm:
+    case Kind::Cmov:
+    case Kind::Setcc:
       return !m.is_reg;
     default:
       return false;
@@ -555,6 +563,43 @@ u64 truncate(u64 v, u8 width) {
   return width >= 64 ? v : (v & ((1ULL << width) - 1));
 }
 
+/// x2 = 1 if x86 condition `cc` holds for the flags in ctx->rflags, else 0.
+/// Same predicate as the interpreter's check_condition(). Clobbers x1, x3.
+void emit_cond(Arm64Emitter &e, u8 cc) {
+  constexpr u8 CF = 0, PF = 2, ZF = 6, SF = 7, OF = 11;
+  e.ldr_reg(1, 19, offsetof(CpuContext, rflags));
+  auto bit = [&](u8 rd, u8 lsb) { e.ubfx(true, rd, 1, lsb, 1); };
+  switch ((cc >> 1) & 7) {
+  case 0: bit(2, OF); break;
+  case 1: bit(2, CF); break;
+  case 2: bit(2, ZF); break;
+  case 3: bit(2, CF); bit(3, ZF); e.orr_reg(2, 2, 3); break;
+  case 4: bit(2, SF); break;
+  case 5: bit(2, PF); break;
+  case 6: bit(2, SF); bit(3, OF); e.eor_reg(2, 2, 3); break;
+  case 7:
+    bit(2, SF); bit(3, OF); e.eor_reg(2, 2, 3);
+    bit(3, ZF); e.orr_reg(2, 2, 3);
+    break;
+  }
+  if (cc & 1) {
+    e.mov_imm64(3, 1);
+    e.eor_reg(2, 2, 3);
+  }
+}
+
+/// x0 = next RIP after a block-final Jcc, branch-free:
+/// x0 = fallthrough + (-cond & (target - fallthrough)). Clobbers x1-x4.
+void emit_jcc_rip(Arm64Emitter &e, const JitInsn &d) {
+  emit_cond(e, d.reg);
+  const GuestAddr fallthrough = d.rip + d.len;
+  e.sub_reg(2, 31, 2); // all ones when taken
+  e.mov_imm64(3, d.target - fallthrough);
+  e.and_reg(3, 3, 2);
+  e.mov_imm64(4, fallthrough);
+  e.add_reg(0, 4, 3);
+}
+
 /// Control transfers and traps: the interpreter executes them, and the block
 /// ends in front of them without that counting as "unsupported".
 bool is_block_terminator(const u8 *code, usize avail, const x86::Prefixes &p) {
@@ -562,10 +607,9 @@ bool is_block_terminator(const u8 *code, usize avail, const x86::Prefixes &p) {
   const u8 op0 = code[c];
   const u8 op1 = (c + 1 < avail) ? code[c + 1] : 0;
   if (op0 == 0xF4 || op0 == 0xCC || op0 == 0xC3 || op0 == 0xC2 ||
-      op0 == 0xE8 || (op0 >= 0x70 && op0 <= 0x7F))
+      op0 == 0xE8)
     return true;
-  if (op0 == 0x0F &&
-      (op1 == 0x05 || op1 == 0x0B || (op1 >= 0x80 && op1 <= 0x8F)))
+  if (op0 == 0x0F && (op1 == 0x05 || op1 == 0x0B))
     return true;
   return false;
 }
@@ -847,8 +891,54 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return true;
   }
 
+  // Jcc rel8. Reads the flags the block has already stored to ctx->rflags.
+  if (op0 >= 0x70 && op0 <= 0x7F) {
+    if (!imm(1))
+      return false;
+    d.kind = Kind::Jcc;
+    d.reg = op0 & 0x0F;
+    d.flags_read = FLAGS_ARITH;
+    finish();
+    d.target = rip + d.len + d.imm;
+    return true;
+  }
+
   if (op0 == 0x0F && pos < avail) {
     const u8 op1 = code[pos++];
+
+    // Jcc rel32 (66-prefixed rel16 forms are left to the interpreter)
+    if (op1 >= 0x80 && op1 <= 0x8F) {
+      if (p.opsize16 || !imm(4))
+        return false;
+      d.kind = Kind::Jcc;
+      d.reg = op1 & 0x0F;
+      d.flags_read = FLAGS_ARITH;
+      finish();
+      d.target = rip + d.len + d.imm;
+      return true;
+    }
+
+    // CMOVcc r32/r64, r/m. 16-bit forms are left to the interpreter.
+    if (op1 >= 0x40 && op1 <= 0x4F) {
+      if (op_bits == 16 || !modrm())
+        return false;
+      d.kind = Kind::Cmov;
+      d.reg = op1 & 0x0F;
+      d.width = op_bits;
+      d.flags_read = FLAGS_ARITH;
+      return finish();
+    }
+
+    // SETcc r/m8
+    if (op1 >= 0x90 && op1 <= 0x9F) {
+      if (!modrm())
+        return false;
+      d.kind = Kind::Setcc;
+      d.reg = op1 & 0x0F;
+      d.width = 8;
+      d.flags_read = FLAGS_ARITH;
+      return finish();
+    }
 
     // Multi-byte NOP: 0F 1F /0
     if (op1 == 0x1F) {
@@ -894,6 +984,23 @@ public:
     switch (d.kind) {
     case Kind::Nop:
     case Kind::Jmp:
+    case Kind::Jcc: // the block epilogue selects the next RIP
+      break;
+    case Kind::Cmov:
+      // Branch-free select; a 32-bit CMOV zero-extends even when not taken.
+      // The source is read either way, as on hardware.
+      emit_cond(m_e, d.reg);
+      load_gpr(0, d.m.reg, w);
+      load_rm(5, w);
+      m_e.eor_reg(6, 0, 5);
+      m_e.sub_reg(2, 31, 2);
+      m_e.and_reg(6, 6, 2);
+      m_e.eor_reg(0, 0, 6);
+      store_gpr(d.m.reg, w, 0);
+      break;
+    case Kind::Setcc:
+      emit_cond(m_e, d.reg);
+      store_rm(2, 8);
       break;
     case Kind::MovRegImm:
       m_e.mov_imm64(0, truncate(d.imm, w));
@@ -1359,12 +1466,12 @@ void JitCompiler::commit_code(void *dest, const u32 *src, usize size_bytes) {
 }
 
 bool JitCompiler::is_block_cached(GuestAddr guest_rip) const {
-  std::lock_guard<std::mutex> lock(m_cache_mutex);
+  std::shared_lock lock(m_cache_mutex);
   return m_blocks.find(guest_rip) != m_blocks.end();
 }
 
 void JitCompiler::clear_cache() {
-  std::lock_guard<std::mutex> lock(m_cache_mutex);
+  std::unique_lock lock(m_cache_mutex);
   m_blocks.clear();
   m_metrics.clear();
   m_failed.clear();
@@ -1372,23 +1479,24 @@ void JitCompiler::clear_cache() {
 }
 
 usize JitCompiler::cached_block_count() const noexcept {
-  std::lock_guard<std::mutex> lock(m_cache_mutex);
+  std::shared_lock lock(m_cache_mutex);
   return m_blocks.size();
 }
 
 usize JitCompiler::code_buffer_used() const noexcept {
-  std::lock_guard<std::mutex> lock(m_cache_mutex);
+  std::shared_lock lock(m_cache_mutex);
   return m_code_buffer_offset;
 }
 
 usize JitCompiler::total_invocations() const noexcept {
-  std::lock_guard<std::mutex> lock(m_cache_mutex);
-  return m_total_invocations;
+  std::shared_lock lock(m_cache_mutex);
+  return std::atomic_ref<usize>(const_cast<usize &>(m_total_invocations))
+      .load(std::memory_order_relaxed);
 }
 
 const JitBlockMetrics *
 JitCompiler::get_block_metrics(GuestAddr guest_rip) const {
-  std::lock_guard<std::mutex> lock(m_cache_mutex);
+  std::shared_lock lock(m_cache_mutex);
   auto it = m_metrics.find(guest_rip);
   if (it != m_metrics.end()) {
     return &it->second;
@@ -1398,7 +1506,7 @@ JitCompiler::get_block_metrics(GuestAddr guest_rip) const {
 
 JittedBlockFunc JitCompiler::compile_block(GuestAddr guest_rip,
                                            const MemoryManager &memory) {
-  std::lock_guard<std::mutex> lock(m_cache_mutex);
+  std::unique_lock lock(m_cache_mutex);
   return compile_block_locked(guest_rip, memory);
 }
 
@@ -1447,6 +1555,10 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
     }
 
     insns.push_back(insn);
+    if (insn.kind == Kind::Jcc) {
+      block_ended = true;
+      break;
+    }
     if (insn.kind == Kind::Jmp) {
       current_rip = insn.target;
       block_ended = true;
@@ -1469,14 +1581,15 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
 
   // Pass 2: flag liveness. Every flag is live at the block exit; a flag write
   // is dead if a later instruction in the block overwrites that flag before
-  // anything could read it. (No translated instruction reads flags; INC/DEC
-  // simply do not write CF.) Side exits stay exact: the interpreter
+  // anything could read it. (Jcc/CMOVcc/SETcc read flags from ctx->rflags,
+  // so they keep earlier writes live; INC/DEC simply do not write CF.) Side exits stay exact: the interpreter
   // re-executes the exiting instruction, which rewrites those same flags.
   std::vector<u64> flags_needed(insns.size(), 0);
   u64 live = FLAGS_ARITH;
   for (usize i = insns.size(); i-- > 0;) {
     flags_needed[i] = insns[i].flags_written & live;
     live &= ~insns[i].flags_written;
+    live |= insns[i].flags_read;
   }
 
   // Pass 3: emit.
@@ -1490,7 +1603,11 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
   const usize instructions = insns.size();
 
   // Always update RIP at end of block; return the retired-instruction count
-  m_emitter.mov_imm64(0, current_rip);
+  if (insns.back().kind == Kind::Jcc) {
+    emit_jcc_rip(m_emitter, insns.back());
+  } else {
+    m_emitter.mov_imm64(0, current_rip);
+  }
   m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
   m_emitter.mov_imm64(0, instructions);
   m_emitter.emit_epilogue();
@@ -1522,12 +1639,24 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
     *retired = 0;
   JittedBlockFunc fn = nullptr;
   {
-    std::lock_guard<std::mutex> lock(m_cache_mutex);
+    // Fast path: cache hit (or a known compile failure) under the shared lock.
+    std::shared_lock lock(m_cache_mutex);
+    if (auto it = m_blocks.find(ctx.rip); it != m_blocks.end()) {
+      fn = it->second;
+      std::atomic_ref<usize>(m_metrics.find(ctx.rip)->second.execution_count)
+          .fetch_add(1, std::memory_order_relaxed);
+      std::atomic_ref<usize>(m_total_invocations)
+          .fetch_add(1, std::memory_order_relaxed);
+    } else if (m_failed.count(ctx.rip) != 0) {
+      return false;
+    }
+  }
+  if (!fn) {
+    std::unique_lock lock(m_cache_mutex);
     fn = compile_block_locked(ctx.rip, memory);
     if (!fn) {
       return false;
     }
-
     m_metrics[ctx.rip].execution_count++;
     m_total_invocations++;
   }

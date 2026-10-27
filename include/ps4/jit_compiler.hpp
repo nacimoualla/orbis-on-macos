@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -176,7 +177,10 @@ private:
     std::unordered_map<GuestAddr, JitBlockMetrics> m_metrics;
     std::unordered_set<GuestAddr> m_failed; // block starts that compiled to nothing
     Arm64Emitter m_emitter;
-    mutable std::mutex m_cache_mutex;
+    // Shared for cache hits (every guest thread, every block), exclusive for
+    // compiles and cache-wide changes. Hit counters are bumped atomically under
+    // the shared lock.
+    mutable std::shared_mutex m_cache_mutex;
 
     JittedBlockFunc compile_block_locked(GuestAddr guest_rip, const MemoryManager& memory);
     void* allocate_code(usize size);

@@ -461,6 +461,21 @@ void gen_jmp(Gen& g, const Template& t, Insn& out) {
     for (u8 i = 0; i < skip; ++i) out.bytes.push_back(g.rng.coin() ? 0xF4 : 0xCC);
 }
 
+// Jcc rel8 (70+cc) / rel32 (0F 80+cc) over HLT/INT3 filler, like gen_jmp: a
+// wrong condition makes the JIT and the interpreter stop at different RIPs.
+// `opcode` holds the condition code; `imm` selects rel32 when 4.
+void gen_jcc(Gen& g, const Template& t, Insn& out) {
+    const u8 skip = static_cast<u8>(g.rng.below(7));
+    const u8 cc = static_cast<u8>(t.opcode & 0x0F);
+    if (t.imm == 4) {
+        out.bytes = {0x0F, static_cast<u8>(0x80 + cc)};
+        push32(out.bytes, skip);
+    } else {
+        out.bytes = {static_cast<u8>(0x70 + cc), skip};
+    }
+    for (u8 i = 0; i < skip; ++i) out.bytes.push_back(g.rng.coin() ? 0xF4 : 0xCC);
+}
+
 void gen_push_reg(Gen& g, const Template&, Insn& out) {
     Enc e;
     const u8 r = g.pick_any();
@@ -552,6 +567,35 @@ std::vector<Template> build_templates() {
 
     add({.group = "jmp", .name = "jmp_rel8", .gen = gen_jmp, .opcode = 0xEB});
     add({.group = "jmp", .name = "jmp_rel32", .gen = gen_jmp, .opcode = 0xE9});
+    {
+        static const char* const CCN[] = {"o", "no", "b", "ae", "e", "ne", "be", "a",
+                                          "s", "ns", "p", "np", "l", "ge", "le", "g"};
+        for (u8 cc = 0; cc < 16; ++cc) {
+            add({.group = "jcc", .name = std::string("j") + CCN[cc] + "_rel8", .gen = gen_jcc,
+                 .opcode = cc, .imm = 1});
+            add({.group = "jcc", .name = std::string("j") + CCN[cc] + "_rel32", .gen = gen_jcc,
+                 .opcode = cc, .imm = 4});
+        }
+    }
+
+    // CMOVcc r32/r64, r/m and SETcc r/m8 for all 16 conditions. Preceding ALU
+    // instructions leave varied flags, so both outcomes of each are exercised.
+    {
+        static const char* const CCN[] = {"o", "no", "b", "ae", "e", "ne", "be", "a",
+                                          "s", "ns", "p", "np", "l", "ge", "le", "g"};
+        for (u16 cc = 0; cc < 16; ++cc) {
+            const std::string c = CCN[cc];
+            add({.group = "cmov", .name = "cmov" + c, .opcode = static_cast<u16>(0x0F40 + cc),
+                 .reg_role = R_DST, .rm_role = R_ANY});
+            add({.group = "cmov_mem", .name = "cmov" + c + "_mem",
+                 .opcode = static_cast<u16>(0x0F40 + cc), .reg_role = R_DST, .mem = true});
+            add({.group = "setcc", .name = "set" + c, .opcode = static_cast<u16>(0x0F90 + cc),
+                 .reg_role = R_DIGIT, .rm_role = R_DST, .wmode = W_0, .byte_regs = true});
+            add({.group = "setcc_mem", .name = "set" + c + "_mem",
+                 .opcode = static_cast<u16>(0x0F90 + cc), .reg_role = R_DIGIT, .mem = true,
+                 .wmode = W_0});
+        }
+    }
 
     // --- Memory-operand forms (ready for the JIT to grow into) --------------
     add({.group = "mov_mem", .name = "mov_m_r(89)", .opcode = 0x89, .reg_role = R_ANY, .mem = true});

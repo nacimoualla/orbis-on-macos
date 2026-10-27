@@ -3774,6 +3774,9 @@ StepResult CpuExecutor::step() {
                 if (op_bits == 64) set_gpr64(m_context, m.reg_id, val);
                 else if (op_bits == 32) set_gpr32(m_context, m.reg_id, static_cast<u32>(val));
                 else set_gpr16(m_context, m.reg_id, static_cast<u16>(val));
+            } else if (op_bits == 32) {
+                // In 64-bit mode a 32-bit CMOV clears bits 63:32 even when not taken.
+                set_gpr32(m_context, m.reg_id, static_cast<u32>(get_gpr64(m_context, m.reg_id)));
             }
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;

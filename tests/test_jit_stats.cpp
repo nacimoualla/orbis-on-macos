@@ -70,7 +70,7 @@ const u8 PROG[] = {
     0x48, 0x83, 0xC0, 0x01,       // 0A: add rax, 1
     0x48, 0x83, 0xDA, 0xFF,       // 0E: sbb rdx, -1    (unsupported)
     0x83, 0xD9, 0x00,             // 12: sbb ecx, 0     (unsupported)
-    0x75, 0xF0,                   // 15: jnz loop       (terminator)
+    0x75, 0xF0,                   // 15: jnz loop       (JIT, ends its block)
     0x89, 0xD7,                   // 17: mov edi, edx
     0xB8, 0x01, 0x00, 0x00, 0x00, // 19: mov eax, 1 (SYS_exit)
     0x0F, 0x05,                   // 1E: syscall        (terminator)
@@ -116,25 +116,26 @@ void test_mixed_run() {
 
     // Every retired instruction is attributed to exactly one engine.
     assert(t.jit_retired + t.interp_retired == res.instructions_executed);
-    // Block @00: 4 insns, block @07: 2 insns x 99, block @17: 2 insns.
-    assert(t.jit_retired == 4 + 99 * 2 + 2);
-    // sbb, sbb, jnz per iteration + the final syscall.
-    assert(t.interp_retired == 3 * 100 + 1);
-    assert(t.jit_block_executions == 1 + 99 + 1);
-    assert(t.blocks_compiled == 3);
+    // Block @00: 4 insns, block @07: 2 insns x 99, block @15 (jnz alone)
+    // x 100, block @17: 2 insns.
+    assert(t.jit_retired == 4 + 99 * 2 + 100 + 2);
+    // sbb, sbb per iteration + the final syscall.
+    assert(t.interp_retired == 2 * 100 + 1);
+    assert(t.jit_block_executions == 1 + 99 + 100 + 1);
+    assert(t.blocks_compiled == 4);
     // Failed compiles are cached, so each failing address (sbb @0E, sbb @12,
-    // jnz @15, syscall @1E) is compiled only once.
-    assert(t.compile_failures == 4);
+    // syscall @1E) is compiled only once.
+    assert(t.compile_failures == 3);
 
     assert(interp_count("83 /3 reg") == 200);
-    assert(interp_count("75") == 100);
+    assert(interp_count("75") == 0);
     assert(interp_count("0F 05") == 1);
     assert(interp_count("89 reg") == 0);
 
     std::ostringstream json;
     dump_jit_stats(json);
     const std::string s = json.str();
-    assert(s.find("\"jit_retired\": 204") != std::string::npos);
+    assert(s.find("\"jit_retired\": 304") != std::string::npos);
     assert(s.find("\"key\": \"83 /3 reg\"") != std::string::npos);
     assert(s.find("\"reason\": \"unsupported\", \"blocks\": 2, \"failed_compiles\": 2") !=
            std::string::npos);
