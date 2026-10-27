@@ -99,7 +99,13 @@ int main() {
         if (!translator->submit_frame(false)) return fail("GPU frame submission failed");
         if (!window.present_frame()) return fail("headless frame presentation failed");
         if (result.status != ps4::StepResult::Ok &&
-            result.status != ps4::StepResult::Syscall)
+            result.status != ps4::StepResult::Syscall) {
+            std::fprintf(stderr, "[Flappy test] Main CPU RIP=0x%llx\n", (unsigned long long)cpu.context().rip);
+            ps4::u8 b[16] = {0};
+            memory.read_bytes(cpu.context().rip, b, 16);
+            std::fprintf(stderr, "[Flappy test] Bytes at RIP: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+            registry.thread_manager(memory).dump_thread_states();
             return fail("guest execution stopped at frame " + std::to_string(frame + 1) +
                         " before the smoke interval completed (status=" +
                         std::string(ps4::step_result_to_string(result.status)) +
@@ -110,6 +116,7 @@ int main() {
                         " draws=" + std::to_string(translator->draw_count()) +
                         " unsupported=" + std::to_string(translator->unsupported_packet_count()) +
                         ". Relevant CPU/HLE/GPU diagnostics above are intentionally preserved.)");
+        }
     }
 
     if (!metal.wait_for_last_frame()) return fail("last GPU frame did not complete");

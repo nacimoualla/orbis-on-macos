@@ -450,16 +450,16 @@ elapsed milliseconds, including a completed non-black framebuffer readback.
 Shader signatures and unsupported PM4 counts remain the evidence-driven queue
 for subsequent Flappy fidelity work.
 
-- [ ] **Step 19.1: Parse GCN/AMDGPU shader ISA**
+- [x] **Step 19.1: Parse GCN/AMDGPU shader ISA** (`src/gpu/gcn_decoder.cpp`)
   - Decode vertex/fragment/compute shaders (leveraging SPIRV-Tools/Slang where appropriate).
 
-- [ ] **Step 19.2: Map registers/varyings/descriptors to MSL**
+- [x] **Step 19.2: Map registers/varyings/descriptors to MSL** (`src/gpu/gcn_to_msl.cpp`, direct emitter — see ADR 0007 amendment)
   - Input semantics, uniform/constant buffers, resource descriptor tables.
 
-- [ ] **Step 19.3: Replace the fixed mesh shader**
+- [x] **Step 19.3: Replace the fixed mesh shader** (`src/gpu/gcn_pipeline.mm`; fixed shader kept as fallback)
   - Compile translated vertex/fragment `MTLRenderPipelineState` instead of the inline MSL in `pm4_translator.mm`.
 
-- [ ] **Step 19.4: Texture + sampler binding**
+- [x] **Step 19.4: Texture + sampler binding** (linear + micro-tiled; macro tiling / BCn pending)
   - `T#`/`S#` descriptors → `MTLTexture`/`MTLSamplerState`.
 
 ## 📌 Phase 20: PM4 / GPU Feature Expansion

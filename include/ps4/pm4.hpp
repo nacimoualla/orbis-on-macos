@@ -12,36 +12,79 @@ enum class Pm4PacketType : u8 {
     Type3 = 3  // Command packet
 };
 
-// Canonical GCN PM4 Type-3 Opcodes
+// PM4 Type-3 IT opcodes for GCN 1.1 / CIK (Sea Islands), the family of the PS4
+// "Liverpool" GPU. Values match AMD's CIK PM4 spec / Mesa sid.h. Each value
+// appears exactly once: there are no aliases and no emulator-private opcodes.
 enum Pm4Opcode : u8 {
-    IT_NOP                  = 0x10,
-    IT_SET_BASE             = 0x11,
-    IT_CLEAR_STATE          = 0x12,
-    IT_INDEX_BUFFER_SIZE    = 0x13,
-    IT_DISPATCH_DIRECT      = 0x15,
-    IT_DISPATCH_INDIRECT    = 0x16,
-    IT_INDEX_TYPE           = 0x20,
-    IT_DRAW_INDEX           = 0x27,
-    IT_DRAW_INDEX_2         = 0x28,
-    IT_INDEX_BASE           = 0x2A,
-    IT_DRAW_INDEX_AUTO      = 0x2D,
-    IT_DRAW_INDIRECT        = 0x2E,
-    IT_DRAW_INDEX_INDIRECT  = 0x2E,
-    IT_NUM_INSTANCES        = 0x2F,
-    IT_INDEX_BASE_MAX       = 0x30,
-    IT_DRAW_INDEX_INDIRECT_MULTI = 0x33,
-    IT_DRAW_INDEX_OFFSET_2  = 0x35,
-    IT_WRITE_DATA           = 0x37,
-    IT_WAIT_REG_MEM         = 0x3C,
-    IT_INDIRECT_BUFFER      = 0x3F,
-    IT_EVENT_WRITE          = 0x46,
-    IT_RELEASE_MEM          = 0x47,
-    IT_DMA_DATA             = 0x50,
-    IT_ACQUIRE_MEM          = 0x58,
-    IT_SET_CONFIG_REG       = 0x68,
-    IT_SET_CONTEXT_REG      = 0x69,
-    IT_SET_SH_REG           = 0x76,
-    IT_LOAD_CONFIG_REG      = 0x79
+    IT_NOP                       = 0x10,
+    IT_SET_BASE                  = 0x11,
+    IT_CLEAR_STATE               = 0x12,
+    IT_INDEX_BUFFER_SIZE         = 0x13,
+    IT_DISPATCH_DIRECT           = 0x15,
+    IT_DISPATCH_INDIRECT         = 0x16,
+    IT_ATOMIC_GDS                = 0x1D,
+    IT_ATOMIC_MEM                = 0x1E,
+    IT_OCCLUSION_QUERY           = 0x1F,
+    IT_SET_PREDICATION           = 0x20,
+    IT_REG_RMW                   = 0x21,
+    IT_COND_EXEC                 = 0x22,
+    IT_PRED_EXEC                 = 0x23,
+    IT_DRAW_INDIRECT             = 0x24,
+    IT_DRAW_INDEX_INDIRECT       = 0x25,
+    IT_INDEX_BASE                = 0x26,
+    IT_DRAW_INDEX_2              = 0x27,
+    IT_CONTEXT_CONTROL           = 0x28,
+    IT_INDEX_TYPE                = 0x2A,
+    IT_DRAW_INDIRECT_MULTI       = 0x2C,
+    IT_DRAW_INDEX_AUTO           = 0x2D,
+    IT_NUM_INSTANCES             = 0x2F,
+    IT_DRAW_INDEX_MULTI_AUTO     = 0x30,
+    IT_INDIRECT_BUFFER_CNST      = 0x33,
+    IT_STRMOUT_BUFFER_UPDATE     = 0x34,
+    IT_DRAW_INDEX_OFFSET_2       = 0x35,
+    IT_DRAW_PREAMBLE             = 0x36,
+    IT_WRITE_DATA                = 0x37,
+    IT_DRAW_INDEX_INDIRECT_MULTI = 0x38,
+    IT_MEM_SEMAPHORE             = 0x39,
+    IT_COPY_DW                   = 0x3B,
+    IT_WAIT_REG_MEM              = 0x3C,
+    IT_INDIRECT_BUFFER           = 0x3F,
+    IT_COPY_DATA                 = 0x40,
+    IT_CP_DMA                    = 0x41,
+    IT_PFP_SYNC_ME               = 0x42,
+    IT_SURFACE_SYNC              = 0x43,
+    IT_ME_INITIALIZE             = 0x44,
+    IT_COND_WRITE                = 0x45,
+    IT_EVENT_WRITE               = 0x46,
+    IT_EVENT_WRITE_EOP           = 0x47,
+    IT_EVENT_WRITE_EOS           = 0x48,
+    IT_RELEASE_MEM               = 0x49,
+    IT_PREAMBLE_CNTL             = 0x4A,
+    IT_DMA_DATA                  = 0x50,
+    IT_CONTEXT_REG_RMW           = 0x51,
+    IT_ACQUIRE_MEM               = 0x58,
+    IT_REWIND                    = 0x59,
+    IT_LOAD_UCONFIG_REG          = 0x5E,
+    IT_LOAD_SH_REG               = 0x5F,
+    IT_LOAD_CONFIG_REG           = 0x60,
+    IT_LOAD_CONTEXT_REG          = 0x61,
+    IT_SET_CONFIG_REG            = 0x68,
+    IT_SET_CONTEXT_REG           = 0x69,
+    IT_SET_CONTEXT_REG_INDIRECT  = 0x73,
+    IT_SET_SH_REG                = 0x76,
+    IT_SET_SH_REG_OFFSET         = 0x77,
+    IT_SET_QUEUE_REG             = 0x78,
+    IT_SET_UCONFIG_REG           = 0x79,
+    IT_SCRATCH_RAM_WRITE         = 0x7D,
+    IT_SCRATCH_RAM_READ          = 0x7E,
+    IT_LOAD_CONST_RAM            = 0x80,
+    IT_WRITE_CONST_RAM           = 0x81,
+    IT_DUMP_CONST_RAM            = 0x83,
+    IT_INCREMENT_CE_COUNTER      = 0x84,
+    IT_INCREMENT_DE_COUNTER      = 0x85,
+    IT_WAIT_ON_CE_COUNTER        = 0x86,
+    IT_WAIT_ON_DE_COUNTER_DIFF   = 0x88,
+    IT_SWITCH_BUFFER             = 0x8B
 };
 
 inline const char* pm4_opcode_to_name(u8 op) {
@@ -52,39 +95,115 @@ inline const char* pm4_opcode_to_name(u8 op) {
         case IT_INDEX_BUFFER_SIZE: return "INDEX_BUFFER_SIZE";
         case IT_DISPATCH_DIRECT: return "DISPATCH_DIRECT";
         case IT_DISPATCH_INDIRECT: return "DISPATCH_INDIRECT";
-        case IT_INDEX_TYPE: return "INDEX_TYPE";
-        case IT_DRAW_INDEX: return "DRAW_INDEX";
-        case IT_DRAW_INDEX_2: return "DRAW_INDEX_2";
-        case IT_DRAW_INDEX_OFFSET_2: return "DRAW_INDEX_OFFSET_2";
-        case IT_INDEX_BASE: return "INDEX_BASE";
-        case IT_DRAW_INDEX_AUTO: return "DRAW_INDEX_AUTO";
+        case IT_ATOMIC_GDS: return "ATOMIC_GDS";
+        case IT_ATOMIC_MEM: return "ATOMIC_MEM";
+        case IT_OCCLUSION_QUERY: return "OCCLUSION_QUERY";
+        case IT_SET_PREDICATION: return "SET_PREDICATION";
+        case IT_REG_RMW: return "REG_RMW";
+        case IT_COND_EXEC: return "COND_EXEC";
+        case IT_PRED_EXEC: return "PRED_EXEC";
         case IT_DRAW_INDIRECT: return "DRAW_INDIRECT";
+        case IT_DRAW_INDEX_INDIRECT: return "DRAW_INDEX_INDIRECT";
+        case IT_INDEX_BASE: return "INDEX_BASE";
+        case IT_DRAW_INDEX_2: return "DRAW_INDEX_2";
+        case IT_CONTEXT_CONTROL: return "CONTEXT_CONTROL";
+        case IT_INDEX_TYPE: return "INDEX_TYPE";
+        case IT_DRAW_INDIRECT_MULTI: return "DRAW_INDIRECT_MULTI";
+        case IT_DRAW_INDEX_AUTO: return "DRAW_INDEX_AUTO";
         case IT_NUM_INSTANCES: return "NUM_INSTANCES";
-        case IT_INDEX_BASE_MAX: return "INDEX_BASE_MAX";
-        case IT_DRAW_INDEX_INDIRECT_MULTI: return "DRAW_INDEX_INDIRECT_MULTI";
+        case IT_DRAW_INDEX_MULTI_AUTO: return "DRAW_INDEX_MULTI_AUTO";
+        case IT_INDIRECT_BUFFER_CNST: return "INDIRECT_BUFFER_CNST";
+        case IT_STRMOUT_BUFFER_UPDATE: return "STRMOUT_BUFFER_UPDATE";
+        case IT_DRAW_INDEX_OFFSET_2: return "DRAW_INDEX_OFFSET_2";
+        case IT_DRAW_PREAMBLE: return "DRAW_PREAMBLE";
         case IT_WRITE_DATA: return "WRITE_DATA";
+        case IT_DRAW_INDEX_INDIRECT_MULTI: return "DRAW_INDEX_INDIRECT_MULTI";
+        case IT_MEM_SEMAPHORE: return "MEM_SEMAPHORE";
+        case IT_COPY_DW: return "COPY_DW";
         case IT_WAIT_REG_MEM: return "WAIT_REG_MEM";
         case IT_INDIRECT_BUFFER: return "INDIRECT_BUFFER";
+        case IT_COPY_DATA: return "COPY_DATA";
+        case IT_CP_DMA: return "CP_DMA";
+        case IT_PFP_SYNC_ME: return "PFP_SYNC_ME";
+        case IT_SURFACE_SYNC: return "SURFACE_SYNC";
+        case IT_ME_INITIALIZE: return "ME_INITIALIZE";
+        case IT_COND_WRITE: return "COND_WRITE";
         case IT_EVENT_WRITE: return "EVENT_WRITE";
+        case IT_EVENT_WRITE_EOP: return "EVENT_WRITE_EOP";
+        case IT_EVENT_WRITE_EOS: return "EVENT_WRITE_EOS";
         case IT_RELEASE_MEM: return "RELEASE_MEM";
+        case IT_PREAMBLE_CNTL: return "PREAMBLE_CNTL";
         case IT_DMA_DATA: return "DMA_DATA";
+        case IT_CONTEXT_REG_RMW: return "CONTEXT_REG_RMW";
         case IT_ACQUIRE_MEM: return "ACQUIRE_MEM";
+        case IT_REWIND: return "REWIND";
+        case IT_LOAD_UCONFIG_REG: return "LOAD_UCONFIG_REG";
+        case IT_LOAD_SH_REG: return "LOAD_SH_REG";
+        case IT_LOAD_CONFIG_REG: return "LOAD_CONFIG_REG";
+        case IT_LOAD_CONTEXT_REG: return "LOAD_CONTEXT_REG";
         case IT_SET_CONFIG_REG: return "SET_CONFIG_REG";
         case IT_SET_CONTEXT_REG: return "SET_CONTEXT_REG";
+        case IT_SET_CONTEXT_REG_INDIRECT: return "SET_CONTEXT_REG_INDIRECT";
         case IT_SET_SH_REG: return "SET_SH_REG";
-        case IT_LOAD_CONFIG_REG: return "LOAD_CONFIG_REG";
+        case IT_SET_SH_REG_OFFSET: return "SET_SH_REG_OFFSET";
+        case IT_SET_QUEUE_REG: return "SET_QUEUE_REG";
+        case IT_SET_UCONFIG_REG: return "SET_UCONFIG_REG";
+        case IT_SCRATCH_RAM_WRITE: return "SCRATCH_RAM_WRITE";
+        case IT_SCRATCH_RAM_READ: return "SCRATCH_RAM_READ";
+        case IT_LOAD_CONST_RAM: return "LOAD_CONST_RAM";
+        case IT_WRITE_CONST_RAM: return "WRITE_CONST_RAM";
+        case IT_DUMP_CONST_RAM: return "DUMP_CONST_RAM";
+        case IT_INCREMENT_CE_COUNTER: return "INCREMENT_CE_COUNTER";
+        case IT_INCREMENT_DE_COUNTER: return "INCREMENT_DE_COUNTER";
+        case IT_WAIT_ON_CE_COUNTER: return "WAIT_ON_CE_COUNTER";
+        case IT_WAIT_ON_DE_COUNTER_DIFF: return "WAIT_ON_DE_COUNTER_DIFF";
+        case IT_SWITCH_BUFFER: return "SWITCH_BUFFER";
         default: return "UNKNOWN";
     }
 }
 
-// GCN Primitive types
+// Register-space bases (dword offsets). SET_*_REG packets carry the register
+// offset relative to these bases in payload[0][15:0].
+constexpr u32 kPm4ConfigRegBase  = 0x2000;  // SET_CONFIG_REG  (0x8000 bytes)
+constexpr u32 kPm4ShRegBase      = 0x2C00;  // SET_SH_REG      (0xB000 bytes)
+constexpr u32 kPm4ContextRegBase = 0xA000;  // SET_CONTEXT_REG (0x28000 bytes)
+constexpr u32 kPm4UconfigRegBase = 0xC000;  // SET_UCONFIG_REG (0x30000 bytes, CIK+)
+
+// CIK user-config registers (offsets relative to kPm4UconfigRegBase).
+enum UconfigRegOffset : u16 {
+    UCONFIG_VGT_PRIMITIVE_TYPE = 0x0242,   // 0x30908
+    UCONFIG_VGT_INDEX_TYPE     = 0x0243,   // 0x3090C
+    UCONFIG_VGT_NUM_INDICES    = 0x024C,   // 0x30930
+    UCONFIG_VGT_NUM_INSTANCES  = 0x024D,   // 0x30934
+};
+
+// VGT_DMA_INDEX_TYPE / INDEX_TYPE packet fields.
+constexpr u32 kIndexTypeMask = 0x3;        // 0=16-bit, 1=32-bit, 2=8-bit (VI+, invalid on CIK)
+
+// DRAW_INITIATOR (VGT_DRAW_INITIATOR) SOURCE_SELECT values.
+constexpr u32 kDiSrcSelDma       = 0;
+constexpr u32 kDiSrcSelImmediate = 1;
+constexpr u32 kDiSrcSelAutoIndex = 2;
+
+// GCN primitive types (VGT_PRIMITIVE_TYPE.PRIM_TYPE / DI_PT_* values).
 enum class PrimitiveType : u8 {
+    None          = 0x00,
     PointList     = 0x01,
     LineList      = 0x02,
     LineStrip     = 0x03,
     TriangleList  = 0x04,
-    TriangleStrip = 0x05,
-    RectList      = 0x08
+    TriangleFan   = 0x05,
+    TriangleStrip = 0x06,
+    Patch         = 0x09,
+    LineListAdj   = 0x0A,
+    LineStripAdj  = 0x0B,
+    TriListAdj    = 0x0C,
+    TriStripAdj   = 0x0D,
+    RectList      = 0x11,
+    LineLoop      = 0x12,
+    QuadList      = 0x13,
+    QuadStrip     = 0x14,
+    Polygon       = 0x15
 };
 
 // Context Register Offsets (relative to 0xA000)
@@ -109,7 +228,6 @@ enum ContextRegOffset : u16 {
     CB_COLOR0_CLEAR_WORD1_GFX7 = 0x0324,
     CB_COLOR_CLEAR_WORD0   = 0x00DC,
     CB_COLOR_CLEAR_WORD1   = 0x00DD,
-    VGT_PRIMITIVE_TYPE_REG = 0x0258,
     VGT_DMA_MAX_SIZE_REG   = 0x029E,
     VGT_DMA_INDEX_TYPE_REG = 0x029F
 };

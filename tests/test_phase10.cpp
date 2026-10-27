@@ -219,7 +219,7 @@ int main() {
         draw_pkt.header.count = 2;
         draw_pkt.payload = {
             3, // vertex count
-            static_cast<ps4::u32>(ps4::PrimitiveType::TriangleList)
+            ps4::kDiSrcSelAutoIndex // draw initiator
         };
 
         assert(translator.execute_packet(draw_pkt));
@@ -259,7 +259,7 @@ int main() {
 
         // 3. DRAW_INDEX_AUTO
         assert(ring.write_type3_packet(ps4::IT_DRAW_INDEX_AUTO, {
-            6, static_cast<ps4::u32>(ps4::PrimitiveType::TriangleList)
+            6, ps4::kDiSrcSelAutoIndex
         }));
 
         // 4. EVENT_WRITE (Flush)

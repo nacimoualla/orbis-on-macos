@@ -172,6 +172,7 @@ struct FlipState {
     std::atomic<u64> last_flip_time_us{0};
 };
 static FlipState s_flip_state;
+constexpr u64 kVideoOutEventFlip = 0; // SCE_VIDEO_OUT_EVENT_FLIP (VBLANK is 1)
 
 // Real Orbis semaphore table for Unity worker threads (file scope so the
 // watchdog dump and synthetic wake can inspect it).
@@ -581,6 +582,122 @@ static void sync_gnm_label_slot(MemoryManager& mem) {
     if (mem.is_valid_address(kGnmLabelSlotAddr, sizeof(u32))) {
         mem.write_value(kGnmLabelSlotAddr, g_gnm_completed_label.load());
     }
+}
+
+// ---------------------------------------------------------------------------
+// GPU -> CPU completion signalling (Gnm EOP interrupts)
+//
+// sceGnmAddEqEvent(eq, kEopEventId, udata) registers an EVFILT_GRAPHICS_CORE
+// knote. The GPU raises it when the command processor retires an
+// EVENT_WRITE_EOP / RELEASE_MEM packet whose INT_SEL requests an interrupt --
+// and only then. Unity's gfx worker waits on that queue ("EOP QUEUE") for the
+// end-of-frame EOP of the previous frame before it reuses that frame's command
+// memory, and pairs it with the frame label the same packet writes.
+// ---------------------------------------------------------------------------
+constexpr i32 kGnmEopEventId = 0x40; // GnmEventIdents::GfxEop
+
+struct GnmEqSubscription {
+    u32 eq_id{0};
+    i32 event_id{0};
+    u64 udata{0};
+};
+static std::mutex s_gnm_eq_mtx;
+static std::vector<GnmEqSubscription> s_gnm_eq_subscriptions;
+static std::atomic<u64> s_gnm_eop_interrupts{0};
+
+static void deliver_gnm_eop_interrupt() {
+    s_gnm_eop_interrupts.fetch_add(1, std::memory_order_relaxed);
+    if (!g_thread_manager) return;
+    std::lock_guard<std::mutex> lock(s_gnm_eq_mtx);
+    for (const auto& sub : s_gnm_eq_subscriptions) {
+        if (sub.event_id != kGnmEopEventId) continue;
+        SceKernelEvent ev{};
+        ev.ident = static_cast<u64>(sub.event_id);
+        ev.filter = kEvFiltGraphicsCore;
+        ev.flags = 0;
+        ev.fflags = 0;
+        ev.data = sub.event_id; // sceGnmGetEqEventType reads the event type back from data
+        ev.udata = sub.udata;
+        g_thread_manager->equeue_signal(sub.eq_id, ev);
+    }
+}
+
+// Count the end-of-pipe packets in a DCB that request a CPU interrupt
+// (EVENT_WRITE_EOP INT_SEL = dw2[25:24], RELEASE_MEM INT_SEL = dw1[26:24]).
+// The PM4 translator performs the label writes; the interrupts belong to the
+// HLE equeue path, raised after the stream has executed (the label is visible
+// before the waiter wakes, as on hardware).
+static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_bytes, bool log) {
+    if (!mem.is_valid_address(dcb, size_bytes)) return 0;
+    const u32* dw = mem.to_host_ptr<u32>(dcb);
+    const usize n = size_bytes / sizeof(u32);
+    usize off = 0;
+    u32 interrupts = 0;
+    while (off < n) {
+        const Pm4Header hdr = decode_pm4_header(dw[off++]);
+        if (hdr.type == Pm4PacketType::Type2) continue;
+        if (hdr.type != Pm4PacketType::Type3 && hdr.type != Pm4PacketType::Type0) break;
+        if (off + hdr.count > n) break;
+        const u32* p = dw + off;
+        if (hdr.type == Pm4PacketType::Type3) {
+            if (hdr.opcode == IT_EVENT_WRITE_EOP && hdr.count >= 3 && ((p[2] >> 24) & 0x3) != 0) ++interrupts;
+            if (hdr.opcode == IT_RELEASE_MEM && hdr.count >= 2 && ((p[1] >> 24) & 0x7) != 0) ++interrupts;
+            if (log) {
+                switch (hdr.opcode) {
+                case IT_WAIT_REG_MEM:
+                case IT_EVENT_WRITE_EOP:
+                case IT_EVENT_WRITE_EOS:
+                case IT_RELEASE_MEM:
+                case IT_WRITE_DATA: {
+                    std::fprintf(stderr, "[GnmSync] dcb=0x%llx +%zu %s:", (unsigned long long)dcb,
+                                 (off - 1) * 4, pm4_opcode_to_name(hdr.opcode));
+                    for (u16 i = 0; i < hdr.count && i < 8; ++i) std::fprintf(stderr, " %08x", p[i]);
+                    std::fprintf(stderr, "\n");
+                    break;
+                }
+                default: break;
+                }
+            }
+        }
+        off += hdr.count;
+    }
+    return interrupts;
+}
+
+// Execute the DCBs of a submit on the emulated command processor and raise the
+// EOP interrupts they request. Shared by sceGnmSubmitCommandBuffers and
+// sceGnmSubmitAndFlipCommandBuffers.
+static void execute_submitted_dcbs(MemoryManager& mem, u32 count, GuestAddr dcb_addrs_ptr,
+                                   GuestAddr dcb_sizes_ptr) {
+    if (dcb_addrs_ptr == 0 || dcb_sizes_ptr == 0 || count > 64) return;
+    static std::atomic<u32> s_submits_logged{0};
+    const bool log = s_submits_logged.fetch_add(1, std::memory_order_relaxed) < 4;
+    if (g_pm4_translator) g_pm4_translator->set_memory_manager(&mem);
+    u32 interrupts = 0;
+    for (u32 i = 0; i < count; ++i) {
+        GuestAddr dcb_gpu_addr = 0;
+        u32 dcb_size_bytes = 0;
+        if (mem.is_valid_address(dcb_addrs_ptr + i * sizeof(GuestAddr), sizeof(GuestAddr))) {
+            mem.read_value(dcb_addrs_ptr + i * sizeof(GuestAddr), dcb_gpu_addr);
+        }
+        if (mem.is_valid_address(dcb_sizes_ptr + i * sizeof(u32), sizeof(u32))) {
+            mem.read_value(dcb_sizes_ptr + i * sizeof(u32), dcb_size_bytes);
+        }
+        if (dcb_gpu_addr <= 0x1000 || dcb_size_bytes < sizeof(u32) ||
+            !mem.is_valid_address(dcb_gpu_addr, dcb_size_bytes)) {
+            continue;
+        }
+        interrupts += count_dcb_eop_interrupts(mem, dcb_gpu_addr, dcb_size_bytes, log);
+        if (g_pm4_translator) {
+            const usize pkts_in_dcb = g_pm4_translator->execute_command_buffer(dcb_gpu_addr, dcb_size_bytes);
+            auto cc = g_pm4_translator->clear_color();
+            std::fprintf(stderr, "[Gnm] Executed DCB #%u at 0x%llx (%u bytes, %zu pkts, total_draws=%zu, reg_writes=%zu, clear=(%.2f,%.2f,%.2f,%.2f))\n",
+                         i, (unsigned long long)dcb_gpu_addr, dcb_size_bytes, pkts_in_dcb,
+                         g_pm4_translator->draw_count(), g_pm4_translator->context_reg_writes(),
+                         cc.r, cc.g, cc.b, cc.a);
+        }
+    }
+    for (u32 i = 0; i < interrupts; ++i) deliver_gnm_eop_interrupt();
 }
 
 // Sema-table snapshot for the stall watchdog (id, count/max per semaphore).
@@ -1366,6 +1483,14 @@ void NidRegistry::register_default_libraries() {
                 has_timeout = true;
             }
 
+            {
+                static std::atomic<u32> s_wait_logged{0};
+                if (s_wait_logged.fetch_add(1) < 40) {
+                    std::fprintf(stderr, "[Equeue] T%d WaitEqueue(eq=%u, num=%d, timeout=%s%llu)\n",
+                                 (int)t_guest_tid, eq_id, num, has_timeout ? "" : "inf/",
+                                 (unsigned long long)timeout_usec);
+                }
+            }
             auto& tm = get_thread_manager(mem);
             std::vector<SceKernelEvent> out_events;
             const bool ok = tm.equeue_wait(eq_id, out_events, num > 0 ? static_cast<usize>(num) : 1, timeout_usec, has_timeout);
@@ -2176,7 +2301,7 @@ void NidRegistry::register_default_libraries() {
 
     // sceKernelSignalSema(SceKernelSema sema, int signalCount). Shared handler
     // also reused by the verified 0xE1CC... registration below.
-    auto signal_sema_handler = [](CpuContext& ctx, MemoryManager&) {
+    auto signal_sema_handler = [](CpuContext& ctx, MemoryManager& mem) {
         const u32 id = static_cast<u32>(ctx.rdi);
         const i32 sig = static_cast<i32>(ctx.rsi) > 0 ? static_cast<i32>(ctx.rsi) : 1;
         std::shared_ptr<GuestSema> sema;
@@ -2189,7 +2314,21 @@ void NidRegistry::register_default_libraries() {
             std::lock_guard<std::mutex> lock(sema->mtx);
             sema->count = std::min(sema->max_count, sema->count + sig);
             sema->cv.notify_all();
-            std::fprintf(stderr, "[Sema] SignalSema(%u, %d) -> count=%d\n", id, sig, sema->count);
+            GuestAddr ret = 0;
+            if (mem.is_valid_address(ctx.rsp, sizeof(GuestAddr))) mem.read_value(ctx.rsp, ret);
+            std::fprintf(stderr, "[Sema] SignalSema(%u, %d) -> count=%d (T%d ret=0x%llx)", id, sig, sema->count,
+                         (int)t_guest_tid, (unsigned long long)ret);
+            if (std::getenv("PS4_SEMA_CHAIN")) {
+                GuestAddr fp = ctx.rbp;
+                for (int f = 0; f < 10 && fp > 0x1000 && mem.is_valid_address(fp, 16); ++f) {
+                    GuestAddr sfp = 0, ra = 0;
+                    mem.read_value(fp, sfp); mem.read_value(fp + 8, ra);
+                    std::fprintf(stderr, " <0x%llx", (unsigned long long)ra);
+                    if (sfp <= fp) break;
+                    fp = sfp;
+                }
+            }
+            std::fprintf(stderr, "\n");
         } else {
             std::fprintf(stderr,
                          "[HLE WARNING TID=%d rip=0x%llx] sceKernelSignalSema(%u): unknown sema id "
@@ -3762,30 +3901,7 @@ void NidRegistry::register_default_libraries() {
     static std::mutex s_flip_subs_mtx;
     static std::vector<FlipSubscription> s_flip_subscriptions;
 
-    struct GnmEqSubscription {
-        u32 eq_id{0};
-        i32 event_id{0};
-        u64 udata{0};
-    };
-    static std::mutex s_gnm_eq_mtx;
-    static std::vector<GnmEqSubscription> s_gnm_eq_subscriptions;
-
-    auto trigger_gnm_eop_events = []() {
-        if (!g_thread_manager) return;
-        std::lock_guard<std::mutex> lock(s_gnm_eq_mtx);
-        for (const auto& sub : s_gnm_eq_subscriptions) {
-            SceKernelEvent ev{};
-            ev.ident = static_cast<u64>(sub.event_id);
-            ev.filter = 0;
-            ev.flags = 0;
-            ev.fflags = 0;
-            ev.data = 0;
-            ev.udata = sub.udata;
-            g_thread_manager->equeue_signal(sub.eq_id, ev);
-        }
-    };
-
-    auto perform_flip = [&trigger_gnm_eop_events](MemoryManager& mem, u32 buffer_index, i64 flip_arg) {
+    auto perform_flip = [](MemoryManager& mem, u32 buffer_index, i64 flip_arg) {
         const u64 count = s_flip_state.flip_count.fetch_add(1) + 1;
         const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -3823,24 +3939,25 @@ void NidRegistry::register_default_libraries() {
             }
         }
 
+        // Flip completion: deliver SCE_VIDEO_OUT_EVENT_FLIP (ident 0,
+        // EVFILT_VIDEO_OUT) to every equeue registered with
+        // sceVideoOutAddFlipEvent -- and to no other queue. data packs
+        // flipArg[63:16] | count[15:12] | time[11:0]; equeue_signal coalesces
+        // the count while the event is still pending.
         if (g_thread_manager) {
+            const u64 packed = (static_cast<u64>(flip_arg) << 16) | (1ULL << 12) | (now_us & 0xFFFULL);
             std::lock_guard<std::mutex> lock(s_flip_subs_mtx);
-            if (!s_flip_subscriptions.empty()) {
-                for (const auto& sub : s_flip_subscriptions) {
-                    SceKernelEvent ev{};
-                    ev.ident = 1;
-                    ev.filter = -1;
-                    ev.flags = 0;
-                    ev.fflags = 0;
-                    ev.data = flip_arg;
-                    ev.udata = sub.udata;
-                    g_thread_manager->equeue_signal(sub.eq_id, ev);
-                }
-            } else {
-                g_thread_manager->signal_flip_event(flip_arg);
+            for (const auto& sub : s_flip_subscriptions) {
+                SceKernelEvent ev{};
+                ev.ident = kVideoOutEventFlip;
+                ev.filter = kEvFiltVideoOut;
+                ev.flags = 0;
+                ev.fflags = 0;
+                ev.data = static_cast<i64>(packed);
+                ev.udata = sub.udata;
+                g_thread_manager->equeue_signal(sub.eq_id, ev);
             }
         }
-        trigger_gnm_eop_events();
     };
 
     // sceVideoOutRegisterBuffers(int handle, int startIndex, void* const* addresses, int bufferCount, ...)
@@ -3918,12 +4035,22 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x49B537770A7CD254ULL, "sceVideoOutGetFlipStatus", "libSceVideoOut",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr status_ptr = ctx.rsi;
-            if (status_ptr != 0 && mem.is_valid_address(status_ptr, 32)) {
+            // SceVideoOutFlipStatus (64 bytes): count, processTime, tsc,
+            // flipArg, submitTsc, reserved0, gcQueueNum, flipPendingNum,
+            // currentBuffer, reserved1. Flips complete synchronously, so
+            // nothing is ever queued or pending.
+            if (status_ptr != 0 && mem.is_valid_address(status_ptr, 64)) {
+                const u64 t = s_flip_state.last_flip_time_us.load();
                 mem.write_value(status_ptr + 0, s_flip_state.flip_count.load());
-                mem.write_value(status_ptr + 8, s_flip_state.last_flip_time_us.load());
-                mem.write_value(status_ptr + 16, s_flip_state.last_flip_arg.load());
-                mem.write_value(status_ptr + 24, static_cast<u32>(0)); // flipMode
-                mem.write_value(status_ptr + 28, s_flip_state.current_buffer.load());
+                mem.write_value(status_ptr + 8, t);
+                mem.write_value(status_ptr + 16, t);
+                mem.write_value(status_ptr + 24, s_flip_state.last_flip_arg.load());
+                mem.write_value(status_ptr + 32, t);
+                mem.write_value(status_ptr + 40, static_cast<u64>(0));
+                mem.write_value(status_ptr + 48, static_cast<i32>(0)); // gcQueueNum
+                mem.write_value(status_ptr + 52, static_cast<i32>(0)); // flipPendingNum
+                mem.write_value(status_ptr + 56, static_cast<i32>(s_flip_state.current_buffer.load()));
+                mem.write_value(status_ptr + 60, static_cast<u32>(0));
             }
             ctx.rax = SCE_OK;
         });
@@ -4926,7 +5053,9 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // sceGnmDrawIndex -- writes IT_DRAW_INDEX_2 (0x28, 6 DWORDs) + NOP padding
+    // sceGnmDrawIndex -- writes IT_DRAW_INDEX_2 (0x27, 6 DWORDs) + NOP padding, matching
+    // Gnm: [MAX_SIZE, INDEX_BASE_LO, INDEX_BASE_HI, INDEX_COUNT, DRAW_INITIATOR=DMA].
+    // Topology comes from VGT_PRIMITIVE_TYPE, not from the packet.
     register_symbol(0x1E54CFA19FE863B6ULL, "sceGnmDrawIndex", "libSceGnm",
         [write_dcb_nop_padding](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr dcb_addr = ctx.rdi;
@@ -4942,12 +5071,12 @@ void NidRegistry::register_default_libraries() {
 
             if (num_dwords >= 6 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
                 u32 pkt[6];
-                pkt[0] = 0xC0042800U; // Type 3, count=4, opcode=0x28 (IT_DRAW_INDEX_2)
+                pkt[0] = 0xC0042700U; // Type 3, count=4, opcode=0x27 (IT_DRAW_INDEX_2)
                 pkt[1] = index_count;
                 pkt[2] = static_cast<u32>(index_buffer_addr & 0xFFFFFFFFU);
                 pkt[3] = static_cast<u32>((index_buffer_addr >> 32) & 0xFFFFFFFFU);
                 pkt[4] = index_count;
-                pkt[5] = 4U; // PrimitiveType::TriangleList
+                pkt[5] = 0U; // DRAW_INITIATOR: SOURCE_SELECT=DI_SRC_SEL_DMA
                 mem.write_bytes(dcb_addr, pkt, sizeof(pkt));
                 write_dcb_nop_padding(mem, dcb_addr + sizeof(pkt), num_dwords - 6);
             } else if (num_dwords > 0 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
@@ -5066,12 +5195,67 @@ void NidRegistry::register_default_libraries() {
     // submit-completion wait (imported by eboot.bin, libSceJobManager.prx and
     // libSceS3DConversion.prx). Body unchanged: sleep instead of spin so the
     // guest yields the host thread at ~60 FPS VBlank cadence.
-    auto vblank_wait_handler = [](CpuContext& ctx, MemoryManager& mem) {
-        ensure_unity_screen_resolution(mem);
-        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS VBlank
-        ctx.rax = SCE_OK;
-    };
-    register_symbol(0xCAF67BDEE414AAB9ULL, "sceGnmSubmitDone", "libSceGnm", vblank_wait_handler);
+    // sceGnmSubmitDone only tells the driver that the application finished
+    // submitting for this frame (TRC R4089); it does not wait for the GPU or
+    // for VBlank. Every submit already ran to completion synchronously.
+    register_symbol(0xCAF67BDEE414AAB9ULL, "sceGnmSubmitDone", "libSceGnm",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            ensure_unity_screen_resolution(mem);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceGnmSubmitCommandBuffers(count, dcbGpuAddrs, dcbSizes, ccbGpuAddrs, ccbSizes)
+    // NID: 0xCF0634615F754D32 (imported by eboot; was unregistered, so a
+    // submit without flip silently dropped its DCBs and their EOP interrupts).
+    register_symbol(0xCF0634615F754D32ULL, "sceGnmSubmitCommandBuffers", "libSceGnmDriver",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            execute_submitted_dcbs(mem, static_cast<u32>(ctx.rdi), ctx.rsi, ctx.rdx);
+            g_gnm_completed_label.fetch_add(1);
+            sync_gnm_label_slot(mem);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceGnmAreSubmitsAllowed() -> bool. NID: 0x6F4F0082D3E51CF8. Submits are
+    // only suspended while the system has the GPU (never, here); the unset
+    // stub's 0 meant "not allowed".
+    register_symbol(0x6F4F0082D3E51CF8ULL, "sceGnmAreSubmitsAllowed", "libSceGnmDriver",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 1; });
+
+    // sceGnmGetEqEventType(const SceKernelEvent* ev) -> event type (ev->data).
+    // NID: 0x528618D0358C0B45.
+    register_symbol(0x528618D0358C0B45ULL, "sceGnmGetEqEventType", "libSceGnmDriver",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            i64 data = 0;
+            if (ctx.rdi > 0x1000 && mem.is_valid_address(ctx.rdi + 0x10, sizeof(i64))) mem.read_value(ctx.rdi + 0x10, data);
+            ctx.rax = static_cast<u64>(data);
+        });
+
+    // sceGnmDeleteEqEvent(eq, id). NID: 0x3D54FE7EEA12F605.
+    register_symbol(0x3D54FE7EEA12F605ULL, "sceGnmDeleteEqEvent", "libSceGnmDriver",
+        [](CpuContext& ctx, MemoryManager&) {
+            const u32 eq_id = static_cast<u32>(ctx.rdi);
+            const i32 event_id = static_cast<i32>(ctx.rsi);
+            std::lock_guard<std::mutex> lock(s_gnm_eq_mtx);
+            std::erase_if(s_gnm_eq_subscriptions, [&](const GnmEqSubscription& sub) {
+                return sub.eq_id == eq_id && sub.event_id == event_id;
+            });
+            ctx.rax = SCE_OK;
+        });
+
+    // sceKernelGetEventFilter / sceKernelGetEventId(const SceKernelEvent* ev).
+    // NIDs 0xDB708F3C8D6DC816 / 0x989EDA8219A0BDF7 (both imported).
+    register_symbol(0xDB708F3C8D6DC816ULL, "sceKernelGetEventFilter", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            i16 filter = 0;
+            if (ctx.rdi > 0x1000 && mem.is_valid_address(ctx.rdi + 0x08, sizeof(i16))) mem.read_value(ctx.rdi + 0x08, filter);
+            ctx.rax = static_cast<u64>(static_cast<i64>(filter));
+        });
+    register_symbol(0x989EDA8219A0BDF7ULL, "sceKernelGetEventId", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            u64 ident = 0;
+            if (ctx.rdi > 0x1000 && mem.is_valid_address(ctx.rdi, sizeof(u64))) mem.read_value(ctx.rdi, ident);
+            ctx.rax = ident;
+        });
 
     // sceKernelGetProcessTimeCounter(void) -> monotonic microseconds (1MHz by
     // construction). The Frequency NID is unknown and was never called; absolute
@@ -5118,29 +5302,9 @@ void NidRegistry::register_default_libraries() {
                          count, (unsigned long long)dcb_addrs_ptr, (unsigned long long)dcb_sizes_ptr,
                          buffer_index, (unsigned long long)flip_arg);
 
-            if (g_pm4_translator && dcb_addrs_ptr != 0 && dcb_sizes_ptr != 0) {
-                g_pm4_translator->set_memory_manager(&mem);
-                for (u32 i = 0; i < count; ++i) {
-                    GuestAddr dcb_gpu_addr = 0;
-                    u32 dcb_size_bytes = 0;
-                    if (mem.is_valid_address(dcb_addrs_ptr + i * sizeof(GuestAddr), sizeof(GuestAddr))) {
-                        mem.read_value(dcb_addrs_ptr + i * sizeof(GuestAddr), dcb_gpu_addr);
-                    }
-                    if (mem.is_valid_address(dcb_sizes_ptr + i * sizeof(u32), sizeof(u32))) {
-                        mem.read_value(dcb_sizes_ptr + i * sizeof(u32), dcb_size_bytes);
-                    }
-
-                    if (dcb_gpu_addr > 0x1000 && dcb_size_bytes >= sizeof(u32) && mem.is_valid_address(dcb_gpu_addr, dcb_size_bytes)) {
-                        const usize pkts_in_dcb = g_pm4_translator->execute_command_buffer(dcb_gpu_addr, dcb_size_bytes);
-                        auto cc = g_pm4_translator->clear_color();
-                        std::fprintf(stderr, "[Gnm] Executed DCB #%u at 0x%llx (%u bytes, %zu pkts, total_draws=%zu, reg_writes=%zu, clear=(%.2f,%.2f,%.2f,%.2f))\n",
-                                     i, (unsigned long long)dcb_gpu_addr, dcb_size_bytes, pkts_in_dcb,
-                                     g_pm4_translator->draw_count(), g_pm4_translator->context_reg_writes(),
-                                     cc.r, cc.g, cc.b, cc.a);
-                    }
-                }
-            }
-
+            // The command processor runs the DCBs to completion here (labels
+            // written, EOP interrupts raised), then the flip is performed.
+            execute_submitted_dcbs(mem, count, dcb_addrs_ptr, dcb_sizes_ptr);
             g_gnm_completed_label.fetch_add(1);
             sync_gnm_label_slot(mem);
 
@@ -5153,10 +5317,11 @@ void NidRegistry::register_default_libraries() {
     // a full frame early. Real presentation lives in 0xC5BC... below.)
     // NID: 0x15ADF1EF938E2D10ULL
     register_symbol(0x15ADF1EF938E2D10ULL, "sceGnmEndWorkload", "libSceGnmDriver",
-        [trigger_gnm_eop_events](CpuContext& ctx, MemoryManager& mem) {
+        [](CpuContext& ctx, MemoryManager& mem) {
+            // No GPU work is retired here: EOP events come only from EOP
+            // packets that request an interrupt (see execute_submitted_dcbs).
             g_gnm_completed_label.fetch_add(1);
             sync_gnm_label_slot(mem);
-            trigger_gnm_eop_events();
             ctx.rax = SCE_OK;
         });
 

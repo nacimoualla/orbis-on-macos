@@ -40,6 +40,39 @@ int main() {
         std::cout << "  ✓ VHADDPS VEX map=1 opcode 0x7c verified\n";
     }
 
+    // VMOVLPS m64, xmm1 (VEX.128.0F 13 /r).  The VEX.vvvv field is reserved
+    // and VEX.L=1 is invalid for this 64-bit store form.
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x403100ULL;
+        const ps4::GuestAddr data_addr = 0x600000ULL;
+        const ps4::u8 code[] = {
+            0xC5, 0xF8, 0x13, 0x08, // vmovlps [rax], xmm1
+            0xF4
+        };
+        assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        cpu.context().rax = data_addr;
+        cpu.context().ymm[1].q[0] = 0x1122334455667788ULL;
+        cpu.context().ymm[1].q[1] = 0xAABBCCDDEEFF0011ULL;
+        assert(memory.write_value(data_addr, 0xDEADBEEFDEADBEEFULL));
+        cpu.set_entry_point(code_addr);
+        assert(cpu.step() == ps4::StepResult::Ok);
+        ps4::u64 stored = 0;
+        assert(memory.read_value(data_addr, stored));
+        assert(stored == 0x1122334455667788ULL);
+
+        const ps4::GuestAddr invalid_rip = cpu.context().rip;
+        const ps4::u8 invalid_256[] = {
+            0xC5, 0xFC, 0x13, 0x08 // VEX.L=1: invalid VMOVLPS encoding
+        };
+        assert(memory.write_bytes(invalid_rip, invalid_256, sizeof(invalid_256)));
+        assert(cpu.step() == ps4::StepResult::IllegalInstruction);
+        assert(cpu.context().rip == invalid_rip);
+        assert(memory.read_value(data_addr, stored));
+        assert(stored == 0x1122334455667788ULL);
+        std::cout << "  ✓ VMOVLPS VEX map=1 opcode 0x13 128-bit store and 256-bit rejection verified\n";
+    }
+
     // Test 1: Stack initialization
     {
         ps4::CpuExecutor cpu(memory, syscalls);

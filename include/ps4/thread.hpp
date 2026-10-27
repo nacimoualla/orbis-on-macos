@@ -45,6 +45,11 @@ struct SceKernelEvent {
     u64 udata{0};
 };
 
+// Orbis kqueue filters (SceKernelEvent::filter).
+constexpr i16 kEvFiltUser = -11;         // SCE_KERNEL_EVFILT_USER
+constexpr i16 kEvFiltVideoOut = -13;     // SCE_KERNEL_EVFILT_VIDEO_OUT
+constexpr i16 kEvFiltGraphicsCore = -14; // SCE_KERNEL_EVFILT_GRAPHICS_CORE
+
 struct Equeue {
     u32 id{0};
     std::string name{"equeue"};
@@ -194,7 +199,6 @@ public:
                      u64 timeout_usec = 0, bool has_timeout = false);
     bool equeue_trigger_user_event(u32 eq_id, i32 event_id, u64 udata);
     bool equeue_signal(u32 eq_id, const SceKernelEvent& ev);
-    void signal_flip_event(i64 flip_arg = 0);
 
 private:
     void dump_stall_snapshot(const char* tag) const;

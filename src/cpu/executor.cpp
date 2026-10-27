@@ -683,6 +683,9 @@ StepResult CpuExecutor::step() {
     thread_local GuestAddr s_rip_history[128] = {0};
     thread_local usize s_rip_hist_idx = 0;
 
+    // Record RIP for debugging
+    s_rip_history[s_rip_hist_idx++ % 128] = m_context.rip;
+
     if (m_context.rip < 0x20) {
         u64 ret_addr = 0;
         m_memory.read_value(m_context.rsp, ret_addr);
@@ -852,6 +855,55 @@ StepResult CpuExecutor::step() {
     }
 
     const GuestAddr start_rip = m_context.rip;
+
+    struct ExecHistoryEntry {
+        GuestAddr rip;
+        usize len;
+        u8 bytes[8];
+    };
+    static thread_local ExecHistoryEntry s_ring_hist[32] = {};
+    static thread_local usize s_ring_hist_idx = 0;
+
+    if ((raw_code[0] == 0xDB && raw_code[1] == 0xC5) || raw_code[0] == 0xCC || raw_code[0] == 0xF4) {
+        if (start_rip >= 0xf6d600 && start_rip <= 0xf6e000) {
+            std::fprintf(stderr, "\n[FAULT HIT] Opcode %02x %02x at RIP=0x%llx (TID %u)\n",
+                         raw_code[0], raw_code[1], (unsigned long long)start_rip, (unsigned)ps4::t_guest_tid);
+            std::fprintf(stderr, "[FAULT HIT] Last 16 instructions executed:\n");
+            for (int i = 16; i >= 1; --i) {
+                usize idx = (s_ring_hist_idx + 32 - i) % 32;
+                const auto& ent = s_ring_hist[idx];
+                std::fprintf(stderr, "  [%02d] RIP=0x%llx (len=%zu): %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                             17 - i, (unsigned long long)ent.rip, ent.len,
+                             ent.bytes[0], ent.bytes[1], ent.bytes[2], ent.bytes[3],
+                             ent.bytes[4], ent.bytes[5], ent.bytes[6], ent.bytes[7]);
+            }
+            std::fprintf(stderr, "[FAULT HIT] Memory dump [RIP-48 .. RIP+32]:\n");
+            for (GuestAddr addr = start_rip - 48; addr < start_rip + 32; addr += 16) {
+                u8 b[16] = {0};
+                m_memory.read_bytes(addr, b, 16);
+                std::fprintf(stderr, "  0x%llx: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                             (unsigned long long)addr,
+                             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                             b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+            }
+            std::fflush(stderr);
+        }
+    }
+
+    struct RingRecorder {
+        GuestAddr rip;
+        u8 bytes[8];
+        const GuestAddr& end_rip;
+        RingRecorder(GuestAddr r, const u8* c, const GuestAddr& er) : rip(r), end_rip(er) {
+            std::memcpy(bytes, c, 8);
+        }
+        ~RingRecorder() {
+            usize idx = s_ring_hist_idx++ % 32;
+            s_ring_hist[idx].rip = rip;
+            s_ring_hist[idx].len = (end_rip >= rip) ? (end_rip - rip) : 0;
+            std::memcpy(s_ring_hist[idx].bytes, bytes, 8);
+        }
+    } ring_recorder(start_rip, raw_code, m_context.rip);
     // ---- one-shot tracer: PS4_TRACE_AT=<guest_addr> ------------------------
     // Prints registers and the chain walk at the first execution of <addr>.
     // PS4_TRACE_ITER=N also re-dumps after N further hits.
@@ -1281,6 +1333,8 @@ StepResult CpuExecutor::step() {
             if (cursor + 1 >= 15) return StepResult::IllegalInstruction;
             const u8 b1 = raw_code[cursor++];
             vex_r = (b1 & 0x80) ? 0 : 1;
+            vex_x = 0;
+            vex_b = 0;
             vex_vvvv = (~(b1 >> 3)) & 0x0F;
             vex_l = (b1 & 4) != 0;
             vex_pp = b1 & 3;
@@ -1306,6 +1360,21 @@ StepResult CpuExecutor::step() {
         const u8 vex_op = raw_code[cursor++];
         g_vex_op = vex_op;
         const GuestAddr next_ip_base_vex = start_rip + cursor;
+
+        // VMOVLPS store (VEX.128.0F 13 /r, pp=0): copy the low 64 bits of the
+        // ModR/M.reg XMM register to memory.
+        // VMOVLPD store (VEX.128.0F 13 /r, pp=1): copy the low 64 bits of the
+        // ModR/M.reg XMM register to memory (double-precision variant).
+        // VEX.L=1 is invalid for both. vvvv is ignored (reserved).
+        if (vex_map == 1 && vex_op == 0x13) {
+            if (vex_l) return StepResult::IllegalInstruction;
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex,
+                                  vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid || m.is_reg) return StepResult::IllegalInstruction;
+            m_memory.write_value(m.mem_addr, m_context.ymm[m.reg_id & 15].q[0]);
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
 
         // VMOVUPS / VMOVUPD / VMOVSS / VMOVSD (0x10 load, 0x11 store)
         if (vex_op == 0x10) {
@@ -1643,6 +1712,245 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
+        // VPMULLD (map 2, op 0x40): multiply packed signed 32-bit integers
+        // VEX.128/256.66.0F38.WIG 40 /r -- NO imm8
+        if (vex_map == 2 && vex_op == 0x40) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            const usize count = vex_l ? 8 : 4;
+            for (usize i = 0; i < count; ++i) {
+                const i32 a = static_cast<i32>(m_context.ymm[src1].d[i]);
+                const i32 b = static_cast<i32>(src2.d[i]);
+                const i64 prod = static_cast<i64>(a) * static_cast<i64>(b);
+                m_context.ymm[dest].d[i] = static_cast<u32>(prod);
+            }
+            if (!vex_l) {
+                m_context.ymm[dest].q[2] = 0;
+                m_context.ymm[dest].q[3] = 0;
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // VPMOVZX (map 2, op 0x20..0x25) / VPMOVSX (map 2, op 0x30..0x35)
+        // 0x20/0x30: BW (byte to word)
+        // 0x21/0x31: BD (byte to dword)
+        // 0x22/0x32: BQ (byte to qword)
+        // 0x23/0x33: WD (word to dword)
+        // 0x24/0x34: WQ (word to qword)
+        // 0x25/0x35: DQ (dword to qword)
+        if (vex_map == 2 && ((vex_op >= 0x20 && vex_op <= 0x25) || (vex_op >= 0x30 && vex_op <= 0x35)) && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const bool is_signed = (vex_op >= 0x30);
+            const u8 op_type = vex_op & 0x0F;
+
+            usize src_bytes = 0;
+            switch (op_type) {
+                case 0: src_bytes = vex_l ? 16 : 8; break;
+                case 1: src_bytes = vex_l ? 8 : 4; break;
+                case 2: src_bytes = vex_l ? 4 : 2; break;
+                case 3: src_bytes = vex_l ? 16 : 8; break;
+                case 4: src_bytes = vex_l ? 8 : 4; break;
+                case 5: src_bytes = vex_l ? 16 : 8; break;
+            }
+
+            CpuContext::YmmReg src{};
+            if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src, src_bytes);
+
+            CpuContext::YmmReg res{};
+            switch (op_type) {
+                case 0: { // BW: byte to word
+                    const usize count = vex_l ? 16 : 8;
+                    for (usize i = 0; i < count; ++i) {
+                        res.w[i] = is_signed ? static_cast<u16>(static_cast<i16>(static_cast<i8>(src.b[i])))
+                                             : static_cast<u16>(src.b[i]);
+                    }
+                    break;
+                }
+                case 1: { // BD: byte to dword
+                    const usize count = vex_l ? 8 : 4;
+                    for (usize i = 0; i < count; ++i) {
+                        res.d[i] = is_signed ? static_cast<u32>(static_cast<i32>(static_cast<i8>(src.b[i])))
+                                             : static_cast<u32>(src.b[i]);
+                    }
+                    break;
+                }
+                case 2: { // BQ: byte to qword
+                    const usize count = vex_l ? 4 : 2;
+                    for (usize i = 0; i < count; ++i) {
+                        res.q[i] = is_signed ? static_cast<u64>(static_cast<i64>(static_cast<i8>(src.b[i])))
+                                             : static_cast<u64>(src.b[i]);
+                    }
+                    break;
+                }
+                case 3: { // WD: word to dword
+                    const usize count = vex_l ? 8 : 4;
+                    for (usize i = 0; i < count; ++i) {
+                        res.d[i] = is_signed ? static_cast<u32>(static_cast<i32>(static_cast<i16>(src.w[i])))
+                                             : static_cast<u32>(src.w[i]);
+                    }
+                    break;
+                }
+                case 4: { // WQ: word to qword
+                    const usize count = vex_l ? 4 : 2;
+                    for (usize i = 0; i < count; ++i) {
+                        res.q[i] = is_signed ? static_cast<u64>(static_cast<i64>(static_cast<i16>(src.w[i])))
+                                             : static_cast<u64>(src.w[i]);
+                    }
+                    break;
+                }
+                case 5: { // DQ: dword to qword
+                    const usize count = vex_l ? 4 : 2;
+                    for (usize i = 0; i < count; ++i) {
+                        res.q[i] = is_signed ? static_cast<u64>(static_cast<i64>(static_cast<i32>(src.d[i])))
+                                             : static_cast<u64>(src.d[i]);
+                    }
+                    break;
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // VPTEST (map 2, op 0x17): packed bit test
+        // VEX.128/256.66.0F38.W0 17 /r -- NO imm8
+        // Sets ZF = ((src1 & src2) == 0), CF = ((~src1 & src2) == 0)
+        if (vex_map == 2 && vex_op == 0x17 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            bool zf = true, cf = true;
+            const usize qwords = vex_l ? 4 : 2;
+            for (usize i = 0; i < qwords; ++i) {
+                u64 a = m_context.ymm[src1].q[i];
+                u64 b = src2.q[i];
+                if ((a & b) != 0) zf = false;
+                if ((a & ~b) != 0) cf = false;
+            }
+            m_context.rflags &= ~(CpuContext::FLAG_ZF | CpuContext::FLAG_CF);
+            if (zf) m_context.rflags |= CpuContext::FLAG_ZF;
+            if (cf) m_context.rflags |= CpuContext::FLAG_CF;
+
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // VDPPS (map 3, op 0x40): dot product of packed single-precision floats
+        // VEX.128/256.66.0F3A 40 /r ib -- HAS imm8
+        if (vex_map == 3 && vex_op == 0x40 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            const usize lanes = vex_l ? 2 : 1;
+            for (usize lane = 0; lane < lanes; ++lane) {
+                const usize base = lane * 4;
+                float sum = 0.0f;
+                for (usize i = 0; i < 4; ++i) {
+                    if (imm8 & (0x10u << i)) {
+                        sum += m_context.ymm[src1].f[base + i] * src2.f[base + i];
+                    }
+                }
+                for (usize i = 0; i < 4; ++i) {
+                    res.f[base + i] = (imm8 & (1u << i)) ? sum : 0.0f;
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VDPPD (map 3, op 0x41): dot product of packed double-precision floats
+        // VEX.128/256.66.0F3A 41 /r ib -- HAS imm8
+        if (vex_map == 3 && vex_op == 0x41 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            const usize lanes = vex_l ? 2 : 1;
+            for (usize lane = 0; lane < lanes; ++lane) {
+                const usize base = lane * 2;
+                double sum = 0.0;
+                for (usize i = 0; i < 2; ++i) {
+                    if (imm8 & (0x10u << i)) {
+                        sum += m_context.ymm[src1].df[base + i] * src2.df[base + i];
+                    }
+                }
+                for (usize i = 0; i < 2; ++i) {
+                    res.df[base + i] = (imm8 & (1u << i)) ? sum : 0.0;
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VMOVMSKPS / VMOVMSKPD (map 1, op 0x50): extract sign mask from packed FP
+        // pp=0: VMOVMSKPS (single), pp=1: VMOVMSKPD (double)
+        if (vex_op == 0x50) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid || !m.is_reg) return StepResult::IllegalInstruction;
+            const u8 dest_reg = m.reg_id & 15;
+            const u8 src = m.rm_id & 15;
+            u32 mask = 0;
+            if (vex_pp == 1) { // VMOVMSKPD: double (2 or 4 elements)
+                const usize count = vex_l ? 4 : 2;
+                for (usize i = 0; i < count; ++i) {
+                    u64 val = 0;
+                    std::memcpy(&val, &m_context.ymm[src].q[i], 8);
+                    if (static_cast<i64>(val) < 0) mask |= (1u << i);
+                }
+            } else { // VMOVMSKPS: single (4 or 8 elements)
+                const usize count = vex_l ? 8 : 4;
+                for (usize i = 0; i < count; ++i) {
+                    u32 val = 0;
+                    std::memcpy(&val, &m_context.ymm[src].d[i], 4);
+                    if (static_cast<i32>(val) < 0) mask |= (1u << i);
+                }
+            }
+            set_gpr32(m_context, dest_reg, mask);
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
         // VMOVD / VMOVQ (0x6E GPR -> Vector, 0x7E Vector -> GPR)
         if (vex_op == 0x6E) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
@@ -1666,6 +1974,208 @@ StepResult CpuExecutor::step() {
                 write_rm(m, m_context.ymm[src].q[0], 64);
             } else {
                 write_rm(m, m_context.ymm[src].d[0], 32);
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // VMOVQ xmm, xmm/m64 (VEX.128.F3.0F D6 /r) - map=1, op=0xD6, pp=1
+        if (vex_map == 1 && vex_op == 0xD6 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            if (m.is_reg) {
+                m_context.ymm[dest].q[0] = m_context.ymm[m.rm_id & 15].q[0];
+            } else {
+                u64 val = 0;
+                m_memory.read_value(m.mem_addr, val);
+                m_context.ymm[dest].q[0] = val;
+            }
+            // Clear upper bits for VEX.128
+            if (!vex_l) {
+                m_context.ymm[dest].q[1] = 0;
+                m_context.ymm[dest].q[2] = 0;
+                m_context.ymm[dest].q[3] = 0;
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // VMOVHPS store (VEX.128.0F 17 /r): copy the high 64 bits of the
+        // ModR/M.reg XMM register to memory (vex_pp=0 for PS, vex_pp=1 for PD).
+        // VEX.L=1 is invalid.
+        if (vex_map == 1 && vex_op == 0x17) {
+            if (vex_l) return StepResult::IllegalInstruction;
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex,
+                                  vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid || m.is_reg) return StepResult::IllegalInstruction;
+            m_memory.write_value(m.mem_addr, m_context.ymm[m.reg_id & 15].q[1]);
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // VMOVLPS load (VEX.128.0F 12 /r, pp=0 or 1): load 64 bits from memory to low 64 bits of dest
+        // vex_pp=0 && mod==3: VMOVHLPS xmm1, xmm2, xmm3 (dst.q[0]=src_rm.q[1], dst.q[1]=src_vvvv.q[1])
+        // vex_pp=2 (F3): VMOVSLDUP (duplicate even 32-bit floats)
+        // vex_pp=3 (F2): VMOVDDUP (duplicate low 64-bit qword in each lane)
+        if (vex_map == 1 && vex_op == 0x12) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex,
+                                  vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+
+            if (vex_pp == 2) { // VMOVSLDUP
+                CpuContext::YmmReg src{};
+                if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+                else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
+                const usize count = vex_l ? 4 : 2;
+                for (usize i = 0; i < count; ++i) {
+                    m_context.ymm[dest].f[i * 2] = src.f[i * 2];
+                    m_context.ymm[dest].f[i * 2 + 1] = src.f[i * 2];
+                }
+                if (!vex_l) {
+                    m_context.ymm[dest].q[2] = 0;
+                    m_context.ymm[dest].q[3] = 0;
+                }
+            } else if (vex_pp == 3) { // VMOVDDUP
+                CpuContext::YmmReg src{};
+                if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+                else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 8);
+                m_context.ymm[dest].q[0] = src.q[0];
+                m_context.ymm[dest].q[1] = src.q[0];
+                if (vex_l) {
+                    m_context.ymm[dest].q[2] = src.q[2];
+                    m_context.ymm[dest].q[3] = src.q[2];
+                } else {
+                    m_context.ymm[dest].q[2] = 0;
+                    m_context.ymm[dest].q[3] = 0;
+                }
+            } else { // vex_pp == 0 (PS) or 1 (PD)
+                if (vex_l) return StepResult::IllegalInstruction;
+                if (m.is_reg) {
+                    if (vex_pp != 0) return StepResult::IllegalInstruction;
+                    // VMOVHLPS: dst.q[0] = src_rm.q[1], dst.q[1] = src_vvvv.q[1]
+                    m_context.ymm[dest].q[0] = m_context.ymm[m.rm_id & 15].q[1];
+                    m_context.ymm[dest].q[1] = m_context.ymm[src1].q[1];
+                } else {
+                    u64 val = 0;
+                    m_memory.read_value(m.mem_addr, val);
+                    m_context.ymm[dest].q[0] = val;
+                    m_context.ymm[dest].q[1] = m_context.ymm[src1].q[1];
+                }
+                m_context.ymm[dest].q[2] = 0;
+                m_context.ymm[dest].q[3] = 0;
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // VMOVHPS load (VEX.128.0F 16 /r, pp=0 or 1): load 64 bits from memory to high 64 bits
+        // vex_pp=0 && mod==3: VMOVLHPS xmm1, xmm2, xmm3 (dst.q[0]=src_vvvv.q[0], dst.q[1]=src_rm.q[0])
+        // vex_pp=2 (F3): VMOVSHDUP (duplicate odd 32-bit floats)
+        if (vex_map == 1 && vex_op == 0x16) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex,
+                                  vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+
+            if (vex_pp == 2) { // VMOVSHDUP
+                CpuContext::YmmReg src{};
+                if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+                else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
+                const usize count = vex_l ? 4 : 2;
+                for (usize i = 0; i < count; ++i) {
+                    m_context.ymm[dest].f[i * 2] = src.f[i * 2 + 1];
+                    m_context.ymm[dest].f[i * 2 + 1] = src.f[i * 2 + 1];
+                }
+                if (!vex_l) {
+                    m_context.ymm[dest].q[2] = 0;
+                    m_context.ymm[dest].q[3] = 0;
+                }
+            } else { // vex_pp == 0 or 1
+                if (vex_l) return StepResult::IllegalInstruction;
+                if (m.is_reg) {
+                    if (vex_pp != 0) return StepResult::IllegalInstruction;
+                    // VMOVLHPS: dst.q[0] = src_vvvv.q[0], dst.q[1] = src_rm.q[0]
+                    m_context.ymm[dest].q[0] = m_context.ymm[src1].q[0];
+                    m_context.ymm[dest].q[1] = m_context.ymm[m.rm_id & 15].q[0];
+                } else {
+                    u64 val = 0;
+                    m_memory.read_value(m.mem_addr, val);
+                    m_context.ymm[dest].q[0] = m_context.ymm[src1].q[0];
+                    m_context.ymm[dest].q[1] = val;
+                }
+                m_context.ymm[dest].q[2] = 0;
+                m_context.ymm[dest].q[3] = 0;
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // VUNPCKLPS / VUNPCKLPD (map 1, op 0x14): unpack low packed single/double
+        // pp=0: VUNPCKLPS (single), pp=1: VUNPCKLPD (double)
+        if (vex_map == 1 && (vex_op == 0x14 || vex_op == 0x15)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            const bool is_pd = (vex_pp == 1);
+            const usize elements = is_pd ? (vex_l ? 4 : 2) : (vex_l ? 8 : 4);
+            const bool is_low = (vex_op == 0x14);
+
+            for (usize lane = 0; lane < (vex_l ? 2 : 1); ++lane) {
+                const usize base = lane * elements;
+                const usize src1_base = lane * elements;
+                const usize src2_base = lane * elements;
+                for (usize i = 0; i < elements; ++i) {
+                    const usize res_idx = base + i;
+                    if (is_low) {
+                        // UNPCKL: interleave low elements from src1 and src2
+                        if (i < elements / 2) {
+                            if (is_pd) {
+                                res.q[res_idx] = m_context.ymm[src1].q[src1_base + i];
+                            } else {
+                                res.d[res_idx] = m_context.ymm[src1].d[src1_base + i];
+                            }
+                        } else {
+                            const usize src2_idx = i - elements / 2;
+                            if (is_pd) {
+                                res.q[res_idx] = src2.q[src2_base + src2_idx];
+                            } else {
+                                res.d[res_idx] = src2.d[src2_base + src2_idx];
+                            }
+                        }
+                    } else {
+                        // UNPCKH: interleave high elements from src1 and src2
+                        if (i < elements / 2) {
+                            const usize src1_idx = elements / 2 + i;
+                            if (is_pd) {
+                                res.q[res_idx] = m_context.ymm[src1].q[src1_base + src1_idx];
+                            } else {
+                                res.d[res_idx] = m_context.ymm[src1].d[src1_base + src1_idx];
+                            }
+                        } else {
+                            const usize src2_idx = elements / 2 + i - elements / 2;
+                            if (is_pd) {
+                                res.q[res_idx] = src2.q[src2_base + elements / 2 + src2_idx];
+                            } else {
+                                res.d[res_idx] = src2.d[src2_base + elements / 2 + src2_idx];
+                            }
+                        }
+                    }
+                }
+            }
+            m_context.ymm[dest] = res;
+            if (!vex_l) {
+                m_context.ymm[dest].q[2] = 0;
+                m_context.ymm[dest].q[3] = 0;
             }
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
@@ -1923,8 +2433,10 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // 0x58 (VADD), 0x59 (VMUL), 0x5C (VSUB), 0x5E (VDIV)
-        if (vex_op == 0x58 || vex_op == 0x59 || vex_op == 0x5C || vex_op == 0x5E) {
+        // 0x51 (VSQRT), 0x52 (VRSQRT), 0x53 (VRCP), 0x58 (VADD), 0x59 (VMUL), 0x5C (VSUB), 0x5E (VDIV)
+        if (vex_op == 0x51 || vex_op == 0x52 || vex_op == 0x53 ||
+            vex_op == 0x58 || vex_op == 0x59 || vex_op == 0x5C || vex_op == 0x5D ||
+            vex_op == 0x5E || vex_op == 0x5F) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 dest = m.reg_id & 15;
@@ -1937,9 +2449,15 @@ StepResult CpuExecutor::step() {
                 float s1 = 0.0f, s2 = 0.0f;
                 std::memcpy(&s1, &m_context.ymm[src1].d[0], 4);
                 std::memcpy(&s2, &src2.d[0], 4);
-                float r = (vex_op == 0x58) ? (s1 + s2) :
+                float r = (vex_op == 0x51) ? std::sqrt(s2) :
+                          (vex_op == 0x52) ? (1.0f / std::sqrt(s2)) :
+                          (vex_op == 0x53) ? (1.0f / s2) :
+                          (vex_op == 0x58) ? (s1 + s2) :
                           (vex_op == 0x59) ? (s1 * s2) :
-                          (vex_op == 0x5C) ? (s1 - s2) : (s1 / s2);
+                          (vex_op == 0x5C) ? (s1 - s2) :
+                          (vex_op == 0x5D) ? ((s1 < s2) ? s1 : s2) : // VMINSS
+                          (vex_op == 0x5E) ? (s1 / s2) :
+                                             ((s1 > s2) ? s1 : s2); // VMAXSS (0x5F)
                 CpuContext::YmmReg res = m_context.ymm[src1];
                 std::memcpy(&res.d[0], &r, 4);
                 res.q[2] = 0; res.q[3] = 0;
@@ -1948,9 +2466,13 @@ StepResult CpuExecutor::step() {
                 double s1 = 0.0, s2 = 0.0;
                 std::memcpy(&s1, &m_context.ymm[src1].q[0], 8);
                 std::memcpy(&s2, &src2.q[0], 8);
-                double r = (vex_op == 0x58) ? (s1 + s2) :
+                double r = (vex_op == 0x51) ? std::sqrt(s2) :
+                           (vex_op == 0x58) ? (s1 + s2) :
                            (vex_op == 0x59) ? (s1 * s2) :
-                           (vex_op == 0x5C) ? (s1 - s2) : (s1 / s2);
+                           (vex_op == 0x5C) ? (s1 - s2) :
+                           (vex_op == 0x5D) ? ((s1 < s2) ? s1 : s2) : // VMINSD
+                           (vex_op == 0x5E) ? (s1 / s2) :
+                                             ((s1 > s2) ? s1 : s2); // VMAXSD (0x5F)
                 CpuContext::YmmReg res = m_context.ymm[src1];
                 std::memcpy(&res.q[0], &r, 8);
                 res.q[2] = 0; res.q[3] = 0;
@@ -1961,9 +2483,15 @@ StepResult CpuExecutor::step() {
                     float s1 = 0.0f, s2 = 0.0f;
                     std::memcpy(&s1, &m_context.ymm[src1].d[i], 4);
                     std::memcpy(&s2, &src2.d[i], 4);
-                    float r = (vex_op == 0x58) ? (s1 + s2) :
+                    float r = (vex_op == 0x51) ? std::sqrt(s2) :
+                              (vex_op == 0x52) ? (1.0f / std::sqrt(s2)) :
+                              (vex_op == 0x53) ? (1.0f / s2) :
+                              (vex_op == 0x58) ? (s1 + s2) :
                               (vex_op == 0x59) ? (s1 * s2) :
-                              (vex_op == 0x5C) ? (s1 - s2) : (s1 / s2);
+                              (vex_op == 0x5C) ? (s1 - s2) :
+                              (vex_op == 0x5D) ? ((s1 < s2) ? s1 : s2) : // VMINPS
+                              (vex_op == 0x5E) ? (s1 / s2) :
+                                                 ((s1 > s2) ? s1 : s2); // VMAXPS (0x5F)
                     std::memcpy(&m_context.ymm[dest].d[i], &r, 4);
                 }
                 if (!vex_l) { m_context.ymm[dest].q[2] = 0; m_context.ymm[dest].q[3] = 0; }
@@ -1973,9 +2501,13 @@ StepResult CpuExecutor::step() {
                     double s1 = 0.0, s2 = 0.0;
                     std::memcpy(&s1, &m_context.ymm[src1].q[i], 8);
                     std::memcpy(&s2, &src2.q[i], 8);
-                    double r = (vex_op == 0x58) ? (s1 + s2) :
+                    double r = (vex_op == 0x51) ? std::sqrt(s2) :
+                               (vex_op == 0x58) ? (s1 + s2) :
                               (vex_op == 0x59) ? (s1 * s2) :
-                              (vex_op == 0x5C) ? (s1 - s2) : (s1 / s2);
+                              (vex_op == 0x5C) ? (s1 - s2) :
+                              (vex_op == 0x5D) ? ((s1 < s2) ? s1 : s2) : // VMINPD
+                              (vex_op == 0x5E) ? (s1 / s2) :
+                                                 ((s1 > s2) ? s1 : s2); // VMAXPD (0x5F)
                     std::memcpy(&m_context.ymm[dest].q[i], &r, 8);
                 }
                 if (!vex_l) { m_context.ymm[dest].q[2] = 0; m_context.ymm[dest].q[3] = 0; }
@@ -1984,7 +2516,80 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // 0x2E (VUCOMISS), 0x2F (VCOMISS / VUCOMISD / VCOMISD)
+        // VPCMPGTQ (map 2, op 0x37, pp=1): compare packed qwords for greater than (signed)
+        if (vex_map == 2 && vex_op == 0x37 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            const usize count = vex_l ? 4 : 2;
+            for (usize i = 0; i < count; ++i) {
+                const i64 a = static_cast<i64>(m_context.ymm[src1].q[i]);
+                const i64 b = static_cast<i64>(src2.q[i]);
+                res.q[i] = (a > b) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+            }
+            m_context.ymm[dest] = res;
+            if (!vex_l) {
+                m_context.ymm[dest].q[2] = 0;
+                m_context.ymm[dest].q[3] = 0;
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // VPMINSB/VPMINSD/VPMINUW/VPMINUD / VPMAXSB/VPMAXSD/VPMAXUW/VPMAXUD (map 2, op 0x38-0x3F)
+        if (vex_map == 2 && vex_op >= 0x38 && vex_op <= 0x3F && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            if (vex_op == 0x38 || vex_op == 0x3C) { // PMINSB / PMAXSB (bytes)
+                const usize count = vex_l ? 32 : 16;
+                for (usize i = 0; i < count; ++i) {
+                    const i8 a = static_cast<i8>(m_context.ymm[src1].b[i]);
+                    const i8 b = static_cast<i8>(src2.b[i]);
+                    res.b[i] = (vex_op == 0x38) ? ((a < b) ? a : b) : ((a > b) ? a : b);
+                }
+            } else if (vex_op == 0x39 || vex_op == 0x3D) { // PMINSD / PMAXSD (dwords signed)
+                const usize count = vex_l ? 8 : 4;
+                for (usize i = 0; i < count; ++i) {
+                    const i32 a = static_cast<i32>(m_context.ymm[src1].d[i]);
+                    const i32 b = static_cast<i32>(src2.d[i]);
+                    res.d[i] = static_cast<u32>((vex_op == 0x39) ? ((a < b) ? a : b) : ((a > b) ? a : b));
+                }
+            } else if (vex_op == 0x3A || vex_op == 0x3E) { // PMINUW / PMAXUW (words unsigned)
+                const usize count = vex_l ? 16 : 8;
+                for (usize i = 0; i < count; ++i) {
+                    const u16 a = m_context.ymm[src1].w[i];
+                    const u16 b = src2.w[i];
+                    res.w[i] = (vex_op == 0x3A) ? ((a < b) ? a : b) : ((a > b) ? a : b);
+                }
+            } else { // 0x3B / 0x3F: PMINUD / PMAXUD (dwords unsigned)
+                const usize count = vex_l ? 8 : 4;
+                for (usize i = 0; i < count; ++i) {
+                    const u32 a = m_context.ymm[src1].d[i];
+                    const u32 b = src2.d[i];
+                    res.d[i] = (vex_op == 0x3B) ? ((a < b) ? a : b) : ((a > b) ? a : b);
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
         if (vex_op == 0x2E || vex_op == 0x2F) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
@@ -2056,7 +2661,265 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // 0x2C: VCVTTSS2SI (pp=2) / VCVTTSD2SI (pp=3)
+        // VPERMILPS (map 3, op 0x04, pp=1): permute in-lane single-precision
+        // VEX.128/256.66.0F3A 04 /r ib -- HAS imm8
+        if (vex_map == 3 && vex_op == 0x04 && (vex_pp == 1 || vex_pp == 0)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            CpuContext::YmmReg src{};
+            if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            const usize lanes = vex_l ? 2 : 1;
+            for (usize lane = 0; lane < lanes; ++lane) {
+                const usize base = lane * 4;
+                for (usize i = 0; i < 4; ++i) {
+                    const u8 sel = (imm8 >> (i * 2)) & 3;
+                    res.d[base + i] = src.d[base + sel];
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VPERMILPD (map 3, op 0x05, pp=1): permute in-lane double-precision
+        // VEX.128/256.66.0F3A 05 /r ib -- HAS imm8
+        if (vex_map == 3 && vex_op == 0x05 && (vex_pp == 1 || vex_pp == 0)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            CpuContext::YmmReg src{};
+            if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            const usize lanes = vex_l ? 2 : 1;
+            for (usize lane = 0; lane < lanes; ++lane) {
+                const usize base = lane * 2;
+                for (usize i = 0; i < 2; ++i) {
+                    const u8 sel = (imm8 >> i) & 1;
+                    res.q[base + i] = src.q[base + sel];
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VROUNDPS (map 3, op 0x08, pp=1): round packed single-precision floats
+        // VEX.128/256.66.0F3A 08 /r ib -- HAS imm8
+        if (vex_map == 3 && vex_op == 0x08 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            CpuContext::YmmReg src{};
+            if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
+
+            const u8 mode = (imm8 & 8) ? 0 : static_cast<u8>(imm8 & 3);
+            CpuContext::YmmReg res{};
+            const usize count = vex_l ? 8 : 4;
+            for (usize i = 0; i < count; ++i) {
+                switch (mode) {
+                    case 0: res.f[i] = std::nearbyint(src.f[i]); break;
+                    case 1: res.f[i] = std::floor(src.f[i]); break;
+                    case 2: res.f[i] = std::ceil(src.f[i]); break;
+                    case 3: default: res.f[i] = std::trunc(src.f[i]); break;
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VROUNDPD (map 3, op 0x09, pp=1): round packed double-precision floats
+        // VEX.128/256.66.0F3A 09 /r ib -- HAS imm8
+        if (vex_map == 3 && vex_op == 0x09 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            CpuContext::YmmReg src{};
+            if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
+
+            const u8 mode = (imm8 & 8) ? 0 : static_cast<u8>(imm8 & 3);
+            CpuContext::YmmReg res{};
+            const usize count = vex_l ? 4 : 2;
+            for (usize i = 0; i < count; ++i) {
+                switch (mode) {
+                    case 0: res.df[i] = std::nearbyint(src.df[i]); break;
+                    case 1: res.df[i] = std::floor(src.df[i]); break;
+                    case 2: res.df[i] = std::ceil(src.df[i]); break;
+                    case 3: default: res.df[i] = std::trunc(src.df[i]); break;
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VROUNDSS (map 3, op 0x0A, pp=1): round scalar single-precision float
+        // VEX.128.66.0F3A 0A /r ib -- HAS imm8
+        if (vex_map == 3 && vex_op == 0x0A && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            float in_val = 0.0f;
+            if (m.is_reg) in_val = m_context.ymm[m.rm_id & 15].f[0];
+            else m_memory.read_bytes(m.mem_addr, &in_val, 4);
+
+            const u8 mode = (imm8 & 8) ? 0 : static_cast<u8>(imm8 & 3);
+            CpuContext::YmmReg res = m_context.ymm[src1];
+            switch (mode) {
+                case 0: res.f[0] = std::nearbyint(in_val); break;
+                case 1: res.f[0] = std::floor(in_val); break;
+                case 2: res.f[0] = std::ceil(in_val); break;
+                case 3: default: res.f[0] = std::trunc(in_val); break;
+            }
+            res.q[2] = 0;
+            res.q[3] = 0;
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VROUNDSD (map 3, op 0x0B, pp=1): round scalar double-precision float
+        // VEX.128.66.0F3A 0B /r ib -- HAS imm8
+        if (vex_map == 3 && vex_op == 0x0B && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            double in_val = 0.0;
+            if (m.is_reg) in_val = m_context.ymm[m.rm_id & 15].df[0];
+            else m_memory.read_bytes(m.mem_addr, &in_val, 8);
+
+            const u8 mode = (imm8 & 8) ? 0 : static_cast<u8>(imm8 & 3);
+            CpuContext::YmmReg res = m_context.ymm[src1];
+            switch (mode) {
+                case 0: res.df[0] = std::nearbyint(in_val); break;
+                case 1: res.df[0] = std::floor(in_val); break;
+                case 2: res.df[0] = std::ceil(in_val); break;
+                case 3: default: res.df[0] = std::trunc(in_val); break;
+            }
+            res.q[2] = 0;
+            res.q[3] = 0;
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VPBLENDD (map 3, op 0x02, pp=1) & VBLENDPS (map 3, op 0x0C, pp=1)
+        // VEX.128/256.66.0F3A 02 / 0C /r ib -- HAS imm8
+        if (vex_map == 3 && (vex_op == 0x02 || vex_op == 0x0C) && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res = m_context.ymm[src1];
+            const usize count = vex_l ? 8 : 4;
+            for (usize i = 0; i < count; ++i) {
+                if (imm8 & (1u << i)) {
+                    res.d[i] = src2.d[i];
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VBLENDPD (map 3, op 0x0D, pp=1): blend packed 64-bit double floats using imm8 mask
+        // VEX.128/256.66.0F3A 0D /r ib -- HAS imm8
+        if (vex_map == 3 && vex_op == 0x0D && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res = m_context.ymm[src1];
+            const usize count = vex_l ? 4 : 2;
+            for (usize i = 0; i < count; ++i) {
+                if (imm8 & (1u << i)) {
+                    res.q[i] = src2.q[i];
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VPBLENDW (map 3, op 0x0E): blend packed 16-bit words using imm8 mask
+        // VEX.128/256.66.0F3A 0E /r ib -- HAS imm8
+        if (vex_map == 3 && vex_op == 0x0E && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            const usize count = vex_l ? 16 : 8;
+            for (usize i = 0; i < count; ++i) {
+                if (imm8 & (1u << i)) {
+                    m_context.ymm[dest].w[i] = src2.w[i];
+                } else {
+                    m_context.ymm[dest].w[i] = m_context.ymm[src1].w[i];
+                }
+            }
+            if (!vex_l) {
+                m_context.ymm[dest].q[2] = 0;
+                m_context.ymm[dest].q[3] = 0;
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // 0x2A: VCVTSI2SS (pp=2) / VCVTSI2SD (pp=3)
         if (vex_op == 0x2C) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
@@ -2077,27 +2940,104 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // 0x5A: VCVTSS2SD (pp=2) / VCVTSD2SS (pp=3)
-        if (vex_op == 0x5A) {
+        // 0x5A: VCVTPS2PD (pp=0) / VCVTPD2PS (pp=1) / VCVTSS2SD (pp=2) / VCVTSD2SS (pp=3)
+        if (vex_map == 1 && vex_op == 0x5A) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 dest = m.reg_id & 15;
             const u8 src1 = vex_vvvv & 15;
             CpuContext::YmmReg res = m_context.ymm[src1];
-            if (vex_pp == 3) { // VCVTSD2SS: double to float
+            if (vex_pp == 3) { // VCVTSD2SS: double to float (scalar)
                 double dval = 0.0;
                 if (m.is_reg) std::memcpy(&dval, &m_context.ymm[m.rm_id & 15].q[0], 8);
                 else m_memory.read_bytes(m.mem_addr, &dval, 8);
                 const float fval = static_cast<float>(dval);
                 std::memcpy(&res.d[0], &fval, 4);
-            } else { // VCVTSS2SD: float to double
+                res.q[2] = 0; res.q[3] = 0;
+            } else if (vex_pp == 2) { // VCVTSS2SD: float to double (scalar)
                 float fval = 0.0f;
                 if (m.is_reg) std::memcpy(&fval, &m_context.ymm[m.rm_id & 15].d[0], 4);
                 else m_memory.read_bytes(m.mem_addr, &fval, 4);
                 const double dval = static_cast<double>(fval);
                 std::memcpy(&res.q[0], &dval, 8);
+                res.q[2] = 0; res.q[3] = 0;
+            } else if (vex_pp == 0) { // VCVTPS2PD: packed float to double
+                CpuContext::YmmReg src{};
+                if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+                else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 16 : 8);
+                const usize count = vex_l ? 4 : 2;
+                for (usize i = 0; i < count; ++i) res.df[i] = static_cast<double>(src.f[i]);
+                if (!vex_l) { res.q[2] = 0; res.q[3] = 0; }
+            } else if (vex_pp == 1) { // VCVTPD2PS: packed double to float
+                CpuContext::YmmReg src{};
+                if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+                else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
+                const usize count = vex_l ? 4 : 2;
+                for (usize i = 0; i < count; ++i) res.f[i] = static_cast<float>(src.df[i]);
+                for (usize i = count; i < 8; ++i) res.d[i] = 0;
             }
-            res.q[2] = 0; res.q[3] = 0;
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // 0x5B: VCVTDQ2PS (pp=0) / VCVTPS2DQ (pp=1) / VCVTTPS2DQ (pp=2)
+        if (vex_map == 1 && vex_op == 0x5B) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            CpuContext::YmmReg src{};
+            if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            const usize count = vex_l ? 8 : 4;
+            if (vex_pp == 0) { // VCVTDQ2PS: dword to float
+                for (usize i = 0; i < count; ++i) {
+                    res.f[i] = static_cast<float>(static_cast<i32>(src.d[i]));
+                }
+            } else if (vex_pp == 1) { // VCVTPS2DQ: float to dword (round to nearest)
+                for (usize i = 0; i < count; ++i) {
+                    res.d[i] = static_cast<u32>(static_cast<i32>(std::nearbyint(src.f[i])));
+                }
+            } else if (vex_pp == 2) { // VCVTTPS2DQ: float to dword (truncate)
+                for (usize i = 0; i < count; ++i) {
+                    res.d[i] = static_cast<u32>(static_cast<i32>(std::trunc(src.f[i])));
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // 0xE6: VCVTTPD2DQ (pp=1) / VCVTDQ2PD (pp=2) / VCVTPD2DQ (pp=3)
+        if (vex_map == 1 && vex_op == 0xE6) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            CpuContext::YmmReg res{};
+            if (vex_pp == 2) { // VCVTDQ2PD: packed dword to double
+                CpuContext::YmmReg src{};
+                if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+                else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 16 : 8);
+                const usize count = vex_l ? 4 : 2;
+                for (usize i = 0; i < count; ++i) res.df[i] = static_cast<double>(static_cast<i32>(src.d[i]));
+                if (!vex_l) { res.q[2] = 0; res.q[3] = 0; }
+            } else { // VCVTTPD2DQ (pp=1, truncate) / VCVTPD2DQ (pp=3, round)
+                CpuContext::YmmReg src{};
+                if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+                else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
+                const usize count = vex_l ? 4 : 2;
+                for (usize i = 0; i < count; ++i) {
+                    res.d[i] = (vex_pp == 1) ? static_cast<u32>(static_cast<i32>(std::trunc(src.df[i])))
+                                             : static_cast<u32>(static_cast<i32>(std::nearbyint(src.df[i])));
+                }
+                for (usize i = count; i < 8; ++i) res.d[i] = 0;
+            }
             m_context.ymm[dest] = res;
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
@@ -2142,6 +3082,297 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
+        // VCMPPS / VCMPPD / VCMPSS / VCMPSD (map 1, op 0xC2): compare packed/scalar FP
+        // pp=0: VCMPPS (packed single), pp=1: VCMPPD (packed double)
+        // pp=2: VCMPSS (scalar single), pp=3: VCMPSD (scalar double)
+        if (vex_map == 1 && vex_op == 0xC2) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, (vex_pp >= 2) ? 8 : (vex_l ? 32 : 16));
+
+            CpuContext::YmmReg res{};
+            const bool is_pd = (vex_pp == 1);
+            const bool is_scalar = (vex_pp >= 2);
+            const usize count = is_scalar ? 1 : (is_pd ? (vex_l ? 4 : 2) : (vex_l ? 8 : 4));
+
+            for (usize i = 0; i < count; ++i) {
+                bool cmp_result = false;
+                if (is_pd) {
+                    double a = 0.0, b = 0.0;
+                    std::memcpy(&a, &m_context.ymm[src1].q[i], 8);
+                    std::memcpy(&b, &src2.q[i], 8);
+                    switch (imm8 & 0x1F) {
+                        case 0: cmp_result = (a == b); break;      // EQ
+                        case 1: cmp_result = (a < b); break;       // LT
+                        case 2: cmp_result = (a <= b); break;      // LE
+                        case 3: cmp_result = std::isnan(a) || std::isnan(b); break; // UNORD
+                        case 4: cmp_result = (a != b); break;      // NEQ
+                        case 5: cmp_result = (a >= b); break;      // NLT
+                        case 6: cmp_result = (a > b); break;       // NLE
+                        case 7: cmp_result = !(std::isnan(a) || std::isnan(b)); break; // ORD
+                        default: cmp_result = false;
+                    }
+                    res.q[i] = cmp_result ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                } else {
+                    float a = 0.0f, b = 0.0f;
+                    std::memcpy(&a, &m_context.ymm[src1].d[i], 4);
+                    std::memcpy(&b, &src2.d[i], 4);
+                    switch (imm8 & 0x1F) {
+                        case 0: cmp_result = (a == b); break;      // EQ
+                        case 1: cmp_result = (a < b); break;       // LT
+                        case 2: cmp_result = (a <= b); break;      // LE
+                        case 3: cmp_result = std::isnan(a) || std::isnan(b); break; // UNORD
+                        case 4: cmp_result = (a != b); break;      // NEQ
+                        case 5: cmp_result = (a >= b); break;      // NLT
+                        case 6: cmp_result = (a > b); break;       // NLE
+                        case 7: cmp_result = !(std::isnan(a) || std::isnan(b)); break; // ORD
+                        default: cmp_result = false;
+                    }
+                    res.d[i] = cmp_result ? 0xFFFFFFFFU : 0U;
+                }
+            }
+            if (is_scalar) {
+                // For scalar, preserve upper bits from src1
+                if (is_pd) {
+                    res.q[1] = m_context.ymm[src1].q[1];
+                    if (vex_l) { res.q[2] = m_context.ymm[src1].q[2]; res.q[3] = m_context.ymm[src1].q[3]; }
+                } else {
+                    res.d[1] = m_context.ymm[src1].d[1];
+                    res.d[2] = m_context.ymm[src1].d[2];
+                    res.d[3] = m_context.ymm[src1].d[3];
+                    if (vex_l) { res.q[2] = m_context.ymm[src1].q[2]; res.q[3] = m_context.ymm[src1].q[3]; }
+                }
+            } else if (!vex_l) {
+                res.q[2] = 0; res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VSHUFPS (map 1, op 0xC6, pp=0): shuffle packed single-precision floats
+        // VEX.128/256.0F C6 /r ib -- HAS imm8
+        if (vex_map == 1 && vex_op == 0xC6 && vex_pp == 0) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            const usize lanes = vex_l ? 2 : 1;
+            for (usize lane = 0; lane < lanes; ++lane) {
+                const usize base = lane * 4;
+                res.d[base + 0] = m_context.ymm[src1].d[base + ((imm8 >> 0) & 3)];
+                res.d[base + 1] = m_context.ymm[src1].d[base + ((imm8 >> 2) & 3)];
+                res.d[base + 2] = src2.d[base + ((imm8 >> 4) & 3)];
+                res.d[base + 3] = src2.d[base + ((imm8 >> 6) & 3)];
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VSHUFPD (map 1, op 0xC6, pp=1): shuffle packed double-precision floats
+        // VEX.128/256.66.0F C6 /r ib -- HAS imm8
+        if (vex_map == 1 && vex_op == 0xC6 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res{};
+            if (!vex_l) {
+                res.q[0] = m_context.ymm[src1].q[(imm8 >> 0) & 1];
+                res.q[1] = src2.q[(imm8 >> 1) & 1];
+                res.q[2] = 0;
+                res.q[3] = 0;
+            } else {
+                res.q[0] = m_context.ymm[src1].q[(imm8 >> 0) & 1];
+                res.q[1] = src2.q[(imm8 >> 1) & 1];
+                res.q[2] = m_context.ymm[src1].q[2 + ((imm8 >> 2) & 1)];
+                res.q[3] = src2.q[2 + ((imm8 >> 3) & 1)];
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VPEXTRW (map 1, op 0xC5, pp=1): extract word into GPR
+        // VEX.128.66.0F C5 /r ib -- HAS imm8
+        if (vex_map == 1 && vex_op == 0xC5 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            u16 val = 0;
+            if (m.is_reg) {
+                val = m_context.ymm[m.rm_id & 15].w[imm8 & 7];
+            } else {
+                CpuContext::YmmReg src{};
+                m_memory.read_bytes(m.mem_addr, &src, 16);
+                val = src.w[imm8 & 7];
+            }
+            set_gpr64(m_context, dest, static_cast<u64>(val));
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VBLENDVPS (map 3, op 0x4A, pp=1): blend packed singles using sign bits from mask reg
+        // VEX.128/256.66.0F3A 4A /r /is4 ib -- HAS imm8
+        // imm8[7:4] = mask_reg (YMM index)
+        if (vex_map == 3 && vex_op == 0x4A && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            const u8 mask_reg = (imm8 >> 4) & 0xF;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res = m_context.ymm[src1];
+            const usize count = vex_l ? 8 : 4;
+            for (usize i = 0; i < count; ++i) {
+                if (m_context.ymm[mask_reg].d[i] & 0x80000000U) { // High bit of each float
+                    res.f[i] = src2.f[i];
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VBLENDVPD (map 3, op 0x4B, pp=1): blend packed doubles using sign bits from mask reg
+        // VEX.128/256.66.0F3A 4B /r /is4 ib -- HAS imm8
+        // imm8[7:4] = mask_reg (YMM index)
+        if (vex_map == 3 && vex_op == 0x4B && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            const u8 mask_reg = (imm8 >> 4) & 0xF;
+            CpuContext::YmmReg src2{};
+            if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_l ? 32 : 16);
+
+            CpuContext::YmmReg res = m_context.ymm[src1];
+            const usize count = vex_l ? 4 : 2;
+            for (usize i = 0; i < count; ++i) {
+                if (m_context.ymm[mask_reg].q[i] & 0x8000000000000000ULL) { // High bit of each double
+                    res.f[i * 2] = src2.f[i * 2];
+                    res.f[i * 2 + 1] = src2.f[i * 2 + 1];
+                }
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VPINSRB (map 3, op 0x20, pp=1): insert byte from r/m8 into xmm at imm8 position
+        if (vex_map == 3 && vex_op == 0x20 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src = vex_vvvv & 15;
+            CpuContext::YmmReg res = m_context.ymm[src];
+            u8 val = 0;
+            if (m.is_reg) {
+                val = static_cast<u8>(get_gpr64(m_context, m.rm_id & 15));
+            } else {
+                m_memory.read_value(m.mem_addr, val);
+            }
+            res.b[imm8 & 15] = val;
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VPINSRW (map 1, op 0xC4, pp=1): insert word from r/m16 into xmm at imm8 position
+        if (vex_map == 1 && vex_op == 0xC4 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src = vex_vvvv & 15;
+            CpuContext::YmmReg res = m_context.ymm[src];
+            u16 val = 0;
+            if (m.is_reg) {
+                val = static_cast<u16>(get_gpr64(m_context, m.rm_id & 15));
+            } else {
+                m_memory.read_value(m.mem_addr, val);
+            }
+            res.w[imm8 & 7] = val;
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VINSERTPS (map 3, op 0x21, pp=1): insert single float from src2 into dest, zeroing specified elements
+        if (vex_map == 3 && vex_op == 0x21 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg res = m_context.ymm[src1];
+            u32 src_val = 0;
+            if (m.is_reg) {
+                const u8 count_s = (imm8 >> 6) & 3;
+                src_val = m_context.ymm[m.rm_id & 15].d[count_s];
+            } else {
+                m_memory.read_value(m.mem_addr, src_val);
+            }
+            const u8 count_d = (imm8 >> 4) & 3;
+            res.d[count_d] = src_val;
+            const u8 zmask = imm8 & 0x0F;
+            for (usize i = 0; i < 4; ++i) {
+                if (zmask & (1u << i)) {
+                    res.d[i] = 0;
+                }
+            }
+            res.q[2] = 0;
+            res.q[3] = 0;
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
         // VPEXTRB (0x14), VPEXTRW (0x15), VPEXTRD / VPEXTRQ (0x16)
         if (vex_map == 3 && (vex_op == 0x14 || vex_op == 0x15 || vex_op == 0x16)) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
@@ -2163,6 +3394,40 @@ StepResult CpuExecutor::step() {
                 const u8 val = m_context.ymm[src].b[imm8 & 15];
                 write_rm(m, val, 8);
             }
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VPINSRD / VPINSRQ (map 3, op 0x22, pp=1): insert dword/qword from r/m into xmm at imm8 position
+        if (vex_map == 3 && vex_op == 0x22 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 dest = m.reg_id & 15;
+            const u8 src1 = vex_vvvv & 15;
+            CpuContext::YmmReg res = m_context.ymm[src1];
+            if (vex_w) {
+                u64 val = 0;
+                if (m.is_reg) {
+                    val = get_gpr64(m_context, m.rm_id & 15);
+                } else {
+                    m_memory.read_value(m.mem_addr, val);
+                }
+                res.q[imm8 & 1] = val;
+            } else {
+                u32 val = 0;
+                if (m.is_reg) {
+                    val = static_cast<u32>(get_gpr64(m_context, m.rm_id & 15));
+                } else {
+                    m_memory.read_value(m.mem_addr, val);
+                }
+                res.d[imm8 & 3] = val;
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
             m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
             return StepResult::Ok;
         }
@@ -2261,9 +3526,12 @@ StepResult CpuExecutor::step() {
                 }
             }
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, extra_imm);
-            std::fprintf(stderr, "[CPU UNIMPL VEX] map=%u op=0x%02x at RIP=0x%llx\n",
+            std::fprintf(stderr, "[CPU UNIMPL VEX] map=%u op=0x%02x at RIP=0x%llx vex_l=%u vex_pp=%u vex_vvvv=%u tid=%u\n",
                          static_cast<unsigned>(vex_map), static_cast<unsigned>(vex_op),
-                         static_cast<unsigned long long>(start_rip));
+                         static_cast<unsigned long long>(start_rip),
+                         static_cast<unsigned>(vex_l), static_cast<unsigned>(vex_pp), static_cast<unsigned>(vex_vvvv),
+                         static_cast<unsigned>(ps4::t_guest_tid));
+            std::fflush(stderr);
             (void)m;
             return StepResult::IllegalInstruction;
         }
@@ -3885,6 +5153,38 @@ StepResult CpuExecutor::step() {
         return StepResult::Ok;
     }
 
+    // 0xE0: LOOPNE rel8 / LOOPNZ rel8
+    if (op0 == 0xE0) {
+        const i8 rel8 = static_cast<i8>(raw_code[cursor]);
+        const u64 cnt_reg = (m_context.rcx & 0xFFFFFFFFFFFFFFFFULL);
+        m_context.rcx = cnt_reg - 1;
+        const bool cond = (m_context.rflags & CpuContext::FLAG_ZF) == 0 && m_context.rcx != 0;
+        m_context.rip = (start_rip + cursor + 1) + (cond ? rel8 : 0);
+        return StepResult::Ok;
+    }
+
+    // 0xE1: LOOPE rel8 / LOOPZ rel8
+    if (op0 == 0xE1) {
+        const i8 rel8 = static_cast<i8>(raw_code[cursor]);
+        const u64 cnt_reg = (m_context.rcx & 0xFFFFFFFFFFFFFFFFULL);
+        m_context.rcx = cnt_reg - 1;
+        const bool cond = (m_context.rflags & CpuContext::FLAG_ZF) != 0 && m_context.rcx != 0;
+        m_context.rip = (start_rip + cursor + 1) + (cond ? rel8 : 0);
+        return StepResult::Ok;
+    }
+
+    // 0xE2: LOOP rel8
+    if (op0 == 0xE2) {
+        const i8 rel8 = static_cast<i8>(raw_code[cursor]);
+        const u64 cnt_reg = (m_context.rcx & 0xFFFFFFFFFFFFFFFFULL);
+        m_context.rcx = cnt_reg - 1;
+        const bool cond = m_context.rcx != 0;
+        m_context.rip = (start_rip + cursor + 1) + (cond ? rel8 : 0);
+        return StepResult::Ok;
+    }
+
+    // 0xEB: JMP rel8
+
     // 0xE9: JMP rel32
     if (op0 == 0xE9) {
         i32 rel32 = 0;
@@ -4102,6 +5402,13 @@ StepResult CpuExecutor::step() {
     // and 32-bit integer only), FBLD/FBSTP (m80 BCD), FCOMPP, FUCOMPP.
     if (op0 == 0xD8 || op0 == 0xD9 || op0 == 0xDA || op0 == 0xDB ||
         op0 == 0xDC || op0 == 0xDD || op0 == 0xDE || op0 == 0xDF) {
+        // Debug: track x87 instructions in the Mono runtime loop
+        if (start_rip >= 0xf6d600 && start_rip <= 0xf6d700) {
+            std::fprintf(stderr, "[CPU DEBUG x87] op0=0x%02x at RIP=0x%llx modrm=0x%02x mod=%u reg=%u rm=%u\n",
+                         static_cast<unsigned>(op0), static_cast<unsigned long long>(start_rip),
+                         static_cast<unsigned>(raw_code[cursor]), static_cast<unsigned>((raw_code[cursor]>>6)&3),
+                         static_cast<unsigned>((raw_code[cursor]>>3)&7), static_cast<unsigned>(raw_code[cursor]&7));
+        }
         // Decode the ModRM (and any SIB/disp) to get the operand address AND the
         // true instruction length. len must be advanced as the bytes are
         // consumed -- conflating "length" with "cursor" here silently truncated

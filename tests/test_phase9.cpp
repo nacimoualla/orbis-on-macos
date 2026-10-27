@@ -177,19 +177,41 @@ int main() {
         assert(thread_mgr.equeue_wait(eq, evs, 1));
         assert(evs.size() == 1);
         assert(evs[0].ident == 100);
-        assert(evs[0].filter == -1); // EVFILT_USER
+        assert(evs[0].filter == ps4::kEvFiltUser); // EVFILT_USER (-11)
         assert(evs[0].udata == 0xbeef);
 
-        // Signal flip event
-        thread_mgr.signal_flip_event(42);
+        // kqueue semantics: a knote that is re-triggered before it is consumed
+        // is updated in place, not queued twice. A VideoOut flip event packs
+        // flipArg[63:16] | count[15:12] | time[11:0]; the count accumulates.
+        ps4::SceKernelEvent flip{};
+        flip.ident = 0; // SCE_VIDEO_OUT_EVENT_FLIP
+        flip.filter = ps4::kEvFiltVideoOut;
+        flip.udata = 0x1234;
+        flip.data = static_cast<ps4::i64>((41ULL << 16) | (1ULL << 12));
+        assert(thread_mgr.equeue_signal(eq, flip));
+        flip.data = static_cast<ps4::i64>((42ULL << 16) | (1ULL << 12));
+        assert(thread_mgr.equeue_signal(eq, flip));
+        // A different knote (EOP, EVFILT_GRAPHICS_CORE) is a separate event.
+        ps4::SceKernelEvent eop{};
+        eop.ident = 0x40;
+        eop.filter = ps4::kEvFiltGraphicsCore;
+        eop.data = 0x40;
+        assert(thread_mgr.equeue_signal(eq, eop));
+        assert(thread_mgr.equeue_signal(eq, eop));
         evs.clear();
-        assert(thread_mgr.equeue_wait(eq, evs, 1));
-        assert(evs.size() == 1);
-        assert(evs[0].filter == 0);
-        assert(evs[0].data == 42);
+        assert(thread_mgr.equeue_wait(eq, evs, 8, 1000, true));
+        assert(evs.size() == 2);
+        assert(evs[0].filter == ps4::kEvFiltVideoOut && evs[0].ident == 0);
+        assert((static_cast<ps4::u64>(evs[0].data) >> 16) == 42);          // latest flipArg
+        assert(((static_cast<ps4::u64>(evs[0].data) >> 12) & 0xF) == 2);   // two flips
+        assert(evs[0].udata == 0x1234);
+        assert(evs[1].filter == ps4::kEvFiltGraphicsCore && evs[1].ident == 0x40);
+        // Consumed: nothing stale left to satisfy the next wait.
+        evs.clear();
+        assert(!thread_mgr.equeue_wait(eq, evs, 8, 1000, true));
 
         assert(thread_mgr.equeue_delete(eq));
-        std::cout << "  ✓ Test 7: Equeue create, timeout, trigger user event, flip signal, and delete verified\n";
+        std::cout << "  ✓ Test 7: Equeue create, timeout, trigger user event, knote coalescing, and delete verified\n";
     }
 
     // Test 8: Guest thread execution of x86-64 bytecode

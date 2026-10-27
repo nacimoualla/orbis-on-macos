@@ -100,6 +100,10 @@ public:
     [[nodiscard]] GuestAddr indirect_base_address() const noexcept;
     [[nodiscard]] GuestAddr last_dma_dst_address() const noexcept;
     [[nodiscard]] usize last_dma_size() const noexcept;
+    /// Command-processor state (VGT_PRIMITIVE_TYPE, NUM_INSTANCES, shadow register file)
+    [[nodiscard]] PrimitiveType primitive_type() const noexcept;
+    [[nodiscard]] u32 num_instances() const noexcept;
+    [[nodiscard]] u32 register_value(u32 abs_dword_reg) const noexcept;
 
     void set_index_base_address(GuestAddr addr) noexcept;
     void set_indirect_base_address(GuestAddr addr) noexcept;

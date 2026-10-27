@@ -5,6 +5,7 @@
 #include "ps4/pm4_translator.hpp"
 #include <cassert>
 #include <iostream>
+#include <vector>
 
 using namespace ps4;
 
@@ -66,7 +67,7 @@ void test_pm4_draw_index_2_packet_decoding() {
         0x1000,               // index_base_lo
         0x0000,               // index_base_hi
         3,                    // index count
-        static_cast<u32>(PrimitiveType::TriangleList) // topology
+        kDiSrcSelDma          // draw initiator (topology comes from VGT_PRIMITIVE_TYPE)
     };
 
     const u32 header_word = encode_pm4_type3_header(IT_DRAW_INDEX_2, 5);
@@ -195,7 +196,7 @@ void test_metal_3d_indexed_triangle_rendering() {
         static_cast<u32>(idx_addr & 0xFFFFFFFF),   // index base lo
         static_cast<u32>(idx_addr >> 32),          // index base hi
         3,                                          // count
-        static_cast<u32>(PrimitiveType::TriangleList) // initiator
+        kDiSrcSelDma                                // draw initiator
     });
 
     // Execute ring buffer
@@ -332,9 +333,11 @@ void test_pm4_type0_index_configuration() {
 
     Pm4Translator translator;
 
-    // Write to VGT_DMA_INDEX_TYPE_REG (0x029F) with 1 (UInt32)
+    // Type-0 packets address absolute dword registers:
+    // VGT_DMA_INDEX_TYPE = context base 0xA000 + 0x029F, value 1 (UInt32)
     const u32 type_val = 1;
-    const u32 type0_hdr1 = encode_pm4_type0_header(VGT_DMA_INDEX_TYPE_REG, 1);
+    const u32 type0_hdr1 = encode_pm4_type0_header(
+        static_cast<u16>(kPm4ContextRegBase + VGT_DMA_INDEX_TYPE_REG), 1);
     Pm4Packet pkt1{
         .header = decode_pm4_header(type0_hdr1),
         .payload = {type_val}
@@ -342,9 +345,10 @@ void test_pm4_type0_index_configuration() {
     assert(translator.execute_packet(pkt1));
     assert(translator.is_32bit_index() == true);
 
-    // Write to VGT_DMA_MAX_SIZE_REG (0x029E) with 32768
+    // VGT_DMA_MAX_SIZE = 0xA000 + 0x029E, value 32768
     const u32 max_val = 32768;
-    const u32 type0_hdr2 = encode_pm4_type0_header(VGT_DMA_MAX_SIZE_REG, 1);
+    const u32 type0_hdr2 = encode_pm4_type0_header(
+        static_cast<u16>(kPm4ContextRegBase + VGT_DMA_MAX_SIZE_REG), 1);
     Pm4Packet pkt2{
         .header = decode_pm4_header(type0_hdr2),
         .payload = {max_val}
@@ -423,7 +427,7 @@ void test_pm4_draw_index_indirect_execution() {
     const u32 draw_payload[] = {
         0,                                            // data_offset = 0
         0,                                            // SGPR offsets
-        static_cast<u32>(PrimitiveType::TriangleList) // topology
+        kDiSrcSelDma                                  // draw initiator
     };
     Pm4Packet draw_pkt{
         .header = decode_pm4_header(encode_pm4_type3_header(IT_DRAW_INDEX_INDIRECT, 3)),
@@ -451,7 +455,7 @@ void test_pm4_draw_index_indirect_execution() {
     dcb_data.push_back(encode_pm4_type3_header(IT_DRAW_INDEX_INDIRECT, 3));
     dcb_data.push_back(0); // data_offset
     dcb_data.push_back(0);
-    dcb_data.push_back(static_cast<u32>(PrimitiveType::TriangleList));
+    dcb_data.push_back(kDiSrcSelDma); // draw initiator
 
     memory.write_bytes(dcb_addr, dcb_data.data(), dcb_data.size() * sizeof(u32));
     const usize pkts = translator.execute_command_buffer(dcb_addr, dcb_data.size() * sizeof(u32));
@@ -756,6 +760,120 @@ void test_pm4_texture_cache_and_cross_resource_lru() {
     std::cout << "  -> Texture reuse, local invalidation, and LRU ordering passed!\n";
 }
 
+static bool run_pkt(Pm4Translator& t, u8 op, std::vector<u32> payload) {
+    Pm4Packet p{};
+    p.header = decode_pm4_header(encode_pm4_type3_header(op, static_cast<u16>(payload.size())));
+    p.payload = std::move(payload);
+    return t.execute_packet(p);
+}
+
+void test_pm4_cik_state_and_sync_packets() {
+    std::cout << "[Test 14.13] Testing CIK PM4 state/sync packet semantics...\n";
+
+    // Opcode table sanity: real CIK numbers, no aliases.
+    static_assert(IT_DRAW_INDEX_2 == 0x27 && IT_CONTEXT_CONTROL == 0x28 && IT_INDEX_TYPE == 0x2A);
+    static_assert(IT_DRAW_INDEX_INDIRECT == 0x25 && IT_DRAW_INDIRECT == 0x24 && IT_INDEX_BASE == 0x26);
+    static_assert(IT_EVENT_WRITE_EOP == 0x47 && IT_RELEASE_MEM == 0x49 && IT_SET_UCONFIG_REG == 0x79);
+    static_assert(IT_INDIRECT_BUFFER == 0x3F && IT_INDIRECT_BUFFER_CNST == 0x33 && IT_ACQUIRE_MEM == 0x58);
+
+    MemoryManager memory;
+    assert(memory.initialize());
+    Pm4Translator t;
+    t.set_memory_manager(&memory);
+
+    // INDEX_TYPE drives the index size used by indexed draws.
+    assert(run_pkt(t, IT_INDEX_TYPE, {1}));
+    assert(t.is_32bit_index());
+    assert(run_pkt(t, IT_INDEX_TYPE, {0}));
+    assert(!t.is_32bit_index());
+
+    // SET_UCONFIG_REG: VGT_PRIMITIVE_TYPE / VGT_INDEX_TYPE / VGT_NUM_INSTANCES.
+    assert(run_pkt(t, IT_SET_UCONFIG_REG, {UCONFIG_VGT_PRIMITIVE_TYPE, 0x11, 1}));
+    assert(t.primitive_type() == PrimitiveType::RectList);
+    assert(t.is_32bit_index());
+    assert(t.register_value(kPm4UconfigRegBase + UCONFIG_VGT_PRIMITIVE_TYPE) == 0x11);
+    assert(run_pkt(t, IT_NUM_INSTANCES, {3}));
+    assert(t.num_instances() == 3);
+
+    // CONTEXT_CONTROL is the real 2-dword packet.
+    assert(run_pkt(t, IT_CONTEXT_CONTROL, {0x80000000u, 0x80000000u}));
+
+    // EVENT_WRITE_EOP: 32-bit and 64-bit label writes at the decoded address.
+    const GuestAddr label = 0x210000;
+    memory.write_value<u64>(label, 0);
+    assert(run_pkt(t, IT_EVENT_WRITE_EOP, {0x504u | 0x28u, static_cast<u32>(label), (1u << 29), 0xCAFEu, 0xFFFFu}));
+    u64 v64 = 0;
+    memory.read_value(label, v64);
+    assert(v64 == 0xCAFEu);
+    assert(run_pkt(t, IT_EVENT_WRITE_EOP, {0x504u | 0x28u, static_cast<u32>(label), (2u << 29), 0x1u, 0x2u}));
+    memory.read_value(label, v64);
+    assert(v64 == 0x200000001ull);
+
+    // RELEASE_MEM (0x49) uses the 6-dword CIK layout.
+    assert(run_pkt(t, IT_RELEASE_MEM, {0x28u, (1u << 29), static_cast<u32>(label), 0, 0x77u, 0}));
+    u32 v32 = 0;
+    memory.read_value(label, v32);
+    assert(v32 == 0x77u);
+
+    // WAIT_REG_MEM on an already-satisfied label must not modify memory.
+    assert(run_pkt(t, IT_WAIT_REG_MEM, {0x13u, static_cast<u32>(label), 0, 0x77u, 0xFFFFFFFFu, 10}));
+    memory.read_value(label, v32);
+    assert(v32 == 0x77u);
+
+    // WRITE_DATA to memory and to a register.
+    assert(run_pkt(t, IT_WRITE_DATA, {(5u << 8), static_cast<u32>(label), 0, 0xAAu, 0xBBu}));
+    memory.read_value(label + 4, v32);
+    assert(v32 == 0xBBu);
+    assert(run_pkt(t, IT_WRITE_DATA, {(0u << 8), kPm4UconfigRegBase + UCONFIG_VGT_PRIMITIVE_TYPE, 0, 0x6u}));
+    assert(t.primitive_type() == PrimitiveType::TriangleStrip);
+
+    // DMA_DATA into register space (DAS=1, DAIC=1) must not touch guest memory
+    // at the register's byte address (Gnm L2-prefetch idiom).
+    const GuestAddr src = 0x220000;
+    const u32 src_words[4] = {1, 2, 3, 4};
+    memory.write_bytes(src, src_words, sizeof(src_words));
+    memory.write_value<u32>(0x3022C, 0xDEADBEEFu);
+    assert(run_pkt(t, IT_DMA_DATA, {0x60000000u, static_cast<u32>(src), 0, 0x3022Cu, 0,
+                                    (1u << 21) | (1u << 27) | (1u << 29) | 16u}));
+    memory.read_value(GuestAddr{0x3022C}, v32);
+    assert(v32 == 0xDEADBEEFu);
+    assert(t.register_value(0x3022C >> 2) == 4u);
+
+    // COPY_DATA immediate -> memory (64-bit).
+    assert(run_pkt(t, IT_COPY_DATA, {5u | (1u << 8) | (1u << 16), 0x11u, 0x22u, static_cast<u32>(label), 0}));
+    memory.read_value(label, v64);
+    assert(v64 == 0x2200000011ull);
+
+    // ACQUIRE_MEM (6 dwords) is a handled cache-coherency packet.
+    assert(run_pkt(t, IT_ACQUIRE_MEM, {0x88c40000u, 0xFFFFFFFFu, 0, 0, 0, 10}));
+
+    // INDIRECT_BUFFER executes the referenced stream; COND_EXEC skips when 0.
+    const GuestAddr ib = 0x230000;
+    const GuestAddr flag = 0x231000;
+    memory.write_value<u32>(flag, 0);
+    std::vector<u32> ib_words = {
+        encode_pm4_type3_header(IT_COND_EXEC, 4), static_cast<u32>(flag), 0, 0, 3,
+        encode_pm4_type3_header(IT_INDEX_TYPE, 1), 1,   // skipped (2 dwords)
+        encode_pm4_type2_nop(),                         // skipped (1 dword)
+        encode_pm4_type3_header(IT_NUM_INSTANCES, 1), 7,
+    };
+    memory.write_bytes(ib, ib_words.data(), ib_words.size() * 4);
+    assert(run_pkt(t, IT_INDEX_TYPE, {0}));
+    assert(run_pkt(t, IT_INDIRECT_BUFFER, {static_cast<u32>(ib), 0, static_cast<u32>(ib_words.size())}));
+    assert(!t.is_32bit_index());
+    assert(t.num_instances() == 7);
+
+    // Constant-engine RAM round trip.
+    assert(run_pkt(t, IT_WRITE_CONST_RAM, {0x100, 0x12345678u, 0x9ABCDEF0u}));
+    assert(run_pkt(t, IT_DUMP_CONST_RAM, {0x100, 2, static_cast<u32>(label), 0}));
+    memory.read_value(label, v64);
+    assert(v64 == 0x9ABCDEF012345678ull);
+
+    assert(t.unsupported_packet_count() == 0);
+    assert(t.malformed_packet_count() == 0);
+    std::cout << "  -> CIK state/sync packet semantics passed!\n";
+}
+
 int main() {
     std::cout << "=== Phase 14: 3D Graphics Mesh Pipeline & Sample Demo Tests ===\n";
 
@@ -772,6 +890,7 @@ int main() {
     test_pm4_guest_resource_cache_and_invalidation();
     test_pm4_texture_cache_and_cross_resource_lru();
     test_pm4_rejects_malformed_and_unsupported_packets();
+    test_pm4_cik_state_and_sync_packets();
 
     std::cout << "=== All Phase 14 tests passed successfully! ===\n";
     return 0;

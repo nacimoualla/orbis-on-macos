@@ -52,6 +52,9 @@ add_library(ps4_core
     src/gpu/display_window.mm
     src/gpu/gpu_ring_buffer.cpp
     src/gpu/pm4_translator.mm
+    src/gpu/gcn_decoder.cpp
+    src/gpu/gcn_to_msl.cpp
+    src/gpu/gcn_pipeline.mm
     src/audio/audio_manager.cpp
     src/audio/coreaudio_backend.mm
     src/hle/nid_registry.cpp
@@ -70,6 +73,7 @@ target_link_libraries(ps4_core PUBLIC
 set_source_files_properties(src/gpu/metal_backend.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/gpu/display_window.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/gpu/pm4_translator.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+set_source_files_properties(src/gpu/gcn_pipeline.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/audio/coreaudio_backend.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/gui/game_library_gui.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
@@ -146,6 +150,13 @@ add_executable(test_flappy_gpu tests/test_flappy_gpu.cpp)
 target_link_libraries(test_flappy_gpu PRIVATE ps4_core)
 target_compile_definitions(test_flappy_gpu PRIVATE CMAKE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME Flappy_GpuSmoke COMMAND test_flappy_gpu)
+
+# Phase 19: GCN -> MSL translation of Flappy's real shaders, compiled and
+# rendered with Metal.
+add_executable(test_gcn_shader tests/test_gcn_shader.mm)
+target_link_libraries(test_gcn_shader PRIVATE ps4_core)
+set_source_files_properties(tests/test_gcn_shader.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+add_test(NAME Phase19_GcnShader COMMAND test_gcn_shader)
 set_tests_properties(Flappy_GpuSmoke PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 

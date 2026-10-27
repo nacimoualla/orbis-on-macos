@@ -758,7 +758,7 @@ bool ThreadManager::equeue_wait(u32 eq_id, std::vector<SceKernelEvent>& out_even
 bool ThreadManager::equeue_trigger_user_event(u32 eq_id, i32 event_id, u64 udata) {
     SceKernelEvent ev{};
     ev.ident = static_cast<u64>(event_id);
-    ev.filter = -1; // EVFILT_USER
+    ev.filter = kEvFiltUser;
     ev.flags = 0;
     ev.fflags = 0;
     ev.data = 0;
@@ -766,6 +766,15 @@ bool ThreadManager::equeue_trigger_user_event(u32 eq_id, i32 event_id, u64 udata
     return equeue_signal(eq_id, ev);
 }
 
+// kqueue semantics: an equeue holds at most one pending event per registered
+// (ident, filter) knote. Re-triggering a knote that has not been consumed yet
+// updates it in place instead of queueing a duplicate, so a producer that runs
+// ahead of its consumer (flips, EOP interrupts) cannot build an unbounded
+// backlog that later satisfies waits for events that are long stale.
+//
+// EVFILT_VIDEO_OUT carries packed data (as decoded by sceVideoOutGetEventData /
+// sceVideoOutGetEventCount): bits [11:0] time, [15:12] trigger count since the
+// event was last consumed (saturating at 15), [63:16] flipArg.
 bool ThreadManager::equeue_signal(u32 eq_id, const SceKernelEvent& ev) {
     std::shared_ptr<Equeue> eq;
     {
@@ -775,26 +784,24 @@ bool ThreadManager::equeue_signal(u32 eq_id, const SceKernelEvent& ev) {
         eq = it->second;
     }
     std::lock_guard<std::mutex> lock(eq->mutex);
-    eq->events.push_back(ev);
-    eq->cv.notify_one();
-    return true;
-}
-
-void ThreadManager::signal_flip_event(i64 flip_arg) {
-    std::lock_guard<std::mutex> lock(m_equeues_mutex);
-    for (auto& [id, eq] : m_equeues) {
-        if (!eq || eq->deleted) continue;
-        std::lock_guard<std::mutex> eq_lock(eq->mutex);
-        SceKernelEvent ev{};
-        ev.ident = 1;
-        ev.filter = 0;
-        ev.flags = 0;
-        ev.fflags = 0;
-        ev.data = flip_arg;
-        ev.udata = 0;
-        eq->events.push_back(ev);
+    if (eq->deleted) return false;
+    for (auto& pending : eq->events) {
+        if (pending.ident != ev.ident || pending.filter != ev.filter) continue;
+        if (ev.filter == kEvFiltVideoOut) {
+            const u64 old_count = (static_cast<u64>(pending.data) >> 12) & 0xF;
+            const u64 count = old_count < 0xF ? old_count + 1 : 0xF;
+            pending.data = static_cast<i64>((static_cast<u64>(ev.data) & ~0xF000ULL) | (count << 12));
+        } else {
+            pending.data = ev.data;
+        }
+        pending.fflags |= ev.fflags;
+        pending.udata = ev.udata;
         eq->cv.notify_all();
+        return true;
     }
+    eq->events.push_back(ev);
+    eq->cv.notify_all();
+    return true;
 }
 
 } // namespace ps4

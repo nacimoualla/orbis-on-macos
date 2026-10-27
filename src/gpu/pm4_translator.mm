@@ -2,6 +2,8 @@
 #include <simd/simd.h>
 #include "ps4/memory.hpp"
 #include "ps4/pm4_translator.hpp"
+#include "ps4/gcn_pipeline.hpp"
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -67,6 +69,16 @@ struct Pm4Translator::Impl {
     usize last_dma_size{0};
     bool last_dma_is_copy_or_nonzero{false};
     u32 num_instances{1};
+    // PM4 command-processor state (owned by execute_packet).
+    // Shadow of the GPU register file, indexed by absolute dword register
+    // address (config 0x2000.., SH 0x2C00.., context 0xA000.., uconfig 0xC000..).
+    std::vector<u32> reg_file = std::vector<u32>(0x10000, 0);
+    // Constant-engine RAM (48 KiB on CIK) for LOAD/WRITE/DUMP_CONST_RAM.
+    std::vector<u8> ce_ram = std::vector<u8>(48 * 1024, 0);
+    // Dwords the stream walker must skip (COND_EXEC / PRED_EXEC false).
+    usize pending_skip_dwords{0};
+    // Nesting depth of INDIRECT_BUFFER execution (guards runaway recursion).
+    u32 ib_depth{0};
 
     GuestAddr vs_shader_addr{0};
     u32 vs_pgm_lo{0};
@@ -167,6 +179,15 @@ struct Pm4Translator::Impl {
     u32 vs_user_sgprs[16]{};
     GuestAddr last_idx_addr{0};
     u32 last_idx_count{0};
+
+    // Phase 19: translated GCN shader path (gcn_pipeline.mm). User SGPRs and
+    // context state are read from reg_file; the fixed mesh shader below
+    // remains the fallback when a shader or state is unsupported.
+    std::unique_ptr<GcnPipelineCache> gcn_cache;
+    bool gcn_enabled{GcnPipelineCache::enabled_by_env()};
+    bool try_gcn_draw(bool indexed, u32 count, GuestAddr idx_addr, MTLIndexType idx_type,
+                      PrimitiveType prim_type, i32 base_vertex, u32 instance_count);
+    void apply_viewport_scissor(id<MTLRenderCommandEncoder> enc);
 
     bool init_mesh_pipeline();
     id<MTLRenderPipelineState> pipeline_for_current_shader();
@@ -1004,6 +1025,70 @@ void Pm4Translator::Impl::log_draw_diagnostics(const char* draw_type, u32 count,
     std::fprintf(stderr, "========================================================\n\n");
 }
 
+void Pm4Translator::Impl::apply_viewport_scissor(id<MTLRenderCommandEncoder> enc) {
+    const u32 fb_w = metal->width() > 0 ? metal->width() : 1920;
+    const u32 fb_h = metal->height() > 0 ? metal->height() : 1080;
+    const f32 origin_x = (viewport.width > 0.0f && viewport.x >= (viewport.width / 2.0f))
+                             ? (viewport.x - (viewport.width / 2.0f)) : viewport.x;
+    const f32 origin_y = (viewport.height > 0.0f && viewport.y >= (viewport.height / 2.0f))
+                             ? (viewport.y - (viewport.height / 2.0f)) : viewport.y;
+    [enc setViewport:MTLViewport{
+        .originX = origin_x,
+        .originY = origin_y,
+        .width = viewport.width > 0.0f ? std::min<f32>(viewport.width, static_cast<f32>(fb_w)) : static_cast<f32>(fb_w),
+        .height = viewport.height > 0.0f ? std::min<f32>(viewport.height, static_cast<f32>(fb_h)) : static_cast<f32>(fb_h),
+        .znear = viewport.min_depth,
+        .zfar = viewport.max_depth
+    }];
+    const u32 sc_x = std::min<u32>(scissor.x, fb_w - 1);
+    const u32 sc_y = std::min<u32>(scissor.y, fb_h - 1);
+    const u32 sc_w = (scissor.width > 0 && sc_x + scissor.width <= fb_w) ? scissor.width : (fb_w - sc_x);
+    const u32 sc_h = (scissor.height > 0 && sc_y + scissor.height <= fb_h) ? scissor.height : (fb_h - sc_y);
+    [enc setScissorRect:MTLScissorRect{.x = sc_x, .y = sc_y, .width = sc_w, .height = sc_h}];
+}
+
+// Phase 19: draw with the game's own GCN shaders translated to MSL. Returns
+// false (nothing encoded) when the translated path is disabled or anything
+// is unsupported, so the caller falls through to the fixed mesh shader.
+bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_addr, MTLIndexType idx_type,
+                                       PrimitiveType prim_type, i32 base_vertex, u32 instance_count) {
+    if (!gcn_enabled || !memory || !metal || vs_shader_addr <= 0x1000 || ps_shader_addr <= 0x1000) return false;
+    @autoreleasepool {
+        if (!gcn_cache) gcn_cache = std::make_unique<GcnPipelineCache>(metal->raw_device(), memory);
+        gcn_cache->set_memory(memory);
+        if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
+        id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
+        id<MTLTexture> fb = (__bridge id<MTLTexture>)metal->raw_framebuffer();
+        if (!enc || !fb) return false;
+        GcnDrawRequest req;
+        req.vs_addr = vs_shader_addr;
+        req.ps_addr = ps_shader_addr;
+        req.vs_rsrc2 = vs_rsrc2;
+        req.ps_rsrc2 = ps_rsrc2;
+        // SPI_SHADER_USER_DATA_PS_0 = SH 0x0C, SPI_SHADER_USER_DATA_VS_0 = SH 0x4C.
+        req.vs_user = reg_file.data() + kPm4ShRegBase + 0x4C;
+        req.ps_user = reg_file.data() + kPm4ShRegBase + 0x0C;
+        req.ctx_regs = reg_file.data() + kPm4ContextRegBase;
+        req.ctx_reg_count = kPm4UconfigRegBase - kPm4ContextRegBase;
+        req.prim = prim_type;
+        req.indexed = indexed;
+        req.count = count;
+        req.index_addr = idx_addr;
+        req.index32 = idx_type == MTLIndexTypeUInt32;
+        req.base_vertex = base_vertex;
+        req.instances = instance_count;
+        apply_viewport_scissor(enc);
+        std::string why;
+        if (!gcn_cache->encode_draw((__bridge void*)enc, static_cast<u32>(fb.pixelFormat), req, &why)) return false;
+        if (draw_diagnostics_enabled) {
+            std::fprintf(stderr, "[GCN] draw #%zu %s count=%u prim=%u VS=0x%llx PS=0x%llx (translated)\n",
+                         draw_count + 1, indexed ? "indexed" : "auto", count, static_cast<u32>(prim_type),
+                         (unsigned long long)vs_shader_addr, (unsigned long long)ps_shader_addr);
+        }
+        return true;
+    }
+}
+
 bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count, PrimitiveType prim_type,
                                               MTLIndexType idx_type, i32 base_vertex, u32 instance_count) {
     last_idx_addr = idx_addr;
@@ -1018,6 +1103,15 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
     if (!metal->frame_in_progress()) {
         std::fprintf(stderr, "[PM4] draw outside frame\n");
         return false;
+    }
+
+    if (try_gcn_draw(true, idx_count, idx_addr, idx_type, prim_type, base_vertex, instance_count)) {
+        draw_count++;
+        indexed_draw_count++;
+        frame_stats.draws++;
+        frame_stats.indexed_draws++;
+        frame_draw_encoded = true;
+        return true;
     }
 
     @autoreleasepool {
@@ -1226,6 +1320,18 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         std::fprintf(stderr, "[PM4] draw outside frame\n");
         return false;
     }
+
+    if (try_gcn_draw(false, vtx_count, 0, MTLIndexTypeUInt16, prim_type, base_vertex, instance_count)) {
+        draw_count++;
+        frame_stats.draws++;
+        frame_draw_encoded = true;
+        return true;
+    }
+    // Fixed-shader fallback has no RectList/QuadList lowering for guest
+    // vertices: keep the pre-VGT_PRIMITIVE_TYPE behaviour (a single quad as a
+    // 4-vertex strip, a rect as a plain triangle).
+    if (prim_type == PrimitiveType::QuadList && vtx_count == 4) prim_type = PrimitiveType::TriangleStrip;
+    if (prim_type == PrimitiveType::RectList) prim_type = PrimitiveType::TriangleList;
 
     @autoreleasepool {
         id<MTLRenderPipelineState> pipeline = pipeline_for_current_shader();
@@ -1467,7 +1573,39 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
     if (!m_impl->metal) return true;
     if (!m_impl->metal->frame_in_progress()) return false;
     m_impl->metal->end_render_encoder();
-    const bool submitted = m_impl->metal->submit_frame(wait_for_completion);
+    // PS4_GPU_READBACK=1: wait for frames that drew and log the framebuffer
+    // centre (diagnostic for comparing the GCN path with the fixed shader).
+    static const bool readback = std::getenv("PS4_GPU_READBACK") != nullptr;
+    const bool drew = m_impl->frame_draw_encoded;
+    const bool submitted = m_impl->metal->submit_frame(wait_for_completion || (readback && drew));
+    if (readback && drew && submitted) {
+        u8 r = 0, g = 0, b = 0, a = 0;
+        const u32 w = m_impl->metal->width(), h = m_impl->metal->height();
+        m_impl->metal->read_pixel(w / 2, h / 2, r, g, b, a);
+        u8 r2 = 0, g2 = 0, b2 = 0, a2 = 0;
+        m_impl->metal->read_pixel(w / 4, h / 4, r2, g2, b2, a2);
+        std::fprintf(stderr, "[GPU readback] frame %llu: center RGBA(%u,%u,%u,%u) quarter RGBA(%u,%u,%u,%u) (gcn %s)\n",
+                     (unsigned long long)m_impl->metal->submitted_frame_count(), r, g, b, a, r2, g2, b2, a2,
+                     m_impl->gcn_enabled ? "on" : "off");
+        const char* dir = std::getenv("PS4_GPU_READBACK");
+        if (dir && dir[0] == '/') {   // also dump the frame as a PPM
+            id<MTLTexture> fb = (__bridge id<MTLTexture>)m_impl->metal->raw_framebuffer();
+            std::vector<u8> px(static_cast<usize>(w) * h * 4);
+            [fb getBytes:px.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/frame_%llu_%s.ppm", dir,
+                          (unsigned long long)m_impl->metal->submitted_frame_count(),
+                          m_impl->gcn_enabled ? "gcn" : "fixed");
+            if (FILE* f = std::fopen(path, "wb")) {
+                std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+                for (usize p = 0; p < static_cast<usize>(w) * h; ++p) {
+                    const u8 rgb[3] = {px[p * 4 + 2], px[p * 4 + 1], px[p * 4 + 0]};
+                    std::fwrite(rgb, 1, 3, f);
+                }
+                std::fclose(f);
+            }
+        }
+    }
     m_impl->frame_stats.command_buffers_submitted =
         m_impl->metal->submitted_frame_count() - m_impl->frame_submission_start;
     return submitted;
@@ -1518,6 +1656,10 @@ void Pm4Translator::reset_state() {
     m_impl->index_buffer_size = 0;
     m_impl->index_type = MTLIndexTypeUInt16;
     m_impl->primitive_type = PrimitiveType::TriangleList;
+    m_impl->num_instances = 1;
+    // CLEAR_STATE semantics: context registers return to their defaults (0).
+    std::fill(m_impl->reg_file.begin() + kPm4ContextRegBase,
+              m_impl->reg_file.begin() + kPm4UconfigRegBase, 0u);
     m_impl->indirect_base_addr = 0;
     m_impl->gnm_base_addr = 0;
     m_impl->last_dma_dst_addr = 0;
@@ -1622,30 +1764,274 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
         return true;
     }
 
-    if (packet.header.type == Pm4PacketType::Type0) {
-        // Type 0: register writes
-        m_impl->context_reg_writes += packet.payload.size();
-        const u16 base_reg = packet.header.base_reg;
-        for (usize i = 0; i < packet.payload.size(); ++i) {
-            const u16 reg = base_reg + static_cast<u16>(i);
-            const u32 val = packet.payload[i];
+    Impl& st = *m_impl;
 
-            // VGT_DMA_INDEX_TYPE: reg 0x895C (config) or 0x029F / 0x229F / 0xA29F
-            if (reg == 0x895C || reg == 0x029F || reg == 0x229F || reg == 0xA29F || reg == VGT_DMA_INDEX_TYPE_REG) {
-                m_impl->index_type = (val & 1) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
-                std::fprintf(stderr, "[PM4 Type-0] Set INDEX_TYPE via reg 0x%04x: %s (val=0x%08x)\n",
-                             reg, (val & 1) ? "UInt32" : "UInt16", val);
+    // ---------------------------------------------------------------------
+    // Register-space helpers. Every register write (SET_*_REG, Type-0,
+    // WRITE_DATA/COPY_DATA/DMA_DATA to a register, LOAD_*_REG, RMW packets)
+    // lands in the shadow register file and is re-dispatched through the
+    // matching SET_*_REG handler so that side effects live in one place.
+    // ---------------------------------------------------------------------
+    auto reg_space_for = [](u32 abs_reg, u8& op, u32& base) -> bool {
+        if (abs_reg >= kPm4UconfigRegBase && abs_reg < 0x10000) { op = IT_SET_UCONFIG_REG; base = kPm4UconfigRegBase; return true; }
+        if (abs_reg >= kPm4ContextRegBase && abs_reg < kPm4UconfigRegBase) { op = IT_SET_CONTEXT_REG; base = kPm4ContextRegBase; return true; }
+        if (abs_reg >= kPm4ShRegBase && abs_reg < kPm4ShRegBase + 0x400) { op = IT_SET_SH_REG; base = kPm4ShRegBase; return true; }
+        if (abs_reg >= kPm4ConfigRegBase && abs_reg < kPm4ShRegBase) { op = IT_SET_CONFIG_REG; base = kPm4ConfigRegBase; return true; }
+        return false;
+    };
+    auto write_regs = [&](u32 abs_reg, const u32* vals, usize n) -> bool {
+        if (n == 0) return true;
+        u8 op = 0;
+        u32 base = 0;
+        if (!reg_space_for(abs_reg, op, base)) {
+            // Outside the four SET_*_REG apertures: keep the value only.
+            for (usize i = 0; i < n; ++i) {
+                if (abs_reg + i < st.reg_file.size()) st.reg_file[abs_reg + i] = vals[i];
             }
-            // VGT_DMA_MAX_SIZE: reg 0x28A78/4 = 0xA29E or 0x029E / 0x229E
-            else if (reg == 0x029E || reg == 0x229E || reg == 0xA29E || reg == VGT_DMA_MAX_SIZE_REG) {
-                m_impl->index_buffer_size = val;
-                std::fprintf(stderr, "[PM4 Type-0] Set INDEX_MAX_SIZE via reg 0x%04x: %u\n", reg, val);
-            }
+            return true;
+        }
+        Pm4Packet sub{};
+        sub.header.type = Pm4PacketType::Type3;
+        sub.header.opcode = op;
+        sub.header.count = static_cast<u16>(n + 1);
+        sub.payload.reserve(n + 1);
+        sub.payload.push_back(abs_reg - base);
+        sub.payload.insert(sub.payload.end(), vals, vals + n);
+        const bool counted_frame = st.metal && st.metal->frame_in_progress();
+        const bool ok = execute_packet(sub);
+        // An internal re-dispatch is not a separate command-stream packet.
+        --st.packets_processed;
+        if (counted_frame && st.frame_stats.packets > 0) st.frame_stats.packets--;
+        return ok;
+    };
+    auto read_reg = [&](u32 abs_reg) -> u32 {
+        return abs_reg < st.reg_file.size() ? st.reg_file[abs_reg] : 0u;
+    };
+    auto set_index_type = [&](u32 val, const char* src) {
+        const u32 t = val & kIndexTypeMask;
+        if (t == 2) {
+            std::fprintf(stderr, "[PM4] %s: 8-bit index type is not valid on CIK; using 16-bit\n", src);
+        }
+        st.index_type = (t == 1) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
+        st.dirty_bits |= Impl::DirtyVertexLayout;
+    };
+    // VGT state that CIK keeps in user-config space (SI kept it in config space).
+    auto apply_vgt_reg = [&](u32 abs_reg, u32 val) {
+        switch (abs_reg) {
+            case kPm4UconfigRegBase + UCONFIG_VGT_PRIMITIVE_TYPE:
+            case kPm4ConfigRegBase + 0x256: // SI mmVGT_PRIMITIVE_TYPE (0x8958)
+                st.primitive_type = static_cast<PrimitiveType>(val & 0x3F);
+                st.dirty_bits |= Impl::DirtyPipeline;
+                std::fprintf(stderr, "[PM4] VGT_PRIMITIVE_TYPE = 0x%02x\n", val & 0x3F);
+                break;
+            case kPm4UconfigRegBase + UCONFIG_VGT_INDEX_TYPE:
+                set_index_type(val, "VGT_INDEX_TYPE");
+                break;
+            case kPm4UconfigRegBase + UCONFIG_VGT_NUM_INSTANCES:
+            case kPm4ConfigRegBase + 0x25D: // SI mmVGT_NUM_INSTANCES (0x8974)
+                st.num_instances = val;
+                break;
+            default:
+                break;
+        }
+    };
+    auto instances = [&]() -> u32 { return std::max<u32>(1u, st.num_instances); };
+    auto gpu_clock = []() -> u64 {
+        // 100 MHz reference clock (PS4 GPU core counter frequency is fixed by Gnm).
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        return static_cast<u64>(ns) / 10u;
+    };
+    // EOP/EOS/RELEASE_MEM data write. DATA_SEL: 0 discard, 1 32-bit low,
+    // 2 64-bit, 3 64-bit GPU clock, 4 64-bit system clock.
+    auto write_end_of_pipe = [&](const char* name, GuestAddr addr, u32 data_sel, u32 lo, u32 hi) -> bool {
+        if (data_sel == 0) return true;
+        if (!st.memory) return true;
+        u64 value = 0;
+        usize bytes = 0;
+        switch (data_sel) {
+            case 1: value = lo; bytes = 4; addr &= ~GuestAddr{3}; break;
+            case 2: value = (static_cast<u64>(hi) << 32) | lo; bytes = 8; addr &= ~GuestAddr{7}; break;
+            case 3:
+            case 4: value = gpu_clock(); bytes = 8; addr &= ~GuestAddr{7}; break;
+            default:
+                std::fprintf(stderr, "[PM4] %s: unsupported DATA_SEL=%u\n", name, data_sel);
+                return false;
+        }
+        if (addr == 0 || !st.memory->is_valid_address(addr, bytes)) {
+            std::fprintf(stderr, "[PM4] %s: label address 0x%llx is not mapped\n", name,
+                         (unsigned long long)addr);
+            return true;
+        }
+        if (bytes == 4) {
+            st.memory->write_value<u32>(addr, static_cast<u32>(value));
+        } else {
+            st.memory->write_value<u64>(addr, value);
         }
         return true;
+    };
+    // Shared DMA engine for DMA_DATA and CP_DMA.
+    // src_sel: 0 = src address (memory, or register when SAS), 1 = GDS,
+    //          2 = immediate DATA, 3 = src address via L2 (memory).
+    // dst_sel: 0 = dst address (memory, or register when DAS), 1 = GDS,
+    //          3 = nowhere (pure prefetch).
+    auto run_dma = [&](const char* name, u32 src_sel, u32 dst_sel, GuestAddr src, GuestAddr dst,
+                       usize bytes, bool sas, bool das, bool saic, bool daic, u32 imm) -> bool {
+        st.last_dma_dst_addr = dst;
+        st.last_dma_src_addr = src;
+        st.last_dma_size = bytes;
+        st.last_dma_is_copy_or_nonzero = !(src_sel == 2 && imm == 0);
+        if (bytes == 0 || dst_sel == 3) return true;
+        if (src_sel == 1 || dst_sel == 1) {
+            std::fprintf(stderr, "[PM4] %s: GDS source/destination is not emulated (src_sel=%u dst_sel=%u)\n",
+                         name, src_sel, dst_sel);
+            return false;
+        }
+        const usize dwords = (bytes + 3) / 4;
+        auto src_dword = [&](usize i) -> u32 {
+            if (src_sel == 2) return imm;
+            if (sas) return read_reg(static_cast<u32>(src >> 2) + (saic ? 0u : static_cast<u32>(i)));
+            const GuestAddr a = src + (saic ? 0 : i * 4);
+            u32 v = 0;
+            if (st.memory && st.memory->is_valid_address(a, 4)) st.memory->read_value(a, v);
+            return v;
+        };
+        if (das) {
+            const u32 reg = static_cast<u32>(dst >> 2);
+            if (daic) {
+                const u32 last = src_dword(dwords - 1);
+                return write_regs(reg, &last, 1);
+            }
+            std::vector<u32> vals(dwords);
+            for (usize i = 0; i < dwords; ++i) vals[i] = src_dword(i);
+            return write_regs(reg, vals.data(), vals.size());
+        }
+        if (!st.memory) return true;
+        if (daic) {
+            if (st.memory->is_valid_address(dst, 4)) st.memory->write_value<u32>(dst, src_dword(dwords - 1));
+            return true;
+        }
+        if (!st.memory->is_valid_address(dst, bytes)) {
+            std::fprintf(stderr, "[PM4] %s: destination 0x%llx+%zu is not mapped\n", name,
+                         (unsigned long long)dst, bytes);
+            return true;
+        }
+        u8* dst_ptr = st.memory->to_host_ptr<u8>(dst);
+        if (src_sel != 2 && !sas && !saic && st.memory->is_valid_address(src, bytes)) {
+            std::memmove(dst_ptr, st.memory->to_host_ptr<u8>(src), bytes);
+        } else {
+            for (usize i = 0; i < dwords; ++i) {
+                const u32 v = src_dword(i);
+                std::memcpy(dst_ptr + i * 4, &v, std::min<usize>(4, bytes - i * 4));
+            }
+        }
+        st.invalidate_resources(dst, bytes);
+        return true;
+    };
+    auto hex_payload = [](const Pm4Packet& p, usize max_dw) {
+        std::string s;
+        for (usize d = 0; d < p.payload.size() && d < max_dw; ++d) {
+            char b[16];
+            std::snprintf(b, sizeof(b), "0x%08x ", p.payload[d]);
+            s += b;
+        }
+        return s;
+    };
+    // Per-draw diagnostics (VS/PS ISA, V# contents, first indices). Other
+    // subsystems read these lines from logs, so they are kept verbatim.
+    auto dump_draw_state = [&](const char* tag, GuestAddr idx_addr, u32 count, MTLIndexType idx_type) {
+        std::fprintf(stderr, "      VS ISA: 0x%llx | PS ISA: 0x%llx | RT: 0x%llx (vp: %.0fx%.0f [%.0f,%.0f], sc: %u,%u %ux%u) prim=0x%02x inst=%u\n",
+                     (unsigned long long)st.vs_shader_addr, (unsigned long long)st.ps_shader_addr,
+                     (unsigned long long)st.cb_color0_base,
+                     st.viewport.width, st.viewport.height, st.viewport.x, st.viewport.y,
+                     st.scissor.x, st.scissor.y, st.scissor.width, st.scissor.height,
+                     static_cast<u32>(st.primitive_type), instances());
+        std::fprintf(stderr, "      VtxBuf: 0x%llx (sz=%zu, stride=%zu)\n",
+                     (unsigned long long)st.vertex_buffer_addr, st.vertex_buffer_size, st.vertex_stride);
+        if (!st.memory) return;
+        (void)tag;
+        if (idx_addr > 0x1000 && count > 0) {
+            const usize esz = (idx_type == MTLIndexTypeUInt32) ? 4 : 2;
+            const usize n = std::min<u32>(count, 16);
+            if (st.memory->is_valid_address(idx_addr, n * esz)) {
+                std::string idx_s;
+                for (usize i = 0; i < n; ++i) {
+                    u32 v = 0;
+                    if (esz == 4) st.memory->read_value(idx_addr + i * 4, v);
+                    else { u16 h = 0; st.memory->read_value(idx_addr + i * 2, h); v = h; }
+                    char b[16];
+                    std::snprintf(b, sizeof(b), "%u ", v);
+                    idx_s += b;
+                }
+                std::fprintf(stderr, "      Indices (u%zu): [%s]\n", esz * 8, idx_s.c_str());
+            }
+        }
+        for (const auto& [slot, buf_desc] : st.vs_user_sgpr_buffers) {
+            const usize stride = buf_desc.stride > 0 ? buf_desc.stride : 16;
+            const usize dump_records = std::min<u32>(buf_desc.num_records, 24);
+            const usize dump_bytes = dump_records * stride;
+            if (buf_desc.base_addr <= 0x1000 || dump_bytes == 0 ||
+                !st.memory->is_valid_address(buf_desc.base_addr, dump_bytes)) {
+                continue;
+            }
+            std::vector<u8> raw(dump_bytes);
+            st.memory->read_bytes(buf_desc.base_addr, raw.data(), dump_bytes);
+            std::string recs_s;
+            for (usize r = 0; r < dump_records; ++r) {
+                float f[4] = {0, 0, 0, 0};
+                std::memcpy(f, raw.data() + r * stride, std::min<usize>(16, stride));
+                char b[128];
+                if (stride >= 16) std::snprintf(b, sizeof(b), " r%zu:[%.3f,%.3f,%.3f,%.3f]", r, f[0], f[1], f[2], f[3]);
+                else std::snprintf(b, sizeof(b), " r%zu:[%.3f,%.3f]", r, f[0], f[1]);
+                recs_s += b;
+            }
+            std::fprintf(stderr, "      [V# s%u..s%u] base=0x%llx str=%u rec=%u:%s\n",
+                         slot, slot + 3, (unsigned long long)buf_desc.base_addr, buf_desc.stride,
+                         buf_desc.num_records, recs_s.c_str());
+        }
+        auto dump_isa = [&](const char* label, GuestAddr addr, int dws) {
+            if (addr <= 0x1000 || !st.memory->is_valid_address(addr, dws * 4)) return;
+            std::vector<u32> code(dws);
+            st.memory->read_bytes(addr, code.data(), dws * 4);
+            std::string s;
+            for (int k = 0; k < dws; ++k) {
+                char b[16];
+                std::snprintf(b, sizeof(b), "0x%08x ", code[k]);
+                s += b;
+                if ((k + 1) % 8 == 0) s += "\n        ";
+            }
+            std::fprintf(stderr, "      %s ISA [0x%llx] (%d dw):\n        %s\n", label,
+                         (unsigned long long)addr, dws, s.c_str());
+        };
+        dump_isa("VS", st.vs_shader_addr, 80);
+        dump_isa("PS", st.ps_shader_addr, 50);
+    };
+
+    if (packet.header.type == Pm4PacketType::Type0) {
+        // Type 0: consecutive writes starting at an absolute dword register.
+        st.context_reg_writes += packet.payload.size();
+        return write_regs(packet.header.base_reg, packet.payload.data(), packet.payload.size());
     }
 
     if (packet.header.type == Pm4PacketType::Type3) {
+        // Shadow every SET_*_REG write into the register file first.
+        {
+            u32 base = 0;
+            switch (packet.header.opcode) {
+                case IT_SET_CONFIG_REG:  base = kPm4ConfigRegBase; break;
+                case IT_SET_SH_REG:      base = kPm4ShRegBase; break;
+                case IT_SET_CONTEXT_REG: base = kPm4ContextRegBase; break;
+                case IT_SET_UCONFIG_REG: base = kPm4UconfigRegBase; break;
+                default: break;
+            }
+            if (base != 0 && packet.payload.size() >= 2) {
+                const u32 first = base + (packet.payload[0] & 0xFFFF);
+                for (usize i = 1; i < packet.payload.size(); ++i) {
+                    const u32 r = first + static_cast<u32>(i - 1);
+                    if (r < st.reg_file.size()) st.reg_file[r] = packet.payload[i];
+                }
+            }
+        }
         switch (packet.header.opcode) {
             case IT_NOP: {
                 if (!packet.payload.empty()) {
@@ -1675,60 +2061,122 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             }
 
             case IT_SET_BASE: {
-                if (!m_impl->require_payload(packet, 3, "IT_SET_BASE")) return false;
-                const u32 base_type = packet.payload[0];
-                const u32 base_lo = packet.payload[1];
-                const u32 base_hi = packet.payload[2];
-                const GuestAddr base_addr = (static_cast<u64>(base_hi) << 32) | base_lo;
-                std::fprintf(stderr, "[PM4] IT_SET_BASE: type=%u, addr=0x%llx\n",
-                             base_type, (unsigned long long)base_addr);
-                m_impl->indirect_base_addr = base_addr;
+                // [BASE_INDEX, ADDR_LO, ADDR_HI]. BASE_INDEX 1 = DRAW_INDEX_BASE:
+                // the base used by DRAW_(INDEX_)INDIRECT and DISPATCH_INDIRECT.
+                if (!st.require_payload(packet, 3, "IT_SET_BASE")) return false;
+                const u32 base_index = packet.payload[0] & 0xF;
+                const GuestAddr base_addr =
+                    (static_cast<u64>(packet.payload[2] & 0xFFFFu) << 32) | (packet.payload[1] & ~7u);
+                std::fprintf(stderr, "[PM4] IT_SET_BASE: index=%u, addr=0x%llx\n",
+                             base_index, (unsigned long long)base_addr);
+                if (base_index == 1) {
+                    st.indirect_base_addr = base_addr;
+                }
                 return true;
             }
 
             case IT_CLEAR_STATE:
-                if (!m_impl->require_payload(packet, 1, "IT_CLEAR_STATE")) return false;
+                if (!st.require_payload(packet, 1, "IT_CLEAR_STATE")) return false;
                 reset_state();
                 return true;
 
+            case IT_CONTEXT_CONTROL:
+                // [LOAD_CONTROL, SHADOW_ENABLE]: controls register shadowing
+                // across hardware context switches. The emulator runs a single
+                // context with a full shadow register file, so there is
+                // nothing to load or shadow.
+                return st.require_payload(packet, 2, "IT_CONTEXT_CONTROL");
+
             case IT_INDEX_BUFFER_SIZE: {
-                if (!m_impl->require_payload(packet, 1, "IT_INDEX_BUFFER_SIZE")) return false;
-                m_impl->index_buffer_size = packet.payload[0];
-                std::fprintf(stderr, "[PM4] IT_INDEX_BUFFER_SIZE: %u\n", packet.payload[0]);
+                // [NUM_INDICES] -> VGT_DMA_MAX_SIZE (in indices).
+                if (!st.require_payload(packet, 1, "IT_INDEX_BUFFER_SIZE")) return false;
+                st.index_buffer_size = packet.payload[0];
                 return true;
             }
 
             case IT_INDEX_TYPE: {
-                if (!m_impl->require_payload(packet, 1, "IT_INDEX_TYPE")) return false;
-                m_impl->index_type = (packet.payload[0] & 1) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
-                std::fprintf(stderr, "[PM4] IT_INDEX_TYPE: %s (0x%x)\n",
-                             (packet.payload[0] & 1) ? "UInt32" : "UInt16", packet.payload[0]);
+                // [INDEX_TYPE[1:0] (0=16-bit, 1=32-bit), SWAP_MODE[3:2]]
+                if (!st.require_payload(packet, 1, "IT_INDEX_TYPE")) return false;
+                set_index_type(packet.payload[0], "IT_INDEX_TYPE");
+                st.reg_file[kPm4ContextRegBase + VGT_DMA_INDEX_TYPE_REG] = packet.payload[0];
                 return true;
             }
 
             case IT_INDEX_BASE: {
-                if (!m_impl->require_payload(packet, 1, "IT_INDEX_BASE")) return false;
-                std::string p_str;
-                for (size_t p = 0; p < packet.payload.size(); ++p) {
-                    char b[32];
-                    std::snprintf(b, sizeof(b), "0x%08x ", packet.payload[p]);
-                    p_str += b;
-                }
-                std::fprintf(stderr, "[PM4] IT_INDEX_BASE: count=%zu payload=[%s]\n",
-                             packet.payload.size(), p_str.c_str());
+                // [BASE_LO (2-byte aligned), BASE_HI[15:0]]
+                if (!st.require_payload(packet, 2, "IT_INDEX_BASE")) return false;
+                st.index_base_addr =
+                    (static_cast<u64>(packet.payload[1] & 0xFFFFu) << 32) | (packet.payload[0] & ~1u);
+                std::fprintf(stderr, "[PM4] IT_INDEX_BASE: addr=0x%llx\n",
+                             (unsigned long long)st.index_base_addr);
+                return true;
+            }
 
-                if (packet.payload.size() >= 2) {
-                    const u32 base_lo = packet.payload[0] & ~1U;
-                    const u32 base_hi = packet.payload[1] & 0xFFFFU;
-                    m_impl->index_base_addr = (static_cast<u64>(base_hi) << 32) | base_lo;
-                    std::fprintf(stderr, "[PM4]   -> addr=0x%llx (lo=0x%08x, hi=0x%08x)\n",
-                                 (unsigned long long)m_impl->index_base_addr, packet.payload[0], packet.payload[1]);
-                } else if (packet.payload.size() == 1) {
-                    m_impl->index_base_addr = packet.payload[0] & ~1U;
-                    std::fprintf(stderr, "[PM4]   -> addr=0x%llx (32-bit)\n",
-                                 (unsigned long long)m_impl->index_base_addr);
+            case IT_SET_CONFIG_REG:
+            case IT_SET_UCONFIG_REG: {
+                // [REG_OFFSET, values...] relative to the config/uconfig base.
+                const char* name = packet.header.opcode == IT_SET_CONFIG_REG ? "IT_SET_CONFIG_REG"
+                                                                              : "IT_SET_UCONFIG_REG";
+                if (!st.require_payload(packet, 2, name)) return false;
+                const u32 base = packet.header.opcode == IT_SET_CONFIG_REG ? kPm4ConfigRegBase
+                                                                            : kPm4UconfigRegBase;
+                const u32 first = base + (packet.payload[0] & 0xFFFF);
+                for (usize i = 1; i < packet.payload.size(); ++i) {
+                    apply_vgt_reg(first + static_cast<u32>(i - 1), packet.payload[i]);
                 }
                 return true;
+            }
+
+            case IT_CONTEXT_REG_RMW: {
+                // [REG_OFFSET, MASK, DATA]: reg = (reg & ~MASK) | (DATA & MASK)
+                if (!st.require_payload(packet, 3, "IT_CONTEXT_REG_RMW")) return false;
+                const u32 reg = kPm4ContextRegBase + (packet.payload[0] & 0xFFFF);
+                const u32 mask = packet.payload[1];
+                const u32 val = (read_reg(reg) & ~mask) | (packet.payload[2] & mask);
+                return write_regs(reg, &val, 1);
+            }
+
+            case IT_REG_RMW: {
+                // [MOD_ADRS[15:0] | AND_MASK_SRC[30] | OR_MASK_SRC[31], AND_MASK, OR_MASK]
+                // *_SRC=1 takes the mask from the register following MOD_ADRS.
+                if (!st.require_payload(packet, 3, "IT_REG_RMW")) return false;
+                const u32 reg = packet.payload[0] & 0xFFFF;
+                const u32 and_mask = (packet.payload[0] & (1u << 30)) ? read_reg(reg + 1) : packet.payload[1];
+                const u32 or_mask = (packet.payload[0] & (1u << 31)) ? read_reg(reg + 1) : packet.payload[2];
+                const u32 val = (read_reg(reg) & and_mask) | or_mask;
+                return write_regs(reg, &val, 1);
+            }
+
+            case IT_LOAD_CONFIG_REG:
+            case IT_LOAD_SH_REG:
+            case IT_LOAD_CONTEXT_REG:
+            case IT_LOAD_UCONFIG_REG: {
+                // [BASE_LO, BASE_HI, (REG_OFFSET, NUM_DWORDS)*]. Registers are
+                // loaded from BASE + REG_OFFSET*4.
+                if (!st.require_payload(packet, 4, pm4_opcode_to_name(packet.header.opcode))) return false;
+                u32 base = kPm4ConfigRegBase;
+                if (packet.header.opcode == IT_LOAD_SH_REG) base = kPm4ShRegBase;
+                else if (packet.header.opcode == IT_LOAD_CONTEXT_REG) base = kPm4ContextRegBase;
+                else if (packet.header.opcode == IT_LOAD_UCONFIG_REG) base = kPm4UconfigRegBase;
+                const GuestAddr mem_base =
+                    (static_cast<u64>(packet.payload[1] & 0xFFFFu) << 32) | (packet.payload[0] & ~3u);
+                bool ok = true;
+                for (usize i = 2; i + 1 < packet.payload.size(); i += 2) {
+                    const u32 off = packet.payload[i] & 0xFFFF;
+                    const u32 n = packet.payload[i + 1] & 0x3FFF;
+                    const GuestAddr src = mem_base + static_cast<GuestAddr>(off) * 4;
+                    if (n == 0) continue;
+                    if (!st.memory || !st.memory->is_valid_address(src, n * 4ull)) {
+                        std::fprintf(stderr, "[PM4] %s: source 0x%llx+%u dw is not mapped\n",
+                                     pm4_opcode_to_name(packet.header.opcode), (unsigned long long)src, n);
+                        ok = false;
+                        continue;
+                    }
+                    std::vector<u32> vals(n);
+                    st.memory->read_bytes(src, vals.data(), n * 4ull);
+                    ok = write_regs(base + off, vals.data(), n) && ok;
+                }
+                return ok;
             }
 
             case IT_SET_CONTEXT_REG: {
@@ -1796,10 +2244,9 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                         m_impl->index_type = (val & 1) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
                         std::fprintf(stderr, "[PM4 Context] VGT_DMA_INDEX_TYPE: %s (%u)\n",
                                      (val & 1) ? "UInt32" : "UInt16", val);
-                    } else if (reg == VGT_PRIMITIVE_TYPE_REG) {
-                        m_impl->dirty_bits |= Impl::DirtyPipeline;
-                        m_impl->primitive_type = static_cast<PrimitiveType>(val & 0x3F);
                     }
+                    // Note: VGT_PRIMITIVE_TYPE is not a context register on GCN;
+                    // it is handled by SET_UCONFIG_REG (CIK) / SET_CONFIG_REG (SI).
                 }
                 m_impl->context_reg_writes += (packet.payload.size() - 1);
                 return true;
@@ -1910,402 +2357,464 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             }
 
             case IT_DRAW_INDEX_AUTO: {
-                if (!m_impl->require_payload(packet, 1, "IT_DRAW_INDEX_AUTO")) return false;
+                // [INDEX_COUNT, DRAW_INITIATOR]. Topology comes from
+                // VGT_PRIMITIVE_TYPE, instance count from NUM_INSTANCES.
+                if (!st.require_payload(packet, 2, "IT_DRAW_INDEX_AUTO")) return false;
                 const u32 count = packet.payload[0];
-                const u32 initiator = packet.payload.size() > 1 ? packet.payload[1] : 0;
+                const u32 initiator = packet.payload[1];
                 std::fprintf(stderr, "[PM4 Draw #%zu] IT_DRAW_INDEX_AUTO: count=%u initiator=0x%08x\n",
-                             m_impl->draw_count + 1, count, initiator);
-                std::fprintf(stderr, "      VS ISA: 0x%llx | PS ISA: 0x%llx | RT: 0x%llx (vp: %.0fx%.0f [%.0f,%.0f], sc: %u,%u %ux%u)\n",
-                             (unsigned long long)m_impl->vs_shader_addr,
-                             (unsigned long long)m_impl->ps_shader_addr,
-                             (unsigned long long)m_impl->cb_color0_base,
-                             m_impl->viewport.width, m_impl->viewport.height,
-                             m_impl->viewport.x, m_impl->viewport.y,
-                             m_impl->scissor.x, m_impl->scissor.y, m_impl->scissor.width, m_impl->scissor.height);
-                std::fprintf(stderr, "      VtxBuf: 0x%llx (sz=%zu, stride=%zu)\n",
-                             (unsigned long long)m_impl->vertex_buffer_addr,
-                             m_impl->vertex_buffer_size, m_impl->vertex_stride);
-                if (m_impl->memory) {
-                    for (const auto& [slot, buf_desc] : m_impl->vs_user_sgpr_buffers) {
-                        const usize dump_records = std::min<u32>(buf_desc.num_records, 24);
-                        const usize dump_bytes = dump_records * (buf_desc.stride > 0 ? buf_desc.stride : 16);
-                        if (buf_desc.base_addr > 0x1000 && dump_bytes > 0 && m_impl->memory->is_valid_address(buf_desc.base_addr, dump_bytes)) {
-                            std::vector<u8> raw(dump_bytes);
-                            m_impl->memory->read_bytes(buf_desc.base_addr, raw.data(), dump_bytes);
-                            std::string recs_s;
-                            for (usize r = 0; r < dump_records; ++r) {
-                                const float* fptr = reinterpret_cast<const float*>(raw.data() + r * (buf_desc.stride > 0 ? buf_desc.stride : 16));
-                                char b[128];
-                                if (buf_desc.stride >= 16 || buf_desc.stride == 0) {
-                                    std::snprintf(b, sizeof(b), " r%zu:[%.3f,%.3f,%.3f,%.3f]", r, fptr[0], fptr[1], fptr[2], fptr[3]);
-                                } else {
-                                    std::snprintf(b, sizeof(b), " r%zu:[%.3f,%.3f]", r, fptr[0], fptr[1]);
-                                }
-                                recs_s += b;
-                            }
-                            std::fprintf(stderr, "      [V# s%u..s%u] base=0x%llx str=%u rec=%u:%s\n",
-                                         slot, slot + 3, (unsigned long long)buf_desc.base_addr, buf_desc.stride, buf_desc.num_records,
-                                         recs_s.c_str());
-                        }
-                    }
-                    if (m_impl->vs_shader_addr > 0x1000 && m_impl->memory->is_valid_address(m_impl->vs_shader_addr, 320)) {
-                        u32 vs_code[80] = {0};
-                        m_impl->memory->read_bytes(m_impl->vs_shader_addr, vs_code, 320);
-                        std::string vs_str;
-                        for (int k = 0; k < 80; ++k) {
-                            char b[16];
-                            std::snprintf(b, sizeof(b), "0x%08x ", vs_code[k]);
-                            vs_str += b;
-                            if ((k + 1) % 8 == 0) vs_str += "\n        ";
-                        }
-                        std::fprintf(stderr, "      VS ISA [0x%llx] (80 dw):\n        %s\n",
-                                     (unsigned long long)m_impl->vs_shader_addr, vs_str.c_str());
-                    }
-                    if (m_impl->ps_shader_addr > 0x1000 && m_impl->memory->is_valid_address(m_impl->ps_shader_addr, 200)) {
-                        u32 ps_code[50] = {0};
-                        m_impl->memory->read_bytes(m_impl->ps_shader_addr, ps_code, 200);
-                        std::string ps_str;
-                        for (int k = 0; k < 50; ++k) {
-                            char b[16];
-                            std::snprintf(b, sizeof(b), "0x%08x ", ps_code[k]);
-                            ps_str += b;
-                            if ((k + 1) % 8 == 0) ps_str += "\n        ";
-                        }
-                        std::fprintf(stderr, "      PS ISA [0x%llx] (50 dw):\n        %s\n",
-                                     (unsigned long long)m_impl->ps_shader_addr, ps_str.c_str());
-                    }
+                             st.draw_count + 1, count, initiator);
+                if ((initiator & 3) != kDiSrcSelAutoIndex) {
+                    std::fprintf(stderr, "[PM4]   DRAW_INDEX_AUTO with SOURCE_SELECT=%u (expected AUTO_INDEX)\n",
+                                 initiator & 3);
                 }
-                PrimitiveType prim = m_impl->primitive_type;
-                if (count == 4) {
-                    prim = PrimitiveType::TriangleStrip;
-                }
-                return m_impl->render_auto_mesh(count, prim);
+                dump_draw_state("DRAW_INDEX_AUTO", 0, 0, st.index_type);
+                // RectList/QuadList are lowered in render_auto_mesh (translated
+                // GCN path: in-shader expansion; fixed fallback: see there).
+                return st.render_auto_mesh(count, st.primitive_type, 0, instances());
             }
 
-            case IT_DRAW_INDEX:
             case IT_DRAW_INDEX_2: {
-                if (m_impl->require_payload(packet, 4, "IT_DRAW_INDEX")) {
-                    const u32 idx_lo = packet.payload[1];
-                    const u32 idx_hi = packet.payload[2];
-                    const GuestAddr idx_addr = (static_cast<u64>(idx_hi) << 32) | idx_lo;
-                    const u32 count = packet.payload[3];
-                    PrimitiveType prim = PrimitiveType::TriangleList;
-                    if (packet.payload.size() >= 5) {
-                        const u8 prim_val = static_cast<u8>(packet.payload[4] & 0x3F);
-                        if (prim_val != 0) {
-                            prim = static_cast<PrimitiveType>(prim_val);
-                        }
-                    }
-                    std::fprintf(stderr, "[PM4 Draw #%zu] IT_DRAW_INDEX_2: idx_addr=0x%llx count=%u prim=%u\n",
-                                 m_impl->draw_count + 1, (unsigned long long)idx_addr, count, static_cast<u32>(prim));
-                    std::fprintf(stderr, "      VS ISA: 0x%llx | PS ISA: 0x%llx | RT: 0x%llx (vp: %.0fx%.0f [%.0f,%.0f], sc: %u,%u %ux%u)\n",
-                                 (unsigned long long)m_impl->vs_shader_addr,
-                                 (unsigned long long)m_impl->ps_shader_addr,
-                                 (unsigned long long)m_impl->cb_color0_base,
-                                 m_impl->viewport.width, m_impl->viewport.height,
-                                 m_impl->viewport.x, m_impl->viewport.y,
-                                 m_impl->scissor.x, m_impl->scissor.y, m_impl->scissor.width, m_impl->scissor.height);
-                    std::fprintf(stderr, "      VtxBuf: 0x%llx (sz=%zu, stride=%zu)\n",
-                                 (unsigned long long)m_impl->vertex_buffer_addr,
-                                 m_impl->vertex_buffer_size, m_impl->vertex_stride);
-                    if (m_impl->memory && idx_addr > 0x1000 && count > 0) {
-                        if (m_impl->index_type == MTLIndexTypeUInt16) {
-                            std::vector<u16> indices(std::min<u32>(count, 16));
-                            if (m_impl->memory->is_valid_address(idx_addr, indices.size() * sizeof(u16))) {
-                                m_impl->memory->read_bytes(idx_addr, indices.data(), indices.size() * sizeof(u16));
-                                std::string idx_s;
-                                for (auto id : indices) { char b[16]; std::snprintf(b, sizeof(b), "%u ", id); idx_s += b; }
-                                std::fprintf(stderr, "      Indices (u16): [%s]\n", idx_s.c_str());
-                            }
-                        } else {
-                            std::vector<u32> indices(std::min<u32>(count, 16));
-                            if (m_impl->memory->is_valid_address(idx_addr, indices.size() * sizeof(u32))) {
-                                m_impl->memory->read_bytes(idx_addr, indices.data(), indices.size() * sizeof(u32));
-                                std::string idx_s;
-                                for (auto id : indices) { char b[16]; std::snprintf(b, sizeof(b), "%u ", id); idx_s += b; }
-                                std::fprintf(stderr, "      Indices (u32): [%s]\n", idx_s.c_str());
-                            }
-                        }
-                    }
-                    if (m_impl->memory) {
-                        for (const auto& [slot, buf_desc] : m_impl->vs_user_sgpr_buffers) {
-                            const usize dump_records = std::min<u32>(buf_desc.num_records, 24);
-                            const usize dump_bytes = dump_records * (buf_desc.stride > 0 ? buf_desc.stride : 16);
-                            if (buf_desc.base_addr > 0x1000 && dump_bytes > 0 && m_impl->memory->is_valid_address(buf_desc.base_addr, dump_bytes)) {
-                                std::vector<u8> raw(dump_bytes);
-                                m_impl->memory->read_bytes(buf_desc.base_addr, raw.data(), dump_bytes);
-                                std::string recs_s;
-                                for (usize r = 0; r < dump_records; ++r) {
-                                    const u32* uptr = reinterpret_cast<const u32*>(raw.data() + r * (buf_desc.stride > 0 ? buf_desc.stride : 16));
-                                    const float* fptr = reinterpret_cast<const float*>(uptr);
-                                    if (uptr[0] != 0 || uptr[1] != 0 || uptr[2] != 0 || uptr[3] != 0) {
-                                        char b[256];
-                                        std::snprintf(b, sizeof(b), " r%zu:flt[%.3f,%.3f,%.3f,%.3f]|hex[0x%08x,0x%08x,0x%08x,0x%08x]",
-                                                      r, fptr[0], fptr[1], fptr[2], fptr[3], uptr[0], uptr[1], uptr[2], uptr[3]);
-                                        recs_s += b;
-                                    }
-                                }
-                                std::fprintf(stderr, "      [V# s%u..s%u] base=0x%llx str=%u rec=%u:%s\n",
-                                             slot, slot + 3, (unsigned long long)buf_desc.base_addr, buf_desc.stride, buf_desc.num_records,
-                                             recs_s.c_str());
-                            }
-                        }
-                        if (m_impl->vs_shader_addr > 0x1000 && m_impl->memory->is_valid_address(m_impl->vs_shader_addr, 320)) {
-                            u32 vs_code[80] = {0};
-                            m_impl->memory->read_bytes(m_impl->vs_shader_addr, vs_code, 320);
-                            std::string vs_str;
-                            for (int k = 0; k < 80; ++k) {
-                                char b[16];
-                                std::snprintf(b, sizeof(b), "0x%08x ", vs_code[k]);
-                                vs_str += b;
-                                if ((k + 1) % 8 == 0) vs_str += "\n        ";
-                            }
-                            std::fprintf(stderr, "      VS ISA [0x%llx] (80 dw):\n        %s\n",
-                                         (unsigned long long)m_impl->vs_shader_addr, vs_str.c_str());
-                        }
-                        if (m_impl->ps_shader_addr > 0x1000 && m_impl->memory->is_valid_address(m_impl->ps_shader_addr, 200)) {
-                            u32 ps_code[50] = {0};
-                            m_impl->memory->read_bytes(m_impl->ps_shader_addr, ps_code, 200);
-                            std::string ps_str;
-                            for (int k = 0; k < 50; ++k) {
-                                char b[16];
-                                std::snprintf(b, sizeof(b), "0x%08x ", ps_code[k]);
-                                ps_str += b;
-                                if ((k + 1) % 8 == 0) ps_str += "\n        ";
-                            }
-                            std::fprintf(stderr, "      PS ISA [0x%llx] (50 dw):\n        %s\n",
-                                         (unsigned long long)m_impl->ps_shader_addr, ps_str.c_str());
-                        }
-                        // Dump memory around index buffer
-                        if (idx_addr > 0x1000 && m_impl->memory->is_valid_address(idx_addr - 128, 512)) {
-                            std::fprintf(stderr, "      Around idx_addr [0x%llx - 128]:\n", (unsigned long long)idx_addr);
-                            for (int line = -2; line < 6; ++line) {
-                                GuestAddr a = idx_addr + line * 32;
-                                float f[8] = {0};
-                                u32 u[8] = {0};
-                                m_impl->memory->read_bytes(a, u, 32);
-                                std::memcpy(f, u, 32);
-                                std::fprintf(stderr, "        0x%llx: [%.3f, %.3f, %.3f, %.3f | %.3f, %.3f, %.3f, %.3f]\n",
-                                             (unsigned long long)a, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
-                            }
-                        }
-                    }
-                    return m_impl->render_indexed_mesh(idx_addr, count, prim, m_impl->index_type);
+                // [MAX_SIZE, INDEX_BASE_LO, INDEX_BASE_HI, INDEX_COUNT, DRAW_INITIATOR]
+                if (!st.require_payload(packet, 5, "IT_DRAW_INDEX_2")) return false;
+                const u32 max_size = packet.payload[0];
+                const GuestAddr idx_addr =
+                    (static_cast<u64>(packet.payload[2] & 0xFFFFu) << 32) | (packet.payload[1] & ~1u);
+                const u32 count = packet.payload[3];
+                const u32 initiator = packet.payload[4];
+                std::fprintf(stderr, "[PM4 Draw #%zu] IT_DRAW_INDEX_2: idx_addr=0x%llx count=%u max=%u initiator=0x%08x prim=0x%02x %s\n",
+                             st.draw_count + 1, (unsigned long long)idx_addr, count, max_size, initiator,
+                             static_cast<u32>(st.primitive_type),
+                             st.index_type == MTLIndexTypeUInt32 ? "u32" : "u16");
+                if (count > max_size) {
+                    std::fprintf(stderr, "[PM4]   DRAW_INDEX_2: index_count %u exceeds MAX_SIZE %u\n", count, max_size);
                 }
-                return false;
+                st.index_buffer_size = max_size;
+                dump_draw_state("DRAW_INDEX_2", idx_addr, count, st.index_type);
+                return st.render_indexed_mesh(idx_addr, count, st.primitive_type, st.index_type, 0, instances());
+            }
+
+            case IT_DRAW_INDEX_OFFSET_2: {
+                // [MAX_SIZE, INDEX_OFFSET, INDEX_COUNT, DRAW_INITIATOR]; indices
+                // are fetched from INDEX_BASE + INDEX_OFFSET elements.
+                if (!st.require_payload(packet, 4, "IT_DRAW_INDEX_OFFSET_2")) return false;
+                const usize esz = (st.index_type == MTLIndexTypeUInt32) ? 4 : 2;
+                const GuestAddr idx_addr = st.index_base_addr + static_cast<GuestAddr>(packet.payload[1]) * esz;
+                const u32 count = packet.payload[2];
+                std::fprintf(stderr, "[PM4 Draw #%zu] IT_DRAW_INDEX_OFFSET_2: idx_addr=0x%llx count=%u max=%u\n",
+                             st.draw_count + 1, (unsigned long long)idx_addr, count, packet.payload[0]);
+                st.index_buffer_size = packet.payload[0];
+                dump_draw_state("DRAW_INDEX_OFFSET_2", idx_addr, count, st.index_type);
+                return st.render_indexed_mesh(idx_addr, count, st.primitive_type, st.index_type, 0, instances());
             }
 
             case IT_NUM_INSTANCES: {
-                if (!m_impl->require_payload(packet, 1, "IT_NUM_INSTANCES")) return false;
-                m_impl->num_instances = packet.payload[0];
-                std::fprintf(stderr, "[PM4] IT_NUM_INSTANCES: %u (raw=0x%08x)\n",
-                             m_impl->num_instances, packet.payload[0]);
+                if (!st.require_payload(packet, 1, "IT_NUM_INSTANCES")) return false;
+                st.num_instances = packet.payload[0];
+                st.reg_file[kPm4UconfigRegBase + UCONFIG_VGT_NUM_INSTANCES] = packet.payload[0];
                 return true;
             }
 
+            case IT_DRAW_INDIRECT:
             case IT_DRAW_INDEX_INDIRECT: {
-                if (!m_impl->require_payload(packet, 3, "IT_DRAW_INDEX_INDIRECT")) return false;
-                std::string p_str;
-                for (size_t p = 0; p < packet.payload.size(); ++p) {
-                    char b[32];
-                    std::snprintf(b, sizeof(b), "0x%08x ", packet.payload[p]);
-                    p_str += b;
+                // CIK: [DATA_OFFSET, BASE_VTX_LOC, START_INST_LOC, DRAW_INITIATOR]
+                // SI : [DATA_OFFSET, BASE_VTX_LOC | START_INST_LOC<<16, DRAW_INITIATOR]
+                // Arguments live at the SET_BASE(DRAW_INDEX_BASE) address + DATA_OFFSET.
+                const bool indexed = packet.header.opcode == IT_DRAW_INDEX_INDIRECT;
+                const char* name = indexed ? "IT_DRAW_INDEX_INDIRECT" : "IT_DRAW_INDIRECT";
+                if (!st.require_payload(packet, 3, name)) return false;
+                const u32 data_offset = packet.payload[0];
+                const GuestAddr args_addr = st.indirect_base_addr + data_offset;
+                std::fprintf(stderr, "[PM4 Draw #%zu] %s: base=0x%llx offset=0x%x payload=[%s]\n",
+                             st.draw_count + 1, name, (unsigned long long)st.indirect_base_addr, data_offset,
+                             hex_payload(packet, 4).c_str());
+                const usize args_size = indexed ? 20 : 16;
+                if (st.indirect_base_addr == 0 || !st.memory ||
+                    !st.memory->is_valid_address(args_addr, args_size)) {
+                    std::fprintf(stderr, "[PM4]   -> indirect args at 0x%llx are not mapped (SET_BASE missing?)\n",
+                                 (unsigned long long)args_addr);
+                    return false;
                 }
-                std::fprintf(stderr, "[PM4] IT_DRAW_INDEX_INDIRECT: count=%zu payload=[%s]\n",
-                             packet.payload.size(), p_str.c_str());
-
-                if (!packet.payload.empty()) {
-                    const u32 data_offset = (packet.payload.size() >= 3) ? packet.payload[0] : 0;
-                    const u32 base_vtx_loc = (packet.payload.size() >= 2) ? packet.payload[1] : 0;
-                    (void)base_vtx_loc;
-                    const u32 draw_initiator = (packet.payload.size() >= 3) ? packet.payload[2] : packet.payload[0];
-
-                    PrimitiveType prim = m_impl->primitive_type;
-                    const u8 prim_code = static_cast<u8>(draw_initiator & 0x3F);
-                    if (prim_code != 0) {
-                        prim = static_cast<PrimitiveType>(prim_code);
-                    }
-
-                    struct DrawIndexIndirectArgs {
-                        u32 index_count;
-                        u32 instance_count;
-                        u32 first_index;
-                        i32 vertex_offset;
-                        u32 first_instance;
-                    } args{};
-
-                    const GuestAddr dma_cand = m_impl->last_dma_is_copy_or_nonzero ? m_impl->last_dma_dst_addr : 0;
-                    const GuestAddr dma_src_cand = m_impl->last_dma_is_copy_or_nonzero ? m_impl->last_dma_src_addr : 0;
-                    struct CandEntry {
-                        const char* name;
-                        GuestAddr addr;
-                    } candidates[] = {
-                        {"indirect_base + offset", m_impl->indirect_base_addr ? (m_impl->indirect_base_addr + data_offset) : 0},
-                        {"last_dma + offset",      dma_cand ? (dma_cand + data_offset) : 0},
-                        {"last_dma direct",        dma_cand},
-                        {"last_dma_src + offset",  dma_src_cand ? (dma_src_cand + data_offset) : 0},
-                        {"last_dma_src direct",    dma_src_cand},
-                        {"gnm_base + offset",      m_impl->gnm_base_addr ? (m_impl->gnm_base_addr + data_offset) : 0},
-                        {"direct data_offset",     (data_offset > 0x1000) ? static_cast<GuestAddr>(data_offset) : 0}
-                    };
-
-                    GuestAddr args_addr = 0;
-                    const char* matched_source = "none";
-                    bool found_args = false;
-
-                    for (const auto& cand : candidates) {
-                        if (cand.addr > 0x1000 && m_impl->memory && m_impl->memory->is_valid_address(cand.addr, sizeof(args))) {
-                            DrawIndexIndirectArgs test_args{};
-                            m_impl->memory->read_value(cand.addr + 0, test_args.index_count);
-                            m_impl->memory->read_value(cand.addr + 4, test_args.instance_count);
-                            m_impl->memory->read_value(cand.addr + 8, test_args.first_index);
-                            m_impl->memory->read_value(cand.addr + 12, test_args.vertex_offset);
-                            m_impl->memory->read_value(cand.addr + 16, test_args.first_instance);
-
-                            if (test_args.index_count > 0 && test_args.index_count < 10000000 &&
-                                test_args.instance_count > 0 && test_args.instance_count <= 65536) {
-                                args = test_args;
-                                args_addr = cand.addr;
-                                matched_source = cand.name;
-                                found_args = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (found_args) {
-                        std::fprintf(stderr, "[PM4]   -> IndirectArgs at 0x%llx (source: %s): idxCount=%u, instCount=%u, firstIdx=%u, vtxOffset=%d, firstInst=%u\n",
-                                     (unsigned long long)args_addr, matched_source, args.index_count, args.instance_count,
-                                     args.first_index, args.vertex_offset, args.first_instance);
-
-                        const usize elem_sz = (m_impl->index_type == MTLIndexTypeUInt32) ? sizeof(u32) : sizeof(u16);
-                        const GuestAddr idx_start = m_impl->index_base_addr + (args.first_index * elem_sz);
-
-                        m_impl->render_indexed_mesh(idx_start, args.index_count, prim,
-                                                    m_impl->index_type, args.vertex_offset, args.instance_count);
-                    } else {
-                        std::fprintf(stderr, "[PM4]   -> IndirectArgs not found! (data_offset=0x%x, last_dma_dst=0x%llx, last_dma_src=0x%llx, idx_base=0x%llx)\n",
-                                     data_offset, (unsigned long long)m_impl->last_dma_dst_addr,
-                                     (unsigned long long)m_impl->last_dma_src_addr,
-                                     (unsigned long long)m_impl->index_base_addr);
-                        for (const auto& cand : candidates) {
-                            if (cand.addr > 0x1000 && m_impl->memory && m_impl->memory->is_valid_address(cand.addr, 20)) {
-                                u32 w[5] = {0};
-                                m_impl->memory->read_bytes(cand.addr, w, 20);
-                                std::fprintf(stderr, "[PM4]      Cand '%s' at 0x%llx: [0x%x, 0x%x, 0x%x, 0x%x, 0x%x]\n",
-                                             cand.name, (unsigned long long)cand.addr, w[0], w[1], w[2], w[3], w[4]);
-                            }
-                        }
-                    }
+                u32 a[5] = {0, 0, 0, 0, 0};
+                st.memory->read_bytes(args_addr, a, args_size);
+                if (indexed) {
+                    // {index_count, instance_count, start_index, base_vertex, start_instance}
+                    const usize esz = (st.index_type == MTLIndexTypeUInt32) ? 4 : 2;
+                    const GuestAddr idx_start = st.index_base_addr + static_cast<GuestAddr>(a[2]) * esz;
+                    std::fprintf(stderr, "[PM4]   -> args@0x%llx: idxCount=%u instCount=%u firstIdx=%u vtxOffset=%d firstInst=%u\n",
+                                 (unsigned long long)args_addr, a[0], a[1], a[2], static_cast<i32>(a[3]), a[4]);
+                    if (a[0] == 0 || a[1] == 0) return true; // empty draw
+                    dump_draw_state(name, idx_start, a[0], st.index_type);
+                    return st.render_indexed_mesh(idx_start, a[0], st.primitive_type, st.index_type,
+                                                  static_cast<i32>(a[3]), a[1]);
                 }
-                return true;
+                // {vertex_count, instance_count, start_vertex, start_instance}
+                std::fprintf(stderr, "[PM4]   -> args@0x%llx: vtxCount=%u instCount=%u firstVtx=%u firstInst=%u\n",
+                             (unsigned long long)args_addr, a[0], a[1], a[2], a[3]);
+                if (a[0] == 0 || a[1] == 0) return true;
+                dump_draw_state(name, 0, 0, st.index_type);
+                return st.render_auto_mesh(a[0], st.primitive_type, static_cast<i32>(a[2]), a[1]);
             }
 
             case IT_WRITE_DATA: {
-                if (!m_impl->require_payload(packet, 4, "IT_WRITE_DATA")) return false;
-                if (m_impl->memory) {
-                    const u32 addr_lo = packet.payload[1];
-                    const u32 addr_hi = packet.payload[2];
-                    const GuestAddr dst_addr = (static_cast<u64>(addr_hi) << 32) | addr_lo;
-                    const usize count = packet.payload.size() - 3;
-                    const usize byte_size = count * sizeof(u32);
-                    if (dst_addr > 0x1000 && m_impl->memory->is_valid_address(dst_addr, byte_size)) {
-                        m_impl->memory->write_bytes(dst_addr, &packet.payload[3], byte_size);
-                    }
+                // [CONTROL, DST_ADDR_LO, DST_ADDR_HI, DATA...]
+                // CONTROL: DST_SEL[11:8] (0 register, 1 memory sync, 2 TC_L2,
+                // 5 memory async), WR_ONE_ADDR[16], WR_CONFIRM[20], ENGINE[31:30].
+                if (!st.require_payload(packet, 4, "IT_WRITE_DATA")) return false;
+                const u32 control = packet.payload[0];
+                const u32 dst_sel = (control >> 8) & 0xF;
+                const bool one_addr = (control & (1u << 16)) != 0;
+                const u32* data = &packet.payload[3];
+                const usize n = packet.payload.size() - 3;
+                if (dst_sel == 0) {
+                    const u32 reg = packet.payload[1] & 0xFFFF;
+                    if (one_addr) return write_regs(reg, &data[n - 1], 1);
+                    return write_regs(reg, data, n);
                 }
+                if (dst_sel != 1 && dst_sel != 2 && dst_sel != 5) {
+                    std::fprintf(stderr, "[PM4] IT_WRITE_DATA: unsupported DST_SEL=%u\n", dst_sel);
+                    return false;
+                }
+                const GuestAddr dst =
+                    (static_cast<u64>(packet.payload[2]) << 32) | (packet.payload[1] & ~3u);
+                const usize bytes = one_addr ? 4 : n * 4;
+                if (!st.memory || dst == 0 || !st.memory->is_valid_address(dst, bytes)) {
+                    std::fprintf(stderr, "[PM4] IT_WRITE_DATA: destination 0x%llx+%zu is not mapped\n",
+                                 (unsigned long long)dst, bytes);
+                    return true;
+                }
+                if (one_addr) {
+                    st.memory->write_value<u32>(dst, data[n - 1]);
+                } else {
+                    st.memory->write_bytes(dst, data, bytes);
+                }
+                st.invalidate_resources(dst, bytes);
                 return true;
             }
 
             case IT_WAIT_REG_MEM: {
+                // [CONTROL, POLL_ADDR_LO|REG, POLL_ADDR_HI, REFERENCE, MASK, POLL_INTERVAL]
+                // CONTROL: FUNCTION[2:0] (0 always, 1 <, 2 <=, 3 ==, 4 !=, 5 >=, 6 >),
+                // MEM_SPACE[4] (0 register, 1 memory), OPERATION[7:6], ENGINE[8].
+                if (!st.require_payload(packet, 6, "IT_WAIT_REG_MEM")) return false;
+                const u32 control = packet.payload[0];
+                const u32 func = control & 0x7u;
+                const bool is_mem = (control & 0x10u) != 0;
+                const u32 ref = packet.payload[3];
+                const u32 mask = packet.payload[4];
+                auto passes = [func, ref, mask](u32 v) {
+                    const u32 x = v & mask;
+                    switch (func) {
+                        case 0: return true;
+                        case 1: return x < ref;
+                        case 2: return x <= ref;
+                        case 3: return x == ref;
+                        case 4: return x != ref;
+                        case 5: return x >= ref;
+                        case 6: return x > ref;
+                        default: return true;
+                    }
+                };
+                if (!is_mem) {
+                    const u32 reg = packet.payload[1] & 0xFFFF;
+                    if (!passes(read_reg(reg))) {
+                        std::fprintf(stderr, "[PM4] IT_WAIT_REG_MEM: register 0x%04x=0x%08x never satisfies func=%u ref=0x%08x mask=0x%08x; continuing\n",
+                                     reg, read_reg(reg), func, ref, mask);
+                    }
+                    return true;
+                }
+                const GuestAddr poll_addr =
+                    (static_cast<u64>(packet.payload[2] & 0xFFFFu) << 32) | (packet.payload[1] & ~3u);
+                if (!st.memory || poll_addr == 0 || !st.memory->is_valid_address(poll_addr, 4)) {
+                    std::fprintf(stderr, "[PM4] IT_WAIT_REG_MEM: poll address 0x%llx is not mapped\n",
+                                 (unsigned long long)poll_addr);
+                    return true;
+                }
+                u32 cur = 0;
+                st.memory->read_value(poll_addr, cur);
+                if (passes(cur)) return true;
+                // The command processor executes the stream synchronously on
+                // the submitting thread, so a wait that is not yet satisfied
+                // can never be satisfied by a later packet of this stream. The
+                // GPU never writes the polled location itself, so neither do
+                // we: report the unsatisfied wait and continue.
+                std::fprintf(stderr, "[PM4] IT_WAIT_REG_MEM: unsatisfied wait on 0x%llx (cur=0x%08x func=%u ref=0x%08x mask=0x%08x); continuing\n",
+                             (unsigned long long)poll_addr, cur, func, ref, mask);
                 return true;
             }
 
-            case IT_EVENT_WRITE:
-                return true;
-
-            case IT_RELEASE_MEM: {
-                if (!m_impl->require_payload(packet, 5, "IT_RELEASE_MEM")) return false;
-                if (m_impl->memory) {
-                    const u32 addr_lo = packet.payload[2];
-                    const u32 addr_hi = packet.payload[3];
-                    const GuestAddr label_addr = (static_cast<u64>(addr_hi) << 32) | addr_lo;
-                    const u32 data_lo = packet.payload[4];
-                    const u32 data_hi = packet.payload.size() >= 6 ? packet.payload[5] : 0;
-                    const u64 data_val = (static_cast<u64>(data_hi) << 32) | data_lo;
-                    if (label_addr > 0x1000 && m_impl->memory->is_valid_address(label_addr, 4)) {
-                        m_impl->memory->write_value(label_addr, data_val);
-                    }
+            case IT_EVENT_WRITE: {
+                // [EVENT_TYPE[5:0] | EVENT_INDEX[11:8], (ADDR_LO, ADDR_HI)]
+                // Cache flush / pipeline events have no observable effect on a
+                // synchronously executed stream. Events with a memory payload
+                // (ZPASS_DONE, SAMPLE_PIPELINESTAT, ...) write query results,
+                // which are reported as zero.
+                if (!st.require_payload(packet, 1, "IT_EVENT_WRITE")) return false;
+                if (packet.payload.size() >= 3 && st.memory) {
+                    const GuestAddr addr =
+                        (static_cast<u64>(packet.payload[2] & 0xFFFFu) << 32) | (packet.payload[1] & ~7u);
+                    const u32 event_type = packet.payload[0] & 0x3F;
+                    std::fprintf(stderr, "[PM4] IT_EVENT_WRITE: event=0x%02x query addr=0x%llx (results not emulated)\n",
+                                 event_type, (unsigned long long)addr);
                 }
                 return true;
+            }
+
+            case IT_EVENT_WRITE_EOP: {
+                // [EVENT_CNTL, ADDR_LO, ADDR_HI[15:0] | INT_SEL[25:24] | DATA_SEL[31:29], DATA_LO, DATA_HI]
+                if (!st.require_payload(packet, 5, "IT_EVENT_WRITE_EOP")) return false;
+                const u32 dw2 = packet.payload[2];
+                const GuestAddr addr = (static_cast<u64>(dw2 & 0xFFFFu) << 32) | packet.payload[1];
+                const u32 data_sel = (dw2 >> 29) & 0x7;
+                const u32 int_sel = (dw2 >> 24) & 0x3;
+                std::fprintf(stderr, "[PM4] IT_EVENT_WRITE_EOP: event=0x%02x addr=0x%llx data_sel=%u int_sel=%u data=0x%08x_%08x\n",
+                             packet.payload[0] & 0x3F, (unsigned long long)addr, data_sel, int_sel,
+                             packet.payload[4], packet.payload[3]);
+                // Interrupt delivery (INT_SEL) is owned by the HLE equeue path.
+                return write_end_of_pipe("IT_EVENT_WRITE_EOP", addr, data_sel, packet.payload[3], packet.payload[4]);
+            }
+
+            case IT_EVENT_WRITE_EOS: {
+                // [EVENT_CNTL, ADDR_LO, ADDR_HI[15:0] | CMD[31:29], DATA]
+                // CMD: 1 = store GDS data, 2 = store 32-bit DATA.
+                if (!st.require_payload(packet, 4, "IT_EVENT_WRITE_EOS")) return false;
+                const u32 dw2 = packet.payload[2];
+                const GuestAddr addr = (static_cast<u64>(dw2 & 0xFFFFu) << 32) | packet.payload[1];
+                const u32 cmd = (dw2 >> 29) & 0x7;
+                if (cmd == 2) return write_end_of_pipe("IT_EVENT_WRITE_EOS", addr, 1, packet.payload[3], 0);
+                if (cmd == 1) {
+                    std::fprintf(stderr, "[PM4] IT_EVENT_WRITE_EOS: GDS store is not emulated\n");
+                    return false;
+                }
+                return true;
+            }
+
+            case IT_RELEASE_MEM: {
+                // [EVENT_CNTL, DST_SEL[17:16] | INT_SEL[26:24] | DATA_SEL[31:29],
+                //  ADDR_LO, ADDR_HI, DATA_LO, DATA_HI]
+                if (!st.require_payload(packet, 6, "IT_RELEASE_MEM")) return false;
+                const u32 dw1 = packet.payload[1];
+                const GuestAddr addr = (static_cast<u64>(packet.payload[3]) << 32) | packet.payload[2];
+                const u32 data_sel = (dw1 >> 29) & 0x7;
+                std::fprintf(stderr, "[PM4] IT_RELEASE_MEM: event=0x%02x addr=0x%llx data_sel=%u int_sel=%u data=0x%08x_%08x\n",
+                             packet.payload[0] & 0x3F, (unsigned long long)addr, data_sel, (dw1 >> 24) & 0x7,
+                             packet.payload[5], packet.payload[4]);
+                return write_end_of_pipe("IT_RELEASE_MEM", addr, data_sel, packet.payload[4], packet.payload[5]);
             }
 
             case IT_DMA_DATA: {
-                if (!m_impl->require_payload(packet, 6, "IT_DMA_DATA")) return false;
-                if (m_impl->memory) {
-                    const u32 control = packet.payload[0];
-                    const u32 src_lo = packet.payload[1];
-                    const u32 src_hi = packet.payload[2];
-                    const u32 dst_lo = packet.payload[3];
-                    const u32 dst_hi = packet.payload[4];
-                    const u32 command = packet.payload[5];
-                    const usize byte_size = command & 0x1FFFFF;
-                    const u32 src_sel = (control >> 29) & 0x03;
-                    const u32 dst_sel = (control >> 20) & 0x03;
-                    const GuestAddr dst_addr = (static_cast<u64>(dst_hi) << 32) | dst_lo;
-                    const GuestAddr src_addr = (static_cast<u64>(src_hi) << 32) | src_lo;
+                // [CONTROL, SRC_LO|DATA, SRC_HI, DST_LO, DST_HI, COMMAND]
+                // CONTROL: DST_SEL[21:20], SRC_SEL[30:29], CP_SYNC[31].
+                // COMMAND: BYTE_COUNT[20:0], SAS[26], DAS[27], SAIC[28], DAIC[29].
+                if (!st.require_payload(packet, 6, "IT_DMA_DATA")) return false;
+                const u32 control = packet.payload[0];
+                const u32 command = packet.payload[5];
+                const u32 src_sel = (control >> 29) & 0x3;
+                const u32 dst_sel = (control >> 20) & 0x3;
+                const GuestAddr src = (static_cast<u64>(packet.payload[2]) << 32) | packet.payload[1];
+                const GuestAddr dst = (static_cast<u64>(packet.payload[4]) << 32) | packet.payload[3];
+                const usize bytes = command & 0x1FFFFF;
+                const bool sas = (command >> 26) & 1, das = (command >> 27) & 1;
+                const bool saic = (command >> 28) & 1, daic = (command >> 29) & 1;
+                std::fprintf(stderr, "[PM4] IT_DMA_DATA: src_sel=%u dst_sel=%u src=0x%llx%s dst=0x%llx%s bytes=%zu\n",
+                             src_sel, dst_sel, (unsigned long long)src, sas ? "(reg)" : "",
+                             (unsigned long long)dst, das ? "(reg)" : "", bytes);
+                return run_dma("IT_DMA_DATA", src_sel, dst_sel, src, dst, bytes, sas, das, saic, daic,
+                               packet.payload[1]);
+            }
 
-                    m_impl->last_dma_dst_addr = dst_addr;
-                    m_impl->last_dma_src_addr = src_addr;
-                    m_impl->last_dma_size = byte_size;
-                    const bool is_zero_clear = (src_sel == 2 && src_lo == 0);
-                    m_impl->last_dma_is_copy_or_nonzero = !is_zero_clear;
+            case IT_CP_DMA: {
+                // [SRC_LO|DATA, SRC_HI[15:0] | DST_SEL[21:20] | SRC_SEL[30:29] | CP_SYNC[31],
+                //  DST_LO, DST_HI[15:0], COMMAND (as DMA_DATA)]
+                if (!st.require_payload(packet, 5, "IT_CP_DMA")) return false;
+                const u32 dw1 = packet.payload[1];
+                const u32 command = packet.payload[4];
+                const GuestAddr src = (static_cast<u64>(dw1 & 0xFFFFu) << 32) | packet.payload[0];
+                const GuestAddr dst = (static_cast<u64>(packet.payload[3] & 0xFFFFu) << 32) | packet.payload[2];
+                return run_dma("IT_CP_DMA", (dw1 >> 29) & 0x3, (dw1 >> 20) & 0x3, src, dst,
+                               command & 0x1FFFFF, (command >> 26) & 1, (command >> 27) & 1,
+                               (command >> 28) & 1, (command >> 29) & 1, packet.payload[0]);
+            }
 
-                    std::string dwords_str;
-                    for (size_t d = 0; d < packet.payload.size(); ++d) {
-                        char buf[32];
-                        std::snprintf(buf, sizeof(buf), "0x%08x ", packet.payload[d]);
-                        dwords_str += buf;
-                    }
-
-                    std::fprintf(stderr, "[PM4] IT_DMA_DATA: ctl=0x%08x (src_sel=%u, dst_sel=%u), src=0x%08x_%08x, dst=0x%llx, sz=%zu raw=[%s]\n",
-                                 control, src_sel, dst_sel, src_hi, src_lo, (unsigned long long)dst_addr, byte_size, dwords_str.c_str());
-
-                    if (byte_size > 0 && m_impl->memory->is_valid_address(dst_addr, byte_size)) {
-                        void* dst = m_impl->memory->to_host_ptr<void>(dst_addr);
-                        if (dst) {
-                            if (src_sel == 2) {
-                                // Immediate data / constant-fill:
-                                // Fill memory with 32-bit pattern in src_lo
-                                u32* dst32 = static_cast<u32*>(dst);
-                                const usize dwords = byte_size / sizeof(u32);
-                                for (usize d = 0; d < dwords; ++d) {
-                                    dst32[d] = src_lo;
-                                }
-                                const usize rem = byte_size % sizeof(u32);
-                                if (rem > 0) {
-                                    std::memcpy(reinterpret_cast<u8*>(dst32 + dwords), &src_lo, rem);
-                                }
-                            } else {
-                                // Memory-to-memory copy
-                                const GuestAddr src_addr = (static_cast<u64>(src_hi) << 32) | src_lo;
-                                if (m_impl->memory->is_valid_address(src_addr, byte_size)) {
-                                    const void* src = m_impl->memory->to_host_ptr<void>(src_addr);
-                                    if (src) {
-                                        std::memcpy(dst, src, byte_size);
-                                    }
-                                }
-                            }
-                        }
-                    }
+            case IT_ACQUIRE_MEM:
+            case IT_SURFACE_SYNC: {
+                // ACQUIRE_MEM: [COHER_CNTL, COHER_SIZE, COHER_SIZE_HI, COHER_BASE_LO, COHER_BASE_HI, POLL]
+                // SURFACE_SYNC: [COHER_CNTL, COHER_SIZE, COHER_BASE, POLL]
+                // Sizes/bases are in 256-byte units; SIZE=0xFFFFFFFF means all.
+                // Host-side resource caches are content-validated on use, so a
+                // full-range acquire needs no work; a bounded range drops the
+                // cached Metal copies covering it.
+                const bool acquire = packet.header.opcode == IT_ACQUIRE_MEM;
+                if (!st.require_payload(packet, acquire ? 6 : 4,
+                                        acquire ? "IT_ACQUIRE_MEM" : "IT_SURFACE_SYNC")) return false;
+                const u64 size_units = acquire
+                    ? ((static_cast<u64>(packet.payload[2] & 0xFF) << 32) | packet.payload[1])
+                    : packet.payload[1];
+                const u64 base_units = acquire
+                    ? ((static_cast<u64>(packet.payload[4] & 0xFF) << 32) | packet.payload[3])
+                    : packet.payload[2];
+                const bool full = (packet.payload[1] == 0xFFFFFFFFu);
+                if (!full && size_units != 0) {
+                    st.invalidate_resources(base_units << 8, static_cast<usize>(size_units << 8));
                 }
+                return true;
+            }
+
+            case IT_INDIRECT_BUFFER:
+            case IT_INDIRECT_BUFFER_CNST: {
+                // [IB_BASE_LO, IB_BASE_HI[15:0], IB_SIZE[19:0] | CHAIN[20] | VALID[23] | VMID[31:24]]
+                const char* name = packet.header.opcode == IT_INDIRECT_BUFFER ? "IT_INDIRECT_BUFFER"
+                                                                               : "IT_INDIRECT_BUFFER_CNST";
+                if (!st.require_payload(packet, 3, name)) return false;
+                const GuestAddr ib = (static_cast<u64>(packet.payload[1] & 0xFFFFu) << 32) | (packet.payload[0] & ~3u);
+                const usize ib_dwords = packet.payload[2] & 0xFFFFF;
+                if (st.ib_depth >= 8) {
+                    std::fprintf(stderr, "[PM4] %s: nesting too deep at 0x%llx\n", name, (unsigned long long)ib);
+                    return false;
+                }
+                ++st.ib_depth;
+                const usize executed = execute_command_buffer(ib, ib_dwords * 4);
+                --st.ib_depth;
+                return ib_dwords == 0 || executed > 0;
+            }
+
+            case IT_COND_EXEC: {
+                // [BOOL_ADDR_LO, BOOL_ADDR_HI, CONTROL, EXEC_COUNT[13:0]]:
+                // skip the next EXEC_COUNT dwords when the 32-bit value is 0.
+                if (!st.require_payload(packet, 4, "IT_COND_EXEC")) return false;
+                const GuestAddr addr = (static_cast<u64>(packet.payload[1] & 0xFFFFu) << 32) | (packet.payload[0] & ~3u);
+                u32 v = 1;
+                if (st.memory && st.memory->is_valid_address(addr, 4)) st.memory->read_value(addr, v);
+                if (v == 0) st.pending_skip_dwords = packet.payload[3] & 0x3FFF;
+                return true;
+            }
+
+            case IT_PRED_EXEC: {
+                // [EXEC_COUNT[13:0] | DEVICE_SELECT[31:24]]: single-GPU device mask bit 0.
+                if (!st.require_payload(packet, 1, "IT_PRED_EXEC")) return false;
+                if (((packet.payload[0] >> 24) & 1u) == 0) st.pending_skip_dwords = packet.payload[0] & 0x3FFF;
+                return true;
+            }
+
+            case IT_SET_PREDICATION:
+                // Render predication on occlusion results. Occlusion queries are
+                // not emulated, so predicated draws always execute (the "draw"
+                // outcome the hardware takes when results are unavailable).
+                return st.require_payload(packet, 2, "IT_SET_PREDICATION");
+
+            case IT_WRITE_CONST_RAM: {
+                // [OFFSET[15:0] (bytes), DATA...]
+                if (!st.require_payload(packet, 2, "IT_WRITE_CONST_RAM")) return false;
+                const usize off = packet.payload[0] & 0xFFFC;
+                const usize bytes = (packet.payload.size() - 1) * 4;
+                if (off + bytes > st.ce_ram.size()) return false;
+                std::memcpy(st.ce_ram.data() + off, &packet.payload[1], bytes);
+                return true;
+            }
+
+            case IT_LOAD_CONST_RAM: {
+                // [ADDR_LO, ADDR_HI, NUM_DW[14:0], START_ADDR[15:0] (bytes)]
+                if (!st.require_payload(packet, 4, "IT_LOAD_CONST_RAM")) return false;
+                const GuestAddr src = (static_cast<u64>(packet.payload[1]) << 32) | (packet.payload[0] & ~3u);
+                const usize bytes = static_cast<usize>(packet.payload[2] & 0x7FFF) * 4;
+                const usize off = packet.payload[3] & 0xFFFC;
+                if (off + bytes > st.ce_ram.size() || !st.memory || !st.memory->is_valid_address(src, bytes)) return false;
+                st.memory->read_bytes(src, st.ce_ram.data() + off, bytes);
+                return true;
+            }
+
+            case IT_DUMP_CONST_RAM: {
+                // [OFFSET[15:0] (bytes), NUM_DW[14:0], ADDR_LO, ADDR_HI]
+                if (!st.require_payload(packet, 4, "IT_DUMP_CONST_RAM")) return false;
+                const usize off = packet.payload[0] & 0xFFFC;
+                const usize bytes = static_cast<usize>(packet.payload[1] & 0x7FFF) * 4;
+                const GuestAddr dst = (static_cast<u64>(packet.payload[3]) << 32) | (packet.payload[2] & ~3u);
+                if (off + bytes > st.ce_ram.size() || !st.memory || !st.memory->is_valid_address(dst, bytes)) return false;
+                st.memory->write_bytes(dst, st.ce_ram.data() + off, bytes);
+                st.invalidate_resources(dst, bytes);
+                return true;
+            }
+
+            case IT_INCREMENT_CE_COUNTER:
+            case IT_INCREMENT_DE_COUNTER:
+            case IT_WAIT_ON_CE_COUNTER:
+            case IT_WAIT_ON_DE_COUNTER_DIFF:
+            case IT_SWITCH_BUFFER:
+            case IT_PFP_SYNC_ME:
+            case IT_PREAMBLE_CNTL:
+            case IT_REWIND:
+                // CE/DE and PFP/ME synchronization primitives. The emulator
+                // executes a single in-order stream, so every such wait is
+                // already satisfied when the packet is reached.
+                return true;
+
+            case IT_COPY_DATA: {
+                // [CONTROL, SRC_LO|REG|IMM_LO, SRC_HI|IMM_HI, DST_LO|REG, DST_HI]
+                // CONTROL: SRC_SEL[3:0] (0 reg, 1 mem, 2 TC_L2, 5 imm, 9 GPU clock),
+                // DST_SEL[11:8] (0 reg, 1 mem, 2 TC_L2, 5 mem async), COUNT_SEL[16].
+                if (!st.require_payload(packet, 5, "IT_COPY_DATA")) return false;
+                const u32 control = packet.payload[0];
+                const u32 src_sel = control & 0xF;
+                const u32 dst_sel = (control >> 8) & 0xF;
+                const bool is64 = (control & (1u << 16)) != 0;
+                const usize bytes = is64 ? 8 : 4;
+                const GuestAddr align = is64 ? ~GuestAddr{7} : ~GuestAddr{3};
+                u64 value = 0;
+                switch (src_sel) {
+                    case 0: {
+                        const u32 reg = packet.payload[1] & 0xFFFF;
+                        value = read_reg(reg) | (is64 ? static_cast<u64>(read_reg(reg + 1)) << 32 : 0);
+                        break;
+                    }
+                    case 1:
+                    case 2: {
+                        const GuestAddr src = ((static_cast<u64>(packet.payload[2]) << 32) | packet.payload[1]) & align;
+                        if (!st.memory || !st.memory->is_valid_address(src, bytes)) {
+                            std::fprintf(stderr, "[PM4] IT_COPY_DATA: source 0x%llx is not mapped\n",
+                                         (unsigned long long)src);
+                            return true;
+                        }
+                        st.memory->read_bytes(src, &value, bytes);
+                        break;
+                    }
+                    case 5:
+                        value = packet.payload[1] | (is64 ? static_cast<u64>(packet.payload[2]) << 32 : 0);
+                        break;
+                    case 9:
+                        value = gpu_clock();
+                        break;
+                    default:
+                        std::fprintf(stderr, "[PM4] IT_COPY_DATA: unsupported SRC_SEL=%u\n", src_sel);
+                        return false;
+                }
+                if (dst_sel == 0) {
+                    const u32 vals[2] = {static_cast<u32>(value), static_cast<u32>(value >> 32)};
+                    return write_regs(packet.payload[3] & 0xFFFF, vals, is64 ? 2 : 1);
+                }
+                if (dst_sel != 1 && dst_sel != 2 && dst_sel != 5) {
+                    std::fprintf(stderr, "[PM4] IT_COPY_DATA: unsupported DST_SEL=%u\n", dst_sel);
+                    return false;
+                }
+                const GuestAddr dst = ((static_cast<u64>(packet.payload[4]) << 32) | packet.payload[3]) & align;
+                if (!st.memory || !st.memory->is_valid_address(dst, bytes)) {
+                    std::fprintf(stderr, "[PM4] IT_COPY_DATA: destination 0x%llx is not mapped\n",
+                                 (unsigned long long)dst);
+                    return true;
+                }
+                st.memory->write_bytes(dst, &value, bytes);
                 return true;
             }
 
             default:
-                if (m_impl->metal && m_impl->metal->frame_in_progress()) {
-                    m_impl->frame_stats.unsupported_packets++;
+                if (st.metal && st.metal->frame_in_progress()) {
+                    st.frame_stats.unsupported_packets++;
+                    std::fprintf(stderr, "[PM4 UNIMPL] op=0x%02x(%s) count=%zu d0=0x%08x d1=0x%08x\n",
+                                 packet.header.opcode, pm4_opcode_to_name(packet.header.opcode),
+                                 packet.payload.size(),
+                                 packet.payload.size() > 0 ? packet.payload[0] : 0,
+                                 packet.payload.size() > 1 ? packet.payload[1] : 0);
                 }
-                ++m_impl->unsupported_packets;
+                ++st.unsupported_packets;
                 return false;
         }
     }
@@ -2330,8 +2839,16 @@ usize Pm4Translator::execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_b
     usize pkts_executed = 0;
     std::map<u8, usize> op_counts;
     usize t0_count = 0, t2_count = 0, t3_count = 0;
+    m_impl->pending_skip_dwords = 0;
 
     while (offset < num_dwords) {
+        if (m_impl->pending_skip_dwords > 0) {
+            // COND_EXEC / PRED_EXEC evaluated false: skip the guarded dwords.
+            const usize skip = std::min(m_impl->pending_skip_dwords, num_dwords - offset);
+            offset += skip;
+            m_impl->pending_skip_dwords = 0;
+            continue;
+        }
         const u32 hdr_dword = dcb_dwords[offset++];
         Pm4Header hdr = decode_pm4_header(hdr_dword);
         Pm4Packet pkt{};
@@ -2364,6 +2881,7 @@ usize Pm4Translator::execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_b
         execute_packet(pkt);
         pkts_executed++;
     }
+    m_impl->pending_skip_dwords = 0;
 
     std::string hist_str;
     for (const auto& [op, cnt] : op_counts) {
@@ -2380,11 +2898,18 @@ usize Pm4Translator::execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_b
 usize Pm4Translator::execute_ring_buffer(GpuRingBuffer& ring_buffer) {
     auto packets = ring_buffer.parse_pending_packets();
     usize count = 0;
+    if (m_impl) m_impl->pending_skip_dwords = 0;
     for (const auto& pkt : packets) {
+        if (m_impl && m_impl->pending_skip_dwords > 0) {
+            const usize dwords = 1 + pkt.payload.size();
+            m_impl->pending_skip_dwords -= std::min(m_impl->pending_skip_dwords, dwords);
+            continue;
+        }
         if (execute_packet(pkt)) {
             count++;
         }
     }
+    if (m_impl) m_impl->pending_skip_dwords = 0;
     return count;
 }
 
@@ -2448,6 +2973,18 @@ GuestAddr Pm4Translator::last_dma_dst_address() const noexcept {
 
 usize Pm4Translator::last_dma_size() const noexcept {
     return m_impl ? m_impl->last_dma_size : 0;
+}
+
+PrimitiveType Pm4Translator::primitive_type() const noexcept {
+    return m_impl ? m_impl->primitive_type : PrimitiveType::TriangleList;
+}
+
+u32 Pm4Translator::num_instances() const noexcept {
+    return m_impl ? m_impl->num_instances : 1;
+}
+
+u32 Pm4Translator::register_value(u32 abs_dword_reg) const noexcept {
+    return (m_impl && abs_dword_reg < m_impl->reg_file.size()) ? m_impl->reg_file[abs_dword_reg] : 0;
 }
 
 void Pm4Translator::set_index_base_address(GuestAddr addr) noexcept {
