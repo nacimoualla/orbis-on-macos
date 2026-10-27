@@ -157,6 +157,12 @@ A standalone Python suite audits the HLE NID registry (hash vectors, tag round-t
 python3 tests/test_verify_nids_adversarial.py
 ```
 
+### CPU/JIT testing off-Mac
+
+- `scripts/cpu_harness.sh [phase|tests/foo.cpp ...]` — cross-compiles the CPU sources plus the given tests to Linux/aarch64 and runs them under `qemu-aarch64` (default: phases 5, 13, 15), so JIT work can be tested on any Linux box.
+- `scripts/cpu_harness.sh tests/test_jit_diff.cpp` — differential fuzzer: random x86_64 sequences (grouped templates: `alu_rr`, `alu_imm8`, `mov_mem`, `lea`, `stack`, …) run on the interpreter (reference) and with the JIT attached from identical state; GPRs, RIP, defined flags and scratch memory must match. Mismatches are shrunk to a minimal repro with hex bytes; per-group JIT coverage is reported. Knobs: `JIT_DIFF_SEED`, `JIT_DIFF_TRIALS`, `JIT_DIFF_GROUPS=alu_rr,mov_mem`, `JIT_DIFF_LEN`, `JIT_DIFF_CHECK_FLAGS=0` (full list in the file header; `--list` prints groups).
+- `scripts/jit_fuzz.sh [seed ...]` — runs the fuzzer over several seeds and summarizes pass/fail, summed coverage and unique minimized failures.
+
 ### Debugging HLE coverage
 
 Two stdlib-only scripts support NID work:
