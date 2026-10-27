@@ -3069,11 +3069,11 @@ RunResult CpuExecutor::run(usize max_instructions) {
 
         // Try JIT block execution if compiler attached
         if (m_jit && !m_syscalls.has_exited()) {
-            const GuestAddr prev_rip = m_context.rip;
-            if (m_jit->execute_block(m_context, m_memory)) {
-                const auto* metrics = m_jit->get_block_metrics(prev_rip);
-                const usize count = metrics ? metrics->instructions_compiled : 1;
-                result.instructions_executed += count;
+            usize retired = 0;
+            if (m_jit->execute_block(m_context, m_memory, &retired)) {
+                // A block that side-exits retires fewer instructions than it
+                // compiled; count what actually ran.
+                result.instructions_executed += retired;
 
                 if (m_syscalls.has_exited()) {
                     result.status = StepResult::Exited;

@@ -11,9 +11,16 @@
 
 namespace ps4 {
 
-// Signature for natively compiled basic blocks
-// Argument: pointer to guest CpuContext in register x0
-using JittedBlockFunc = void (*)(CpuContext* ctx);
+// Signature for natively compiled basic blocks (AAPCS64):
+//   x0 = guest CpuContext*            (kept in x19 inside the block)
+//   x1 = host base of guest memory    (kept in x20; host = base + guest addr)
+//   x2 = size of the guest address space in bytes (x21 = size - 8 is the
+//        highest guest address a <= 8-byte access may start at)
+// Returns the number of guest instructions retired. A block retires all of
+// its instructions unless a memory access fails the bounds check, in which
+// case it side-exits with ctx->rip at the faulting instruction (so the
+// interpreter executes it) and returns the count retired before it.
+using JittedBlockFunc = u64 (*)(CpuContext* ctx, u8* guest_base, u64 guest_size);
 
 struct JitBlockMetrics {
     usize instructions_compiled{0};
@@ -53,6 +60,63 @@ public:
     void b(i32 offset_words);
     void b_cond(u8 cond, i32 offset_words);
 
+    // --- Encodings used by the memory-operand / flags translator ----------
+    // `sf` selects the 64-bit (X) form, otherwise the 32-bit (W) form.
+    enum : u8 { SHIFT_LSL = 0, SHIFT_LSR = 1, SHIFT_ASR = 2 };
+
+    // Data processing (shifted register): rd = rn OP (rm SHIFT amount)
+    void add_shifted(bool sf, u8 rd, u8 rn, u8 rm, u8 shift = SHIFT_LSL, u8 amount = 0);
+    void adds_shifted(bool sf, u8 rd, u8 rn, u8 rm, u8 shift = SHIFT_LSL, u8 amount = 0);
+    void subs_shifted(bool sf, u8 rd, u8 rn, u8 rm, u8 shift = SHIFT_LSL, u8 amount = 0);
+    void ands_shifted(bool sf, u8 rd, u8 rn, u8 rm, u8 shift = SHIFT_LSL, u8 amount = 0);
+    void orr_shifted(bool sf, u8 rd, u8 rn, u8 rm, u8 shift = SHIFT_LSL, u8 amount = 0);
+    void eor_shifted(bool sf, u8 rd, u8 rn, u8 rm, u8 shift = SHIFT_LSL, u8 amount = 0);
+    void bic_shifted(bool sf, u8 rd, u8 rn, u8 rm, u8 shift = SHIFT_LSL, u8 amount = 0);
+    void cmp_reg(bool sf, u8 rn, u8 rm) { subs_shifted(sf, 31, rn, rm); }
+    void mov_w(u8 rd, u8 rm); // ORR wd, wzr, wm (zero-extends into xd)
+
+    // Bitfield moves and their aliases
+    void ubfm(bool sf, u8 rd, u8 rn, u8 immr, u8 imms);
+    void sbfm(bool sf, u8 rd, u8 rn, u8 immr, u8 imms);
+    void bfm(bool sf, u8 rd, u8 rn, u8 immr, u8 imms);
+    void lsl_imm(bool sf, u8 rd, u8 rn, u8 shift);
+    void lsr_imm(bool sf, u8 rd, u8 rn, u8 shift);
+    void ubfx(bool sf, u8 rd, u8 rn, u8 lsb, u8 width);
+    void bfi(bool sf, u8 rd, u8 rn, u8 lsb, u8 width);
+    void sxt(bool sf, u8 rd, u8 rn, u8 from_bits); // SXTB/SXTH/SXTW
+
+    void lsrv(bool sf, u8 rd, u8 rn, u8 rm);
+    void movz(bool sf, u8 rd, u16 imm16, u8 hw = 0);
+    void cset(bool sf, u8 rd, u8 cond);
+    void mrs_nzcv(u8 rt);
+    /// rd = rn + imm for any signed 64-bit imm (uses `scratch` if it does not
+    /// fit two 12-bit immediates).
+    void add_imm64(u8 rd, u8 rn, i64 imm, u8 scratch);
+
+    // Loads/stores, unsigned scaled immediate offset (offset in bytes)
+    void ldrb_imm(u8 rt, u8 rn, u32 offset_bytes);
+    void ldrh_imm(u8 rt, u8 rn, u32 offset_bytes);
+    void strb_imm(u8 rt, u8 rn, u32 offset_bytes);
+    void strh_imm(u8 rt, u8 rn, u32 offset_bytes);
+
+    // Loads/stores, register offset: [rn, rm] (64-bit index, no shift)
+    void ldrb_idx(u8 rt, u8 rn, u8 rm);   // zero-extends
+    void ldrh_idx(u8 rt, u8 rn, u8 rm);   // zero-extends
+    void ldr_w_idx(u8 rt, u8 rn, u8 rm);  // zero-extends
+    void ldr_x_idx(u8 rt, u8 rn, u8 rm);
+    void ldrsb_x_idx(u8 rt, u8 rn, u8 rm);
+    void ldrsh_x_idx(u8 rt, u8 rn, u8 rm);
+    void ldrsw_idx(u8 rt, u8 rn, u8 rm);
+    void strb_idx(u8 rt, u8 rn, u8 rm);
+    void strh_idx(u8 rt, u8 rn, u8 rm);
+    void str_w_idx(u8 rt, u8 rn, u8 rm);
+    void str_x_idx(u8 rt, u8 rn, u8 rm);
+
+    /// Current position (in instruction words), e.g. for later patching.
+    [[nodiscard]] usize pos() const noexcept { return m_code.size(); }
+    /// Re-target a B.cond emitted at `at` to the instruction word `target`.
+    void patch_b_cond(usize at, usize target);
+
     // Block calling convention helpers
     void emit_prologue();
     void emit_epilogue();
@@ -77,8 +141,13 @@ public:
     JittedBlockFunc compile_block(GuestAddr guest_rip, const MemoryManager& memory);
 
     /// Execute a block at current ctx.rip (compiling on demand if not cached)
-    /// Returns true if executed via JIT, false if fell back to interpreter
-    bool execute_block(CpuContext& ctx, const MemoryManager& memory);
+    /// Returns true if executed via JIT, false if the caller must fall back to
+    /// the interpreter (nothing compiled, or the block side-exited before
+    /// retiring any instruction). `retired` receives the number of guest
+    /// instructions the block retired.
+    /// The block reads and writes guest memory through memory.base_address().
+    bool execute_block(CpuContext& ctx, const MemoryManager& memory,
+                       usize* retired = nullptr);
 
     /// Check if a guest address has a compiled block in cache
     [[nodiscard]] bool is_block_cached(GuestAddr guest_rip) const;
