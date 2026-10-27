@@ -160,6 +160,18 @@ inline bool check_condition(const CpuContext& ctx, u8 cc) {
     return (cc & 1) ? !cond : cond;
 }
 
+// x86 float -> integer conversion: NaN and out-of-range inputs produce the
+// "integer indefinite" value (0x80000000 / 0x8000000000000000). A plain C++
+// cast is undefined there and saturates on the ARM64 host.
+inline u32 x86_cvt_i32(double v) {
+    if (!(v > -2147483649.0 && v < 2147483648.0)) return 0x80000000u;
+    return static_cast<u32>(static_cast<i32>(v));
+}
+inline u64 x86_cvt_i64(double v) {
+    if (!(v >= -9223372036854775808.0 && v < 9223372036854775808.0)) return 0x8000000000000000ull;
+    return static_cast<u64>(static_cast<i64>(v));
+}
+
 u64 execute_alu_op(CpuContext& ctx, u8 op, u64 a, u64 b, usize bits) {
     const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
     a &= mask;
@@ -2032,6 +2044,16 @@ StepResult CpuExecutor::step() {
         if (vex_op == 0x7E) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
+            if (vex_pp == 2) { // VMOVQ xmm1, xmm2/m64 (F3): load, zero bits 255:64
+                u64 val = 0;
+                if (m.is_reg) val = m_context.ymm[m.rm_id & 15].q[0];
+                else if (!m_memory.read_value(m.mem_addr, val)) return StepResult::MemoryFault;
+                m_context.ymm[m.reg_id & 15] = CpuContext::YmmReg{};
+                m_context.ymm[m.reg_id & 15].q[0] = val;
+                m_context.rip = start_rip + cursor + m.bytes_consumed;
+                return StepResult::Ok;
+            }
+            // 66: VMOVD/VMOVQ r/m32/64, xmm
             const u8 src = m.reg_id & 15;
             if (vex_w) {
                 write_rm(m, m_context.ymm[src].q[0], 64);
@@ -2988,14 +3010,14 @@ StepResult CpuExecutor::step() {
                 double dval = 0.0;
                 if (m.is_reg) std::memcpy(&dval, &m_context.ymm[m.rm_id & 15].q[0], 8);
                 else m_memory.read_bytes(m.mem_addr, &dval, 8);
-                if (vex_w) set_gpr64(m_context, m.reg_id, static_cast<u64>(static_cast<i64>(dval)));
-                else set_gpr32(m_context, m.reg_id, static_cast<u32>(static_cast<i32>(dval)));
+                if (vex_w) set_gpr64(m_context, m.reg_id, x86_cvt_i64(dval));
+                else set_gpr32(m_context, m.reg_id, x86_cvt_i32(dval));
             } else { // VCVTTSS2SI: float to integer with truncation
                 float fval = 0.0f;
                 if (m.is_reg) std::memcpy(&fval, &m_context.ymm[m.rm_id & 15].d[0], 4);
                 else m_memory.read_bytes(m.mem_addr, &fval, 4);
-                if (vex_w) set_gpr64(m_context, m.reg_id, static_cast<u64>(static_cast<i64>(fval)));
-                else set_gpr32(m_context, m.reg_id, static_cast<u32>(static_cast<i32>(fval)));
+                if (vex_w) set_gpr64(m_context, m.reg_id, x86_cvt_i64(fval));
+                else set_gpr32(m_context, m.reg_id, x86_cvt_i32(fval));
             }
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
@@ -3059,7 +3081,7 @@ StepResult CpuExecutor::step() {
                 }
             } else if (vex_pp == 1) { // VCVTPS2DQ: float to dword (round to nearest)
                 for (usize i = 0; i < count; ++i) {
-                    res.d[i] = static_cast<u32>(static_cast<i32>(std::nearbyint(src.f[i])));
+                    res.d[i] = x86_cvt_i32(std::nearbyint(src.f[i]));
                 }
             } else if (vex_pp == 2) { // VCVTTPS2DQ: float to dword (truncate)
                 for (usize i = 0; i < count; ++i) {
@@ -3095,7 +3117,7 @@ StepResult CpuExecutor::step() {
                 const usize count = vex_l ? 4 : 2;
                 for (usize i = 0; i < count; ++i) {
                     res.d[i] = (vex_pp == 1) ? static_cast<u32>(static_cast<i32>(std::trunc(src.df[i])))
-                                             : static_cast<u32>(static_cast<i32>(std::nearbyint(src.df[i])));
+                                             : x86_cvt_i32(std::nearbyint(src.df[i]));
                 }
                 for (usize i = count; i < 8; ++i) res.d[i] = 0;
             }
@@ -3953,7 +3975,15 @@ StepResult CpuExecutor::step() {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const usize bits = (op1 == 0xB0) ? 8 : op_bits;
-            const u64 acc = (bits == 8) ? get_gpr8(m_context, 0, has_rex) : (bits == 64) ? m_context.rax : static_cast<u32>(m_context.rax);
+            const u64 acc = (bits == 8) ? get_gpr8(m_context, 0, has_rex) : (bits == 64) ? m_context.rax
+                          : (bits == 16) ? static_cast<u16>(m_context.rax) : static_cast<u32>(m_context.rax);
+            // Accumulator write on failure: 16-bit merges, 32-bit zero-extends.
+            auto set_acc = [&](u64 v) {
+                if (bits == 8) set_gpr8(m_context, 0, has_rex, static_cast<u8>(v));
+                else if (bits == 16) set_gpr16(m_context, 0, static_cast<u16>(v));
+                else if (bits == 32) set_gpr32(m_context, 0, static_cast<u32>(v));
+                else m_context.rax = v;
+            };
             const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
             if (!m.is_reg) {
                 // Atomic single-step compare-exchange; see guest_atomic_cas.
@@ -3970,11 +4000,7 @@ StepResult CpuExecutor::step() {
                     const u64 rm_val = actual & mask;
                     update_flags_sub(m_context, acc, rm_val, acc - rm_val, bits);
                     m_context.set_flag(CpuContext::FLAG_ZF, handled == 1);
-                    if (handled == 0) {
-                        if (bits == 8) set_gpr8(m_context, 0, has_rex, static_cast<u8>(rm_val));
-                        else if (bits == 64) m_context.rax = rm_val;
-                        else m_context.rax = static_cast<u32>(rm_val);
-                    }
+                    if (handled == 0) set_acc(rm_val);
                     m_context.rip = start_rip + cursor + m.bytes_consumed;
                     return StepResult::Ok;
                 }
@@ -3987,9 +4013,10 @@ StepResult CpuExecutor::step() {
                 write_rm(m, reg_val, bits);
             } else {
                 m_context.set_flag(CpuContext::FLAG_ZF, false);
-                if (bits == 8) set_gpr8(m_context, 0, has_rex, static_cast<u8>(rm_val));
-                else if (bits == 64) m_context.rax = rm_val;
-                else m_context.rax = static_cast<u32>(rm_val);
+                // The destination is written even on failure (with its own
+                // value), so a 32-bit register destination is zero-extended.
+                if (m.is_reg) write_rm(m, rm_val, bits);
+                set_acc(rm_val);
             }
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
@@ -4016,6 +4043,7 @@ StepResult CpuExecutor::step() {
                     update_flags_add(m_context, rm_val, reg_val, sum, bits);
                     if (bits == 8) set_gpr8(m_context, m.reg_id, has_rex, static_cast<u8>(rm_val));
                     else if (bits == 64) set_gpr64(m_context, m.reg_id, rm_val);
+                    else if (bits == 16) set_gpr16(m_context, m.reg_id, static_cast<u16>(rm_val));
                     else set_gpr32(m_context, m.reg_id, static_cast<u32>(rm_val));
                     m_context.rip = start_rip + cursor + m.bytes_consumed;
                     return StepResult::Ok;
@@ -4027,12 +4055,67 @@ StepResult CpuExecutor::step() {
             write_rm(m, sum, bits);
             if (bits == 8) set_gpr8(m_context, m.reg_id, has_rex, static_cast<u8>(rm_val));
             else if (bits == 64) set_gpr64(m_context, m.reg_id, rm_val);
+            else if (bits == 16) set_gpr16(m_context, m.reg_id, static_cast<u16>(rm_val));
             else set_gpr32(m_context, m.reg_id, static_cast<u32>(rm_val));
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
         }
 
         // 0x0F 0xBC / 0xBD: BSF (0xBC), BSR (0xBD) / TZCNT / LZCNT
+        // 0F A4/A5: SHLD r/m, r, imm8/CL;  0F AC/AD: SHRD r/m, r, imm8/CL.
+        // Unimplemented before (skipped by the ModR/M fallback).
+        if (op1 == 0xA4 || op1 == 0xA5 || op1 == 0xAC || op1 == 0xAD) {
+            const bool imm = (op1 == 0xA4 || op1 == 0xAC);
+            const bool left = (op1 == 0xA4 || op1 == 0xA5);
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context, imm ? 1 : 0);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const usize bits = op_bits;
+            u8 count = imm ? raw_code[cursor + m.bytes_consumed] : static_cast<u8>(m_context.rcx);
+            count &= (bits == 64) ? 0x3F : 0x1F;
+            if (count != 0) {
+                const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+                const u64 dst = read_rm(m, bits) & mask;
+                const u64 src = ((bits == 64) ? get_gpr64(m_context, m.reg_id) : get_gpr64(m_context, m.reg_id) & mask);
+                // 16-bit with count > 16 is undefined; use the 32-bit concatenation.
+                const unsigned __int128 wide = left ? ((static_cast<unsigned __int128>(dst) << bits) | src)
+                                                    : ((static_cast<unsigned __int128>(src) << bits) | dst);
+                u64 res;
+                bool cf;
+                if (left) {
+                    res = static_cast<u64>(wide >> (bits - count)) & mask;
+                    cf = ((dst >> (bits - count)) & 1) != 0;
+                } else {
+                    res = static_cast<u64>(wide >> count) & mask;
+                    cf = ((dst >> (count - 1)) & 1) != 0;
+                }
+                const u64 msb = 1ULL << (bits - 1);
+                update_flags_logic(m_context, res, bits);
+                m_context.set_flag(CpuContext::FLAG_CF, cf);
+                m_context.set_flag(CpuContext::FLAG_OF, ((res ^ dst) & msb) != 0);
+                write_rm(m, res, bits);
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed + (imm ? 1 : 0);
+            return StepResult::Ok;
+        }
+
+        // F3 0F B8: POPCNT r, r/m. ZF = (src == 0); CF/OF/SF/AF/PF cleared.
+        // Unimplemented before: the ModR/M fallback skipped it as a NOP.
+        if (op1 == 0xB8 && rep_prefix == 0xF3) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u64 mask = (op_bits == 64) ? ~0ULL : ((1ULL << op_bits) - 1);
+            const u64 src = read_rm(m, op_bits) & mask;
+            const u64 cnt = static_cast<u64>(__builtin_popcountll(src));
+            if (op_bits == 64) set_gpr64(m_context, m.reg_id, cnt);
+            else if (op_bits == 32) set_gpr32(m_context, m.reg_id, static_cast<u32>(cnt));
+            else set_gpr16(m_context, m.reg_id, static_cast<u16>(cnt));
+            m_context.rflags &= ~(CpuContext::FLAG_CF | CpuContext::FLAG_PF | CpuContext::FLAG_AF |
+                                  CpuContext::FLAG_ZF | CpuContext::FLAG_SF | CpuContext::FLAG_OF);
+            if (src == 0) m_context.rflags |= CpuContext::FLAG_ZF;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
         if (op1 == 0xBC || op1 == 0xBD) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
@@ -4388,14 +4471,14 @@ StepResult CpuExecutor::step() {
                 double dval = 0.0;
                 if (m.is_reg) std::memcpy(&dval, &m_context.ymm[m.rm_id & 15].q[0], 8);
                 else m_memory.read_bytes(m.mem_addr, &dval, 8);
-                if (rex_w) set_gpr64(m_context, m.reg_id, static_cast<u64>(static_cast<i64>(dval)));
-                else set_gpr32(m_context, m.reg_id, static_cast<u32>(static_cast<i32>(dval)));
+                if (rex_w) set_gpr64(m_context, m.reg_id, x86_cvt_i64(dval));
+                else set_gpr32(m_context, m.reg_id, x86_cvt_i32(dval));
             } else { // CVTTSS2SI
                 float fval = 0.0f;
                 if (m.is_reg) std::memcpy(&fval, &m_context.ymm[m.rm_id & 15].d[0], 4);
                 else m_memory.read_bytes(m.mem_addr, &fval, 4);
-                if (rex_w) set_gpr64(m_context, m.reg_id, static_cast<u64>(static_cast<i64>(fval)));
-                else set_gpr32(m_context, m.reg_id, static_cast<u32>(static_cast<i32>(fval)));
+                if (rex_w) set_gpr64(m_context, m.reg_id, x86_cvt_i64(fval));
+                else set_gpr32(m_context, m.reg_id, x86_cvt_i32(fval));
             }
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
@@ -5005,24 +5088,54 @@ StepResult CpuExecutor::step() {
         u64 res = val;
 
         if (count > 0) {
+            const u64 msb = 1ULL << (bits - 1);
+            const bool cf_in = m_context.flag_cf();
+            // OF is defined only for 1-bit shifts/rotates. For larger counts it
+            // is undefined: shifts clear it and rotates leave it, matching the
+            // JIT's translation of shifts.
+            const bool one = (count == 1);
             if (sub_op == 0) { // ROL
                 const u8 cnt = count % bits;
-                res = ((val << cnt) | (val >> (bits - cnt))) & mask;
-                m_context.set_flag(CpuContext::FLAG_CF, (res & 1) != 0);
+                res = cnt ? (((val << cnt) | (val >> (bits - cnt))) & mask) : val;
+                const bool cf = (res & 1) != 0;
+                m_context.set_flag(CpuContext::FLAG_CF, cf);
+                if (one) m_context.set_flag(CpuContext::FLAG_OF, ((res & msb) != 0) != cf);
             } else if (sub_op == 1) { // ROR
                 const u8 cnt = count % bits;
-                res = ((val >> cnt) | (val << (bits - cnt))) & mask;
-                m_context.set_flag(CpuContext::FLAG_CF, ((res >> (bits - 1)) & 1) != 0);
+                res = cnt ? (((val >> cnt) | (val << (bits - cnt))) & mask) : val;
+                m_context.set_flag(CpuContext::FLAG_CF, (res & msb) != 0);
+                if (one) m_context.set_flag(CpuContext::FLAG_OF, ((res & msb) != 0) != ((res & (msb >> 1)) != 0));
+            } else if (sub_op == 2 || sub_op == 3) { // RCL / RCR: rotate through CF
+                // Effective count: masked count mod (bits + 1) for 8/16-bit.
+                const u8 cnt = (bits == 8) ? count % 9 : (bits == 16) ? count % 17 : count;
+                bool cf = cf_in;
+                res = val & mask;
+                for (u8 k = 0; k < cnt; ++k) {
+                    if (sub_op == 2) {
+                        const bool out = (res & msb) != 0;
+                        res = ((res << 1) | (cf ? 1 : 0)) & mask;
+                        cf = out;
+                    } else {
+                        const bool out = (res & 1) != 0;
+                        res = (res >> 1) | (cf ? msb : 0);
+                        cf = out;
+                    }
+                }
+                m_context.set_flag(CpuContext::FLAG_CF, cf);
+                if (one && sub_op == 2) m_context.set_flag(CpuContext::FLAG_OF, ((res & msb) != 0) != cf);
+                if (one && sub_op == 3) m_context.set_flag(CpuContext::FLAG_OF, ((res & msb) != 0) != ((res & (msb >> 1)) != 0));
             } else if (sub_op == 4 || sub_op == 6) { // SHL / SAL
                 res = (count < bits) ? ((val << count) & mask) : 0;
                 const bool cf = (count <= bits) ? (((val >> (bits - count)) & 1) != 0) : false;
                 update_flags_logic(m_context, res, bits);
                 m_context.set_flag(CpuContext::FLAG_CF, cf);
+                m_context.set_flag(CpuContext::FLAG_OF, one && (((res & msb) != 0) != cf));
             } else if (sub_op == 5) { // SHR
                 res = (count < bits) ? ((val >> count) & mask) : 0;
                 const bool cf = (count <= bits) ? (((val >> (count - 1)) & 1) != 0) : false;
                 update_flags_logic(m_context, res, bits);
                 m_context.set_flag(CpuContext::FLAG_CF, cf);
+                m_context.set_flag(CpuContext::FLAG_OF, one && (val & msb) != 0);
             } else if (sub_op == 7) { // SAR
                 i64 sval = 0;
                 if (bits == 64) sval = static_cast<i64>(val);
@@ -5030,9 +5143,10 @@ StepResult CpuExecutor::step() {
                 else if (bits == 16) sval = static_cast<i64>(static_cast<i16>(val));
                 else sval = static_cast<i64>(static_cast<i8>(val));
                 res = static_cast<u64>(sval >> ((count < bits) ? count : (bits - 1))) & mask;
-                const bool cf = (((val >> (count - 1)) & 1) != 0);
+                const bool cf = (count < bits) ? (((val >> (count - 1)) & 1) != 0) : (sval < 0);
                 update_flags_logic(m_context, res, bits);
                 m_context.set_flag(CpuContext::FLAG_CF, cf);
+                m_context.set_flag(CpuContext::FLAG_OF, false);
             }
             write_rm(m, res, bits);
         }

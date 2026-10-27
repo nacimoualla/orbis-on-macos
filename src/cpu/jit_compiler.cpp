@@ -1310,6 +1310,8 @@ private:
       int p = -1;
       if (d.alu_op == 4)
         p = c < w ? w - c : (c == w ? 0 : -1);
+      else if (d.alu_op == 7) // SAR: shifting past the width keeps shifting out the sign
+        p = c <= w ? c - 1 : w - 1;
       else
         p = c <= w ? c - 1 : -1;
       if (p >= 0)
@@ -1317,6 +1319,11 @@ private:
       else
         m_e.movz(true, 6, 0);
     }
+    // OF for a 1-bit shift (x10): SHR -> MSB of the source; SHL -> MSB of
+    // the result ^ CF (below); SAR -> 0. Other counts leave OF = 0.
+    const bool of1 = c == 1 && (flags_needed & CpuContext::FLAG_OF);
+    if (of1 && d.alu_op == 5)
+      m_e.ubfx(true, 10, 0, static_cast<u8>(w - 1), 1);
     switch (d.alu_op) {
     case 4: // SHL
       if (c >= w) {
@@ -1349,6 +1356,17 @@ private:
         m_e.ands_shifted(sf, 31, 0, 0);
       }
       emit_flags(false, d.flags_written, 0, 6);
+      if (of1) {
+        if (d.alu_op == 4) {
+          m_e.ubfx(true, 10, 0, static_cast<u8>(w - 1), 1);
+          m_e.eor_reg(10, 10, 6);
+        } else if (d.alu_op == 7) {
+          m_e.movz(true, 10, 0);
+        }
+        m_e.ldr_reg(11, R_CTX, offsetof(CpuContext, rflags));
+        m_e.bfi(true, 11, 10, 11, 1); // OF -> bit 11
+        m_e.str_reg(11, R_CTX, offsetof(CpuContext, rflags));
+      }
     }
     store_rm(0, w);
   }

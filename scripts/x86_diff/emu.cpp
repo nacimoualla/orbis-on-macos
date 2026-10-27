@@ -22,17 +22,17 @@ int main(int argc, char**) {
         for (unsigned t = 0; t < 8; t++) {
             static State s; fill(&s, c, t);
             if (kCases[c].mem) { s.rax = gmem - 0x1ab0; s.rsi = 0; }
-            u8 buf[16]; std::memcpy(buf, kCases[c].bytes, kCases[c].len); buf[kCases[c].len] = 0xF4;
+            u8 buf[24]; std::memcpy(buf, kCases[c].bytes, kCases[c].len); buf[kCases[c].len] = 0xF4;
             mem.write_bytes(code, buf, kCases[c].len + 1);
             mem.write_bytes(gmem, s.mem, 16);
             jit.clear_cache();
             auto& x = cpu.context();
             for (int r = 0; r < 16; r++) std::memcpy(&x.ymm[r], s.ymm[r], 32);
-            x.rax = s.rax; x.rcx = s.rcx; x.rdx = s.rdx; x.rsi = s.rsi; x.rip = code;
+            x.rax = s.rax; x.rcx = s.rcx; x.rdx = s.rdx; x.rsi = s.rsi; x.rflags = s.flags; x.rip = code;
             if (argc > 1) cpu.run(1); else cpu.step();
             if (x.rip != code + kCases[c].len) pr("# rip mismatch case %u: +%llu\n", c, (unsigned long long)(x.rip - code));
             for (int r = 0; r < 16; r++) std::memcpy(s.ymm[r], &x.ymm[r], 32);
-            s.rax = x.rax; s.rcx = x.rcx; s.rdx = x.rdx; s.rsi = x.rsi;
+            s.rax = x.rax; s.rcx = x.rcx; s.rdx = x.rdx; s.rsi = x.rsi; s.flags = x.rflags;
             mem.read_bytes(gmem, s.mem, 16);
             if (kCases[c].mem) s.rax -= gmem - 0x1ab0;
             print_state(&s, c, t, pr);

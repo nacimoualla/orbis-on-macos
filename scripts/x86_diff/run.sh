@@ -19,14 +19,6 @@ arch -x86_64 "$OUT/native" > "$OUT/native.txt"
 "$OUT/emu" 2>/dev/null | grep -v '^#' | grep '^[0-9]' > "$OUT/interp.txt"
 "$OUT/emu" jit 2>/dev/null | grep -v '^#' | grep '^[0-9]' > "$OUT/jit.txt"
 status=0
-for mode in interp jit; do
-    if diff -q "$OUT/native.txt" "$OUT/$mode.txt" >/dev/null; then
-        echo "$mode: all $(wc -l < "$OUT/native.txt" | tr -d ' ') cases match x86"
-    else
-        status=1
-        echo "$mode: MISMATCH (case.trial lines):"
-        diff "$OUT/native.txt" "$OUT/$mode.txt" | grep '^[<>]' | cut -c1-12 | sort -u | head -20
-    fi
-done
+python3 "$HERE/compare.py" "$HERE/cases.h" "$OUT/native.txt" "$OUT/interp.txt" "$OUT/jit.txt" || status=1
 echo "outputs in $OUT"
 exit $status

@@ -2205,6 +2205,20 @@ void NidRegistry::register_default_libraries() {
             VaListArgs args(mem, ap);
             const std::string out = format_guest(mem, mem.to_host_ptr<char>(fmt_addr), args);
             std::cout << "[Guest printf] " << out << std::flush;
+            // Mono reports g_assert failures through here; show where from.
+            if (out.find("Assertion at") != std::string::npos) {
+                GuestAddr ret = 0, fp = ctx.rbp;
+                mem.read_value(ctx.rsp, ret);
+                std::fprintf(stderr, "[assert-bt] TID=%d ret=0x%llx\n", (int)t_guest_tid, (unsigned long long)ret);
+                for (int i = 0; i < 16 && fp > 0x1000 && mem.is_valid_address(fp, 16); ++i) {
+                    GuestAddr next = 0, rip = 0;
+                    mem.read_value(fp, next);
+                    mem.read_value(fp + 8, rip);
+                    std::fprintf(stderr, "[assert-bt]   #%d rip=0x%llx\n", i, (unsigned long long)rip);
+                    if (next <= fp) break;
+                    fp = next;
+                }
+            }
             ctx.rax = out.size();
         });
 
@@ -2261,6 +2275,55 @@ void NidRegistry::register_default_libraries() {
             if (endptr != 0) mem.write_value(endptr, static_cast<u64>(s + (end - text.c_str())));
             // 64-bit unsigned long on PS4; clamp like strtoul on overflow.
             ctx.rax = static_cast<u64>(v);
+        });
+
+    // Dinkumware ctype tables. _Getpctype/_Getptolower/_Getptoupper return
+    // pointers into 16-bit tables indexed by (unsigned char) c, with the EOF
+    // (-1) entry just before element 0; isalpha(c) is `tbl[c] & 0x212`. They
+    // returned NULL, so Mono's tolower/isalpha read address 0 and mangled
+    // every string it case-folded ("UTF-8" -> garbage).
+    static std::once_flag s_ctype_once;
+    static GuestAddr s_ctype = 0, s_tolower = 0, s_toupper = 0;
+    auto ctype_tables = [](MemoryManager& mem) {
+        std::call_once(s_ctype_once, [&mem] {
+            constexpr u16 XD = 0x01, UP = 0x02, SP = 0x04, PU = 0x08, LO = 0x10, DI = 0x20, CN = 0x40, BB = 0x80;
+            u16 ct[257] = {}, lo[257] = {}, up[257] = {};
+            ct[0] = 0;
+            lo[0] = up[0] = 0xFFFF; // EOF maps to EOF
+            for (int c = 0; c < 256; ++c) {
+                u16 f = 0;
+                if (c < 0x20 || c == 0x7F) f = (c >= 0x09 && c <= 0x0D) ? CN : BB;
+                else if (c == ' ') f = SP;
+                else if (c >= '0' && c <= '9') f = DI | XD;
+                else if (c >= 'A' && c <= 'Z') f = UP | ((c <= 'F') ? XD : 0);
+                else if (c >= 'a' && c <= 'z') f = LO | ((c <= 'f') ? XD : 0);
+                else if (c < 0x7F) f = PU;
+                ct[c + 1] = f;
+                lo[c + 1] = static_cast<u16>((c >= 'A' && c <= 'Z') ? c + 32 : c);
+                up[c + 1] = static_cast<u16>((c >= 'a' && c <= 'z') ? c - 32 : c);
+            }
+            const GuestAddr base = bump_alloc(3 * sizeof(ct), 16);
+            if (base == 0) return;
+            mem.write_bytes(base, ct, sizeof(ct));
+            mem.write_bytes(base + sizeof(ct), lo, sizeof(lo));
+            mem.write_bytes(base + 2 * sizeof(ct), up, sizeof(up));
+            s_ctype = base + 2;                   // &table[c] for c = 0
+            s_tolower = base + sizeof(ct) + 2;
+            s_toupper = base + 2 * sizeof(ct) + 2;
+        });
+    };
+    register_symbol(0xB143F58416A8B8ECULL, "_Getpctype", "libc",
+        [ctype_tables](CpuContext& ctx, MemoryManager& mem) { ctype_tables(mem); ctx.rax = s_ctype; });
+    register_symbol(0xD6E260A15AB76D05ULL, "_Getptolower", "libc",
+        [ctype_tables](CpuContext& ctx, MemoryManager& mem) { ctype_tables(mem); ctx.rax = s_tolower; });
+    register_symbol(0xADC40252BD046915ULL, "_Getptoupper", "libc",
+        [ctype_tables](CpuContext& ctx, MemoryManager& mem) { ctype_tables(mem); ctx.rax = s_toupper; });
+
+    // putchar(int c)
+    register_symbol(0x9B9C0DF92C19391EULL, "putchar", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            std::cout << static_cast<char>(ctx.rdi & 0xFF) << std::flush;
+            ctx.rax = ctx.rdi & 0xFF;
         });
 
     // fflush(FILE*): guest stdio is not buffered on our side.
