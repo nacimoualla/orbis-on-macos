@@ -128,3 +128,7 @@ add_test(NAME JitStats COMMAND test_jit_stats)
 add_executable(test_jit_mem tests/test_jit_mem.cpp)
 target_link_libraries(test_jit_mem PRIVATE ps4_core)
 add_test(NAME JitMemOperands COMMAND test_jit_mem)
+
+add_executable(test_jit_diff tests/test_jit_diff.cpp)
+target_link_libraries(test_jit_diff PRIVATE ps4_core)
+add_test(NAME JitDifferentialFuzz COMMAND test_jit_diff)
