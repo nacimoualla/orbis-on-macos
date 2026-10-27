@@ -476,6 +476,55 @@ int main() {
 
   for (const Case &tc : cases)
     run_case(mem, tc);
+
+  // ---- shifts by constant: SHL/SHR/SAR, every width, counts around the
+  // operand size, register (rdx) and memory ([rbx]) forms -------------------
+  {
+    struct ShiftOp {
+      const char *name;
+      u8 sub;
+    };
+    const ShiftOp ops[] = {{"shl", 4}, {"shr", 5}, {"sar", 7}};
+    const u8 small_counts[] = {0, 1, 3, 7, 8, 9, 15, 16, 17, 31};
+    const u8 c32[] = {0, 1, 5, 31};
+    const u8 c64[] = {1, 31, 32, 63};
+    for (const u8 width : {8, 16, 32, 64}) {
+      std::vector<u8> counts;
+      if (width <= 16)
+        counts.assign(std::begin(small_counts), std::end(small_counts));
+      else if (width == 32)
+        counts.assign(std::begin(c32), std::end(c32));
+      else
+        counts.assign(std::begin(c64), std::end(c64));
+      for (const ShiftOp &op : ops) {
+        for (const u8 count : counts) {
+          for (const bool mem_form : {false, true}) {
+            std::vector<u8> code;
+            if (width == 16)
+              code.push_back(0x66);
+            if (width == 64)
+              code.push_back(0x48);
+            const u8 modrm = static_cast<u8>(
+                (mem_form ? 0x00 : 0xC0) | (op.sub << 3) | (mem_form ? 3 : 2));
+            if (count == 1 && !mem_form) {
+              code.push_back(width == 8 ? 0xD0 : 0xD1); // D0/D1: count 1
+              code.push_back(modrm);
+            } else {
+              code.push_back(width == 8 ? 0xC0 : 0xC1);
+              code.push_back(modrm);
+              code.push_back(count);
+            }
+            run_case(mem, {std::string(op.name) + " " +
+                               (mem_form ? "[rbx]" : "reg") + std::to_string(width) +
+                               ", " + std::to_string(count),
+                           code, 1});
+          }
+        }
+      }
+    }
+    run_case(mem, {"sal ecx, 3 (/6) ; shl dh, 2 (AH-BH)",
+                   {0xC1, 0xF1, 0x03, 0xC0, 0xE6, 0x02}, 2});
+  }
   test_executor_side_exit_progress(mem);
 
   std::printf("=== %d/%d cases passed (%llu trials each) ===\n",

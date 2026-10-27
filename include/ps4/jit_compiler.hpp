@@ -82,6 +82,7 @@ public:
     void bfm(bool sf, u8 rd, u8 rn, u8 immr, u8 imms);
     void lsl_imm(bool sf, u8 rd, u8 rn, u8 shift);
     void lsr_imm(bool sf, u8 rd, u8 rn, u8 shift);
+    void asr_imm(bool sf, u8 rd, u8 rn, u8 shift);
     void ubfx(bool sf, u8 rd, u8 rn, u8 lsb, u8 width);
     void bfi(bool sf, u8 rd, u8 rn, u8 lsb, u8 width);
     void sxt(bool sf, u8 rd, u8 rn, u8 from_bits); // SXTB/SXTH/SXTW

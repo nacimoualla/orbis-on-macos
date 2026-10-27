@@ -223,6 +223,10 @@ void Arm64Emitter::lsr_imm(bool sf, u8 rd, u8 rn, u8 shift) {
   ubfm(sf, rd, rn, shift, sf ? 63 : 31);
 }
 
+void Arm64Emitter::asr_imm(bool sf, u8 rd, u8 rn, u8 shift) {
+  sbfm(sf, rd, rn, shift, sf ? 63 : 31);
+}
+
 void Arm64Emitter::ubfx(bool sf, u8 rd, u8 rn, u8 lsb, u8 width) {
   ubfm(sf, rd, rn, lsb, static_cast<u8>(lsb + width - 1));
 }
@@ -489,6 +493,7 @@ enum class Kind : u8 {
   Alu,       // 00-3B (ADD/OR/AND/SUB/XOR/CMP), 84/85 TEST
   AluImm,    // 80/81/83, 04/05.., A8/A9, F6/F7 /0
   IncDec,    // FE/FF /0 /1
+  ShiftImm,  // C0/C1 /4 /5 /6 /7 imm8, D0/D1 (count 1)
   Push,      // 50+r
   PushImm,   // 6A / 68
   PushRm,    // FF /6
@@ -522,6 +527,7 @@ struct JitInsn {
     case Kind::Alu:
     case Kind::AluImm:
     case Kind::IncDec:
+    case Kind::ShiftImm:
     case Kind::PushRm:
       return !m.is_reg;
     default:
@@ -750,6 +756,30 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return finish();
   }
 
+  // SHL/SAL/SHR/SAR r/m, imm8 / 1. The count is known at compile time, so
+  // the interpreter's semantics (incl. count 0 = no-op and counts >= the
+  // operand size for 8/16-bit) are reproduced exactly. Rotates and shifts by
+  // CL are not translated.
+  if (op0 == 0xC0 || op0 == 0xC1 || op0 == 0xD0 || op0 == 0xD1) {
+    if (!modrm())
+      return false;
+    const u8 sub = d.m.reg & 7;
+    if (sub < 4)
+      return false;
+    d.width = (op0 & 1) ? op_bits : 8;
+    if (op0 <= 0xC1) {
+      if (!imm(1))
+        return false;
+    } else {
+      d.imm = 1;
+    }
+    d.imm &= (d.width == 64) ? 0x3F : 0x1F;
+    d.kind = Kind::ShiftImm;
+    d.alu_op = (sub == 6) ? 4 : sub; // SAL == SHL
+    d.flags_written = d.imm ? FLAGS_ARITH : 0;
+    return finish();
+  }
+
   // INC / DEC r/m (CF preserved) ; PUSH r/m64
   if (op0 == 0xFE || op0 == 0xFF) {
     if (!modrm())
@@ -908,6 +938,9 @@ public:
       m_e.movz(false, 1, 1);
       emit_alu(d.alu_op, w, d.flags_written, flags_needed);
       store_rm(0, w);
+      break;
+    case Kind::ShiftImm:
+      emit_shift(d, flags_needed);
       break;
     case Kind::Push:
     case Kind::PushImm:
@@ -1140,11 +1173,72 @@ private:
       emit_flags(borrow, flags_written, 0);
   }
 
+  /// SHL/SHR/SAR by a constant, matching the interpreter: ZF/SF/PF from the
+  /// result, OF = 0, CF = last bit shifted out (0 once the count exceeds the
+  /// operand size); count 0 changes nothing.
+  void emit_shift(const JitInsn &d, u64 flags_needed) {
+    const u8 w = d.width;
+    const u8 c = static_cast<u8>(d.imm);
+    if (c == 0)
+      return;
+    const bool sf = w == 64;
+    load_rm(0, w); // zero-extended
+    if (flags_needed) {
+      // bit index of the last bit shifted out, if any
+      int p = -1;
+      if (d.alu_op == 4)
+        p = c < w ? w - c : (c == w ? 0 : -1);
+      else
+        p = c <= w ? c - 1 : -1;
+      if (p >= 0)
+        m_e.ubfx(true, 6, 0, static_cast<u8>(p), 1);
+      else
+        m_e.movz(true, 6, 0);
+    }
+    switch (d.alu_op) {
+    case 4: // SHL
+      if (c >= w) {
+        m_e.movz(true, 0, 0);
+      } else {
+        m_e.lsl_imm(sf, 0, 0, c);
+        if (w < 32)
+          m_e.ubfx(false, 0, 0, 0, w);
+      }
+      break;
+    case 5: // SHR
+      if (c >= w)
+        m_e.movz(true, 0, 0);
+      else
+        m_e.lsr_imm(sf, 0, 0, c);
+      break;
+    default: // 7: SAR
+      if (w < 64)
+        m_e.sxt(true, 0, 0, w);
+      m_e.asr_imm(true, 0, 0, std::min<u8>(c, static_cast<u8>(w - 1)));
+      if (w < 64)
+        m_e.ubfx(true, 0, 0, 0, w);
+      break;
+    }
+    if (flags_needed) {
+      if (w < 32) {
+        m_e.lsl_imm(false, 7, 0, static_cast<u8>(32 - w));
+        m_e.ands_shifted(false, 31, 7, 7); // N/Z of the narrow result, C=V=0
+      } else {
+        m_e.ands_shifted(sf, 31, 0, 0);
+      }
+      emit_flags(false, d.flags_written, 0, 6);
+    }
+    store_rm(0, w);
+  }
+
   /// Convert NZCV (plus the parity of the low byte of `res`) to x86 flags and
-  /// merge the bits selected by `mask` into ctx.rflags.
-  void emit_flags(bool borrow, u64 mask, u8 res) {
+  /// merge the bits selected by `mask` into ctx.rflags. CF comes from the C
+  /// flag, or from bit 0 of register `cf_reg` when given.
+  void emit_flags(bool borrow, u64 mask, u8 res, int cf_reg = -1) {
     m_e.mrs_nzcv(2);
-    if (mask & CpuContext::FLAG_CF)
+    if ((mask & CpuContext::FLAG_CF) && cf_reg >= 0)
+      m_e.mov_reg(3, static_cast<u8>(cf_reg));
+    else if (mask & CpuContext::FLAG_CF)
       m_e.cset(true, 3, borrow ? COND_CC : COND_CS); // CF -> bit 0
     else
       m_e.movz(true, 3, 0);
