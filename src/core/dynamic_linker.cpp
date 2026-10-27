@@ -251,8 +251,14 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             // Tail-jump: leave the return address we did not push in place, so
             // the module's own `ret` lands directly back in the caller. ctx.rip
             // already points past the `syscall`, so the stub's `ret` never runs.
+            // cpu_rip_modified tells the executor not to advance RIP or copy
+            // sctx.rax back. Without it the jump was discarded: every call that
+            // reached a loaded module through a trampoline (e.g. the 50
+            // mono_aot_register_module calls from MonoAssembliesPS4.prx)
+            // returned SCE_OK without running a single instruction.
             if (sctx.cpu != nullptr) {
                 sctx.cpu->rip = exported;
+                sctx.cpu_rip_modified = true;
             }
             // PRX export call tracking: which loaded-module entry points the
             // guest actually reaches, and with what arguments.
@@ -809,8 +815,13 @@ namespace {
 constexpr u16 SHN_UNDEF_LOCAL = 0;
 constexpr u8 ELF64_ST_TYPE_FUNC = 2;
 
+// Sony's NID token alphabet: '+' is 62 and '-' is 63, the same alphabet
+// decode_nid_from_string() uses for imports. The URL-safe alphabet used here
+// before ('-' = 62, '_' = 63) gave every export whose token contains '-' a
+// wrong NID, so imports of it (e.g. mono_parse_default_optimizations) never
+// found the module's export and fell through to HLE stubs.
 constexpr std::string_view kBase64Url =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
 
 /// Decode exactly 11 base64url characters into a 64-bit big-endian NID.
 ///
@@ -827,11 +838,7 @@ bool decode_nid_token(const char* tok11, Nid* out) {
     u64 acc = 0;
     for (int i = 0; i < 11; ++i) {
         std::string_view::size_type pos = kBase64Url.find(tok11[i]);
-        if (pos == std::string_view::npos) {
-            if (tok11[i] == '+') pos = 62;
-            else if (tok11[i] == '/') pos = 63;
-            else return false;
-        }
+        if (pos == std::string_view::npos) return false;
         acc = (acc << 6) | static_cast<u64>(pos);
         bits += 6;
         if (bits >= 8) {
@@ -1219,12 +1226,14 @@ GuestAddr DynamicLinker::first_module_base() const noexcept {
 namespace {
 DynamicLinker* g_active_linker = nullptr;
 
-// Module bases come out of the mspace arena region, well below the 0x1C0000000
-// direct-memory ceiling and above the 0x160000000 arena that backs HLE
-// allocations. 2 MB-aligned so a module's largest page-alignment stays inside
-// the reservation.
-GuestAddr g_next_module_base = 0x160000000ULL;
-constexpr GuestAddr kModuleBaseCeiling = 0x1C0000000ULL;
+// Modules get the otherwise unused gap between the eboot image (ends ~0x1652000)
+// and the anonymous-mmap arena at 0x10000000 (CPU heap from 0x20000000).
+// They used to start at 0x160000000, which is both the base of the HLE mspace
+// arena and inside the 1:1 direct-memory window (0x40000000..0x1C0000000), so
+// with PS4_LOAD_PRX the first mspace or direct-memory block landing there
+// overwrote mono-ps4.prx's code and GOT.
+GuestAddr g_next_module_base = 0x04000000ULL;
+constexpr GuestAddr kModuleBaseCeiling = 0x10000000ULL;
 constexpr GuestAddr kModuleBaseAlign = 0x200000ULL;
 } // namespace
 

@@ -218,6 +218,17 @@ add_custom_target(ps4-gui-app ALL
     VERBATIM
 )
 
+# qsort/bsearch run as guest code (src/hle/guest_libc.c); exercised on the
+# interpreter and the JIT with a guest comparator.
+add_executable(test_guest_libc tests/test_guest_libc.cpp)
+target_link_libraries(test_guest_libc PRIVATE ps4_core)
+add_test(NAME GuestLibc COMMAND test_guest_libc)
+
+# Guest printf formatting (va_list walk, widths, 16-argument GUID format).
+add_executable(test_guest_printf tests/test_guest_printf.cpp)
+target_link_libraries(test_guest_printf PRIVATE ps4_core)
+add_test(NAME GuestPrintf COMMAND test_guest_printf)
+
 add_executable(test_jit_mem tests/test_jit_mem.cpp)
 target_link_libraries(test_jit_mem PRIVATE ps4_core)
 add_test(NAME JitMemOperands COMMAND test_jit_mem)

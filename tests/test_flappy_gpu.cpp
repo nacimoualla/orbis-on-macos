@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -19,7 +20,7 @@
 #include "ps4/vfs.hpp"
 
 namespace {
-constexpr int kFrames = 120;
+constexpr int kDefaultFrames = 120;
 const std::filesystem::path kElf =
     std::filesystem::path(CMAKE_SOURCE_DIR) /
     "games/flappy_bird/ED1633-NPXX51362_00-TER1520000000000/eboot.elf";
@@ -80,22 +81,61 @@ int main() {
                                    .height = 1080, .resizable = false, .headless = true}))
         return fail("headless DisplayWindow initialization failed");
 
+    // PS4_WATCH_ADDR / PS4_WATCH_SIZE: report guest stores to that range, as in ps4-runner.
+    if (const char* w = std::getenv("PS4_WATCH_ADDR")) {
+        const char* sz = std::getenv("PS4_WATCH_SIZE");
+        ps4::set_write_watch(std::strtoull(w, nullptr, 0), sz ? std::strtoull(sz, nullptr, 0) : 8);
+    }
+
     ps4::JitCompiler jit;
     ps4::CpuExecutor cpu(memory, syscalls);
-    cpu.set_jit_compiler(&jit);
-    registry.set_jit_compiler(&jit);
+    // PS4_NO_JIT=1 runs every guest thread on the interpreter (A/B a JIT bug).
+    if (!std::getenv("PS4_NO_JIT")) {
+        cpu.set_jit_compiler(&jit);
+        registry.set_jit_compiler(&jit);
+    }
     registry.thread_manager(memory).set_main_context(&cpu.context());
     if (!cpu.setup_default_stack()) return fail("guest stack initialization failed");
     cpu.set_entry_point(loader.entry_point());
     ps4::t_guest_tid = 1;
 
+    ps4::GuestAddr trace_lo = 0, trace_hi = 0;
+    int traced = 0;
+    if (const char* r = std::getenv("PS4_TRACE_RANGE")) {
+        char* end = nullptr;
+        trace_lo = std::strtoull(r, &end, 0);
+        trace_hi = (*end == ',') ? std::strtoull(end + 1, nullptr, 0) : trace_lo + 1;
+    }
     const auto start = std::chrono::steady_clock::now();
     ps4::usize packets = 0;
     ps4::RunResult result{};
+    // PS4_FRAMES=<n> runs longer (or shorter) than the default smoke interval.
+    const int kFrames = std::getenv("PS4_FRAMES") ? std::atoi(std::getenv("PS4_FRAMES")) : kDefaultFrames;
     for (int frame = 0; frame < kFrames; ++frame) {
         window.poll_events();
         if (!translator->begin_frame()) return fail("GPU frame begin failed");
-        result = cpu.run(2'000'000);
+        if (trace_lo != 0) {
+            // PS4_TRACE_RANGE=lo,hi: single-step the main thread and print every
+            // RIP inside [lo, hi) (first 4000), for following guest control flow.
+            result = {};
+            for (int n = 0; n < 2'000'000; ++n) {
+                const ps4::GuestAddr rip = cpu.context().rip;
+                if (rip >= trace_lo && rip < trace_hi && traced < 4000) {
+                    const auto& c = cpu.context();
+                    ps4::u64 ret = 0;
+                    memory.read_value(c.rsp, ret);
+                    std::fprintf(stderr, "[trace] 0x%llx rax=0x%llx rdi=0x%llx rsi=0x%llx [rsp]=0x%llx\n",
+                                 (unsigned long long)rip, (unsigned long long)c.rax, (unsigned long long)c.rdi,
+                                 (unsigned long long)c.rsi, (unsigned long long)ret);
+                    ++traced;
+                }
+                result.status = cpu.step();
+                ++result.instructions_executed;
+                if (result.status != ps4::StepResult::Ok && result.status != ps4::StepResult::Syscall) break;
+            }
+        } else {
+            result = cpu.run(2'000'000);
+        }
         packets += translator->frame_stats().packets;
         if (!translator->submit_frame(false)) return fail("GPU frame submission failed");
         if (!window.present_frame()) return fail("headless frame presentation failed");
@@ -107,6 +147,7 @@ int main() {
             std::fprintf(stderr, "[Flappy test] Bytes at RIP: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                          b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
             registry.thread_manager(memory).dump_thread_states();
+            ps4::dump_control_xfers(1); // how the main thread got to RIP
             return fail("guest execution stopped at frame " + std::to_string(frame + 1) +
                         " before the smoke interval completed (status=" +
                         std::string(ps4::step_result_to_string(result.status)) +
@@ -120,6 +161,19 @@ int main() {
         }
     }
 
+    // PS4_DUMP_QWORDS=0xaddr[,0xaddr...]: print guest qwords at the end of the run.
+    if (const char* dump = std::getenv("PS4_DUMP_QWORDS")) {
+        for (const char* p = dump; *p;) {
+            char* end = nullptr;
+            const ps4::GuestAddr a = std::strtoull(p, &end, 0);
+            ps4::u64 v = 0;
+            const bool ok = memory.read_value(a, v);
+            std::fprintf(stderr, "[dump] 0x%llx = %s0x%llx\n", (unsigned long long)a, ok ? "" : "<invalid> ",
+                         (unsigned long long)v);
+            p = (*end == ',') ? end + 1 : end;
+            if (end == p && *p) break;
+        }
+    }
     if (!metal.wait_for_last_frame()) return fail("last GPU frame did not complete");
     ps4::u8 r = 0, g = 0, b = 0, a = 0;
     if (!metal.read_pixel(metal.width() / 2, metal.height() / 2, r, g, b, a))
@@ -135,6 +189,7 @@ int main() {
               << " upload_bytes=" << stats.upload_bytes
               << " elapsed_ms=" << elapsed << "\n";
     ps4::write_jit_stats(); // PS4_JIT_STATS; the guest's exit path can skip atexit
+    ps4::dump_rip_histogram(); // PS4_RIP_HIST=1 (interpreter steps only)
     registry.shutdown();
     if (draws == 0 || packets == 0)
         return fail("retail guest produced no GPU draws or PM4 packets");

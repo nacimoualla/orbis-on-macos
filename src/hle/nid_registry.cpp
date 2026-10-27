@@ -3,6 +3,7 @@
 #include "ps4/executor.hpp"
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
+#include "ps4/guest_libc_blob.hpp"
 #include "ps4/pm4_translator.hpp"
 #include "ps4/syscall_table.hpp"
 #include "ps4/thread.hpp"
@@ -89,6 +90,23 @@ inline GuestAddr mspace_alloc(GuestSize size, GuestSize align) {
     const GuestAddr p = (g_mspace_current.load() + align - 1) & ~(align - 1);
     g_mspace_current.store(p + size);
     return p;
+}
+
+// Anonymous/file mmap arena for loaded modules (mono-ps4.prx's GC maps its heap
+// sections here). Sits between the module region (0x04000000..0x10000000) and
+// the CPU bump heap at 0x20000000, clear of direct memory and the mspace arena.
+// Never reused: munmap only zeroes, like the other bump arenas.
+static constexpr GuestAddr kMmapArenaBase = 0x10000000ULL;
+static constexpr GuestAddr kMmapArenaEnd = 0x20000000ULL;
+static std::atomic<GuestAddr> g_mmap_current{kMmapArenaBase};
+
+inline GuestAddr mmap_arena_alloc(GuestSize size) {
+    const GuestSize len = (size + GUEST_PAGE_SIZE - 1) & ~(GUEST_PAGE_SIZE - 1);
+    GuestAddr cur = g_mmap_current.load();
+    do {
+        if (cur + len > kMmapArenaEnd) return 0;
+    } while (!g_mmap_current.compare_exchange_weak(cur, cur + len));
+    return cur;
 }
 
 // Global ThreadManager and execution dependencies
@@ -516,56 +534,217 @@ const HleSymbol* NidRegistry::find_by_name(std::string_view name) const {
     return nullptr;
 }
 
-// Helper: safely format a guest format string using up to 4 guest GP arguments
-static std::string format_guest_string(const MemoryManager& mem, const char* fmt,
-                                       u64 a0, u64 a1, u64 a2, u64 a3) {
-    if (!fmt) return "";
-    const u64 args[4] = {a0, a1, a2, a3};
-    usize arg_idx = 0;
-    std::string out;
-    out.reserve(256);
+// ---------------------------------------------------------------------------
+// Guest printf formatting
+//
+// Arguments come from a GuestArgs source: a SysV va_list (vsnprintf & co.) or
+// a variadic call's live registers + stack (printf & co.). Each conversion is
+// handed to the host's snprintf with its own flags/width/precision, so the
+// output matches libc. The old formatter took four integer arguments and
+// dropped widths: Mono's GUID format ("%02X" x 16) came out unpadded and
+// truncated, so every image GUID mismatched its AOT module.
+// ---------------------------------------------------------------------------
+class GuestArgs {
+public:
+    virtual ~GuestArgs() = default;
+    virtual u64 next_gp() = 0;
+    virtual double next_fp() = 0;
+};
 
+// SysV va_list: {u32 gp_offset, u32 fp_offset, void* overflow_arg_area,
+// void* reg_save_area}. GP registers live at reg_save_area[0..48), XMM
+// registers at [48..176) in 16-byte slots; the rest spill to the overflow area.
+class VaListArgs final : public GuestArgs {
+public:
+    VaListArgs(const MemoryManager& mem, GuestAddr ap) : m_mem(mem) {
+        if (ap != 0 && mem.is_valid_address(ap, 24)) {
+            mem.read_value(ap + 0, m_gp);
+            mem.read_value(ap + 4, m_fp);
+            mem.read_value(ap + 8, m_overflow);
+            mem.read_value(ap + 16, m_save);
+        } else {
+            m_gp = 48;
+            m_fp = 176;
+        }
+    }
+    u64 next_gp() override {
+        u64 v = 0;
+        if (m_gp < 48) {
+            m_mem.read_value(m_save + m_gp, v);
+            m_gp += 8;
+        } else {
+            m_mem.read_value(m_overflow, v);
+            m_overflow += 8;
+        }
+        return v;
+    }
+    double next_fp() override {
+        u64 bits = 0;
+        if (m_fp < 176) {
+            m_mem.read_value(m_save + m_fp, bits);
+            m_fp += 16;
+        } else {
+            m_mem.read_value(m_overflow, bits);
+            m_overflow += 8;
+        }
+        double d;
+        std::memcpy(&d, &bits, sizeof(d));
+        return d;
+    }
+
+private:
+    const MemoryManager& m_mem;
+    u32 m_gp{0}, m_fp{0};
+    GuestAddr m_overflow{0}, m_save{0};
+};
+
+// The variadic part of a call that just entered an HLE handler: GP registers
+// from index `first_gp` (rdi=0 .. r9=5), XMM0-7, then stack arguments above
+// the return address at [rsp].
+class CallArgs final : public GuestArgs {
+public:
+    CallArgs(const CpuContext& ctx, const MemoryManager& mem, int first_gp)
+        : m_ctx(ctx), m_mem(mem), m_gp(first_gp), m_stack(ctx.rsp + 8) {}
+    u64 next_gp() override {
+        const u64 regs[6] = {m_ctx.rdi, m_ctx.rsi, m_ctx.rdx, m_ctx.rcx, m_ctx.r8, m_ctx.r9};
+        if (m_gp < 6) return regs[m_gp++];
+        return from_stack();
+    }
+    double next_fp() override {
+        u64 bits = m_fp < 8 ? m_ctx.ymm[m_fp++].q[0] : from_stack();
+        double d;
+        std::memcpy(&d, &bits, sizeof(d));
+        return d;
+    }
+
+private:
+    u64 from_stack() {
+        u64 v = 0;
+        m_mem.read_value(m_stack, v);
+        m_stack += 8;
+        return v;
+    }
+    const CpuContext& m_ctx;
+    const MemoryManager& m_mem;
+    int m_gp;
+    int m_fp{0};
+    GuestAddr m_stack;
+};
+
+static std::string guest_cstring(const MemoryManager& mem, GuestAddr p, usize limit) {
+    std::string out;
+    if (p == 0) return "(null)";
+    for (usize i = 0; i < limit; ++i) {
+        char c = 0;
+        if (!mem.read_value(p + i, c) || c == 0) break;
+        out.push_back(c);
+    }
+    return out;
+}
+
+static std::string format_guest(const MemoryManager& mem, const char* fmt, GuestArgs& args) {
+    std::string out;
+    if (!fmt) return out;
+    out.reserve(256);
     for (usize i = 0; fmt[i] != '\0'; ++i) {
         if (fmt[i] != '%') {
             out.push_back(fmt[i]);
             continue;
         }
-        ++i;
-        if (fmt[i] == '\0') break;
-        if (fmt[i] == '%') {
+        if (fmt[i + 1] == '%') {
             out.push_back('%');
+            ++i;
             continue;
         }
-
-        // Skip flags, width, precision, and length modifiers
-        while (fmt[i] == '-' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#' || fmt[i] == '0' ||
-               (fmt[i] >= '1' && fmt[i] <= '9') || fmt[i] == '.') {
+        // %[flags][width][.precision][length]conv -> host spec with '*'s
+        // resolved to numbers and the length modifier normalised.
+        std::string spec = "%";
+        ++i;
+        while (std::strchr("-+ #0'", fmt[i]) != nullptr && fmt[i] != '\0') spec.push_back(fmt[i++]);
+        if (fmt[i] == '*') {
+            spec += std::to_string(static_cast<i32>(args.next_gp()));
             ++i;
+        } else {
+            while (fmt[i] >= '0' && fmt[i] <= '9') spec.push_back(fmt[i++]);
         }
-        while (fmt[i] == 'l' || fmt[i] == 'h' || fmt[i] == 'z' || fmt[i] == 't') {
-            ++i;
-        }
-        const char spec = fmt[i];
-        if (spec == '\0') break;
-
-        const u64 val = (arg_idx < 4) ? args[arg_idx++] : 0;
-        char buf[64]{0};
-        if (spec == 's') {
-            if (val > 0x1000 && mem.is_valid_address(val, 1)) {
-                const char* s = mem.to_host_ptr<char>(val);
-                if (s) out.append(s);
+        int precision = -1;
+        if (fmt[i] == '.') {
+            spec.push_back(fmt[i++]);
+            if (fmt[i] == '*') {
+                precision = static_cast<i32>(args.next_gp());
+                spec += std::to_string(precision);
+                ++i;
+            } else {
+                precision = 0;
+                while (fmt[i] >= '0' && fmt[i] <= '9') {
+                    precision = precision * 10 + (fmt[i] - '0');
+                    spec.push_back(fmt[i++]);
+                }
             }
-        } else if (spec == 'd' || spec == 'i') {
-            std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(static_cast<i64>(val)));
-            out.append(buf);
-        } else if (spec == 'u') {
-            std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(val));
-            out.append(buf);
-        } else if (spec == 'x' || spec == 'X' || spec == 'p') {
-            std::snprintf(buf, sizeof(buf), "%llx", static_cast<unsigned long long>(val));
-            out.append(buf);
-        } else if (spec == 'c') {
-            out.push_back(static_cast<char>(val & 0xFF));
+        }
+        int size = 0; // 0 = int, 1 = char, 2 = short, 8 = 64-bit
+        bool long_double = false;
+        for (;;) {
+            const char c = fmt[i];
+            if (c == 'h') { size = size == 2 ? 1 : 2; ++i; }
+            else if (c == 'l' || c == 'j' || c == 'z' || c == 't' || c == 'q') { size = 8; ++i; }
+            else if (c == 'L') { long_double = true; ++i; }
+            else break;
+        }
+        const char conv = fmt[i];
+        if (conv == '\0') break;
+        char buf[512];
+        switch (conv) {
+        case 'd': case 'i': {
+            i64 v = static_cast<i64>(args.next_gp());
+            if (size == 0) v = static_cast<i32>(v);
+            else if (size == 2) v = static_cast<i16>(v);
+            else if (size == 1) v = static_cast<i8>(v);
+            std::snprintf(buf, sizeof(buf), (spec + "lld").c_str(), static_cast<long long>(v));
+            out += buf;
+            break;
+        }
+        case 'u': case 'o': case 'x': case 'X': {
+            u64 v = args.next_gp();
+            if (size == 0) v = static_cast<u32>(v);
+            else if (size == 2) v = static_cast<u16>(v);
+            else if (size == 1) v = static_cast<u8>(v);
+            std::snprintf(buf, sizeof(buf), (spec + "ll" + conv).c_str(), static_cast<unsigned long long>(v));
+            out += buf;
+            break;
+        }
+        case 'c':
+            std::snprintf(buf, sizeof(buf), (spec + "c").c_str(), static_cast<int>(args.next_gp() & 0xFF));
+            out += buf;
+            break;
+        case 's': {
+            const GuestAddr p = args.next_gp();
+            const std::string str = guest_cstring(mem, p, precision >= 0 ? static_cast<usize>(precision) : 1u << 20);
+            const int n = std::snprintf(nullptr, 0, (spec + "s").c_str(), str.c_str());
+            std::string tmp(static_cast<usize>(n > 0 ? n : 0) + 1, '\0');
+            std::snprintf(tmp.data(), tmp.size(), (spec + "s").c_str(), str.c_str());
+            tmp.pop_back();
+            out += tmp;
+            break;
+        }
+        case 'p':
+            std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(args.next_gp()));
+            out += buf;
+            break;
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
+            // long double (x87 80-bit) is passed in memory; not modelled.
+            const double d = long_double ? 0.0 : args.next_fp();
+            std::snprintf(buf, sizeof(buf), (spec + conv).c_str(), d);
+            out += buf;
+            break;
+        }
+        case 'n':
+            (void)args.next_gp(); // never write through a guest %n
+            break;
+        default:
+            out += spec;
+            out.push_back(conv);
+            break;
         }
     }
     return out;
@@ -856,9 +1035,12 @@ void NidRegistry::register_default_libraries() {
             const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
                                    ? mem.to_host_ptr<char>(path_addr) : "unknown";
 
-            // If PS4_LOAD_PRX is not explicitly set, use HLE stubs:
-            // mono-ps4.prx contains imported symbols whose relocations cannot yet be
-            // resolved cleanly, causing an infinite loop when called from Unity.
+            // Without PS4_LOAD_PRX the Mono modules are not loaded and every
+            // mono-ps4 NID is served by the HLE cookie stubs (no managed code
+            // runs, so Unity never reaches its render phase). With
+            // PS4_LOAD_PRX=1 the real runtime and AOT assemblies load and run:
+            // they initialise, register their AOT modules and reach Gnm setup,
+            // but do not yet render within the smoke-test interval.
             if (!std::getenv("PS4_LOAD_PRX")) {
                 static u32 s_module_id = 0x2000;
                 const u32 handle = ++s_module_id;
@@ -1636,6 +1818,585 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = bump_alloc(num * size, 16);
         });
 
+    // =========================================================================
+    // POSIX entry points imported by mono-ps4.prx (PS4_LOAD_PRX)
+    // =========================================================================
+    // The Mono runtime imports these libkernel/libc NIDs; the eboot never did,
+    // so they fell through to the "return 0" stub. Each zero was a lie with a
+    // consequence: calloc -> NULL tripped eglib's 'hash != NULL' assertion,
+    // open("/mono/config") -> fd 0 plus an unwritten stat buffer made Mono ask
+    // for a 1.9 TB read buffer, mmap -> 0 put the GC heap at address 0, and
+    // getpagesize -> 0 is a divisor. NIDs are hash-verified (name + salt).
+
+    // calloc(size_t n, size_t size): bump blocks are fresh zero pages.
+    register_symbol(0xD97E5A8058CAC4C7ULL, "calloc", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            const GuestSize n = ctx.rdi, size = ctx.rsi;
+            if (size != 0 && n > ~GuestSize{0} / size) {
+                ctx.rax = 0;
+                return;
+            }
+            ctx.rax = bump_alloc(n * size, 16);
+        });
+
+    // open(const char* path, int flags, int mode) -> fd, or -1
+    register_symbol(0xC2E0ABA081A3B768ULL, "open", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path = ctx.rdi;
+            if (path == 0 || !mem.is_valid_address(path, 1)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            const i32 fd = get_vfs().open(mem.to_host_ptr<char>(path),
+                                          static_cast<i32>(ctx.rsi), static_cast<i32>(ctx.rdx));
+            ctx.rax = static_cast<u64>(static_cast<i64>(fd < 0 ? -1 : fd));
+        });
+
+    // close(int fd) -> 0, or -1
+    register_symbol(0x6D8FCF3BA261CE14ULL, "close", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = static_cast<u64>(get_vfs().close(static_cast<i32>(ctx.rdi)) < 0 ? -1 : 0);
+        });
+
+    // read(int fd, void* buf, size_t n) -> bytes read, or -1
+    register_symbol(0x02A062A02DAF1772ULL, "read", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr buf = ctx.rsi;
+            const GuestSize n = ctx.rdx;
+            if (n == 0) {
+                ctx.rax = 0;
+                return;
+            }
+            if (!mem.is_valid_address(buf, n)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            const i64 r = get_vfs().read(static_cast<i32>(ctx.rdi), mem.to_host_ptr<void>(buf), n);
+            ctx.rax = static_cast<u64>(r < 0 ? -1 : r);
+        });
+
+    // stat(const char* path, struct stat* st) -> 0, or -1. Files and
+    // directories both open read-only on the host, so open + fstat + close.
+    register_symbol(0x13A6A8DF8C0FC3E5ULL, "stat", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path = ctx.rdi, out = ctx.rsi;
+            if (path == 0 || !mem.is_valid_address(path, 1) ||
+                !mem.is_valid_address(out, sizeof(OrbisStat))) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            auto& vfs = get_vfs();
+            const i32 fd = vfs.open(mem.to_host_ptr<char>(path), 0 /* O_RDONLY */, 0);
+            if (fd < 0) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            OrbisStat st{};
+            const i32 r = vfs.fstat(fd, st);
+            vfs.close(fd);
+            if (r != 0) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            mem.write_bytes(out, &st, sizeof(st));
+            ctx.rax = 0;
+        });
+
+    // strcpy(char* dst, const char* src) -> dst
+    register_symbol(0x9226525C859DF6F8ULL, "strcpy", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dst = ctx.rdi, src = ctx.rsi;
+            for (GuestSize i = 0;; ++i) {
+                u8 b = 0;
+                if (!mem.read_value(src + i, b) || !mem.write_value(dst + i, b)) break;
+                if (b == 0) break;
+            }
+            ctx.rax = dst;
+        });
+
+    // strrchr(const char* s, int c) -> last match (the terminator counts), or NULL
+    register_symbol(0xF720D63311057495ULL, "strrchr", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr s = ctx.rdi;
+            const u8 c = static_cast<u8>(ctx.rsi);
+            GuestAddr last = 0;
+            for (GuestSize i = 0;; ++i) {
+                u8 b = 0;
+                if (!mem.read_value(s + i, b)) break;
+                if (b == c) last = s + i;
+                if (b == 0) break;
+            }
+            ctx.rax = last;
+        });
+
+    // getpagesize() -> 16 KB on PS4
+    register_symbol(0x93E017AAEDBF7817ULL, "getpagesize", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = GUEST_PAGE_SIZE; });
+
+    // clock() -> process CPU time (FreeBSD CLOCKS_PER_SEC is 128)
+    register_symbol(0x4193FA23D659C691ULL, "clock", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = static_cast<u64>(std::clock()) * 128 / CLOCKS_PER_SEC;
+        });
+
+    // mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off).
+    // FreeBSD flags: MAP_FIXED 0x10, MAP_ANON 0x1000. MAP_FAILED is -1.
+    register_symbol(0x04F13DB3DBD0417AULL, "mmap", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr hint = ctx.rdi;
+            const GuestSize len = ctx.rsi;
+            const u32 flags = static_cast<u32>(ctx.rcx);
+            const i32 fd = static_cast<i32>(ctx.r8);
+            const i64 off = static_cast<i64>(ctx.r9);
+            constexpr u32 kMapFixed = 0x10, kMapAnon = 0x1000;
+            if (len == 0) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            GuestAddr addr = 0;
+            if ((flags & kMapFixed) && mem.is_valid_address(hint, len)) {
+                addr = hint;
+                static std::atomic<u32> s_fixed_logged{0};
+                if (s_fixed_logged.fetch_add(1) < 32)
+                    std::fprintf(stderr, "[mmap] MAP_FIXED 0x%llx len=0x%llx (zeroed)\n",
+                                 (unsigned long long)addr, (unsigned long long)len);
+                std::memset(mem.to_host_ptr<void>(addr), 0, len);
+            } else {
+                addr = mmap_arena_alloc(len);
+            }
+            if (addr == 0) {
+                std::fprintf(stderr, "[mmap] arena exhausted: len=0x%llx\n", (unsigned long long)len);
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            if (!(flags & kMapAnon) && fd >= 0) {
+                auto& vfs = get_vfs();
+                if (vfs.lseek(fd, off, 0 /* SEEK_SET */) >= 0)
+                    vfs.read(fd, mem.to_host_ptr<void>(addr), len);
+            }
+            ctx.rax = addr;
+        });
+
+    // munmap(void* addr, size_t len): arena space is not reused; zero it so a
+    // later MAP_FIXED of the same range sees fresh pages.
+    register_symbol(0x52A0C68D7039C943ULL, "munmap", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            static std::atomic<u32> s_logged{0};
+            if (s_logged.fetch_add(1) < 32)
+                std::fprintf(stderr, "[mmap] munmap 0x%llx len=0x%llx (zeroed)\n",
+                             (unsigned long long)ctx.rdi, (unsigned long long)ctx.rsi);
+            if (ctx.rsi != 0 && mem.is_valid_address(ctx.rdi, ctx.rsi))
+                std::memset(mem.to_host_ptr<void>(ctx.rdi), 0, ctx.rsi);
+            ctx.rax = 0;
+        });
+
+    // mprotect: guest memory is not page-protected.
+    register_symbol(0x61039FC4BE107DE5ULL, "mprotect", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+
+    // pthread_self / pthread_equal: the thread id is the handle, as for
+    // scePthreadSelf, so scePthreadAttrGet() below can find the thread again.
+    register_symbol(0x128B51F1ADC049FEULL, "pthread_self", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = static_cast<u64>(get_thread_manager(mem).current_thread_id());
+        });
+    register_symbol(0xED7976E7B33854D2ULL, "pthread_equal", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = ctx.rdi == ctx.rsi ? 1 : 0; });
+
+    // pthread_mutex_trylock: consistent with the mono-side pthread_mutex_lock
+    // no-op above -- always acquired.
+    register_symbol(0x2BF8D785BB76827EULL, "pthread_mutex_trylock", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+
+    // pthread_cleanup_push/pop: handlers only matter on cancellation, which is
+    // never delivered.
+    register_symbol(0xE1979959C32C015DULL, "pthread_cleanup_push", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+    register_symbol(0x455C5BD12B1AE6DDULL, "pthread_cleanup_pop", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+
+    register_symbol(0x9B9FF66EC35FBFBBULL, "scePthreadCondattrInit", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+    register_symbol(0xC1A3DCC58891DD60ULL, "scePthreadCondattrDestroy", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+
+    // scePthreadAttrGet(ScePthread thread, ScePthreadAttr* attr): the GC reads
+    // each thread's stack bounds through this to scan it for roots. The main
+    // thread has no GuestThread stack record; it runs on the default stack
+    // from CpuExecutor::setup_default_stack().
+    register_symbol(0xC755FBE9AAD83315ULL, "scePthreadAttrGet", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const ScePthreadId tid = static_cast<ScePthreadId>(ctx.rdi);
+            const GuestAddr attr_ptr = ctx.rsi;
+            if (attr_ptr == 0 || !mem.is_valid_address(attr_ptr, sizeof(u64))) {
+                ctx.rax = static_cast<u64>(-22);
+                return;
+            }
+            ScePthreadAttr attr{};
+            attr.stack_addr = 0x1FFF00000ULL;
+            attr.stack_size = 0x100000ULL;
+            if (GuestThread* t = get_thread_manager(mem).get_thread(tid);
+                t != nullptr && t->stack_base != 0) {
+                attr.stack_addr = t->stack_base;
+                attr.stack_size = t->stack_size;
+            }
+            mem.write_value(attr_ptr, static_cast<u64>(attr.stack_size));
+            std::lock_guard<std::mutex> lock(s_pthread_attr_mtx);
+            s_pthread_attrs[attr_ptr] = attr;
+            ctx.rax = SCE_OK;
+        });
+
+    register_symbol(0x46EDFA7E24ED2730ULL, "scePthreadAttrGetstackaddr", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            GuestAddr addr = 0;
+            {
+                std::lock_guard<std::mutex> lock(s_pthread_attr_mtx);
+                if (auto it = s_pthread_attrs.find(ctx.rdi); it != s_pthread_attrs.end())
+                    addr = it->second.stack_addr;
+            }
+            if (ctx.rsi == 0 || !mem.write_value(ctx.rsi, addr)) {
+                ctx.rax = static_cast<u64>(-22);
+                return;
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    register_symbol(0xFDF03EED99460D0BULL, "scePthreadAttrGetstacksize", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            GuestSize size = 2 * 1024 * 1024;
+            {
+                std::lock_guard<std::mutex> lock(s_pthread_attr_mtx);
+                if (auto it = s_pthread_attrs.find(ctx.rdi); it != s_pthread_attrs.end())
+                    size = it->second.stack_size;
+            }
+            if (ctx.rsi == 0 || !mem.write_value(ctx.rsi, static_cast<u64>(size))) {
+                ctx.rax = static_cast<u64>(-22);
+                return;
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // --- Thread-specific data --------------------------------------------
+    // pthread_key_create used to be a sync stub that never wrote a key, and
+    // get/setspecific fell to the zero stub, so Mono had no TLS at all. Guest
+    // threads are not 1:1 with host threads, so values are keyed by guest
+    // thread id rather than host thread_local storage. Destructors are not
+    // run (guest threads are only reaped at shutdown).
+    static std::mutex s_tsd_mtx;
+    static std::unordered_map<u64, u64> s_tsd; // (tid << 32 | key) -> value
+    static std::atomic<u32> s_next_tsd_key{1};
+    auto key_create = [](CpuContext& ctx, MemoryManager& mem) {
+        const u32 key = s_next_tsd_key.fetch_add(1);
+        if (ctx.rdi == 0 || !mem.write_value(ctx.rdi, key)) {
+            ctx.rax = 22; // EINVAL
+            return;
+        }
+        ctx.rax = 0;
+    };
+    auto get_specific = [](CpuContext& ctx, MemoryManager& mem) {
+        const u64 slot = (static_cast<u64>(get_thread_manager(mem).current_thread_id()) << 32) |
+                         static_cast<u32>(ctx.rdi);
+        std::lock_guard<std::mutex> lock(s_tsd_mtx);
+        auto it = s_tsd.find(slot);
+        ctx.rax = it == s_tsd.end() ? 0 : it->second;
+    };
+    auto set_specific = [](CpuContext& ctx, MemoryManager& mem) {
+        const u64 slot = (static_cast<u64>(get_thread_manager(mem).current_thread_id()) << 32) |
+                         static_cast<u32>(ctx.rdi);
+        std::lock_guard<std::mutex> lock(s_tsd_mtx);
+        s_tsd[slot] = ctx.rsi;
+        ctx.rax = 0;
+    };
+    register_symbol(0x9AA50B35D8A64E7DULL, "pthread_key_create", "libScePosix", key_create);
+    register_symbol(0x81E0DAAA01FD9538ULL, "scePthreadKeyCreate", "libkernel", key_create);
+    register_symbol(0xD3F297692EF4C72EULL, "pthread_getspecific", "libScePosix", get_specific);
+    register_symbol(0x7A886DEE640E0A6AULL, "scePthreadGetspecific", "libkernel", get_specific);
+    register_symbol(0x5AB38BBC7534C903ULL, "pthread_setspecific", "libScePosix", set_specific);
+    register_symbol(0xF81CD7624A9878B1ULL, "scePthreadSetspecific", "libkernel", set_specific);
+    register_symbol(0xE81A4466E0D3ED82ULL, "pthread_key_delete", "libScePosix",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+
+    // --- sceKernel file API ------------------------------------------------
+    // Same VFS as open/read/close above, but failures are SCE error codes
+    // (0x80020000 | errno) instead of -1. Mono opens every managed assembly
+    // (mscorlib.dll first) through sceKernelOpen.
+    auto sce_err = [](i64 neg_errno) -> u64 {
+        return 0x80020000ULL | static_cast<u64>(-neg_errno & 0xFFFF);
+    };
+    register_symbol(0xD46DE51751A0D64FULL, "sceKernelOpen", "libkernel",
+        [sce_err](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path = ctx.rdi;
+            if (path == 0 || !mem.is_valid_address(path, 1)) {
+                ctx.rax = sce_err(-14); // EFAULT
+                return;
+            }
+            const char* p = mem.to_host_ptr<char>(path);
+            const i32 fd = get_vfs().open(p, static_cast<i32>(ctx.rsi), static_cast<i32>(ctx.rdx));
+            static std::atomic<u32> s_logged{0};
+            if (s_logged.fetch_add(1) < 64)
+                std::fprintf(stderr, "[VFS] sceKernelOpen('%s', 0x%x) -> %d\n", p,
+                             static_cast<u32>(ctx.rsi), fd);
+            ctx.rax = fd < 0 ? sce_err(fd) : static_cast<u64>(fd);
+        });
+    register_symbol(0x50AD939760D6527BULL, "sceKernelClose", "libkernel",
+        [sce_err](CpuContext& ctx, MemoryManager&) {
+            const i32 r = get_vfs().close(static_cast<i32>(ctx.rdi));
+            ctx.rax = r < 0 ? sce_err(r) : 0;
+        });
+    register_symbol(0x0A0E2CAD9E9329B5ULL, "sceKernelRead", "libkernel",
+        [sce_err](CpuContext& ctx, MemoryManager& mem) {
+            const GuestSize n = ctx.rdx;
+            if (n != 0 && !mem.is_valid_address(ctx.rsi, n)) {
+                ctx.rax = sce_err(-14);
+                return;
+            }
+            const i64 r = n == 0 ? 0 : get_vfs().read(static_cast<i32>(ctx.rdi), mem.to_host_ptr<void>(ctx.rsi), n);
+            ctx.rax = r < 0 ? sce_err(r) : static_cast<u64>(r);
+        });
+    register_symbol(0xFABDEB305C08B55EULL, "sceKernelPread", "libkernel",
+        [sce_err](CpuContext& ctx, MemoryManager& mem) {
+            const i32 fd = static_cast<i32>(ctx.rdi);
+            const GuestSize n = ctx.rdx;
+            if (n != 0 && !mem.is_valid_address(ctx.rsi, n)) {
+                ctx.rax = sce_err(-14);
+                return;
+            }
+            auto& vfs = get_vfs();
+            const i64 saved = vfs.lseek(fd, 0, 1 /* SEEK_CUR */);
+            if (saved < 0 || vfs.lseek(fd, static_cast<i64>(ctx.rcx), 0) < 0) {
+                ctx.rax = sce_err(saved < 0 ? saved : -22);
+                return;
+            }
+            const i64 r = n == 0 ? 0 : vfs.read(fd, mem.to_host_ptr<void>(ctx.rsi), n);
+            vfs.lseek(fd, saved, 0);
+            ctx.rax = r < 0 ? sce_err(r) : static_cast<u64>(r);
+        });
+    register_symbol(0xA226FBE85FF5D9F9ULL, "sceKernelLseek", "libkernel",
+        [sce_err](CpuContext& ctx, MemoryManager&) {
+            const i64 r = get_vfs().lseek(static_cast<i32>(ctx.rdi), static_cast<i64>(ctx.rsi),
+                                          static_cast<i32>(ctx.rdx));
+            ctx.rax = r < 0 ? sce_err(r) : static_cast<u64>(r);
+        });
+    register_symbol(0x901C023EC617FE6EULL, "sceKernelFstat", "libkernel",
+        [sce_err](CpuContext& ctx, MemoryManager& mem) {
+            if (!mem.is_valid_address(ctx.rsi, sizeof(OrbisStat))) {
+                ctx.rax = sce_err(-14);
+                return;
+            }
+            OrbisStat st{};
+            const i32 r = get_vfs().fstat(static_cast<i32>(ctx.rdi), st);
+            if (r < 0) {
+                ctx.rax = sce_err(r);
+                return;
+            }
+            mem.write_bytes(ctx.rsi, &st, sizeof(st));
+            ctx.rax = 0;
+        });
+
+    // vprintf(const char* fmt, va_list ap): Mono's error reporter. Same va_list
+    // walk as vsnprintf (first four GP arguments).
+    register_symbol(0x18CA6FC4F156F76EULL, "vprintf", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr fmt_addr = ctx.rdi, ap = ctx.rsi;
+            if (fmt_addr == 0 || !mem.is_valid_address(fmt_addr, 1)) {
+                ctx.rax = 0;
+                return;
+            }
+            VaListArgs args(mem, ap);
+            const std::string out = format_guest(mem, mem.to_host_ptr<char>(fmt_addr), args);
+            std::cout << "[Guest printf] " << out << std::flush;
+            ctx.rax = out.size();
+        });
+
+    // vasprintf(char** strp, const char* fmt, va_list ap) -> length, or -1.
+    // Mono formats GUIDs ("%02X%02X...") with it; the block is freed with free().
+    register_symbol(0xAA3065C367153003ULL, "vasprintf", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr strp = ctx.rdi, fmt_addr = ctx.rsi;
+            if (strp == 0 || fmt_addr == 0 || !mem.is_valid_address(fmt_addr, 1)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            VaListArgs args(mem, ctx.rdx);
+            const std::string out = format_guest(mem, mem.to_host_ptr<char>(fmt_addr), args);
+            const GuestAddr buf = bump_alloc(out.size() + 1, 16);
+            if (buf == 0 || !mem.write_bytes(buf, out.c_str(), out.size() + 1) ||
+                !mem.write_value(strp, buf)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            ctx.rax = out.size();
+        });
+
+    // sprintf(char* buf, const char* fmt, ...) -> length
+    register_symbol(0xB5C562E528AF17B4ULL, "sprintf", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr buf = ctx.rdi, fmt_addr = ctx.rsi;
+            if (fmt_addr == 0 || !mem.is_valid_address(fmt_addr, 1)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            CallArgs args(ctx, mem, 2);
+            const std::string out = format_guest(mem, mem.to_host_ptr<char>(fmt_addr), args);
+            if (buf == 0 || !mem.write_bytes(buf, out.c_str(), out.size() + 1)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            ctx.rax = out.size();
+        });
+
+    // _Stoul(const char* s, char** endptr, int base): Dinkumware's strtoul,
+    // which libc's strtoul wraps. Parsed on the host from a bounded copy.
+    register_symbol(0xCE57C41FC166C940ULL, "_Stoul", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr s = ctx.rdi, endptr = ctx.rsi;
+            std::string text;
+            for (GuestSize i = 0; i < 256; ++i) {
+                char c = 0;
+                if (!mem.read_value(s + i, c) || c == 0) break;
+                text.push_back(c);
+            }
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(text.c_str(), &end, static_cast<int>(ctx.rdx));
+            if (endptr != 0) mem.write_value(endptr, static_cast<u64>(s + (end - text.c_str())));
+            // 64-bit unsigned long on PS4; clamp like strtoul on overflow.
+            ctx.rax = static_cast<u64>(v);
+        });
+
+    // fflush(FILE*): guest stdio is not buffered on our side.
+    register_symbol(0x3148C2E256C7ACAEULL, "fflush", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+
+    // sceSystemServiceReportAbnormalTermination(const void* info): the game is
+    // about to abort. Say so loudly instead of returning silently.
+    register_symbol(0xDECF1C1E20812811ULL, "sceSystemServiceReportAbnormalTermination",
+                    "libSceSystemService",
+        [](CpuContext& ctx, MemoryManager&) {
+            std::fprintf(stderr, "[HLE] sceSystemServiceReportAbnormalTermination(0x%llx) TID=%d "
+                         "caller RIP=0x%llx -- the guest is aborting\n",
+                         (unsigned long long)ctx.rdi, (int)t_guest_tid,
+                         (unsigned long long)t_guest_rip);
+            ctx.rax = SCE_OK;
+        });
+
+    // --- POSIX thread attributes / misc, as imported by mono-ps4.prx ---------
+    // pthread_create looks attributes up by the guest pthread_attr_t's address
+    // (s_pthread_attrs), exactly as the scePthreadAttr* handlers store them, so
+    // the POSIX names alias those handlers. Return codes agree (0 = success).
+    auto alias = [this](Nid nid, const char* name, Nid target) {
+        if (const HleSymbol* t = find_by_nid(target); t != nullptr && t->handler)
+            register_symbol(nid, name, "libScePosix", t->handler);
+    };
+    alias(0xC2D92DFED791D6CAULL, "pthread_attr_init", 0x9EC628351CB0C0D8ULL);
+    alias(0xD90D33EAB9C1AD31ULL, "pthread_attr_setstacksize", 0x5135F325B5A18531ULL);
+    alias(0x13EB72A37969E4BCULL, "pthread_attr_setdetachstate", 0xFD6ADEA6BB6ED10BULL);
+    alias(0xCC772163C7EDE699ULL, "pthread_attr_destroy", 0xEB6282C04326CDC3ULL);
+    alias(0x87D09C3F7274A153ULL, "pthread_join", 0xA27358F41CA7FD6FULL);
+
+    register_symbol(0x5544F5652AC74F42ULL, "pthread_attr_getdetachstate", "libScePosix",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            i32 state = 0;
+            {
+                std::lock_guard<std::mutex> lock(s_pthread_attr_mtx);
+                if (auto it = s_pthread_attrs.find(ctx.rdi); it != s_pthread_attrs.end())
+                    state = it->second.detachstate;
+            }
+            ctx.rax = (ctx.rsi != 0 && mem.write_value(ctx.rsi, state)) ? 0 : 22;
+        });
+
+    // scePthreadAttrGetstack(attr, void** addr, size_t* size)
+    register_symbol(0xFEAB8F6B8484254CULL, "scePthreadAttrGetstack", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            ScePthreadAttr attr{};
+            {
+                std::lock_guard<std::mutex> lock(s_pthread_attr_mtx);
+                if (auto it = s_pthread_attrs.find(ctx.rdi); it != s_pthread_attrs.end())
+                    attr = it->second;
+            }
+            const bool ok = ctx.rsi != 0 && ctx.rdx != 0 &&
+                            mem.write_value(ctx.rsi, static_cast<u64>(attr.stack_addr)) &&
+                            mem.write_value(ctx.rdx, static_cast<u64>(attr.stack_size));
+            ctx.rax = ok ? SCE_OK : static_cast<u64>(-22);
+        });
+
+    // Detached threads are still reaped at shutdown; nothing to do now.
+    auto detach = [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; };
+    register_symbol(0xF94D51E16B57BE87ULL, "pthread_detach", "libScePosix", detach);
+    register_symbol(0xE2A1AB47A7A83FD6ULL, "scePthreadDetach", "libkernel", detach);
+
+    // __pthread_cleanup_push_imp / _pop_imp: FreeBSD's out-of-line cleanup
+    // handlers. They only run on cancellation, which is never delivered.
+    register_symbol(0xD71BED515C75FD28ULL, "__pthread_cleanup_push_imp", "libScePosix",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+    register_symbol(0x896B0595831FDCACULL, "__pthread_cleanup_pop_imp", "libScePosix",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+
+    // Priorities are recorded on the thread but not used for host scheduling.
+    register_symbol(0x5B41E99B65F4B8F1ULL, "scePthreadSetprio", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (GuestThread* t = get_thread_manager(mem).get_thread(static_cast<ScePthreadId>(ctx.rdi)))
+                t->priority = static_cast<i32>(ctx.rsi);
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0xD6D2B21BB465309AULL, "scePthreadGetprio", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            i32 prio = 256;
+            if (GuestThread* t = get_thread_manager(mem).get_thread(static_cast<ScePthreadId>(ctx.rdi)))
+                prio = t->priority;
+            ctx.rax = (ctx.rsi != 0 && mem.write_value(ctx.rsi, prio)) ? SCE_OK : static_cast<u64>(-22);
+        });
+
+    // scePthreadGetname(thread, char name[32])
+    register_symbol(0x1E8C3B07C39EB7A9ULL, "scePthreadGetname", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string name = "main";
+            if (GuestThread* t = get_thread_manager(mem).get_thread(static_cast<ScePthreadId>(ctx.rdi)))
+                name = t->name;
+            name.resize(std::min<usize>(name.size(), 31));
+            ctx.rax = (ctx.rsi != 0 && mem.write_bytes(ctx.rsi, name.c_str(), name.size() + 1))
+                          ? SCE_OK : static_cast<u64>(-22);
+        });
+
+    // getpid(): a single fixed process.
+    register_symbol(0x1E82D558D6A70417ULL, "getpid", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 1; });
+
+    // clock_gettime / clock_getres(clockid_t, struct timespec*). FreeBSD ids:
+    // REALTIME 0, MONOTONIC 4, UPTIME 5, THREAD_CPUTIME 14, PROCESS_CPUTIME 15.
+    auto host_clock = [](u64 id) -> clockid_t {
+        switch (id) {
+        case 0: return CLOCK_REALTIME;
+        case 14: return CLOCK_THREAD_CPUTIME_ID;
+        case 15: return CLOCK_PROCESS_CPUTIME_ID;
+        default: return CLOCK_MONOTONIC;
+        }
+    };
+    register_symbol(0x94B313F6F240724DULL, "clock_gettime", "libkernel",
+        [host_clock](CpuContext& ctx, MemoryManager& mem) {
+            struct timespec ts{};
+            ::clock_gettime(host_clock(ctx.rdi), &ts);
+            const bool ok = ctx.rsi != 0 && mem.write_value(ctx.rsi, static_cast<i64>(ts.tv_sec)) &&
+                            mem.write_value(ctx.rsi + 8, static_cast<i64>(ts.tv_nsec));
+            ctx.rax = ok ? 0 : static_cast<u64>(-1);
+        });
+    register_symbol(0xB26223EDEAB3644FULL, "clock_getres", "libkernel",
+        [host_clock](CpuContext& ctx, MemoryManager& mem) {
+            struct timespec ts{};
+            ::clock_getres(host_clock(ctx.rdi), &ts);
+            if (ctx.rsi != 0) {
+                mem.write_value(ctx.rsi, static_cast<i64>(ts.tv_sec));
+                mem.write_value(ctx.rsi + 8, static_cast<i64>(ts.tv_nsec));
+            }
+            ctx.rax = 0;
+        });
+
+    register_symbol(0x421BF90110283847ULL, "sceKernelRemoveExceptionHandler", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+
+    // sceKernelInstallExceptionHandler: no signals are ever raised.
+    register_symbol(0x5A4C0477737BC346ULL, "sceKernelInstallExceptionHandler", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+
     // setjmp(jmp_buf env)
     // NID: 0x80D435576BDF5C31ULL / 0x315CDF6B5735D480ULL ("gNQ1V2vfXDE")
     auto setjmp_handler = [](CpuContext& ctx, MemoryManager& mem) {
@@ -1795,7 +2556,8 @@ void NidRegistry::register_default_libraries() {
                 return;
             }
 
-            const std::string formatted = format_guest_string(mem, fmt, ctx.rcx, ctx.r8, ctx.r9, 0);
+            CallArgs args(ctx, mem, 3);
+            const std::string formatted = format_guest(mem, fmt, args);
             if (buf != 0 && sz > 0 && mem.is_valid_address(buf, sz)) {
                 char* dst = mem.to_host_ptr<char>(buf);
                 if (dst) {
@@ -1906,27 +2668,8 @@ void NidRegistry::register_default_libraries() {
                 return;
             }
 
-            // Extract up to 4 GP arguments from x86_64 System V va_list
-            u64 args[4] = {0, 0, 0, 0};
-            if (ap != 0 && mem.is_valid_address(ap, 24)) {
-                u32 gp_offset = 0;
-                GuestAddr overflow_area = 0, reg_save = 0;
-                mem.read_value(ap + 0, gp_offset);
-                mem.read_value(ap + 8, overflow_area);
-                mem.read_value(ap + 16, reg_save);
-
-                for (int i = 0; i < 4; ++i) {
-                    if (gp_offset < 48 && mem.is_valid_address(reg_save + gp_offset, 8)) {
-                        mem.read_value(reg_save + gp_offset, args[i]);
-                        gp_offset += 8;
-                    } else if ( overflow_area > 0x1000 && mem.is_valid_address(overflow_area, 8)) {
-                        mem.read_value(overflow_area, args[i]);
-                        overflow_area += 8;
-                    }
-                }
-            }
-
-            const std::string formatted = format_guest_string(mem, fmt, args[0], args[1], args[2], args[3]);
+            VaListArgs args(mem, ap);
+            const std::string formatted = format_guest(mem, fmt, args);
 
             if (dest != 0 && maxlen > 0 && mem.is_valid_address(dest, maxlen)) {
                 char* out = mem.to_host_ptr<char>(dest);
@@ -2173,37 +2916,44 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
+    // qsort / bsearch take a guest comparator, and HLE handlers never re-enter
+    // the guest CPU to call it. Instead they run AS guest code: the routines
+    // in src/hle/guest_libc.c are compiled to x86-64 (include/ps4/
+    // guest_libc_blob.hpp), copied into guest memory on first use, and the
+    // handler tail-jumps there with the caller's arguments still in place.
+    // The routine's own `ret` returns to the caller, and the comparator is an
+    // ordinary guest call.
+    //
+    // qsort used to leave the array in input order. bsearch was unregistered
+    // and returned NULL: mono-ps4.prx uses it for every metadata table lookup
+    // (206 calls before Unity aborted).
+    static std::once_flag s_guest_libc_once;
+    static GuestAddr s_guest_libc = 0;
+    auto guest_libc_entry = [](MemoryManager& mem, usize offset) -> GuestAddr {
+        std::call_once(s_guest_libc_once, [&mem] {
+            const GuestAddr at = bump_alloc(sizeof(guest_libc::kCode), 64);
+            if (at != 0 && mem.write_bytes(at, guest_libc::kCode, sizeof(guest_libc::kCode)))
+                s_guest_libc = at;
+        });
+        return s_guest_libc == 0 ? 0 : s_guest_libc + offset;
+    };
+
     // qsort(void* base, size_t nmemb, size_t size, int (*compar)(const void*, const void*))
-    // NID: 0x00425D215653126AULL -- imported by eboot.bin and
-    // libSceFaceTracker.prx. Was unregistered, so it fell through to the
-    // unimplemented stub and logged five times a run.
-    //
-    // qsort returns void, so the stub's `rax = 0` was never a wrong *return
-    // value* -- the damage is that the array is not sorted. The honest answer
-    // is still not to sort it: compar is a guest function pointer, and calling
-    // it would mean re-entering the guest CPU core from inside an HLE handler,
-    // which is exactly what the RSP floor and the write-watch ring exist to
-    // police against.
-    //
-    // So: register the call, log it once, leave the array in input order.
-    // Input order is deterministic and reproducible -- the conservative no-op,
-    // what a sort whose comparator reports every pair equal produces. The
-    // alternative (guessing an order, or half-sorting) fabricates state the
-    // guest cannot tell from real data, which is precisely the failure mode
-    // this audit is removing elsewhere.
+    // NID: 0x00425D215653126AULL
     register_symbol(0x00425D215653126AULL, "qsort", "libc",
-        [](CpuContext& ctx, MemoryManager&) {
-            static std::atomic<bool> s_logged{false};
-            if (!s_logged.exchange(true)) {
-                std::fprintf(stderr,
-                             "[qsort] base=0x%llx nmemb=%llu size=%llu compar=0x%llx"
-                             " -- the comparator is guest code and cannot be invoked from HLE;"
-                             " array left in input order\n",
-                             (unsigned long long)ctx.rdi,
-                             (unsigned long long)ctx.rsi,
-                             (unsigned long long)ctx.rdx,
-                             (unsigned long long)ctx.rcx);
-            }
+        [guest_libc_entry](CpuContext& ctx, MemoryManager& mem) {
+            if (const GuestAddr fn = guest_libc_entry(mem, guest_libc::k_qsort_offset))
+                ctx.rip = fn;
+        });
+
+    // bsearch(const void* key, const void* base, size_t n, size_t size, compar)
+    // NID: 0x35EB0881399F1744ULL (hash-verified)
+    register_symbol(0x35EB0881399F1744ULL, "bsearch", "libc",
+        [guest_libc_entry](CpuContext& ctx, MemoryManager& mem) {
+            if (const GuestAddr fn = guest_libc_entry(mem, guest_libc::k_bsearch_offset))
+                ctx.rip = fn;
+            else
+                ctx.rax = 0;
         });
 
     // sceKernelWaitSema(SceKernelSema sema, int needCount, SceKernelUseconds* pTimeout)
@@ -4228,7 +4978,8 @@ void NidRegistry::register_default_libraries() {
             const char* fmt = (fmt_addr > 0x1000 && mem.is_valid_address(fmt_addr, 1))
                                 ? mem.to_host_ptr<char>(fmt_addr) : nullptr;
             if (fmt) {
-                const std::string formatted = format_guest_string(mem, fmt, ctx.rsi, ctx.rdx, ctx.rcx, ctx.r8);
+                CallArgs args(ctx, mem, 1);
+                const std::string formatted = format_guest(mem, fmt, args);
                 std::fprintf(stderr, "[Guest printf] %s\n", formatted.c_str());
             }
             ctx.rax = 0;
@@ -4968,7 +5719,7 @@ void NidRegistry::register_default_libraries() {
         {0xB6D1CD7D4FAA0C15ULL, "pthread_mutex_init", "libScePosix"},
         {0x1C5EE52B8EB1CE36ULL, "pthread_mutexattr_destroy", "libScePosix"},
         {0xD13C959383122EDDULL, "pthread_cond_init", "libScePosix"},
-        {0x9AA50B35D8A64E7DULL, "pthread_key_create", "libScePosix"},
+        // pthread_key_create has a real handler (thread-specific data).
         // Stack-smashing abort, not scePthreadSetprio. Still a stub: the
         // compatibility layer prefers continuing over aborting the guest.
         {0x967DF7CE306B7E39ULL, "sceGnmGetTheTessellationFactorRingBufferBaseAddress", "libSceGnm"},

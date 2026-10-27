@@ -137,6 +137,11 @@ struct CpuContext {
     };
     YmmReg ymm[16]{};
 
+    // SSE control/status. Rounding and exception masks are not applied to
+    // host arithmetic; the value round-trips through LDMXCSR/STMXCSR so guest
+    // save/restore code sees what it stored (default: all masked, RN).
+    u32 mxcsr{0x1F80};
+
     void reset() noexcept {
         *this = CpuContext{};
     }

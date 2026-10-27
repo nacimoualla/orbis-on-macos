@@ -1532,6 +1532,64 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
+        // VLDMXCSR / VSTMXCSR m32 (map 1, op 0xAE /2 /3)
+        if (vex_map == 1 && vex_op == 0xAE) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (m.valid && !m.is_reg && ((m.reg_id & 7) == 2 || (m.reg_id & 7) == 3)) {
+                const bool ok = (m.reg_id & 7) == 2 ? m_memory.read_value(m.mem_addr, m_context.mxcsr)
+                                                    : m_memory.write_value(m.mem_addr, m_context.mxcsr);
+                if (!ok) return StepResult::MemoryFault;
+                m_context.rip = start_rip + cursor + m.bytes_consumed;
+                return StepResult::Ok;
+            }
+        }
+
+        // VEXTRACTPS r/m32, xmm, imm8 (map 3, 66, op 0x17)
+        if (vex_map == 3 && vex_op == 0x17 && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm = raw_code[cursor + m.bytes_consumed];
+            const u32 val = m_context.ymm[m.reg_id & 15].d[imm & 3];
+            if (m.is_reg) {
+                set_gpr64(m_context, m.rm_id, val); // 32-bit GPR write zero-extends
+            } else if (!m_memory.write_value(m.mem_addr, val)) {
+                return StepResult::MemoryFault;
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
+        // VPHADDW / VPHADDD (map 2, 66, op 0x01 / 0x02): pairwise horizontal
+        // add within each 128-bit lane; low half from src1, high half from src2.
+        if (vex_map == 2 && (vex_op == 0x01 || vex_op == 0x02) && vex_pp == 1) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const CpuContext::YmmReg a = m_context.ymm[vex_vvvv & 15];
+            CpuContext::YmmReg b{};
+            if (m.is_reg) b = m_context.ymm[m.rm_id & 15];
+            else if (!m_memory.read_bytes(m.mem_addr, &b, vex_l ? 32 : 16)) return StepResult::MemoryFault;
+            CpuContext::YmmReg res{};
+            for (usize lane = 0; lane < (vex_l ? 2u : 1u); ++lane) {
+                if (vex_op == 0x02) {
+                    const usize o = lane * 4;
+                    for (usize i = 0; i < 2; ++i) {
+                        res.d[o + i] = a.d[o + 2 * i] + a.d[o + 2 * i + 1];
+                        res.d[o + 2 + i] = b.d[o + 2 * i] + b.d[o + 2 * i + 1];
+                    }
+                } else {
+                    const usize o = lane * 8;
+                    for (usize i = 0; i < 4; ++i) {
+                        res.w[o + i] = static_cast<u16>(a.w[o + 2 * i] + a.w[o + 2 * i + 1]);
+                        res.w[o + 4 + i] = static_cast<u16>(b.w[o + 2 * i] + b.w[o + 2 * i + 1]);
+                    }
+                }
+            }
+            m_context.ymm[dest] = res; // VEX.128 zeroes bits 255:128 (res is zero there)
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
         // VPSHUFB (map 2, op 0x00)
         if (vex_map == 2 && vex_op == 0x00) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
@@ -1984,23 +2042,21 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // VMOVQ xmm, xmm/m64 (VEX.128.F3.0F D6 /r) - map=1, op=0xD6, pp=1
+        // VMOVQ xmm1/m64, xmm2 (VEX.128.66.0F D6 /r): a STORE -- ModR/M.reg is
+        // the source. This used to be decoded as a load into ModR/M.reg, so
+        // every `vmovq [mem], xmm` was dropped and clobbered the source
+        // register instead; mono-ps4's GC size-map initialiser then left its
+        // table unwritten and the allocator scanned it forever.
         if (vex_map == 1 && vex_op == 0xD6 && vex_pp == 1) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
-            const u8 dest = m.reg_id & 15;
+            const u64 val = m_context.ymm[m.reg_id & 15].q[0];
             if (m.is_reg) {
-                m_context.ymm[dest].q[0] = m_context.ymm[m.rm_id & 15].q[0];
-            } else {
-                u64 val = 0;
-                m_memory.read_value(m.mem_addr, val);
-                m_context.ymm[dest].q[0] = val;
-            }
-            // Clear upper bits for VEX.128
-            if (!vex_l) {
-                m_context.ymm[dest].q[1] = 0;
-                m_context.ymm[dest].q[2] = 0;
-                m_context.ymm[dest].q[3] = 0;
+                auto& dst = m_context.ymm[m.rm_id & 15];
+                dst.q[0] = val;
+                dst.q[1] = dst.q[2] = dst.q[3] = 0;
+            } else if (!m_memory.write_value(m.mem_addr, val)) {
+                return StepResult::MemoryFault;
             }
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
@@ -3536,6 +3592,13 @@ StepResult CpuExecutor::step() {
                          static_cast<unsigned long long>(start_rip),
                          static_cast<unsigned>(vex_l), static_cast<unsigned>(vex_pp), static_cast<unsigned>(vex_vvvv),
                          static_cast<unsigned>(ps4::t_guest_tid));
+            // A mis-sized earlier instruction lands RIP mid-instruction and
+            // shows up here as a bogus VEX prefix; the history shows which.
+            for (usize i = 0; i < 16; ++i) {
+                const GuestAddr h_rip = s_rip_history[(s_rip_hist_idx + 128 - 16 + i) % 128];
+                if (h_rip != 0)
+                    std::fprintf(stderr, "  [%02zu] RIP=0x%llx\n", i, (unsigned long long)h_rip);
+            }
             std::fflush(stderr);
             (void)m;
             return StepResult::IllegalInstruction;
@@ -3792,6 +3855,14 @@ StepResult CpuExecutor::step() {
                 else if (sub_op == 1) set_gpr64(m_context, m.rm_id, m_context.gs_base);
                 else if (sub_op == 2) m_context.fs_base = get_gpr64(m_context, m.rm_id);
                 else if (sub_op == 3) m_context.gs_base = get_gpr64(m_context, m.rm_id);
+                m_context.rip = start_rip + cursor + m.bytes_consumed;
+                return StepResult::Ok;
+            }
+            // LDMXCSR m32 / STMXCSR m32
+            if ((m.reg_id & 7) == 2 || (m.reg_id & 7) == 3) {
+                const bool ok = (m.reg_id & 7) == 2 ? m_memory.read_value(m.mem_addr, m_context.mxcsr)
+                                                    : m_memory.write_value(m.mem_addr, m_context.mxcsr);
+                if (!ok) return StepResult::MemoryFault;
                 m_context.rip = start_rip + cursor + m.bytes_consumed;
                 return StepResult::Ok;
             }
@@ -4450,10 +4521,37 @@ StepResult CpuExecutor::step() {
             }
         }
 
-        // Generic fallback for any other 0x0F opcode with ModR/M
+        // 0x0F 0xC8+r: BSWAP r32/r64 (no ModR/M). It used to fall through to
+        // the ModR/M-skipping fallback below, which "executed" it as a NOP and
+        // swallowed the next instruction bytes -- in mono-ps4's SHA-1 that
+        // skipped a MOVBE store and then landed RIP mid-instruction.
+        if (op1 >= 0xC8 && op1 <= 0xCF) {
+            const u8 reg = static_cast<u8>((op1 - 0xC8) | (rex_b ? 8 : 0));
+            if (rex_w) {
+                set_gpr64(m_context, reg, __builtin_bswap64(get_gpr64(m_context, reg)));
+            } else if (operand_size_16) {
+                set_gpr16(m_context, reg, 0); // undefined; zero as on Intel hardware
+            } else {
+                set_gpr32(m_context, reg, __builtin_bswap32(static_cast<u32>(get_gpr64(m_context, reg))));
+            }
+            m_context.rip = start_rip + cursor;
+            return StepResult::Ok;
+        }
+
+        // Generic fallback for any other 0x0F opcode with ModR/M: skipped as a
+        // NOP (correct for hints such as 0F 18-1F / 0F 0D). Anything else
+        // skipped here is unimplemented and silently wrong, so name each
+        // opcode the first time it is skipped.
         {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
             if (m.valid) {
+                const bool hint = (op1 >= 0x18 && op1 <= 0x1F) || op1 == 0x0D;
+                static std::atomic<u64> s_reported[4]{};
+                const u64 bit = 1ULL << (op1 & 63);
+                if (!hint && !(s_reported[op1 >> 6].fetch_or(bit) & bit)) {
+                    std::fprintf(stderr, "[CPU] 0F %02X at RIP=0x%llx is unimplemented; skipped as a NOP\n",
+                                 op1, (unsigned long long)start_rip);
+                }
                 m_context.rip = start_rip + cursor + m.bytes_consumed;
                 return StepResult::Ok;
             }

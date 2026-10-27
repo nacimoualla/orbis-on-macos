@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps4/common.hpp"
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -27,31 +28,36 @@ inline constexpr i32 ORBIS_SEEK_SET = 0;
 inline constexpr i32 ORBIS_SEEK_CUR = 1;
 inline constexpr i32 ORBIS_SEEK_END = 2;
 
-// Orbis / FreeBSD stat structure layout (packed/aligned for guest memory)
-#pragma pack(push, 4)
+// Orbis / FreeBSD (amd64) struct stat, 120 bytes. Natural alignment: the
+// timespecs start at 0x18 right after st_rdev. (A 4-byte pad there used to
+// shift st_size to 0x4C, so the guest read file sizes of 0 at 0x48.)
 struct OrbisStat {
-    u32 st_dev;           // Device ID
-    u32 st_ino;           // Inode number
-    u16 st_mode;          // Mode/permissions
-    u16 st_nlink;         // Hard links
-    u32 st_uid;           // User ID
-    u32 st_gid;           // Group ID
-    u32 st_rdev;          // Device type for special files
-    u32 _pad0;
-    i64 st_atime_sec;     // Access time (seconds)
-    i64 st_atimensec;     // Access time (nanoseconds)
-    i64 st_mtime_sec;     // Modification time (seconds)
-    i64 st_mtimensec;     // Modification time (nanoseconds)
-    i64 st_ctime_sec;     // Status change time (seconds)
-    i64 st_ctimensec;     // Status change time (nanoseconds)
-    i64 st_size;          // File size in bytes
-    i64 st_blocks;        // Number of 512B blocks allocated
-    u32 st_blksize;       // Optimal block size for I/O
-    u32 st_flags;         // User defined flags
-    u32 st_gen;           // File generation number
-    u32 _pad1;
+    u32 st_dev;           // 0x00 Device ID
+    u32 st_ino;           // 0x04 Inode number
+    u16 st_mode;          // 0x08 Mode/permissions
+    u16 st_nlink;         // 0x0A Hard links
+    u32 st_uid;           // 0x0C User ID
+    u32 st_gid;           // 0x10 Group ID
+    u32 st_rdev;          // 0x14 Device type for special files
+    i64 st_atime_sec;     // 0x18 Access time (seconds)
+    i64 st_atimensec;     // 0x20 Access time (nanoseconds)
+    i64 st_mtime_sec;     // 0x28 Modification time (seconds)
+    i64 st_mtimensec;     // 0x30 Modification time (nanoseconds)
+    i64 st_ctime_sec;     // 0x38 Status change time (seconds)
+    i64 st_ctimensec;     // 0x40 Status change time (nanoseconds)
+    i64 st_size;          // 0x48 File size in bytes
+    i64 st_blocks;        // 0x50 Number of 512B blocks allocated
+    u32 st_blksize;       // 0x58 Optimal block size for I/O
+    u32 st_flags;         // 0x5C User defined flags
+    u32 st_gen;           // 0x60 File generation number
+    i32 st_lspare;        // 0x64
+    i64 st_birthtime_sec; // 0x68 Creation time (seconds)
+    i64 st_birthtimensec; // 0x70 Creation time (nanoseconds)
 };
-#pragma pack(pop)
+static_assert(offsetof(OrbisStat, st_atime_sec) == 0x18);
+static_assert(offsetof(OrbisStat, st_size) == 0x48);
+static_assert(offsetof(OrbisStat, st_birthtime_sec) == 0x68);
+static_assert(sizeof(OrbisStat) == 0x78);
 
 // Save data structures
 inline constexpr i32 SCE_SAVE_DATA_MOUNT_MODE_RDONLY = 1;
