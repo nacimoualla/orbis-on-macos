@@ -1,7 +1,20 @@
 #include "ps4/jit_compiler.hpp"
 #include <cstring>
 #include <iostream>
+#if defined(__APPLE__)
 #include <libkern/OSCacheControl.h>
+#else
+// Non-Apple hosts (Linux/aarch64 under QEMU for the CPU test harness): no
+// MAP_JIT or per-thread W^X toggle; flush the icache with the builtin.
+#ifndef MAP_JIT
+#define MAP_JIT 0
+#endif
+static inline void pthread_jit_write_protect_np(int) {}
+static inline void sys_icache_invalidate(void *start, size_t len) {
+  __builtin___clear_cache(static_cast<char *>(start),
+                          static_cast<char *>(start) + len);
+}
+#endif
 #include <pthread.h>
 #include <sys/mman.h>
 
