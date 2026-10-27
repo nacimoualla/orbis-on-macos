@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ps4 {
@@ -169,6 +170,7 @@ private:
 
     std::unordered_map<GuestAddr, JittedBlockFunc> m_blocks;
     std::unordered_map<GuestAddr, JitBlockMetrics> m_metrics;
+    std::unordered_set<GuestAddr> m_failed; // block starts that compiled to nothing
     Arm64Emitter m_emitter;
     mutable std::mutex m_cache_mutex;
 

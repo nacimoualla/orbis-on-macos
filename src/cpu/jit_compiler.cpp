@@ -1,4 +1,5 @@
 #include "ps4/jit_compiler.hpp"
+#include "ps4/jit_stats.hpp"
 #include "ps4/x86_decode.hpp"
 #include <algorithm>
 #include <cstring>
@@ -419,6 +420,25 @@ u32 get_gpr_offset(u8 x86_reg_idx) {
     return offsetof(CpuContext, r15);
   default:
     return offsetof(CpuContext, rax);
+  }
+}
+
+// Telemetry (PS4_JIT_STATS): attribute the block end to the instruction that
+// caused it. Terminators (incl. JMP, which is compiled) end with block_ended
+// set and are at insn_rip; otherwise the decoder bailed at current_rip, or the
+// block hit the instruction cap.
+void record_block_end_stats(const MemoryManager &memory, bool block_ended,
+                            GuestAddr insn_rip, GuestAddr current_rip,
+                            usize instructions, usize max_instructions) {
+  if (block_ended) {
+    jit_stats_record_block_end(memory, insn_rip, JitStopReason::Terminator,
+                               instructions);
+  } else if (instructions >= max_instructions) {
+    jit_stats_record_block_end(memory, current_rip, JitStopReason::Limit,
+                               instructions);
+  } else {
+    jit_stats_record_block_end(memory, current_rip, JitStopReason::Unsupported,
+                               instructions);
   }
 }
 
@@ -1173,7 +1193,8 @@ JitCompiler::JitCompiler(JitCompiler &&other) noexcept
       m_code_buffer_offset(other.m_code_buffer_offset),
       m_total_invocations(other.m_total_invocations),
       m_blocks(std::move(other.m_blocks)),
-      m_metrics(std::move(other.m_metrics)) {
+      m_metrics(std::move(other.m_metrics)),
+      m_failed(std::move(other.m_failed)) {
   other.m_code_buffer = nullptr;
   other.m_code_buffer_size = 0;
   other.m_code_buffer_offset = 0;
@@ -1190,6 +1211,7 @@ JitCompiler &JitCompiler::operator=(JitCompiler &&other) noexcept {
     m_total_invocations = other.m_total_invocations;
     m_blocks = std::move(other.m_blocks);
     m_metrics = std::move(other.m_metrics);
+    m_failed = std::move(other.m_failed);
 
     other.m_code_buffer = nullptr;
     other.m_code_buffer_size = 0;
@@ -1236,6 +1258,7 @@ void JitCompiler::clear_cache() {
   std::lock_guard<std::mutex> lock(m_cache_mutex);
   m_blocks.clear();
   m_metrics.clear();
+  m_failed.clear();
   m_code_buffer_offset = 0;
 }
 
@@ -1276,15 +1299,20 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
     return it->second;
   }
 
-  if (!m_code_buffer || !memory.is_valid_address(guest_rip, 1)) {
+  if (!m_code_buffer || !memory.is_valid_address(guest_rip, 1) ||
+      m_failed.count(guest_rip) != 0) {
     return nullptr;
   }
 
   // Pass 1: decode the block.
+  constexpr usize MAX_BLOCK_INSNS = 128;
   std::vector<JitInsn> insns;
   GuestAddr current_rip = guest_rip;
+  bool block_ended = false;
+  GuestAddr insn_rip = guest_rip; // start of the instruction being decoded
 
-  while (insns.size() < 128) {
+  while (!block_ended && insns.size() < MAX_BLOCK_INSNS) {
+    insn_rip = current_rip;
     if (!memory.is_valid_address(current_rip, 1)) {
       break;
     }
@@ -1299,6 +1327,7 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
     x86::Prefixes pfx;
     if (x86::decode_prefixes(code, avail, pfx) &&
         is_block_terminator(code, avail, pfx)) {
+      block_ended = true;
       break;
     }
 
@@ -1311,13 +1340,22 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
     insns.push_back(insn);
     if (insn.kind == Kind::Jmp) {
       current_rip = insn.target;
+      block_ended = true;
       break;
     }
     current_rip += insn.len;
   }
 
+  if (jit_stats_enabled()) {
+    record_block_end_stats(memory, block_ended, insn_rip, current_rip,
+                           insns.size(), MAX_BLOCK_INSNS);
+  }
+
   if (insns.empty()) {
-    return nullptr; // Interpreter fallback
+    // Interpreter fallback. Remember the failure so the next visit does not
+    // decode the same instruction again.
+    m_failed.insert(guest_rip);
+    return nullptr;
   }
 
   // Pass 2: flag liveness. Every flag is live at the block exit; a flag write
