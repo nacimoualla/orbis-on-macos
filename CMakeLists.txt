@@ -229,6 +229,11 @@ add_executable(test_guest_printf tests/test_guest_printf.cpp)
 target_link_libraries(test_guest_printf PRIVATE ps4_core)
 add_test(NAME GuestPrintf COMMAND test_guest_printf)
 
+# Guest exception delivery (sceKernelInstallExceptionHandler/RaiseException).
+add_executable(test_guest_exceptions tests/test_guest_exceptions.cpp)
+target_link_libraries(test_guest_exceptions PRIVATE ps4_core)
+add_test(NAME GuestExceptions COMMAND test_guest_exceptions)
+
 add_executable(test_jit_mem tests/test_jit_mem.cpp)
 target_link_libraries(test_jit_mem PRIVATE ps4_core)
 add_test(NAME JitMemOperands COMMAND test_jit_mem)

@@ -97,6 +97,40 @@ int main() {
     expect(h.format("%s", {0}), "(null)");
     expect(h.format("%p", {0x4000000}), "0x4000000");
 
+    // vsscanf through the real handler: pointers in the va_list GP area.
+    {
+        constexpr Nid kVsscanf = 0x513AE93952DCA0E0ULL;
+        constexpr GuestAddr kIn = 0x56000, kOut = 0x57000;
+        auto scan = [&](const char* input, const char* fmt, int nptrs) -> i64 {
+            assert(h.mem.write_bytes(kIn, input, std::strlen(input) + 1));
+            assert(h.mem.write_bytes(kFmt, fmt, std::strlen(fmt) + 1));
+            std::vector<u8> zero(256, 0);
+            assert(h.mem.write_bytes(kOut, zero.data(), zero.size()));
+            for (int i = 0; i < nptrs; ++i) assert(h.mem.write_value(kSave + 16 + 8 * i, kOut + 32 * i));
+            assert(h.mem.write_value(kVaList + 0, u32{16}));   // after str, fmt
+            assert(h.mem.write_value(kVaList + 4, u32{48}));
+            assert(h.mem.write_value(kVaList + 8, static_cast<u64>(kOverflow)));
+            assert(h.mem.write_value(kVaList + 16, static_cast<u64>(kSave)));
+            CpuContext ctx{};
+            ctx.rdi = kIn;
+            ctx.rsi = kFmt;
+            ctx.rdx = kVaList;
+            h.registry.find_by_nid(kVsscanf)->handler(ctx, h.mem);
+            return static_cast<i64>(ctx.rax);
+        };
+        auto out32 = [&](int i) { u32 v = 0; h.mem.read_value(kOut + 32 * i, v); return v; };
+        auto outstr = [&](int i) { return std::string(h.mem.to_host_ptr<char>(kOut + 32 * i)); };
+        assert(scan("specific_trampoline_lazy_fetch_2147483648", "specific_trampoline_lazy_fetch_%d", 1) == 1);
+        assert(out32(0) == 0x80000000u);
+        assert(scan("  42 ff word rest", "%d %x %s", 3) == 3);
+        assert(out32(0) == 42 && out32(1) == 0xff && outstr(2) == "word");
+        assert(scan("abc", "%d", 1) == 0);
+        assert(scan("", "%d", 1) == -1);
+        assert(scan("key=val;", "%[a-z]=%[^;]", 2) == 2 && outstr(0) == "key" && outstr(1) == "val");
+        assert(scan("12:34", "%*d:%d%n", 2) == 1 && out32(0) == 34 && out32(1) == 5);
+        std::cout << "  -> vsscanf passed\n";
+    }
+
     std::cout << "All guest printf tests passed.\n";
     return 0;
 }

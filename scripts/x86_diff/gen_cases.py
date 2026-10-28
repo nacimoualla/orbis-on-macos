@@ -90,6 +90,10 @@ for pre, nm in (([], "ups"), ([0x66], "upd"), ([0xF3], "ss"), ([0xF2], "sd")):
     add(f"mov{nm} x1,x3", pre + [0x0F, 0x10, 0xCB]); add(f"mov{nm} x3<-x1 (11)", pre + [0x0F, 0x11, 0xCB])
     add(f"mov{nm} x0,[mem]", pre + [0x0F, 0x10] + MEMOP, mem=1)
     add(f"mov{nm} [mem],x0", pre + [0x0F, 0x11] + MEMOP, mem=1)
+for op, nm in ((0x51, "sqrt"), (0x58, "add"), (0x59, "mul"), (0x5C, "sub"), (0x5D, "min"), (0x5E, "div"), (0x5F, "max")):
+    for pre, sfx in (([], "ps"), ([0x66], "pd"), ([0xF3], "ss"), ([0xF2], "sd")):
+        add(f"{nm}{sfx} x1,x3", pre + [0x0F, op, 0xCB])
+    add(f"{nm}sd x0,[mem]", [0xF2, 0x0F, op] + MEMOP, mem=1)
 add("movaps x1,x3", [0x0F, 0x28, 0xCB]); add("movaps [mem],x0", [0x0F, 0x29] + MEMOP, mem=1)
 
 # ---- Integer ALU (interpreter paths). rax=0 dst, rcx=1 src, rdx=2. --------

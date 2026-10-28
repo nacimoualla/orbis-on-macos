@@ -374,6 +374,14 @@ static void libc_exit_handler(CpuContext& ctx, MemoryManager& mem) {
 
 } // namespace
 
+// Run the calling guest thread's pending exception handlers (see
+// ThreadManager::deliver_pending_exceptions). Wait loops call this with their
+// locks released, so a thread blocked in an HLE wait still answers, e.g., the
+// GC's suspend signal.
+static void deliver_guest_exceptions(MemoryManager& mem) {
+    if (CpuExecutor* ex = current_executor()) get_thread_manager(mem).deliver_pending_exceptions(*ex);
+}
+
 // True when an armed write-watch overlaps [addr, addr + n); host-side bulk
 // copies route through write_bytes then so the watch records them.
 static bool watch_overlaps(GuestAddr addr, GuestSize n) {
@@ -755,6 +763,116 @@ static std::string format_guest(const MemoryManager& mem, const char* fmt, Guest
         }
     }
     return out;
+}
+
+// Guest sscanf: parses a guest string, storing through guest pointers taken
+// from `args`. Returns the number of assignments, or -1 on input failure
+// before the first conversion (as C does).
+static int scan_guest(MemoryManager& mem, const std::string& in, const char* fmt, GuestArgs& args) {
+    usize pos = 0;
+    int assigned = 0;
+    bool any_conversion = false;
+    auto ws = [](char c) { return c == ' ' || (c >= '\t' && c <= '\r'); };
+    for (usize i = 0; fmt[i] != '\0'; ++i) {
+        const char f = fmt[i];
+        if (ws(f)) {
+            while (pos < in.size() && ws(in[pos])) ++pos;
+            continue;
+        }
+        if (f != '%') {
+            if (pos >= in.size() || in[pos] != f) return any_conversion || pos < in.size() ? assigned : -1;
+            ++pos;
+            continue;
+        }
+        ++i;
+        if (fmt[i] == '%') {
+            while (pos < in.size() && ws(in[pos])) ++pos;
+            if (pos >= in.size() || in[pos] != '%') return assigned;
+            ++pos;
+            continue;
+        }
+        const bool suppress = fmt[i] == '*';
+        if (suppress) ++i;
+        usize width = 0;
+        while (fmt[i] >= '0' && fmt[i] <= '9') width = width * 10 + static_cast<usize>(fmt[i++] - '0');
+        int size = 4; // bytes stored for integers
+        if (fmt[i] == 'h') { size = 2; ++i; if (fmt[i] == 'h') { size = 1; ++i; } }
+        else if (fmt[i] == 'l') { size = 8; ++i; if (fmt[i] == 'l') ++i; }
+        else if (fmt[i] == 'j' || fmt[i] == 'z' || fmt[i] == 't' || fmt[i] == 'q') { size = 8; ++i; }
+        const char conv = fmt[i];
+        if (conv == '\0') break;
+        if (conv == 'n') {
+            if (!suppress) mem.write_bytes(args.next_gp(), &pos, static_cast<usize>(size));
+            continue;
+        }
+        if (conv != 'c' && conv != '[')
+            while (pos < in.size() && ws(in[pos])) ++pos;
+        if (pos >= in.size()) return any_conversion ? assigned : -1;
+        const usize limit = width ? std::min(in.size(), pos + width) : in.size();
+        if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o' || conv == 'p') {
+            const int base = (conv == 'd' || conv == 'u') ? 10 : (conv == 'o') ? 8 : (conv == 'i') ? 0 : 16;
+            const std::string field = in.substr(pos, limit - pos);
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long v = (conv == 'd' || conv == 'i')
+                ? static_cast<unsigned long long>(std::strtoll(field.c_str(), &end, base))
+                : std::strtoull(field.c_str(), &end, base);
+            if (end == field.c_str()) return assigned;
+            pos += static_cast<usize>(end - field.c_str());
+            any_conversion = true;
+            if (!suppress) {
+                mem.write_bytes(args.next_gp(), &v, static_cast<usize>(conv == 'p' ? 8 : size));
+                ++assigned;
+            }
+        } else if (conv == 's') {
+            const usize start = pos;
+            while (pos < limit && !ws(in[pos])) ++pos;
+            any_conversion = true;
+            if (!suppress) {
+                const std::string tok = in.substr(start, pos - start);
+                mem.write_bytes(args.next_gp(), tok.c_str(), tok.size() + 1);
+                ++assigned;
+            }
+        } else if (conv == 'c') {
+            const usize n = width ? width : 1;
+            if (pos + n > in.size()) return any_conversion ? assigned : -1;
+            any_conversion = true;
+            if (!suppress) {
+                mem.write_bytes(args.next_gp(), in.data() + pos, n);
+                ++assigned;
+            }
+            pos += n;
+        } else if (conv == '[') {
+            ++i;
+            const bool negate = fmt[i] == '^';
+            if (negate) ++i;
+            bool in_set[256] = {};
+            if (fmt[i] == ']') in_set[static_cast<u8>(fmt[i++])] = true;
+            while (fmt[i] != '\0' && fmt[i] != ']') {
+                const u8 a = static_cast<u8>(fmt[i]);
+                if (fmt[i + 1] == '-' && fmt[i + 2] != ']' && fmt[i + 2] != '\0') {
+                    for (unsigned c = a; c <= static_cast<u8>(fmt[i + 2]); ++c) in_set[c] = true;
+                    i += 3;
+                } else {
+                    in_set[a] = true;
+                    ++i;
+                }
+            }
+            const usize start = pos;
+            while (pos < limit && (in_set[static_cast<u8>(in[pos])] != negate)) ++pos;
+            if (pos == start) return assigned;
+            any_conversion = true;
+            if (!suppress) {
+                const std::string tok = in.substr(start, pos - start);
+                mem.write_bytes(args.next_gp(), tok.c_str(), tok.size() + 1);
+                ++assigned;
+            }
+            if (fmt[i] == '\0') break;
+        } else {
+            return assigned; // unsupported conversion (e.g. floating point)
+        }
+    }
+    return assigned;
 }
 
 // Simulated GPU fence + legacy label slot for libSceGnmDriver. The slot address
@@ -2365,6 +2483,38 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = slot;
         });
 
+    // sscanf(const char* str, const char* fmt, ...) / vsscanf(str, fmt, va_list).
+    // Mono parses AOT symbol names with it ("specific_trampoline_lazy_fetch_%d").
+    auto scan_input = [](MemoryManager& mem, GuestAddr str) {
+        std::string in;
+        for (GuestSize i = 0; i < (1u << 16); ++i) {
+            char c = 0;
+            if (!mem.read_value(str + i, c) || c == 0) break;
+            in.push_back(c);
+        }
+        return in;
+    };
+    register_symbol(0xD4F934A99406796AULL, "sscanf", "libc",
+        [scan_input](CpuContext& ctx, MemoryManager& mem) {
+            if (ctx.rdi == 0 || ctx.rsi == 0 || !mem.is_valid_address(ctx.rsi, 1)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            CallArgs args(ctx, mem, 2);
+            const int r = scan_guest(mem, scan_input(mem, ctx.rdi), mem.to_host_ptr<char>(ctx.rsi), args);
+            ctx.rax = static_cast<u64>(static_cast<i64>(r));
+        });
+    register_symbol(0x513AE93952DCA0E0ULL, "vsscanf", "libc",
+        [scan_input](CpuContext& ctx, MemoryManager& mem) {
+            if (ctx.rdi == 0 || ctx.rsi == 0 || !mem.is_valid_address(ctx.rsi, 1)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            VaListArgs args(mem, ctx.rdx);
+            const int r = scan_guest(mem, scan_input(mem, ctx.rdi), mem.to_host_ptr<char>(ctx.rsi), args);
+            ctx.rax = static_cast<u64>(static_cast<i64>(r));
+        });
+
     // fflush(FILE*): guest stdio is not buffered on our side.
     register_symbol(0x3148C2E256C7ACAEULL, "fflush", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
@@ -2493,11 +2643,42 @@ void NidRegistry::register_default_libraries() {
         });
 
     register_symbol(0x421BF90110283847ULL, "sceKernelRemoveExceptionHandler", "libkernel",
-        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+        [](CpuContext& ctx, MemoryManager& mem) {
+            get_thread_manager(mem).install_exception_handler(static_cast<int>(ctx.rdi), 0);
+            ctx.rax = SCE_OK;
+        });
 
     // sceKernelInstallExceptionHandler: no signals are ever raised.
+    // sceKernelInstallExceptionHandler(int signum, void (*handler)(int, void* ctx))
+    // sceKernelRaiseException(ScePthread thread, int signum)
+    // Delivered like signals by ThreadManager (Boehm GC's stop-the-world uses
+    // signal 30: each GC thread's handler records its registers and stack
+    // pointer, acknowledges on a semaphore and waits to be resumed).
     register_symbol(0x5A4C0477737BC346ULL, "sceKernelInstallExceptionHandler", "libkernel",
-        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+        [](CpuContext& ctx, MemoryManager& mem) {
+            static std::once_flag s_sentinel_once;
+            std::call_once(s_sentinel_once, [&mem] {
+                const GuestAddr hlt = bump_alloc(16, 16);
+                const u8 code = 0xF4; // HLT: end of a delivered handler
+                if (hlt != 0 && mem.write_bytes(hlt, &code, 1))
+                    get_thread_manager(mem).set_exception_return_sentinel(hlt);
+            });
+            std::fprintf(stderr, "[exc] install signum=%llu handler=0x%llx TID=%d\n",
+                         (unsigned long long)ctx.rdi, (unsigned long long)ctx.rsi, (int)t_guest_tid);
+            get_thread_manager(mem).install_exception_handler(static_cast<int>(ctx.rdi), ctx.rsi);
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x8A5D379E5B8A7CC9ULL, "sceKernelRaiseException", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const bool ok = get_thread_manager(mem).raise_exception(static_cast<ScePthreadId>(ctx.rdi),
+                                                                    static_cast<int>(ctx.rsi));
+            static std::atomic<u32> s_logged{0};
+            if (s_logged.fetch_add(1) < 16)
+                std::fprintf(stderr, "[exc] raise signum=%llu -> TID %llu: %s (from TID %d)\n",
+                             (unsigned long long)ctx.rsi, (unsigned long long)ctx.rdi,
+                             ok ? "queued" : "no such thread", (int)t_guest_tid);
+            ctx.rax = ok ? SCE_OK : 0x80020003ULL; // SCE_KERNEL_ERROR_ESRCH
+        });
 
     // setjmp(jmp_buf env)
     // NID: 0x80D435576BDF5C31ULL / 0x315CDF6B5735D480ULL ("gNQ1V2vfXDE")
@@ -3122,6 +3303,11 @@ void NidRegistry::register_default_libraries() {
                              (unsigned long long)start_cancel_gen);
                 while (!pred()) {
                     sema->cv.wait_for(lock, std::chrono::milliseconds(50), pred);
+                    if (!pred()) {
+                        lock.unlock();
+                        deliver_guest_exceptions(mem);
+                        lock.lock();
+                    }
                 }
                 // Diagnostic: did we return without the semaphore actually being
                 // satisfied? That is a silent no-op wait -- the requester runs
@@ -3751,6 +3937,9 @@ void NidRegistry::register_default_libraries() {
                     if (g_syscalls && g_syscalls->has_exited()) break;
                     if (s_sem_shutdown.load(std::memory_order_relaxed)) break;
                     s_sem_cv.wait_for(lock, std::chrono::milliseconds(20));
+                    lock.unlock();
+                    deliver_guest_exceptions(mem);
+                    lock.lock();
                 }
             }
             if (cur_th) cur_th->state.store(ThreadState::Running);
@@ -6218,6 +6407,173 @@ void NidRegistry::register_default_libraries() {
                          eq_id, event_id, (unsigned long long)udata);
             ctx.rax = SCE_OK;
         });
+
+    // =========================================================================
+    // POSIX mutexes / condition variables (libScePosix), as used by mono-ps4.
+    // Registered last: they replace earlier no-op stubs (lock/unlock returned
+    // 0 without locking, so Mono's threads raced inside the runtime, and
+    // pthread_cond_* were missing, so waiters were never woken).
+    //
+    // Objects are keyed by the guest pthread_mutex_t / pthread_cond_t address,
+    // which also covers static initialisers. Mutexes are recursive for the
+    // owning thread (a superset of the default type). Blocking waits run in
+    // 20 ms slices with every lock released between them, so a blocked guest
+    // thread still takes pending exceptions (Boehm GC's suspend signal).
+    // Return values are POSIX error numbers (FreeBSD: EPERM 1, EBUSY 16,
+    // EINVAL 22, ETIMEDOUT 60).
+    // =========================================================================
+    struct PMutex {
+        std::mutex m;
+        std::condition_variable cv;
+        std::thread::id owner{};
+        int count{0};
+    };
+    struct PCond {
+        std::mutex m;
+        std::condition_variable cv;
+        u64 seq{0};
+    };
+    static std::mutex s_ptab_mtx;
+    static std::unordered_map<GuestAddr, std::shared_ptr<PMutex>> s_pmutexes;
+    static std::unordered_map<GuestAddr, std::shared_ptr<PCond>> s_pconds;
+    auto pmutex = [](GuestAddr a) {
+        std::lock_guard<std::mutex> l(s_ptab_mtx);
+        auto& p = s_pmutexes[a];
+        if (!p) p = std::make_shared<PMutex>();
+        return p;
+    };
+    auto pcond = [](GuestAddr a) {
+        std::lock_guard<std::mutex> l(s_ptab_mtx);
+        auto& p = s_pconds[a];
+        if (!p) p = std::make_shared<PCond>();
+        return p;
+    };
+    // Acquire `count` levels of `pm` for the calling thread.
+    auto pm_acquire = [](PMutex& pm, MemoryManager& mem, int count) {
+        const auto self = std::this_thread::get_id();
+        std::unique_lock<std::mutex> l(pm.m);
+        while (pm.count > 0 && pm.owner != self) {
+            if (g_syscalls && g_syscalls->has_exited()) break;
+            pm.cv.wait_for(l, std::chrono::milliseconds(20));
+            l.unlock();
+            deliver_guest_exceptions(mem);
+            l.lock();
+        }
+        pm.owner = self;
+        pm.count += count;
+    };
+    // Release all levels held by the calling thread; returns how many.
+    auto pm_release_all = [](PMutex& pm) {
+        std::lock_guard<std::mutex> l(pm.m);
+        if (pm.count == 0 || pm.owner != std::this_thread::get_id()) return 0;
+        const int n = pm.count;
+        pm.count = 0;
+        pm.owner = {};
+        pm.cv.notify_one();
+        return n;
+    };
+    auto ok = [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; };
+    register_symbol(0xB6D1CD7D4FAA0C15ULL, "pthread_mutex_init", "libScePosix",
+        [pmutex](CpuContext& ctx, MemoryManager&) { pmutex(ctx.rdi); ctx.rax = 0; });
+    register_symbol(0x96D09F686AF62461ULL, "pthread_mutex_destroy", "libScePosix",
+        [](CpuContext& ctx, MemoryManager&) {
+            std::lock_guard<std::mutex> l(s_ptab_mtx);
+            s_pmutexes.erase(ctx.rdi);
+            ctx.rax = 0;
+        });
+    register_symbol(0xEC7D224CE7224CBAULL, "pthread_mutex_lock", "libScePosix",
+        [pmutex, pm_acquire](CpuContext& ctx, MemoryManager& mem) {
+            if (ctx.rdi == 0) { ctx.rax = 22; return; }
+            pm_acquire(*pmutex(ctx.rdi), mem, 1);
+            ctx.rax = 0;
+        });
+    register_symbol(0x2BF8D785BB76827EULL, "pthread_mutex_trylock", "libScePosix",
+        [pmutex](CpuContext& ctx, MemoryManager&) {
+            if (ctx.rdi == 0) { ctx.rax = 22; return; }
+            auto pm = pmutex(ctx.rdi);
+            std::lock_guard<std::mutex> l(pm->m);
+            if (pm->count > 0 && pm->owner != std::this_thread::get_id()) { ctx.rax = 16; return; }
+            pm->owner = std::this_thread::get_id();
+            ++pm->count;
+            ctx.rax = 0;
+        });
+    register_symbol(0xD99F8FA58E826898ULL, "pthread_mutex_unlock", "libScePosix",
+        [pmutex](CpuContext& ctx, MemoryManager&) {
+            if (ctx.rdi == 0) { ctx.rax = 22; return; }
+            auto pm = pmutex(ctx.rdi);
+            std::lock_guard<std::mutex> l(pm->m);
+            if (pm->count == 0 || pm->owner != std::this_thread::get_id()) { ctx.rax = 1; return; }
+            if (--pm->count == 0) {
+                pm->owner = {};
+                pm->cv.notify_one();
+            }
+            ctx.rax = 0;
+        });
+    register_symbol(0x7501D612C26DA04EULL, "pthread_mutexattr_init", "libScePosix", ok);
+    register_symbol(0x9839A030E19552A8ULL, "pthread_mutexattr_settype", "libScePosix", ok);
+    register_symbol(0xE6DC4A7DC3140289ULL, "pthread_mutexattr_setprotocol", "libScePosix", ok);
+    register_symbol(0x1C5EE52B8EB1CE36ULL, "pthread_mutexattr_destroy", "libScePosix", ok);
+    register_symbol(0x98AA13C74DC74560ULL, "pthread_condattr_init", "libScePosix", ok);
+    register_symbol(0x74972E4159FAFC8CULL, "pthread_condattr_destroy", "libScePosix", ok);
+    register_symbol(0xD13C959383122EDDULL, "pthread_cond_init", "libScePosix",
+        [pcond](CpuContext& ctx, MemoryManager&) { pcond(ctx.rdi); ctx.rax = 0; });
+    register_symbol(0x4575EA8B80AD17CCULL, "pthread_cond_destroy", "libScePosix",
+        [](CpuContext& ctx, MemoryManager&) {
+            std::lock_guard<std::mutex> l(s_ptab_mtx);
+            s_pconds.erase(ctx.rdi);
+            ctx.rax = 0;
+        });
+    register_symbol(0xD8C3B2FAB51FBA14ULL, "pthread_cond_signal", "libScePosix",
+        [pcond](CpuContext& ctx, MemoryManager&) {
+            auto pc = pcond(ctx.rdi);
+            { std::lock_guard<std::mutex> l(pc->m); ++pc->seq; }
+            pc->cv.notify_one();
+            ctx.rax = 0;
+        });
+    register_symbol(0x9A4C767D584D32C8ULL, "pthread_cond_broadcast", "libScePosix",
+        [pcond](CpuContext& ctx, MemoryManager&) {
+            auto pc = pcond(ctx.rdi);
+            { std::lock_guard<std::mutex> l(pc->m); ++pc->seq; }
+            pc->cv.notify_all();
+            ctx.rax = 0;
+        });
+    // pthread_cond_wait(cond, mutex) / pthread_cond_timedwait(cond, mutex, abstime)
+    auto cond_wait = [pmutex, pcond, pm_acquire, pm_release_all](CpuContext& ctx, MemoryManager& mem, bool timed) {
+        if (ctx.rdi == 0 || ctx.rsi == 0) { ctx.rax = 22; return; }
+        auto pc = pcond(ctx.rdi);
+        auto pm = pmutex(ctx.rsi);
+        std::optional<std::chrono::system_clock::time_point> deadline;
+        if (timed) {
+            i64 sec = 0, nsec = 0;
+            if (ctx.rdx == 0 || !mem.read_value(ctx.rdx, sec) || !mem.read_value(ctx.rdx + 8, nsec)) {
+                ctx.rax = 22;
+                return;
+            }
+            deadline = std::chrono::system_clock::time_point(std::chrono::seconds(sec)) +
+                       std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::nanoseconds(nsec));
+        }
+        std::unique_lock<std::mutex> cl(pc->m);
+        const u64 gen = pc->seq;
+        const int held = pm_release_all(*pm); // atomically w.r.t. signalers: pc->m is held
+        if (held == 0) { ctx.rax = 1; return; } // EPERM: caller does not own the mutex
+        bool timed_out = false;
+        while (pc->seq == gen) {
+            if (g_syscalls && g_syscalls->has_exited()) break;
+            if (deadline && std::chrono::system_clock::now() >= *deadline) { timed_out = true; break; }
+            pc->cv.wait_for(cl, std::chrono::milliseconds(20));
+            if (pc->seq != gen) break;
+            cl.unlock();
+            deliver_guest_exceptions(mem);
+            cl.lock();
+        }
+        cl.unlock();
+        pm_acquire(*pm, mem, held);
+        ctx.rax = timed_out ? 60 : 0;
+    };
+    register_symbol(0x3A9F130466392878ULL, "pthread_cond_wait", "libScePosix",
+        [cond_wait](CpuContext& ctx, MemoryManager& mem) { cond_wait(ctx, mem, false); });
+    register_symbol(0xDBB6C08222663A1DULL, "pthread_cond_timedwait", "libScePosix",
+        [cond_wait](CpuContext& ctx, MemoryManager& mem) { cond_wait(ctx, mem, true); });
 }
 
 } // namespace ps4

@@ -89,7 +89,15 @@ struct GuestThread {
     std::thread host_thread;
     CpuContext context{};
     std::atomic<u64> instructions_executed{0};
+    // Guest exceptions raised at this thread (sceKernelRaiseException),
+    // delivered on its own host thread by ThreadManager::deliver_pending_exceptions.
+    std::mutex pending_signals_mtx;
+    std::vector<int> pending_signals;
+    std::atomic<bool> has_pending_signals{false};
+    bool delivering_signal{false}; // owning host thread only
 };
+
+class CpuExecutor;
 
 class SyscallTable;
 class JitCompiler;
@@ -156,6 +164,19 @@ public:
     /// Set current thread's return value and mark terminated
     void exit_current_thread(u64 return_val);
 
+    // --- Guest exceptions (sceKernelInstallExceptionHandler / RaiseException)
+    // Delivery is asynchronous, like a signal: the target thread runs the
+    // handler on its own stack at its next delivery point -- between execution
+    // quanta, or inside a blocking HLE wait -- then resumes where it was.
+    void install_exception_handler(int signum, GuestAddr handler);
+    /// Address of an HLT the handler returns to (end of delivery).
+    void set_exception_return_sentinel(GuestAddr hlt_addr) noexcept { m_exc_sentinel = hlt_addr; }
+    /// Queue `signum` for thread `tid`. Returns false if no such live thread.
+    bool raise_exception(ScePthreadId tid, int signum);
+    /// Run the calling thread's pending handlers on `ex`. Safe to call with no
+    /// locks held from a wait loop; a no-op when nothing is pending.
+    void deliver_pending_exceptions(CpuExecutor& ex);
+
     /// Total number of active threads
     [[nodiscard]] usize active_thread_count() const;
 
@@ -210,6 +231,10 @@ private:
     mutable std::mutex m_threads_mutex;
     std::unordered_map<ScePthreadId, std::unique_ptr<GuestThread>> m_threads;
     ScePthreadId m_next_thread_id{1};
+
+    std::mutex m_exc_mutex;
+    std::unordered_map<int, GuestAddr> m_exc_handlers;
+    GuestAddr m_exc_sentinel{0};
 
     // Stacks allocated from high guest memory downward
     GuestAddr m_next_stack_top{0x1D0000000ULL};

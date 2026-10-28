@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <cmath>
+#include <limits>
 #include <iostream>
 #include <mutex>
 
@@ -163,6 +164,15 @@ inline bool check_condition(const CpuContext& ctx, u8 cc) {
 // x86 float -> integer conversion: NaN and out-of-range inputs produce the
 // "integer indefinite" value (0x80000000 / 0x8000000000000000). A plain C++
 // cast is undefined there and saturates on the ARM64 host.
+// x86 returns the negative "QNaN indefinite" when an operation creates a NaN
+// from non-NaN inputs (0/0, sqrt(-1), inf-inf); ARM64's default NaN is
+// positive. NaN inputs propagate unchanged on both.
+template <typename T>
+inline T x86_nan(T r, T a, T b) {
+    if (std::isnan(r) && !std::isnan(a) && !std::isnan(b)) return -std::numeric_limits<T>::quiet_NaN();
+    return r;
+}
+
 inline u32 x86_cvt_i32(double v) {
     if (!(v > -2147483649.0 && v < 2147483648.0)) return 0x80000000u;
     return static_cast<u32>(static_cast<i32>(v));
@@ -2551,6 +2561,7 @@ StepResult CpuExecutor::step() {
                           (vex_op == 0x5D) ? ((s1 < s2) ? s1 : s2) : // VMINSS
                           (vex_op == 0x5E) ? (s1 / s2) :
                                              ((s1 > s2) ? s1 : s2); // VMAXSS (0x5F)
+                r = (vex_op == 0x51) ? x86_nan(r, s2, s2) : x86_nan(r, s1, s2);
                 CpuContext::YmmReg res = m_context.ymm[src1];
                 std::memcpy(&res.d[0], &r, 4);
                 res.q[2] = 0; res.q[3] = 0;
@@ -2566,6 +2577,7 @@ StepResult CpuExecutor::step() {
                            (vex_op == 0x5D) ? ((s1 < s2) ? s1 : s2) : // VMINSD
                            (vex_op == 0x5E) ? (s1 / s2) :
                                              ((s1 > s2) ? s1 : s2); // VMAXSD (0x5F)
+                r = (vex_op == 0x51) ? x86_nan(r, s2, s2) : x86_nan(r, s1, s2);
                 CpuContext::YmmReg res = m_context.ymm[src1];
                 std::memcpy(&res.q[0], &r, 8);
                 res.q[2] = 0; res.q[3] = 0;
@@ -2585,6 +2597,7 @@ StepResult CpuExecutor::step() {
                               (vex_op == 0x5D) ? ((s1 < s2) ? s1 : s2) : // VMINPS
                               (vex_op == 0x5E) ? (s1 / s2) :
                                                  ((s1 > s2) ? s1 : s2); // VMAXPS (0x5F)
+                    r = (vex_op == 0x51) ? x86_nan(r, s2, s2) : x86_nan(r, s1, s2);
                     std::memcpy(&m_context.ymm[dest].d[i], &r, 4);
                 }
                 if (!vex_l) { m_context.ymm[dest].q[2] = 0; m_context.ymm[dest].q[3] = 0; }
@@ -2601,6 +2614,7 @@ StepResult CpuExecutor::step() {
                               (vex_op == 0x5D) ? ((s1 < s2) ? s1 : s2) : // VMINPD
                               (vex_op == 0x5E) ? (s1 / s2) :
                                                  ((s1 > s2) ? s1 : s2); // VMAXPD (0x5F)
+                    r = (vex_op == 0x51) ? x86_nan(r, s2, s2) : x86_nan(r, s1, s2);
                     std::memcpy(&m_context.ymm[dest].q[i], &r, 8);
                 }
                 if (!vex_l) { m_context.ymm[dest].q[2] = 0; m_context.ymm[dest].q[3] = 0; }
@@ -4320,6 +4334,41 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
+        // Legacy SSE arithmetic: SQRT (51), ADD (58), MUL (59), SUB (5C),
+        // MIN (5D), DIV (5E), MAX (5F) as PS (none), PD (66), SS (F3), SD (F2).
+        // Scalar forms keep the destination's other lanes; legacy SSE keeps
+        // bits 255:128. MIN/MAX return the second operand when either input
+        // is NaN or both are equal, as on hardware. These were missing and
+        // fell through to the ModR/M-skipping fallback (silently a NOP).
+        if (op1 == 0x51 || op1 == 0x58 || op1 == 0x59 || (op1 >= 0x5C && op1 <= 0x5F)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const bool dbl = (rep_prefix == 0xF2) || (rep_prefix == 0 && operand_size_16);
+            const bool scalar = (rep_prefix == 0xF3 || rep_prefix == 0xF2);
+            const usize lanes = scalar ? 1 : (dbl ? 2 : 4);
+            auto& dst = m_context.ymm[m.reg_id & 15];
+            CpuContext::YmmReg src{};
+            if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+            else if (!m_memory.read_bytes(m.mem_addr, &src, scalar ? (dbl ? 8 : 4) : 16)) return StepResult::MemoryFault;
+            auto apply = [&](auto a, auto b) -> decltype(a) {
+                switch (op1) {
+                case 0x51: return x86_nan(std::sqrt(b), b, b);
+                case 0x58: return x86_nan(a + b, a, b);
+                case 0x59: return x86_nan(a * b, a, b);
+                case 0x5C: return x86_nan(a - b, a, b);
+                case 0x5D: return (a < b) ? a : b;
+                case 0x5E: return x86_nan(a / b, a, b);
+                default:   return (a > b) ? a : b; // 0x5F
+                }
+            };
+            for (usize l = 0; l < lanes; ++l) {
+                if (dbl) dst.df[l] = apply(dst.df[l], src.df[l]);
+                else dst.f[l] = apply(dst.f[l], src.f[l]);
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
         if (op1 == 0x57) { // XORPS
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
@@ -6015,8 +6064,21 @@ StepResult CpuExecutor::step() {
     return StepResult::IllegalInstruction;
 }
 
+namespace {
+thread_local CpuExecutor* t_current_executor = nullptr;
+} // namespace
+
+CpuExecutor* current_executor() noexcept { return t_current_executor; }
+
 RunResult CpuExecutor::run(usize max_instructions) {
     RunResult result{};
+    // Innermost run() on this host thread; restored on return so a nested run
+    // (guest exception handler inside an HLE wait) unwinds correctly.
+    struct CurrentExecutor {
+        CpuExecutor* prev;
+        explicit CurrentExecutor(CpuExecutor* self) : prev(t_current_executor) { t_current_executor = self; }
+        ~CurrentExecutor() { t_current_executor = prev; }
+    } current_executor_scope(this);
 
     while (true) {
         if (max_instructions > 0 && result.instructions_executed >= max_instructions) {

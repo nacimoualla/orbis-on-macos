@@ -253,6 +253,9 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
                     break;
                 }
 
+                if (raw_thread->has_pending_signals.load(std::memory_order_acquire))
+                    deliver_pending_exceptions(executor);
+
                 // Cooperative yield between quanta
                 std::this_thread::yield();
             }
@@ -267,6 +270,90 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
 
     m_threads[tid] = std::move(thread_ptr);
     return tid;
+}
+
+void ThreadManager::install_exception_handler(int signum, GuestAddr handler) {
+    std::lock_guard<std::mutex> lock(m_exc_mutex);
+    if (handler == 0) m_exc_handlers.erase(signum);
+    else m_exc_handlers[signum] = handler;
+}
+
+bool ThreadManager::raise_exception(ScePthreadId tid, int signum) {
+    GuestThread* th = get_thread(tid);
+    if (th == nullptr || th->state.load() == ThreadState::Terminated) return false;
+    {
+        std::lock_guard<std::mutex> lock(th->pending_signals_mtx);
+        th->pending_signals.push_back(signum);
+    }
+    th->has_pending_signals.store(true, std::memory_order_release);
+    return true;
+}
+
+void ThreadManager::deliver_pending_exceptions(CpuExecutor& ex) {
+    GuestThread* th = t_current_guest_thread;
+    if (th == nullptr || th->delivering_signal || m_exc_sentinel == 0 ||
+        !th->has_pending_signals.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<int> sigs;
+    {
+        std::lock_guard<std::mutex> lock(th->pending_signals_mtx);
+        sigs.swap(th->pending_signals);
+        th->has_pending_signals.store(false, std::memory_order_release);
+    }
+    th->delivering_signal = true;
+    const ThreadState prev_state = th->state.load();
+    for (const int sig : sigs) {
+        GuestAddr handler = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_exc_mutex);
+            if (auto it = m_exc_handlers.find(sig); it != m_exc_handlers.end()) handler = it->second;
+        }
+        if (handler == 0) continue;
+
+        const CpuContext saved = ex.context();
+        // Exception context below the interrupted stack's red zone. The GPRs
+        // use FreeBSD's amd64 mcontext layout (mc_rdi at +0x08 ... mc_rsp at
+        // +0xb8); Mono/Boehm's PS4 handler copies the first 0xd8 bytes as
+        // GC roots and takes the thread's stack pointer from +0xf8.
+        constexpr GuestSize kCtxSize = 0x400;
+        const GuestAddr ctx_addr = (saved.rsp - 128 - kCtxSize) & ~0xFULL;
+        std::vector<u8> zeros(kCtxSize, 0);
+        m_memory.write_bytes(ctx_addr, zeros.data(), kCtxSize);
+        const std::pair<u32, u64> fields[] = {
+            {0x08, saved.rdi}, {0x10, saved.rsi}, {0x18, saved.rdx}, {0x20, saved.rcx},
+            {0x28, saved.r8},  {0x30, saved.r9},  {0x38, saved.rax}, {0x40, saved.rbx},
+            {0x48, saved.rbp}, {0x50, saved.r10}, {0x58, saved.r11}, {0x60, saved.r12},
+            {0x68, saved.r13}, {0x70, saved.r14}, {0x78, saved.r15}, {0xa0, saved.rip},
+            {0xb0, saved.rflags}, {0xb8, saved.rsp}, {0xf8, saved.rsp},
+        };
+        for (const auto& [off, v] : fields) m_memory.write_value(ctx_addr + off, v);
+
+        // handler(signum, ctx) returning to the HLT sentinel.
+        const GuestAddr sp = ctx_addr - 8;
+        m_memory.write_value(sp, m_exc_sentinel);
+        CpuContext& c = ex.context();
+        c.rsp = sp;
+        c.rip = handler;
+        c.rdi = static_cast<u64>(sig);
+        c.rsi = ctx_addr;
+        c.rdx = ctx_addr;
+        th->state.store(ThreadState::Running);
+        for (;;) {
+            const RunResult rr = ex.run(200000);
+            if (c.rip == m_exc_sentinel) break;
+            if ((m_syscalls && m_syscalls->has_exited()) || rr.status == StepResult::Exited) break;
+            if (rr.status != StepResult::Ok && rr.status != StepResult::Syscall) {
+                std::fprintf(stderr, "[exc] handler 0x%llx for signal %d on TID %u stopped at RIP=0x%llx (%s)\n",
+                             (unsigned long long)handler, sig, th->id, (unsigned long long)c.rip,
+                             step_result_to_string(rr.status).data());
+                break;
+            }
+        }
+        ex.context() = saved;
+    }
+    th->state.store(prev_state);
+    th->delivering_signal = false;
 }
 
 bool ThreadManager::join_thread(ScePthreadId id, u64* out_return_value) {

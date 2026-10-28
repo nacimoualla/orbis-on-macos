@@ -60,6 +60,11 @@ private:
     JitCompiler* m_jit{nullptr};
 };
 
+/// The executor whose run() is active on the calling host thread (innermost
+/// when nested), or nullptr. Lets HLE code running inside a guest call reach
+/// the executor that made it, e.g. to deliver a guest exception.
+[[nodiscard]] CpuExecutor* current_executor() noexcept;
+
 // Dump the calling thread's control-transfer ring (diagnostic).
 void dump_control_xfers(int tid);
 
