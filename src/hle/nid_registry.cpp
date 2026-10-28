@@ -3298,9 +3298,10 @@ void NidRegistry::register_default_libraries() {
                     return;
                 }
             } else {
-                std::fprintf(stderr, "[Sema] WaitSema(%u, need=%d, timeout=infinite) count=%u deleted=%d gen=%llu\n",
+                std::fprintf(stderr, "[Sema] WaitSema(%u, need=%d, timeout=infinite) count=%u deleted=%d gen=%llu T%d ret=0x%llx\n",
                              id, need, sema->count, sema->deleted ? 1 : 0,
-                             (unsigned long long)start_cancel_gen);
+                             (unsigned long long)start_cancel_gen, (int)t_guest_tid,
+                             (unsigned long long)t_guest_rip);
                 while (!pred()) {
                     sema->cv.wait_for(lock, std::chrono::milliseconds(50), pred);
                     if (!pred()) {
@@ -5983,7 +5984,8 @@ void NidRegistry::register_default_libraries() {
     static constexpr SyncStub kSyncStubs[] = {
         {0x2AE3AE0F9F21AA7EULL, "malloc_stats_fast", "libSceLibcInternal"},
         {0xA4EF7A4F0CCE9B91ULL, "sceKernelGetDirectMemorySize", "libkernel"},
-        {0x04DA30C76979F3C1ULL, "sceKernelGetProcessTimeCounterFrequency", "libkernel"},
+        // sceKernelGetProcessTimeCounterFrequency has a real handler: as a
+        // sync stub it returned 0, and Unity divides by it to get seconds.
         {0xFE99E3DFFEDAE900ULL, "sceKernelSyncStub", "libkernel"}, // FMOD / pad init helper
         {0x8941B88CB45FD196ULL, "sceKernelSyncStub", "libkernel"}, // FMOD mixer thread setup
         {0x54EC7C3469875D3BULL, "sceKernelGetCpumode", "libkernel_cpumode"},
@@ -6317,6 +6319,30 @@ void NidRegistry::register_default_libraries() {
                 std::chrono::steady_clock::now().time_since_epoch()).count());
             ctx.rax = now_us;
         });
+
+    // The counter above ticks in microseconds. Its frequency was a sync stub
+    // returning 0: Unity's Time (counter / frequency) never advanced
+    // sensibly, so the splash screen never finished and the first scene
+    // (level0) was never loaded.
+    register_symbol(0x04DA30C76979F3C1ULL, "sceKernelGetProcessTimeCounterFrequency", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 1000000; });
+
+    // sceKernelGetProcessTime(): microseconds since the process started.
+    static const auto s_process_start = std::chrono::steady_clock::now();
+    register_symbol(0xE09DAC5099AE1D94ULL, "sceKernelGetProcessTime", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - s_process_start).count());
+        });
+
+    // sceKernelReadTsc / sceKernelGetTscFrequency: a nanosecond time-stamp counter.
+    register_symbol(0xFF62115023BFFCF3ULL, "sceKernelReadTsc", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        });
+    register_symbol(0xD63DD2DE7FED4D6EULL, "sceKernelGetTscFrequency", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 1000000000ULL; });
 
     // sceKernelSignalSema(SceKernelSema sema, int count)
     // NID 0xE1CCE9A47062AE2CULL hashes to THIS name (verified against the Orbis

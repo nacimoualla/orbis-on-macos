@@ -103,6 +103,8 @@ int main() {
     const ps4::GuestAddr trace_after =
         std::getenv("PS4_TRACE_AFTER") ? std::strtoull(std::getenv("PS4_TRACE_AFTER"), nullptr, 0) : 0;
     bool trace_armed = false;
+    // PS4_TRACE_MAX: number of trace lines to emit (default 4000).
+    const int trace_max = std::getenv("PS4_TRACE_MAX") ? std::atoi(std::getenv("PS4_TRACE_MAX")) : 4000;
     ps4::GuestAddr trace_lo = 0, trace_hi = 0;
     int traced = 0;
     if (const char* r = std::getenv("PS4_TRACE_RANGE")) {
@@ -126,7 +128,7 @@ int main() {
                 const ps4::GuestAddr rip = cpu.context().rip;
                 if (trace_after != 0 && rip == trace_after) trace_armed = true;
                 if (((trace_after != 0 && trace_armed) || (trace_after == 0 && rip >= trace_lo && rip < trace_hi)) &&
-                    traced < 4000) {
+                    traced < trace_max) {
                     const auto& c = cpu.context();
                     ps4::u64 ret = 0;
                     memory.read_value(c.rsp, ret);
@@ -143,6 +145,21 @@ int main() {
             result = cpu.run(2'000'000);
         }
         packets += translator->frame_stats().packets;
+        // PS4_SAMPLE_MAIN=1: one sample per frame of where the main thread is
+        // (RIP plus its frame-pointer chain), for profiling long stretches.
+        if (std::getenv("PS4_SAMPLE_MAIN")) {
+            const auto& c = cpu.context();
+            std::fprintf(stderr, "[sample] %d rip=0x%llx", frame, (unsigned long long)c.rip);
+            ps4::GuestAddr fp = c.rbp;
+            for (int d = 0; d < 10 && fp > 0x1000; ++d) {
+                ps4::u64 next = 0, ret = 0;
+                if (!memory.read_value(fp, next) || !memory.read_value(fp + 8, ret)) break;
+                std::fprintf(stderr, " 0x%llx", (unsigned long long)ret);
+                if (next <= fp) break;
+                fp = next;
+            }
+            std::fprintf(stderr, "\n");
+        }
         if (!translator->submit_frame(false)) return fail("GPU frame submission failed");
         if (!window.present_frame()) return fail("headless frame presentation failed");
         if (result.status != ps4::StepResult::Ok &&

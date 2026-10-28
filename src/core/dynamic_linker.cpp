@@ -311,6 +311,16 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
 
             static const bool s_log_hle = (std::getenv("PS4_LOG_HLE") != nullptr && std::strcmp(std::getenv("PS4_LOG_HLE"), "1") == 0);
             const bool is_gnm = (sym->name.rfind("sceGnm", 0) == 0);
+            // PS4_LOG_HLE_TID=<tid>: log every HLE call from that guest thread,
+            // unsampled and unfiltered.
+            static const long s_log_tid = std::getenv("PS4_LOG_HLE_TID")
+                                              ? std::strtol(std::getenv("PS4_LOG_HLE_TID"), nullptr, 0) : -1;
+            if (s_log_tid >= 0 && static_cast<long>(hle_tid) == s_log_tid) {
+                std::fprintf(stderr, "[HLE T%u] %s (rdi=0x%llx rsi=0x%llx rdx=0x%llx rcx=0x%llx) caller=0x%llx\n",
+                             (unsigned)hle_tid, sym->name.c_str(), (unsigned long long)sctx.args[0],
+                             (unsigned long long)sctx.args[1], (unsigned long long)sctx.args[2],
+                             (unsigned long long)(sctx.rcx ? sctx.rcx : sctx.args[3]), (unsigned long long)ret_addr);
+            }
             if ((s_log_hle || verbose || is_gnm) && (sym->name != "powf" && sym->name != "memcmp" && sym->name != "memset" &&
                 sym->name != "strlen" && sym->name != "memcpy" && sym->name != "memmove" &&
                 sym->name != "strcmp" && sym->name != "strncmp" && sym->name != "strncpy" &&
