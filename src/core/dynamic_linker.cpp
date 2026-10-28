@@ -219,6 +219,15 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
 
     m_memory.write_bytes(stub_addr, stub, sizeof(stub));
 
+    // PS4_DUMP_TRAMPOLINES=1: map each stub address to its NID and HLE name,
+    // for reading guest code that calls through them.
+    static const bool s_dump_tramps = std::getenv("PS4_DUMP_TRAMPOLINES") != nullptr;
+    if (s_dump_tramps) {
+        const HleSymbol* sym = m_registry.find_by_nid(nid);
+        std::fprintf(stderr, "[tramp] 0x%llx NID=0x%016llx %s\n", (unsigned long long)stub_addr,
+                     (unsigned long long)nid, sym ? sym->name.c_str() : "<unregistered>");
+    }
+
     // Hook pseudo-syscall in SyscallTable
     m_syscalls.register_handler(pseudo_syscall, [this, nid](SyscallContext& sctx) -> OrbisResult {
         note_hle_activity_for(current_hle_thread_id());

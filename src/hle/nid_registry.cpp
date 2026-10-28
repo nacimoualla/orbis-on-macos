@@ -1261,12 +1261,11 @@ void NidRegistry::register_default_libraries() {
             cur_th->sleep_until_us.store(now_us + usec);
         }
 
-        // Unblock job queue flush loops if caller is 0x85ccbc / 0x85ccc6
-        // JobQueue object is in %r15 at 0x8082f570; clearing pending counter [r15 + 0x98] completes flush
-        if (ctx.r15 > 0x1000 && mem.is_valid_address(ctx.r15 + 0x98, sizeof(u64))) {
-            mem.write_value(ctx.r15 + 0x98, static_cast<u64>(0));
-        }
-
+        // (A former workaround here zeroed [r15 + 0x98] on EVERY call, for any
+        // caller, to force PreloadManager's wait-for-all loop to finish while
+        // Mono was stubbed. With the real runtime it erased the queued level0
+        // load -- the preload thread then found its queue empty and the first
+        // scene never loaded -- and it corrupted whatever else r15 pointed at.)
         if (usec > 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(usec));
         } else {

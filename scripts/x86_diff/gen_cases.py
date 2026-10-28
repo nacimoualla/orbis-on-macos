@@ -34,6 +34,32 @@ add("vpblendw x5,x5,x3,cc", [0xc4,0xe3,0x51,0x0e,0xeb,0xcc]); add("vpsrlq x5,3",
 add("vpshufd x5,x5,e8", [0xc5,0xf9,0x70,0xed,0xe8]); add("vmovq [rax+4rsi+1ab0],x5", [0xc5,0xf9,0xd6,0xac,0xb0,0xb0,0x1a,0,0], mem=1)
 add("vmovd x2,ecx", [0xc5,0xf9,0x6e,0xd1]); add("vpxor x3,x3,x3", [0xc5,0xe1,0xef,0xdb]); add("vpand x7,x7,x5", [0xc5,0xc1,0xdb,0xfd])
 
+# Packed integer add/sub (VEX.66.0F), 128 and 256 bit, incl. high regs and aliasing
+for op, nm in ((0xF8,"psubb"),(0xF9,"psubw"),(0xFA,"psubd"),(0xFB,"psubq"),
+               (0xFC,"paddb"),(0xFD,"paddw"),(0xFE,"paddd"),(0xD4,"paddq")):
+    add(f"v{nm} x5,x4,x2", vex(op, 1, 1, 5, 4, 2))
+    add(f"v{nm} y5,y4,y2", vex(op, 1, 1, 5, 4, 2, L=1))
+    add(f"v{nm} x3,x7,x15", vex(op, 1, 1, 3, 7, 15))
+    add(f"v{nm} x2,x2,x2", vex(op, 1, 1, 2, 2, 2))
+
+# VEX integer ops added for Unity's math/text code
+for op in (0xD1,0xD2,0xD3,0xE1,0xE2,0xF1,0xF2,0xF3,0xD5,0xE4,0xE5,0xF4,0xF5,0xD8,0xD9,0xDC,0xDD,
+           0xE8,0xE9,0xEC,0xED,0xE0,0xE3,0xDA,0xDE,0xEA,0xEE,0x63,0x67):
+    add(f"vex66.0f.{op:02x} x5,x4,x2", vex(op, 1, 1, 5, 4, 2))
+    add(f"vex66.0f.{op:02x} y5,y4,y2", vex(op, 1, 1, 5, 4, 2, L=1))
+for op in (0x08,0x09,0x0A,0x1C,0x1D,0x1E,0x2B):
+    add(f"vex66.0f38.{op:02x} x5,x4,x2", vex(op, 1, 2, 5, 4 if op < 0x1C or op == 0x2B else 0, 2))
+    add(f"vex66.0f38.{op:02x} y5,y4,y2", vex(op, 1, 2, 5, 4 if op < 0x1C or op == 0x2B else 0, 2, L=1))
+add("vpmovmskb ecx,x2", vex(0xD7, 1, 1, 1, 0, 2)); add("vpmovmskb ecx,y2", vex(0xD7, 1, 1, 1, 0, 2, L=1))
+add("vaddsubps x5,x4,x2", vex(0xD0, 3, 1, 5, 4, 2)); add("vaddsubps y5,y4,y2", vex(0xD0, 3, 1, 5, 4, 2, L=1))
+add("vpalignr x5,x4,x2,5", vex(0x0F, 1, 3, 5, 4, 2, imm=5)); add("vpalignr y5,y4,y2,19", vex(0x0F, 1, 3, 5, 4, 2, L=1, imm=19))
+add("vperm2f128 y5,y4,y2,31", vex(0x06, 1, 3, 5, 4, 2, L=1, imm=0x31)); add("vperm2f128 y5,y4,y2,8a", vex(0x06, 1, 3, 5, 4, 2, L=1, imm=0x8a))
+add("vpblendvb x5,x4,x2,x3", vex(0x4C, 1, 3, 5, 4, 2, imm=0x30)); add("vpblendvb y5,y4,y2,x3", vex(0x4C, 1, 3, 5, 4, 2, L=1, imm=0x30))
+add("vcvtps2ph x2,x5,0", vex(0x1D, 1, 3, 5, 0, 2, imm=0)); add("vcvtps2ph x2,y5,3", vex(0x1D, 1, 3, 5, 0, 2, L=1, imm=3))
+add("vcvtph2ps x5,x2", vex(0x13, 1, 2, 5, 0, 2)); add("vcvtph2ps y5,x2", vex(0x13, 1, 2, 5, 0, 2, L=1))
+add("vcvtsd2si ecx,x2", vex(0x2D, 3, 1, 1, 0, 2)); add("vcvtss2si rcx,x2", vex(0x2D, 2, 1, 1, 0, 2, W=1))
+add("vpblendw y5,y4,y2,a5", vex(0x0E, 1, 3, 5, 4, 2, L=1, imm=0xa5))
+
 # Scalar / packed float (map 0F)
 for pp, sfx in ((2, "ss"), (3, "sd")):
     for op, nm in ((0x58,"add"),(0x59,"mul"),(0x5C,"sub"),(0x5D,"min"),(0x5E,"div"),(0x5F,"max"),(0x51,"sqrt"),(0x5A,"cvt")):
@@ -139,6 +165,7 @@ for width in (16, 32, 64):
     add(f"movsx{width} rax,cl", pre + [0x0F, 0xBE, 0xC1]); add(f"movzx{width} rax,cl", pre + [0x0F, 0xB6, 0xC1])
 add("movsx32 eax,cx", [0x0F, 0xBF, 0xC1]); add("movsx64 rax,cx", [0x48, 0x0F, 0xBF, 0xC1]); add("movsxd rax,ecx", [0x48, 0x63, 0xC1])
 add("cbw", [0x66, 0x98]); add("cwde", [0x98]); add("cdqe", [0x48, 0x98]); add("cwd", [0x66, 0x99]); add("cdq", [0x99]); add("cqo", [0x48, 0x99])
+add("lahf", [0x9F]); add("sahf", [0x9E], CF | PF | ZF | SF | AF)
 add("xchg rax,rcx", [0x48, 0x91]); add("lea rax,[rcx+rdx*4+9]", [0x48, 0x8D, 0x44, 0x91, 0x09])
 add("bswap ecx", [0x0F, 0xC9]); add("bswap rcx", [0x48, 0x0F, 0xC9])
 add("adc rax,0x7f", [0x48, 0x83, 0xD0, 0x7F], NOAF); add("sbb eax,-1", [0x83, 0xD8, 0xFF], NOAF)

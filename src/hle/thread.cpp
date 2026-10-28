@@ -234,8 +234,30 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
         t_guest_tid = static_cast<int>(raw_thread->id);
 
             constexpr usize QUANTUM = 20000;
+            // PS4_TRACE_TID=<tid>: run that thread one instruction at a time and
+            // print RIP and key registers (PS4_TRACE_MAX lines, default 20000).
+            static const long s_trace_tid = std::getenv("PS4_TRACE_TID")
+                                                ? std::strtol(std::getenv("PS4_TRACE_TID"), nullptr, 0) : -1;
+            static const long s_trace_max = std::getenv("PS4_TRACE_MAX")
+                                                ? std::strtol(std::getenv("PS4_TRACE_MAX"), nullptr, 0) : 20000;
+            const bool trace_this = s_trace_tid >= 0 && static_cast<long>(raw_thread->id) == s_trace_tid;
+            long traced = 0;
             while (raw_thread->state.load() != ThreadState::Terminated && !m_syscalls->has_exited()) {
-                RunResult rr = executor.run(QUANTUM);
+                RunResult rr{};
+                if (trace_this && traced < s_trace_max) {
+                    for (usize n = 0; n < QUANTUM && traced < s_trace_max; ++n, ++traced) {
+                        const CpuContext& c = executor.context();
+                        std::fprintf(stderr, "[ttrace T%u] 0x%llx rax=0x%llx rdi=0x%llx rsi=0x%llx r12=0x%llx r13=0x%llx\n",
+                                     raw_thread->id, (unsigned long long)c.rip, (unsigned long long)c.rax,
+                                     (unsigned long long)c.rdi, (unsigned long long)c.rsi,
+                                     (unsigned long long)c.r12, (unsigned long long)c.r13);
+                        rr.status = executor.step();
+                        ++rr.instructions_executed;
+                        if (rr.status != StepResult::Ok && rr.status != StepResult::Syscall) break;
+                    }
+                } else {
+                    rr = executor.run(QUANTUM);
+                }
                 raw_thread->run_returns.fetch_add(1, std::memory_order_relaxed);
                 raw_thread->instructions_executed.fetch_add(rr.instructions_executed);
                 m_threads_executed_instructions.fetch_add(rr.instructions_executed);
