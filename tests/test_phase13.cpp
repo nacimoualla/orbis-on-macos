@@ -40,17 +40,17 @@ void test_jit_buffer_and_execution() {
     // Write x86_64 guest instructions into memory at 0x10000:
     // mov eax, 0x1337     (B8 37 13 00 00)
     // mov ebx, 0x42       (BB 42 00 00 00)
-    // ret                 (C3)
+    // hlt                 (F4)
     const GuestAddr code_addr = 0x10000;
     const u8 x86_code[] = {
         0xB8, 0x37, 0x13, 0x00, 0x00, // mov eax, 0x1337
         0xBB, 0x42, 0x00, 0x00, 0x00  // mov ebx, 0x42
     };
     memory.write_bytes(code_addr, x86_code, sizeof(x86_code));
-    // ret ends the block (the zero bytes after it would otherwise decode as
+    // hlt ends the block (the zero bytes after it would otherwise decode as
     // `add [rax], al`, which the JIT translates)
-    const u8 ret = 0xC3;
-    memory.write_bytes(code_addr + sizeof(x86_code), &ret, 1);
+    const u8 hlt = 0xF4;
+    memory.write_bytes(code_addr + sizeof(x86_code), &hlt, 1);
 
     CpuContext ctx{};
     ctx.rip = code_addr;

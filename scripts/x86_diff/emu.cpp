@@ -30,6 +30,8 @@ int main(int argc, char**) {
             for (int r = 0; r < 16; r++) std::memcpy(&x.ymm[r], s.ymm[r], 32);
             x.rax = s.rax; x.rcx = s.rcx; x.rdx = s.rdx; x.rsi = s.rsi; x.rflags = s.flags; x.rip = code;
             if (argc > 1) cpu.run(1); else cpu.step();
+            // JIT run: record whether the case was compiled or fell back to the interpreter.
+            if (argc > 1 && t == 0) pr("# jit %u %s\n", c, jit.cached_block_count() ? "compiled" : "interpreted");
             if (x.rip != code + kCases[c].len) pr("# rip mismatch case %u: +%llu\n", c, (unsigned long long)(x.rip - code));
             for (int r = 0; r < 16; r++) std::memcpy(s.ymm[r], &x.ymm[r], 32);
             s.rax = x.rax; s.rcx = x.rcx; s.rdx = x.rdx; s.rsi = x.rsi; s.flags = x.rflags;

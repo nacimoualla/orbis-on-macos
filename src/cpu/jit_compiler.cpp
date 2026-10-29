@@ -1,9 +1,11 @@
 #include "ps4/jit_compiler.hpp"
+#include "arm64_simd.hpp"
 
 #include <atomic>
 #include "ps4/jit_stats.hpp"
 #include "ps4/x86_decode.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <iostream>
@@ -520,6 +522,66 @@ enum class Kind : u8 {
   Jcc,       // 70-7F rel8, 0F 80-8F rel32 (block end; reg = condition code)
   Cmov,      // 0F 40-4F (reg = condition code)
   Setcc,     // 0F 90-9F (reg = condition code)
+  Vec,       // SSE / AVX (vop selects the operation)
+  CallRel,   // E8 rel32
+  Ret,       // C3 / C2 imm16 (imm = extra bytes popped)
+  CallInd,   // FF /2
+  JmpInd,    // FF /4
+};
+
+/// Control transfers that end the block and store the next RIP themselves.
+bool writes_rip(Kind k) {
+  return k == Kind::CallRel || k == Kind::Ret || k == Kind::CallInd || k == Kind::JmpInd;
+}
+
+/// CALL/RET/indirect JMP are translated unless PS4_JIT_NO_CALLS is set; the
+/// interpreter then executes them and keeps its control-transfer history
+/// (dump_control_xfers) complete for crash reports.
+bool jit_translates_calls() {
+  static const bool on = std::getenv("PS4_JIT_NO_CALLS") == nullptr;
+  return on;
+}
+
+// SSE/AVX operations. Operands: dest = ModRM.reg, src1 = VEX.vvvv (legacy
+// SSE: dest), src2 / rm = ModRM.rm or memory. VEX.128 writes zero bits
+// 255:128 of the destination; legacy SSE writes leave them alone.
+enum class VecOp : u8 {
+  Load,        // dest = rm: movups/movaps/movupd/movapd/movdqu/movdqa
+  Store,       // rm = dest register: the 11/29/7F store forms
+  LoadScalar,  // movss/movsd xmm, xmm/m (F3/F2 10)
+  StoreScalar, // movss/movsd xmm/m, xmm (F3/F2 11)
+  Movq,        // movq xmm, xmm/m64 (F3 7E): zero-extended low qword
+  MovqStore,   // movq xmm/m64, xmm (66 D6)
+  MovdToVec,   // movd/movq xmm, r/m (66 6E)
+  MovdFromVec, // movd/movq r/m, xmm (66 7E)
+  LoadLow,     // movlps/movlpd xmm, m64 (12 mem)
+  LoadHigh,    // movhps/movhpd xmm, m64 (16 mem)
+  Movhlps,     // 0F 12 reg
+  Movlhps,     // 0F 16 reg
+  StoreLow,    // movlps/movlpd m64, xmm (13)
+  StoreHigh,   // movhps/movhpd m64, xmm (17)
+  Moveldup,    // movsldup (F3 12)
+  Movehdup,    // movshdup (F3 16)
+  Movddup,     // movddup (F2 12)
+  Packed,      // vbin on every lane, per 128-bit half
+  Scalar,      // vbin on lane 0; the other lanes come from src1
+  Ucomi,       // (u)comiss / (u)comisd -> ZF, PF, CF
+  Shuf,        // shufps / shufpd imm8
+  Pshufd,      // pshufd / vpermilps imm8 (one source)
+  Blend,       // blendps / blendpd imm8
+  Blendv,      // vblendvps / vblendvpd (mask register in imm8[7:4])
+  Insertps,
+  Broadcast,   // vbroadcastss
+  Pextr,       // pextrd / pextrq
+  Pinsr,       // pinsrd / pinsrq
+  CvtF2F,      // cvtss2sd / cvtsd2ss
+  CvtI2F,      // cvtsi2ss / cvtsi2sd
+  CvttF2I,     // cvttss2si / cvttsd2si
+};
+
+enum class VecBin : u8 {
+  Add, Sub, Mul, Div, Min, Max, Sqrt, And, Andn, Or, Xor,
+  UnpckLo, UnpckHi, AddSub, IAdd, ISub, ICmpEq, Cmp,
 };
 
 struct JitInsn {
@@ -540,6 +602,15 @@ struct JitInsn {
   u64 flags_written{0};
   u64 flags_read{0}; // must be in ctx->rflags before this instruction
 
+  // Kind::Vec
+  VecOp vop{VecOp::Load};
+  VecBin vbin{VecBin::Add};
+  bool vex{false};
+  bool l256{false}; // VEX.L: 256-bit operands
+  bool dbl{false};  // double / 64-bit lanes (pd, sd; integer qword forms)
+  bool w64{false};  // REX.W / VEX.W: 64-bit general register operand
+  u8 vvvv{0};       // VEX.vvvv
+
   [[nodiscard]] bool has_mem() const noexcept {
     switch (kind) {
     case Kind::MovRmReg:
@@ -553,6 +624,8 @@ struct JitInsn {
     case Kind::PushRm:
     case Kind::Cmov:
     case Kind::Setcc:
+    case Kind::CallInd:
+    case Kind::JmpInd:
       return !m.is_reg;
     default:
       return false;
@@ -607,12 +680,186 @@ bool is_block_terminator(const u8 *code, usize avail, const x86::Prefixes &p) {
   const usize c = p.length;
   const u8 op0 = code[c];
   const u8 op1 = (c + 1 < avail) ? code[c + 1] : 0;
-  if (op0 == 0xF4 || op0 == 0xCC || op0 == 0xC3 || op0 == 0xC2 ||
-      op0 == 0xE8)
+  if (op0 == 0xF4 || op0 == 0xCC)
+    return true;
+  if ((op0 == 0xC3 || op0 == 0xC2 || op0 == 0xE8) && !jit_translates_calls())
     return true;
   if (op0 == 0x0F && (op1 == 0x05 || op1 == 0x0B))
     return true;
   return false;
+}
+
+/// Opcodes routed to decode_vec (map 1 = 0F, 2 = 0F 38, 3 = 0F 3A). None of
+/// them is handled by the integer decoder.
+bool is_vec_opcode(u8 map, u8 op) {
+  if (map == 1) {
+    switch (op) {
+    case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17:
+    case 0x28: case 0x29: case 0x2A: case 0x2C: case 0x2E: case 0x2F:
+    case 0x51: case 0x54: case 0x55: case 0x56: case 0x57: case 0x58: case 0x59: case 0x5A:
+    case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+    case 0x62: case 0x6A: case 0x6C: case 0x6D: case 0x6E: case 0x6F:
+    case 0x70: case 0x76: case 0x7E: case 0x7F:
+    case 0xC2: case 0xC6: case 0xD0: case 0xD4: case 0xD6: case 0xDB: case 0xDF:
+    case 0xEB: case 0xEF: case 0xFA: case 0xFB: case 0xFE:
+      return true;
+    default:
+      return false;
+    }
+  }
+  if (map == 2)
+    return op == 0x18;
+  return op == 0x04 || op == 0x0C || op == 0x0D || op == 0x16 || op == 0x21 ||
+         op == 0x22 || op == 0x4A || op == 0x4B;
+}
+
+/// Decode an SSE/AVX instruction whose opcode byte is at code[pos] (after
+/// 0F [38|3A] or the VEX prefix). pp: 0 = none, 1 = 66, 2 = F3, 3 = F2.
+/// The forms not listed are left to the interpreter.
+bool decode_vec(const u8 *code, usize avail, usize pos, GuestAddr rip, u8 map,
+                u8 pp, JitInsn &d) {
+  if (pos >= avail)
+    return false;
+  const u8 op = code[pos++];
+  if (!x86::decode_modrm(code + pos, avail - pos, d.p, d.m))
+    return false;
+  pos += d.m.length;
+  const bool mem = !d.m.is_reg;
+  const bool vex = d.vex;
+  d.kind = Kind::Vec;
+  d.w64 = d.p.rex_w;
+  d.dbl = pp == 1 || pp == 3; // pd / sd
+  bool imm8 = false;
+  bool wide_ok = false; // VEX.L = 1 accepted
+  auto set = [&](VecOp v) { d.vop = v; return true; };
+  auto packed = [&](VecBin b) { d.vbin = b; wide_ok = true; return set(VecOp::Packed); };
+  auto scalar = [&](VecBin b) { d.vbin = b; return set(VecOp::Scalar); };
+  auto arith = [&](VecBin b) { return pp <= 1 ? packed(b) : scalar(b); };
+
+  bool ok = false;
+  if (map == 1) {
+    switch (op) {
+    case 0x10: case 0x11:
+      if (pp <= 1) { wide_ok = true; ok = set(op == 0x10 ? VecOp::Load : VecOp::Store); }
+      else ok = set(op == 0x10 ? VecOp::LoadScalar : VecOp::StoreScalar);
+      break;
+    case 0x12:
+      if (pp == 0) ok = set(mem ? VecOp::LoadLow : VecOp::Movhlps);
+      else if (pp == 1 && mem) ok = set(VecOp::LoadLow);
+      else if (pp == 2) { wide_ok = true; ok = set(VecOp::Moveldup); }
+      else if (pp == 3) { wide_ok = true; ok = set(VecOp::Movddup); }
+      break;
+    case 0x16:
+      if (pp == 0) ok = set(mem ? VecOp::LoadHigh : VecOp::Movlhps);
+      else if (pp == 1 && mem) ok = set(VecOp::LoadHigh);
+      else if (pp == 2) { wide_ok = true; ok = set(VecOp::Movehdup); }
+      break;
+    case 0x13: case 0x17:
+      if (pp <= 1 && mem) ok = set(op == 0x13 ? VecOp::StoreLow : VecOp::StoreHigh);
+      break;
+    case 0x14: case 0x15:
+      if (pp <= 1) ok = packed(op == 0x14 ? VecBin::UnpckLo : VecBin::UnpckHi);
+      break;
+    case 0x28: case 0x29:
+      if (pp <= 1) { wide_ok = true; ok = set(op == 0x28 ? VecOp::Load : VecOp::Store); }
+      break;
+    case 0x2A:
+      if (pp >= 2) { d.dbl = pp == 3; ok = set(VecOp::CvtI2F); }
+      break;
+    case 0x2C:
+      if (pp >= 2) { d.dbl = pp == 3; ok = set(VecOp::CvttF2I); }
+      break;
+    case 0x2E: case 0x2F:
+      if (pp <= 1) { d.flags_written = FLAGS_ARITH; ok = set(VecOp::Ucomi); }
+      break;
+    case 0x51: ok = arith(VecBin::Sqrt); break;
+    case 0x54: case 0x55: case 0x56: case 0x57:
+      if (pp <= 1) {
+        static constexpr VecBin kLogic[4] = {VecBin::And, VecBin::Andn, VecBin::Or, VecBin::Xor};
+        ok = packed(kLogic[op - 0x54]);
+      }
+      break;
+    case 0x58: ok = arith(VecBin::Add); break;
+    case 0x59: ok = arith(VecBin::Mul); break;
+    case 0x5C: ok = arith(VecBin::Sub); break;
+    case 0x5D: ok = arith(VecBin::Min); break;
+    case 0x5E: ok = arith(VecBin::Div); break;
+    case 0x5F: ok = arith(VecBin::Max); break;
+    case 0x5A:
+      if (pp >= 2) ok = set(VecOp::CvtF2F); // dbl: source is double
+      break;
+    case 0x62: case 0x6A: case 0x6C: case 0x6D: // punpck{l,h}{dq,qdq}
+      if (pp == 1) {
+        d.dbl = op >= 0x6C;
+        ok = packed((op & 0x0F) == 0x02 || op == 0x6C ? VecBin::UnpckLo : VecBin::UnpckHi);
+      }
+      break;
+    case 0x6E: if (pp == 1) ok = set(VecOp::MovdToVec); break;
+    case 0x7E:
+      if (pp == 1) ok = set(VecOp::MovdFromVec);
+      else if (pp == 2) ok = set(VecOp::Movq);
+      break;
+    case 0x6F: case 0x7F:
+      if (pp == 1 || pp == 2) { wide_ok = true; ok = set(op == 0x6F ? VecOp::Load : VecOp::Store); }
+      break;
+    case 0x70:
+      if (pp == 1) { imm8 = wide_ok = true; ok = set(VecOp::Pshufd); }
+      break;
+    case 0x76: if (pp == 1) { d.dbl = false; ok = packed(VecBin::ICmpEq); } break;
+    case 0xC2: imm8 = true; ok = arith(VecBin::Cmp); break;
+    case 0xC6:
+      if (pp <= 1) { imm8 = wide_ok = true; ok = set(VecOp::Shuf); }
+      break;
+    case 0xD0: // addsubpd (66) / addsubps (F2)
+      if (pp == 1 || pp == 3) { d.dbl = pp == 1; ok = packed(VecBin::AddSub); }
+      break;
+    case 0xD4: case 0xFE: case 0xFA: case 0xFB:
+      if (pp == 1) {
+        d.dbl = op == 0xD4 || op == 0xFB;
+        ok = packed(op == 0xD4 || op == 0xFE ? VecBin::IAdd : VecBin::ISub);
+      }
+      break;
+    case 0xD6: if (pp == 1) ok = set(VecOp::MovqStore); break;
+    case 0xDB: case 0xDF: case 0xEB: case 0xEF:
+      if (pp == 1) {
+        ok = packed(op == 0xDB ? VecBin::And : op == 0xDF ? VecBin::Andn
+                    : op == 0xEB ? VecBin::Or : VecBin::Xor);
+      }
+      break;
+    default: break;
+    }
+  } else if (map == 2) {
+    if (op == 0x18 && vex && pp == 1 && !d.w64) { wide_ok = true; ok = set(VecOp::Broadcast); }
+  } else {
+    imm8 = true;
+    if (pp == 1) {
+      switch (op) {
+      case 0x04: if (vex && !d.w64) { wide_ok = true; ok = set(VecOp::Pshufd); } break;
+      case 0x0C: case 0x0D: d.dbl = op == 0x0D; wide_ok = true; ok = set(VecOp::Blend); break;
+      case 0x16: d.dbl = d.w64; ok = set(VecOp::Pextr); break;
+      case 0x21: ok = set(VecOp::Insertps); break;
+      case 0x22: d.dbl = d.w64; ok = set(VecOp::Pinsr); break;
+      case 0x4A: case 0x4B:
+        if (vex && !d.w64) { d.dbl = op == 0x4B; wide_ok = true; ok = set(VecOp::Blendv); }
+        break;
+      default: break;
+      }
+    }
+  }
+  if (!ok || (d.l256 && !wide_ok))
+    return false;
+  if (imm8) {
+    if (pos >= avail)
+      return false;
+    d.imm = code[pos++];
+  }
+  // Compare predicates beyond the eight SSE ones (VEX imm 8-31) stay in the
+  // interpreter.
+  if ((d.vop == VecOp::Packed || d.vop == VecOp::Scalar) && d.vbin == VecBin::Cmp && d.imm >= 8)
+    return false;
+  d.rip = rip;
+  d.len = static_cast<u8>(pos);
+  return true;
 }
 
 /// Decode one instruction into a JitInsn. Returns false when the JIT does not
@@ -629,6 +876,48 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
   usize pos = p.length;
   const u8 op0 = code[pos++];
   const u8 op_bits = p.op_bits();
+
+  // VEX prefix (C4/C5 are never LES/LDS in 64-bit mode). A 66/F2/F3/REX
+  // prefix in front of it is #UD: leave that to the interpreter.
+  if (op0 == 0xC4 || op0 == 0xC5) {
+    if (p.opsize16 || p.rep || p.has_rex)
+      return false;
+    const usize vex_len = op0 == 0xC5 ? 1 : 2;
+    if (pos + vex_len >= avail)
+      return false;
+    const u8 b1 = code[pos];
+    const u8 last = code[pos + vex_len - 1];
+    u8 map = 1;
+    p.rex_r = !(b1 & 0x80);
+    if (op0 == 0xC4) {
+      p.rex_x = !(b1 & 0x40);
+      p.rex_b = !(b1 & 0x20);
+      map = b1 & 0x1F;
+      p.rex_w = (last & 0x80) != 0;
+    }
+    pos += vex_len;
+    d.vex = true;
+    d.vvvv = static_cast<u8>((~last >> 3) & 0x0F);
+    d.l256 = (last & 4) != 0;
+    if (map < 1 || map > 3)
+      return false;
+    return decode_vec(code, avail, pos, rip, map, last & 3, d);
+  }
+  // Legacy SSE: 0F xx, 0F 38 xx, 0F 3A xx with a 66/F3/F2 mandatory prefix.
+  if (op0 == 0x0F && pos < avail) {
+    u8 map = 1;
+    usize q = pos;
+    if (code[q] == 0x38 || code[q] == 0x3A) {
+      map = code[q] == 0x38 ? 2 : 3;
+      if (++q >= avail)
+        return false;
+    }
+    if (is_vec_opcode(map, code[q])) {
+      const u8 pp = p.rep == 0xF3 ? 2 : p.rep == 0xF2 ? 3 : p.opsize16 ? 1 : 0;
+      return decode_vec(code, avail, q, rip, map, pp, d);
+    }
+  }
+
   if (p.rep && op0 != 0x90) // F3 90 = PAUSE
     return false;
 
@@ -654,6 +943,40 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     d.len = static_cast<u8>(pos);
     return true;
   };
+
+  // CALL rel32, RET [imm16], CALL r/m64, JMP r/m64: block-ending transfers.
+  // 66-prefixed (16-bit) forms stay in the interpreter.
+  if (jit_translates_calls() && !p.opsize16) {
+    if (op0 == 0xE8) {
+      if (!imm(4))
+        return false;
+      d.kind = Kind::CallRel;
+      finish();
+      d.target = rip + d.len + d.imm;
+      return true;
+    }
+    if (op0 == 0xC3 || op0 == 0xC2) {
+      if (op0 == 0xC2) {
+        if (!imm(2))
+          return false;
+        d.imm &= 0xFFFF;
+      } else {
+        d.imm = 0;
+      }
+      d.kind = Kind::Ret;
+      return finish();
+    }
+    if (op0 == 0xFF && pos < avail) {
+      x86::ModRM peek;
+      if (x86::decode_modrm(code + pos, avail - pos, p, peek) &&
+          ((peek.reg & 7) == 2 || (peek.reg & 7) == 4)) {
+        modrm();
+        d.kind = (d.m.reg & 7) == 2 ? Kind::CallInd : Kind::JmpInd;
+        d.width = 64;
+        return finish();
+      }
+    }
+  }
 
   // NOP / PAUSE (REX.B 90 is XCHG r8, rAX)
   if (op0 == 0x90 && !p.rex_b) {
@@ -1080,6 +1403,38 @@ public:
       m_e.str_x_idx(0, R_GBASE, R_EA);
       m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
       break;
+    case Kind::Vec:
+      emit_vec(d);
+      break;
+    case Kind::CallRel:
+    case Kind::CallInd:
+      // The indirect target is read first (with the old RSP, as on hardware).
+      if (d.kind == Kind::CallInd)
+        load_rm(0, 64);
+      else
+        m_e.mov_imm64(0, d.target);
+      m_e.ldr_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      m_e.sub_imm(R_EA, R_EA, 8);
+      emit_bounds_check();
+      m_e.mov_imm64(1, d.rip + d.len);
+      m_e.str_x_idx(1, R_GBASE, R_EA);
+      m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      m_e.str_reg(0, R_CTX, offsetof(CpuContext, rip));
+      break;
+    case Kind::JmpInd:
+      load_rm(0, 64);
+      m_e.str_reg(0, R_CTX, offsetof(CpuContext, rip));
+      break;
+    case Kind::Ret:
+      m_e.ldr_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      emit_bounds_check();
+      m_e.ldr_x_idx(0, R_GBASE, R_EA);
+      m_e.add_imm(R_EA, R_EA, 8);
+      if (d.imm)
+        m_e.add_imm64(R_EA, R_EA, static_cast<i64>(d.imm), 11);
+      m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      m_e.str_reg(0, R_CTX, offsetof(CpuContext, rip));
+      break;
     case Kind::Pop:
       m_e.ldr_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
       emit_bounds_check();
@@ -1249,10 +1604,466 @@ private:
   /// if (x9 > guest_size - 8) side-exit with RIP at the current instruction.
   /// Accesses starting in the last 8 bytes of guest memory also take the
   /// exit; the interpreter then performs them with its own bounds checks.
-  void emit_bounds_check() {
-    m_e.cmp_reg(true, R_EA, R_GLIMIT);
+  /// Wider accesses (`bytes` > 8) check their last 8 bytes the same way.
+  void emit_bounds_check(u32 bytes = 8) {
+    if (bytes > 8) {
+      m_e.add_imm(10, R_EA, bytes - 8);
+      m_e.cmp_reg(true, 10, R_GLIMIT);
+    } else {
+      m_e.cmp_reg(true, R_EA, R_GLIMIT);
+    }
     m_exits.push_back({m_e.pos(), m_cur->rip, m_retired});
     m_e.b_cond(COND_HI, 0); // patched in emit_side_exits()
+  }
+
+  // ---- SSE / AVX ---------------------------------------------------------
+  // Guest XMM/YMM registers live in ctx->ymm; v0-v3 and v31 are scratch
+  // (caller-saved, so the block needs no NEON save/restore).
+
+  static u32 xmm_off(u8 r, u32 byte = 0) {
+    return static_cast<u32>(offsetof(CpuContext, ymm)) + 32u * r + byte;
+  }
+  void vld(u8 vt, u8 r, u32 half) { m_e.emit(a64::ldr_q(vt, R_CTX, xmm_off(r, 16 * half))); }
+  void vst(u8 vt, u8 r, u32 half) { m_e.emit(a64::str_q(vt, R_CTX, xmm_off(r, 16 * half))); }
+  void zero_upper(u8 r) {
+    m_e.emit(a64::movi_zero(31));
+    vst(31, r, 1);
+  }
+  // Register holding EA + off (x9 itself, or x10).
+  u8 ea_plus(u32 off) {
+    if (off == 0)
+      return R_EA;
+    m_e.add_imm(10, R_EA, off);
+    return 10;
+  }
+  void mld_q(u8 vt, u32 off = 0) { m_e.emit(a64::ldr_q_x(vt, R_GBASE, ea_plus(off))); }
+  void mst_q(u8 vt, u32 off = 0) { m_e.emit(a64::str_q_x(vt, R_GBASE, ea_plus(off))); }
+  // Scalar load/store of lane 0 (4 or 8 bytes); a load zeroes the rest of vt.
+  void mld_lane(bool dbl, u8 vt) {
+    m_e.emit(dbl ? a64::ldr_d_x(vt, R_GBASE, R_EA) : a64::ldr_s_x(vt, R_GBASE, R_EA));
+  }
+  void mst_lane(bool dbl, u8 vt) {
+    m_e.emit(dbl ? a64::str_d_x(vt, R_GBASE, R_EA) : a64::str_s_x(vt, R_GBASE, R_EA));
+  }
+  void ctx_ld_lane(bool dbl, u8 vt, u8 r, u32 byte = 0) {
+    m_e.emit(dbl ? a64::ldr_d(vt, R_CTX, xmm_off(r, byte)) : a64::ldr_s(vt, R_CTX, xmm_off(r, byte)));
+  }
+  void ins(bool dbl, u8 d, u32 i, u8 n, u32 j) { m_e.emit(a64::ins_elem(dbl, d, i, n, j)); }
+  // vt = half `half` of the rm operand (register or memory).
+  void ld_rm_q(u8 vt, u32 half) {
+    if (m_cur->m.is_reg)
+      vld(vt, m_cur->m.rm, half);
+    else
+      mld_q(vt, 16 * half);
+  }
+  // vt lane 0 = the scalar rm operand.
+  void ld_rm_lane(bool dbl, u8 vt) {
+    if (m_cur->m.is_reg)
+      ctx_ld_lane(dbl, vt, m_cur->m.rm);
+    else
+      mld_lane(dbl, vt);
+  }
+
+  static u32 vec_mem_bytes(const JitInsn &d) {
+    switch (d.vop) {
+    case VecOp::Load: case VecOp::Store: case VecOp::Packed: case VecOp::Shuf:
+    case VecOp::Pshufd: case VecOp::Blend: case VecOp::Blendv: case VecOp::Moveldup:
+    case VecOp::Movehdup:
+      return d.l256 ? 32 : 16;
+    case VecOp::Movddup:
+      return d.l256 ? 32 : 8;
+    case VecOp::LoadScalar: case VecOp::StoreScalar: case VecOp::Scalar: case VecOp::Ucomi:
+    case VecOp::CvtF2F: case VecOp::CvttF2I:
+      return d.dbl ? 8 : 4;
+    case VecOp::Insertps: case VecOp::Broadcast:
+      return 4;
+    case VecOp::MovdToVec: case VecOp::MovdFromVec: case VecOp::CvtI2F: case VecOp::Pextr:
+    case VecOp::Pinsr:
+      return d.w64 ? 8 : 4;
+    default: // Movq, MovqStore, LoadLow/High, StoreLow/High
+      return 8;
+    }
+  }
+
+  /// x86 returns the negative "QNaN indefinite" where an operation creates a
+  /// NaN from non-NaN inputs (0/0, sqrt(-1), inf - inf); ARM's default NaN is
+  /// positive. Set the sign of such lanes of v2 (inputs v0, v1; `unary`: v1
+  /// only). Clobbers v3-v5.
+  void emit_x86_nan(bool dbl, bool unary) {
+    m_e.emit(a64::fcmeq_v(dbl, 3, 2, 2));            // result is a number
+    m_e.emit(a64::fcmeq_v(dbl, 4, unary ? 1 : 0, unary ? 1 : 0));
+    m_e.emit(a64::fcmeq_v(dbl, 5, 1, 1));
+    m_e.emit(a64::and_v(4, 4, 5));                   // inputs are numbers
+    m_e.emit(a64::bic_v(4, 4, 3));                   // ... but the result is not
+    m_e.emit(a64::shl_sign(dbl, 4, 4));
+    m_e.emit(a64::orr_v(2, 2, 4));
+  }
+
+  /// v2 = v0 OP v1 (all lanes; scalar callers use lane 0). Clobbers v3-v5.
+  void emit_vbin(const JitInsn &d) {
+    const bool dbl = d.dbl;
+    switch (d.vbin) {
+    case VecBin::Add: m_e.emit(a64::fadd_v(dbl, 2, 0, 1)); emit_x86_nan(dbl, false); break;
+    case VecBin::Sub: m_e.emit(a64::fsub_v(dbl, 2, 0, 1)); emit_x86_nan(dbl, false); break;
+    case VecBin::Mul: m_e.emit(a64::fmul_v(dbl, 2, 0, 1)); emit_x86_nan(dbl, false); break;
+    case VecBin::Div: m_e.emit(a64::fdiv_v(dbl, 2, 0, 1)); emit_x86_nan(dbl, false); break;
+    // x86 MIN/MAX return the second operand unless the comparison holds
+    // (NaNs and equal zeros included): a < b ? a : b, a > b ? a : b.
+    case VecBin::Min:
+      m_e.emit(a64::fcmgt_v(dbl, 2, 1, 0));
+      m_e.emit(a64::bsl_v(2, 0, 1));
+      break;
+    case VecBin::Max:
+      m_e.emit(a64::fcmgt_v(dbl, 2, 0, 1));
+      m_e.emit(a64::bsl_v(2, 0, 1));
+      break;
+    case VecBin::Sqrt: m_e.emit(a64::fsqrt_v(dbl, 2, 1)); emit_x86_nan(dbl, true); break;
+    case VecBin::And: m_e.emit(a64::and_v(2, 0, 1)); break;
+    case VecBin::Andn: m_e.emit(a64::bic_v(2, 1, 0)); break; // ~a & b
+    case VecBin::Or: m_e.emit(a64::orr_v(2, 0, 1)); break;
+    case VecBin::Xor: m_e.emit(a64::eor_v(2, 0, 1)); break;
+    case VecBin::UnpckLo: m_e.emit(a64::zip1(dbl, 2, 0, 1)); break;
+    case VecBin::UnpckHi: m_e.emit(a64::zip2(dbl, 2, 0, 1)); break;
+    case VecBin::AddSub: // even lanes a - b, odd lanes a + b
+      m_e.emit(a64::fsub_v(dbl, 2, 0, 1));
+      m_e.emit(a64::fadd_v(dbl, 3, 0, 1));
+      ins(dbl, 2, 1, 3, 1);
+      if (!dbl)
+        ins(false, 2, 3, 3, 3);
+      emit_x86_nan(dbl, false);
+      break;
+    case VecBin::IAdd: m_e.emit(a64::add_v(dbl, 2, 0, 1)); break;
+    case VecBin::ISub: m_e.emit(a64::sub_v(dbl, 2, 0, 1)); break;
+    case VecBin::ICmpEq: m_e.emit(a64::cmeq_v(2, 0, 1)); break;
+    case VecBin::Cmp: {
+      const u32 pred = d.imm & 7;
+      switch (pred & 3) {
+      case 0: m_e.emit(a64::fcmeq_v(dbl, 2, 0, 1)); break; // EQ / NEQ
+      case 1: m_e.emit(a64::fcmgt_v(dbl, 2, 1, 0)); break; // LT / NLT
+      case 2: m_e.emit(a64::fcmge_v(dbl, 2, 1, 0)); break; // LE / NLE
+      default:                                            // ORD / UNORD
+        m_e.emit(a64::fcmeq_v(dbl, 2, 0, 0));
+        m_e.emit(a64::fcmeq_v(dbl, 3, 1, 1));
+        m_e.emit(a64::and_v(2, 2, 3));
+        break;
+      }
+      // Predicates 3-6 are the negations of 7, 0, 1, 2.
+      if (pred >= 3 && pred <= 6)
+        m_e.emit(a64::not_v(2, 2));
+      break;
+    }
+    }
+  }
+
+  void emit_vec(const JitInsn &d) {
+    const bool mem = !d.m.is_reg;
+    if (mem) {
+      emit_ea(d.m, d.rip + d.len, d.p.seg);
+      emit_bounds_check(vec_mem_bytes(d));
+    }
+    const u8 dst = d.m.reg, rm = d.m.rm;
+    const u8 src1 = d.vex ? d.vvvv : dst;
+    const u32 halves = d.l256 ? 2 : 1;
+    const bool dbl = d.dbl;
+    const u32 imm = static_cast<u32>(d.imm & 0xFF);
+    // A VEX.128 write zeroes bits 255:128; VEX.256 wrote both halves.
+    auto done = [&](u8 r) {
+      if (d.vex && !d.l256)
+        zero_upper(r);
+    };
+    switch (d.vop) {
+    case VecOp::Load:
+      for (u32 h = 0; h < halves; ++h) {
+        ld_rm_q(0, h);
+        vst(0, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Store:
+      for (u32 h = 0; h < halves; ++h) {
+        vld(0, dst, h);
+        if (mem)
+          mst_q(0, 16 * h);
+        else
+          vst(0, rm, h);
+      }
+      if (!mem)
+        done(rm);
+      break;
+    case VecOp::LoadScalar:
+      if (mem) {
+        mld_lane(dbl, 0); // zero-extended to 128 bits
+      } else {
+        vld(0, src1, 0);
+        vld(1, rm, 0);
+        ins(dbl, 0, 0, 1, 0);
+      }
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::StoreScalar:
+      if (mem) {
+        ctx_ld_lane(dbl, 0, dst);
+        mst_lane(dbl, 0);
+      } else {
+        vld(0, d.vex ? d.vvvv : rm, 0);
+        vld(1, dst, 0);
+        ins(dbl, 0, 0, 1, 0);
+        vst(0, rm, 0);
+        done(rm);
+      }
+      break;
+    case VecOp::Movq:
+      if (mem)
+        mld_lane(true, 0);
+      else
+        ctx_ld_lane(true, 0, rm);
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::MovqStore:
+      ctx_ld_lane(true, 0, dst);
+      if (mem) {
+        mst_lane(true, 0);
+      } else {
+        vst(0, rm, 0);
+        done(rm);
+      }
+      break;
+    case VecOp::MovdToVec:
+      load_rm(0, d.w64 ? 64 : 32);
+      m_e.emit(d.w64 ? a64::fmov_d_x(0, 0) : a64::fmov_s_w(0, 0)); // zero-extends
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::MovdFromVec:
+      if (d.w64)
+        m_e.ldr_reg(0, R_CTX, xmm_off(dst));
+      else
+        m_e.ldr_w(0, R_CTX, xmm_off(dst));
+      store_rm(0, d.w64 ? 64 : 32);
+      break;
+    case VecOp::LoadLow:
+    case VecOp::LoadHigh:
+      vld(0, src1, 0);
+      mld_lane(true, 1);
+      ins(true, 0, d.vop == VecOp::LoadHigh ? 1 : 0, 1, 0);
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::Movhlps:
+    case VecOp::Movlhps:
+      vld(0, src1, 0);
+      vld(1, rm, 0);
+      if (d.vop == VecOp::Movhlps)
+        ins(true, 0, 0, 1, 1);
+      else
+        ins(true, 0, 1, 1, 0);
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::StoreLow:
+    case VecOp::StoreHigh:
+      ctx_ld_lane(true, 0, dst, d.vop == VecOp::StoreHigh ? 8 : 0);
+      mst_lane(true, 0);
+      break;
+    case VecOp::Moveldup:
+    case VecOp::Movehdup:
+      for (u32 h = 0; h < halves; ++h) {
+        ld_rm_q(1, h);
+        m_e.emit(d.vop == VecOp::Moveldup ? a64::trn1(2, 1, 1) : a64::trn2(2, 1, 1));
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Movddup:
+      for (u32 h = 0; h < halves; ++h) {
+        if (mem && !d.l256)
+          mld_lane(true, 1);
+        else
+          ld_rm_q(1, h);
+        m_e.emit(a64::dup_elem(true, 2, 1, 0));
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Packed:
+      for (u32 h = 0; h < halves; ++h) {
+        if (d.vbin != VecBin::Sqrt)
+          vld(0, src1, h);
+        ld_rm_q(1, h);
+        emit_vbin(d);
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Scalar:
+      vld(0, src1, 0);
+      ld_rm_lane(dbl, 1);
+      emit_vbin(d);
+      ins(dbl, 0, 0, 2, 0);
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::Ucomi: {
+      // ZF, PF, CF = 111 unordered, 000 greater, 001 less, 100 equal;
+      // OF, SF and AF are cleared. After FCMP: less or unordered = LT,
+      // unordered = VS, equal = EQ.
+      ctx_ld_lane(dbl, 0, dst);
+      ld_rm_lane(dbl, 1);
+      m_e.emit(a64::fcmp_s(dbl, 0, 1));
+      m_e.cset(true, 3, 11); // LT -> CF
+      m_e.cset(true, 4, 6);  // VS -> PF
+      m_e.cset(true, 5, 0);  // EQ
+      m_e.orr_reg(5, 5, 4);  // ZF = equal or unordered
+      m_e.bfi(true, 3, 4, 2, 1);
+      m_e.bfi(true, 3, 5, 6, 1);
+      m_e.ldr_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      m_e.mov_imm64(5, FLAGS_ARITH | CpuContext::FLAG_AF);
+      m_e.bic_shifted(true, 4, 4, 5);
+      m_e.orr_shifted(true, 4, 4, 3);
+      m_e.str_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      break;
+    }
+    case VecOp::Shuf:
+      for (u32 h = 0; h < halves; ++h) {
+        vld(0, src1, h);
+        ld_rm_q(1, h);
+        if (!dbl) {
+          ins(false, 2, 0, 0, imm & 3);
+          ins(false, 2, 1, 0, (imm >> 2) & 3);
+          ins(false, 2, 2, 1, (imm >> 4) & 3);
+          ins(false, 2, 3, 1, (imm >> 6) & 3);
+        } else {
+          ins(true, 2, 0, 0, (imm >> (2 * h)) & 1);
+          ins(true, 2, 1, 1, (imm >> (2 * h + 1)) & 1);
+        }
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Pshufd:
+      for (u32 h = 0; h < halves; ++h) {
+        ld_rm_q(1, h);
+        for (u32 i = 0; i < 4; ++i)
+          ins(false, 2, i, 1, (imm >> (2 * i)) & 3);
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Blend: {
+      const u32 lanes = dbl ? 2 : 4;
+      for (u32 h = 0; h < halves; ++h) {
+        vld(0, src1, h);
+        ld_rm_q(1, h);
+        m_e.emit(a64::mov_v(2, 0));
+        for (u32 i = 0; i < lanes; ++i)
+          if ((imm >> (i + lanes * h)) & 1)
+            ins(dbl, 2, i, 1, i);
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    }
+    case VecOp::Blendv: {
+      const u8 mask = static_cast<u8>((imm >> 4) & 15);
+      for (u32 h = 0; h < halves; ++h) {
+        vld(0, src1, h);
+        ld_rm_q(1, h);
+        vld(3, mask, h);
+        m_e.emit(a64::sshr_sign(dbl, 3, 3));
+        m_e.emit(a64::bsl_v(3, 1, 0)); // sign set ? src2 : src1
+        vst(3, dst, h);
+      }
+      done(dst);
+      break;
+    }
+    case VecOp::Insertps: {
+      vld(0, src1, 0);
+      u32 from = 0;
+      if (mem) {
+        mld_lane(false, 1);
+      } else {
+        vld(1, rm, 0);
+        from = (imm >> 6) & 3;
+      }
+      ins(false, 0, (imm >> 4) & 3, 1, from);
+      if (imm & 15) {
+        m_e.emit(a64::movi_zero(31));
+        for (u32 k = 0; k < 4; ++k)
+          if ((imm >> k) & 1)
+            ins(false, 0, k, 31, 0);
+      }
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    }
+    case VecOp::Broadcast:
+      ld_rm_lane(false, 1);
+      m_e.emit(a64::dup_elem(false, 2, 1, 0));
+      for (u32 h = 0; h < halves; ++h)
+        vst(2, dst, h);
+      done(dst);
+      break;
+    case VecOp::Pextr: // ModRM.reg is the XMM source, rm the destination
+      if (d.w64)
+        m_e.ldr_reg(0, R_CTX, xmm_off(dst, 8 * (imm & 1)));
+      else
+        m_e.ldr_w(0, R_CTX, xmm_off(dst, 4 * (imm & 3)));
+      store_rm(0, d.w64 ? 64 : 32);
+      break;
+    case VecOp::Pinsr:
+      vld(0, src1, 0);
+      load_rm(0, d.w64 ? 64 : 32);
+      m_e.emit(a64::ins_gpr(d.w64, 0, d.w64 ? (imm & 1) : (imm & 3), 0));
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::CvtF2F: // dbl: cvtsd2ss, else cvtss2sd
+      vld(0, src1, 0);
+      ld_rm_lane(dbl, 1);
+      if (dbl) {
+        m_e.emit(a64::fcvt_s_d(2, 1));
+        ins(false, 0, 0, 2, 0);
+      } else {
+        m_e.emit(a64::fcvt_d_s(2, 1));
+        ins(true, 0, 0, 2, 0);
+      }
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::CvtI2F:
+      vld(0, src1, 0);
+      load_rm(0, d.w64 ? 64 : 32);
+      m_e.emit(a64::scvtf(dbl, d.w64, 2, 0));
+      ins(dbl, 0, 0, 2, 0);
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::CvttF2I: {
+      // x86 returns the "integer indefinite" (only the sign bit set) for NaN
+      // and out-of-range inputs; FCVTZS saturates and maps NaN to 0.
+      ld_rm_lane(dbl, 1);
+      m_e.emit(a64::fcvtzs(dbl, true, 0, 1));
+      m_e.emit(a64::fcmp_s(dbl, 1, 1));
+      if (d.w64) {
+        m_e.mov_imm64(2, 0x8000000000000000ull);
+        m_e.emit(a64::csel(true, 0, 2, 0, 6)); // NaN (VS)
+        m_e.mov_imm64(3, 0x7FFFFFFFFFFFFFFFull);
+        m_e.cmp_reg(true, 0, 3);
+        m_e.emit(a64::csel(true, 0, 2, 0, 0)); // saturated high (EQ)
+        store_gpr(dst, 64, 0);
+      } else {
+        m_e.mov_imm64(2, 0x80000000ull);
+        m_e.emit(a64::csel(true, 0, 2, 0, 6)); // NaN (VS)
+        m_e.sxt(true, 3, 0, 32);
+        m_e.cmp_reg(true, 3, 0);
+        m_e.emit(a64::csel(true, 0, 2, 0, 1)); // not an int32 (NE)
+        store_gpr(dst, 32, 0);
+      }
+      break;
+    }
+    }
   }
 
   /// x0 = x0 OP x1 at `width` bits (result zero-extended); if any flag it
@@ -1600,7 +2411,7 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
     }
 
     insns.push_back(insn);
-    if (insn.kind == Kind::Jcc) {
+    if (insn.kind == Kind::Jcc || writes_rip(insn.kind)) {
       block_ended = true;
       break;
     }
@@ -1647,13 +2458,15 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
 
   const usize instructions = insns.size();
 
-  // Always update RIP at end of block; return the retired-instruction count
+  // Update RIP at the end of the block (CALL/RET/indirect JMP stored it
+  // already); return the retired-instruction count.
   if (insns.back().kind == Kind::Jcc) {
     emit_jcc_rip(m_emitter, insns.back());
-  } else {
+    m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
+  } else if (!writes_rip(insns.back().kind)) {
     m_emitter.mov_imm64(0, current_rip);
+    m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
   }
-  m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
   m_emitter.mov_imm64(0, instructions);
   m_emitter.emit_epilogue();
 
@@ -1704,6 +2517,10 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
                                 usize *retired) {
   if (retired)
     *retired = 0;
+  // RIP 0 (a guest thread returning from its entry point) and the other
+  // invalid low targets are the interpreter's to report.
+  if (ctx.rip < 0x20)
+    return false;
   JittedBlockFunc fn = nullptr;
   usize *exec_count = nullptr;
   ThreadBlockCache &tc = t_block_cache;

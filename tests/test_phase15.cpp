@@ -84,21 +84,59 @@ void test_basic_block_boundaries_and_traps() {
         assert(ctx.rip == code_addr + 5); // RIP points to hlt
     }
 
-    // 4. RET boundary: code ending in 0xC3 (RET)
+    // 4. RET is translated and ends the block: RIP = popped return address.
     {
-        const GuestAddr code_addr = 0x13000;
+        const GuestAddr code_addr = 0x13000, stack = 0x18000;
         const u8 code[] = {
             0xBF, 0x66, 0x66, 0x00, 0x00, // mov edi, 0x6666 (5 bytes)
             0xC3                          // ret             (1 byte)
         };
         assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        assert(memory.write_value(stack, u64{0x13456}));
 
         CpuContext ctx{};
         ctx.rip = code_addr;
+        ctx.rsp = stack;
 
-        assert(jit.execute_block(ctx, memory));
+        usize retired = 0;
+        assert(jit.execute_block(ctx, memory, &retired));
+        assert(retired == 2);
         assert(ctx.rdi == 0x6666);
-        assert(ctx.rip == code_addr + 5); // RIP points to ret
+        assert(ctx.rip == 0x13456);
+        assert(ctx.rsp == stack + 8);
+    }
+
+    // 5. CALL rel32 pushes the return address; RET imm16 pops extra bytes;
+    //    CALL r/m64 reads its target before pushing.
+    {
+        const GuestAddr code_addr = 0x14000, stack = 0x18100;
+        const u8 call[] = {0xE8, 0xFB, 0x0F, 0x00, 0x00}; // call +0xffb -> 0x15000
+        assert(memory.write_bytes(code_addr, call, sizeof(call)));
+        CpuContext ctx{};
+        ctx.rip = code_addr;
+        ctx.rsp = stack;
+        assert(jit.execute_block(ctx, memory));
+        u64 pushed = 0;
+        assert(memory.read_value(stack - 8, pushed));
+        assert(ctx.rip == 0x15000 && ctx.rsp == stack - 8 && pushed == code_addr + 5);
+
+        const u8 ret16[] = {0xC2, 0x10, 0x00}; // ret 16
+        assert(memory.write_bytes(0x15000, ret16, sizeof(ret16)));
+        assert(jit.execute_block(ctx, memory));
+        assert(ctx.rip == code_addr + 5 && ctx.rsp == stack + 16);
+
+        const u8 call_ind[] = {0xFF, 0x14, 0x24}; // call [rsp]
+        assert(memory.write_bytes(0x16000, call_ind, sizeof(call_ind)));
+        assert(memory.write_value(stack, u64{0x17000}));
+        ctx.rip = 0x16000;
+        ctx.rsp = stack;
+        assert(jit.execute_block(ctx, memory));
+        assert(memory.read_value(stack - 8, pushed));
+        assert(ctx.rip == 0x17000 && ctx.rsp == stack - 8 && pushed == 0x16003);
+
+        // A return to address 0 (thread exit) is left to the interpreter.
+        ctx.rip = 0;
+        assert(!jit.execute_block(ctx, memory));
     }
 
     std::cout << "  -> Basic-block boundaries and trap exits verified!\n";

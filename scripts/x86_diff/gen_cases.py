@@ -181,6 +181,115 @@ add("xchg rax,rcx", [0x48, 0x91]); add("lea rax,[rcx+rdx*4+9]", [0x48, 0x8D, 0x4
 add("bswap ecx", [0x0F, 0xC9]); add("bswap rcx", [0x48, 0x0F, 0xC9])
 add("adc rax,0x7f", [0x48, 0x83, 0xD0, 0x7F], NOAF); add("sbb eax,-1", [0x83, 0xD8, 0xFF], NOAF)
 
+# ---- JIT SSE/AVX coverage: memory operands, 3-operand moves, shuffles and
+# blends across immediates, 256-bit and high-register forms, legacy encodings.
+def vexm(op, pp, mm, d, v, L=0, W=0, imm=None):
+    """VEX form with a memory operand at [rax+4*rsi+0x1ab0] (16-byte scratch)."""
+    b = vex(op, pp, mm, d, v, 0, L=L, W=W, mod_rm=0x84 | ((d & 7) << 3))
+    return b + [0xB0, 0xB0, 0x1A, 0, 0] + ([imm] if imm is not None else [])
+def sse(pre, op, d, r, imm=None, rex=0):
+    """Legacy SSE reg-reg form; op is the byte(s) after 0F."""
+    ops = op if isinstance(op, list) else [op]
+    rx = rex | (4 if d >= 8 else 0) | (1 if r >= 8 else 0)
+    return pre + ([0x40 | rx] if rx else []) + [0x0F] + ops + [0xC0 | ((d & 7) << 3) | (r & 7)] + ([imm] if imm is not None else [])
+def ssem(pre, op, d, imm=None, rex=0):
+    ops = op if isinstance(op, list) else [op]
+    return pre + ([0x40 | rex] if rex else []) + [0x0F] + ops + [0x84 | ((d & 7) << 3), 0xB0, 0xB0, 0x1A, 0, 0] + ([imm] if imm is not None else [])
+
+# moves
+for pp, nm in ((2, "ss"), (3, "sd")):
+    add(f"vmov{nm} x1,x2,x3", vex(0x10, pp, 1, 1, 2, 3)); add(f"vmov{nm} x3,x2,x1 (11)", vex(0x11, pp, 1, 1, 2, 3))
+    add(f"vmov{nm} x1,[mem]", vexm(0x10, pp, 1, 1, 0), mem=1); add(f"vmov{nm} [mem],x1", vexm(0x11, pp, 1, 1, 0), mem=1)
+add("vmovups x1,[mem]", vexm(0x10, 0, 1, 1, 0), mem=1); add("vmovups [mem],x1", vexm(0x11, 0, 1, 1, 0), mem=1)
+add("vmovaps [mem],x1", vexm(0x29, 0, 1, 1, 0), mem=1); add("vmovapd x1,[mem]", vexm(0x28, 1, 1, 1, 0), mem=1)
+add("vmovdqu x1,[mem]", vexm(0x6F, 2, 1, 1, 0), mem=1); add("vmovdqu [mem],x1", vexm(0x7F, 2, 1, 1, 0), mem=1)
+add("vmovdqa x1,x3", vex(0x6F, 1, 1, 1, 0, 3)); add("vmovdqa y1,y3", vex(0x6F, 1, 1, 1, 0, 3, L=1))
+add("vmovdqu y3<-y1 (7f)", vex(0x7F, 2, 1, 1, 0, 3, L=1)); add("vmovups y1,y3", vex(0x10, 0, 1, 1, 0, 3, L=1))
+add("vmovups y3<-y1 (11)", vex(0x11, 0, 1, 1, 0, 3, L=1)); add("vmovaps x9,x14", vex(0x28, 0, 1, 9, 0, 14))
+add("vmovq x1,[mem]", vexm(0x7E, 2, 1, 1, 0), mem=1); add("vmovq x3<-x1 (d6)", vex(0xD6, 1, 1, 1, 0, 3))
+add("vmovd x1,[mem]", vexm(0x6E, 1, 1, 1, 0), mem=1); add("vmovd [mem],x1", vexm(0x7E, 1, 1, 1, 0), mem=1)
+add("vmovq x1,[mem] (6e W1)", vexm(0x6E, 1, 1, 1, 0, W=1), mem=1)
+for op, nm in ((0x12, "lps"), (0x16, "hps")):
+    add(f"vmov{nm} x1,x2,[mem]", vexm(op, 0, 1, 1, 2), mem=1); add(f"vmov{nm[0]}pd x1,x2,[mem]", vexm(op, 1, 1, 1, 2), mem=1)
+add("vmovlps [mem],x1", vexm(0x13, 0, 1, 1, 0), mem=1); add("vmovhps [mem],x1", vexm(0x17, 0, 1, 1, 0), mem=1)
+add("vmovhlps x1,x2,x3", vex(0x12, 0, 1, 1, 2, 3)); add("vmovlhps x1,x2,x3", vex(0x16, 0, 1, 1, 2, 3))
+for pp, op, nm in ((2, 0x12, "sldup"), (2, 0x16, "shdup"), (3, 0x12, "ddup")):
+    add(f"vmov{nm} x1,x3", vex(op, pp, 1, 1, 0, 3)); add(f"vmov{nm} y1,y3", vex(op, pp, 1, 1, 0, 3, L=1))
+add("vmovddup x1,[mem]", vexm(0x12, 3, 1, 1, 0), mem=1)
+
+# packed / scalar arithmetic
+for op, nm in ((0x58,"add"),(0x59,"mul"),(0x5C,"sub"),(0x5D,"min"),(0x5E,"div"),(0x5F,"max"),(0x51,"sqrt")):
+    v = 0 if op == 0x51 else 2
+    add(f"v{nm}ps x1,x2,x3", vex(op, 0, 1, 1, v, 3)); add(f"v{nm}ps y1,y2,y3", vex(op, 0, 1, 1, v, 3, L=1))
+    add(f"v{nm}pd x1,x2,x3", vex(op, 1, 1, 1, v, 3)); add(f"v{nm}pd y1,y2,y3", vex(op, 1, 1, 1, v, 3, L=1))
+    add(f"v{nm}ss x1,x2,[mem]", vexm(op, 2, 1, 1, 2), mem=1); add(f"v{nm}ps x1,x2,[mem]", vexm(op, 0, 1, 1, v), mem=1)
+add("vaddps y9,y12,y14", vex(0x58, 0, 1, 9, 12, 14, L=1)); add("vmulss x15,x8,x10", vex(0x59, 2, 1, 15, 8, 10))
+for op, nm in ((0x55,"andnpd"),(0x56,"orps"),(0x57,"xorpd"),(0x14,"unpcklps"),(0x15,"unpckhps")):
+    pp = 1 if nm.endswith("pd") else 0
+    add(f"v{nm} x1,x2,x3", vex(op, pp, 1, 1, 2, 3)); add(f"v{nm} y1,y2,y3", vex(op, pp, 1, 1, 2, 3, L=1))
+add("vunpcklpd x1,x2,x3", vex(0x14, 1, 1, 1, 2, 3)); add("vunpckhpd y1,y2,y3", vex(0x15, 1, 1, 1, 2, 3, L=1))
+for imm in range(8):
+    add(f"vcmpps x1,x2,x3,{imm}", vex(0xC2, 0, 1, 1, 2, 3, imm=imm)); add(f"vcmpsd x1,x2,x3,{imm}", vex(0xC2, 3, 1, 1, 2, 3, imm=imm))
+add("vcmppd x1,x2,x3,1", vex(0xC2, 1, 1, 1, 2, 3, imm=1)); add("vcmpps y1,y2,y3,2", vex(0xC2, 0, 1, 1, 2, 3, L=1, imm=2))
+add("vcmpss x1,x2,[mem],1", vexm(0xC2, 2, 1, 1, 2, imm=1), mem=1); add("vaddsubpd x1,x2,x3", vex(0xD0, 1, 1, 1, 2, 3))
+
+# shuffles, blends, inserts, broadcasts
+for imm in (0x1B, 0xE4, 0x4E, 0xB1, 0x00):
+    add(f"vshufps x1,x2,x3,{imm:02x}", vex(0xC6, 0, 1, 1, 2, 3, imm=imm))
+    add(f"vpermilps x1,x3,{imm:02x}", vex(0x04, 1, 3, 1, 0, 3, imm=imm))
+add("vshufps y1,y2,y3,1b", vex(0xC6, 0, 1, 1, 2, 3, L=1, imm=0x1B)); add("vpermilps y1,y3,93", vex(0x04, 1, 3, 1, 0, 3, L=1, imm=0x93))
+for imm in range(4):
+    add(f"vshufpd x1,x2,x3,{imm}", vex(0xC6, 1, 1, 1, 2, 3, imm=imm))
+add("vshufpd y1,y2,y3,5", vex(0xC6, 1, 1, 1, 2, 3, L=1, imm=5)); add("vpshufd x1,x3,1b", vex(0x70, 1, 1, 1, 0, 3, imm=0x1B))
+add("vshufps x1,x2,[mem],4e", vexm(0xC6, 0, 1, 1, 2, imm=0x4E), mem=1)
+for imm in (0x05, 0x0A, 0x0F):
+    add(f"vblendps x1,x2,x3,{imm:02x}", vex(0x0C, 1, 3, 1, 2, 3, imm=imm))
+add("vblendps y1,y2,y3,a5", vex(0x0C, 1, 3, 1, 2, 3, L=1, imm=0xA5)); add("vblendpd x1,x2,x3,2", vex(0x0D, 1, 3, 1, 2, 3, imm=2))
+add("vblendpd y1,y2,y3,9", vex(0x0D, 1, 3, 1, 2, 3, L=1, imm=9)); add("vblendvpd y1,y2,y3,y4", vex(0x4B, 1, 3, 1, 2, 3, L=1, imm=0x40))
+add("vblendvps x1,x2,[mem],x4", vexm(0x4A, 1, 3, 1, 2, imm=0x40), mem=1)
+for imm in (0x00, 0x10, 0x20, 0x30, 0x40, 0x0F, 0xC8, 0x5A, 0x1E, 0xF1):
+    add(f"vinsertps x1,x2,x3,{imm:02x}", vex(0x21, 1, 3, 1, 2, 3, imm=imm))
+add("vinsertps x1,x2,[mem],20", vexm(0x21, 1, 3, 1, 2, imm=0x20), mem=1); add("vinsertps x1,x2,[mem],39", vexm(0x21, 1, 3, 1, 2, imm=0x39), mem=1)
+add("vbroadcastss x1,[mem]", vexm(0x18, 1, 2, 1, 0), mem=1); add("vbroadcastss y1,[mem]", vexm(0x18, 1, 2, 1, 0, L=1), mem=1)
+add("vpextrd [mem],x1,2", vexm(0x16, 1, 3, 1, 0, imm=2), mem=1); add("vpinsrd x1,x2,[mem],1", vexm(0x22, 1, 3, 1, 2, imm=1), mem=1)
+
+# compares to flags, conversions
+add("vcomiss x1,x2", vex(0x2F, 0, 1, 1, 0, 2), ALL); add("vcomisd x1,x2", vex(0x2F, 1, 1, 1, 0, 2), ALL)
+add("vucomiss x1,[mem]", vexm(0x2E, 0, 1, 1, 0), ALL, mem=1); add("vucomisd x1,[mem]", vexm(0x2E, 1, 1, 1, 0), ALL, mem=1)
+add("vucomiss x1,x1", vex(0x2E, 0, 1, 1, 0, 1), ALL)
+add("vcvtss2sd x1,x2,[mem]", vexm(0x5A, 2, 1, 1, 2), mem=1); add("vcvtsd2ss x1,x2,[mem]", vexm(0x5A, 3, 1, 1, 2), mem=1)
+add("vcvttss2si ecx,[mem]", vexm(0x2C, 2, 1, 1, 0), mem=1); add("vcvttsd2si rcx,[mem]", vexm(0x2C, 3, 1, 1, 0, W=1), mem=1)
+add("vcvtsi2ss x1,x2,[mem]", vexm(0x2A, 2, 1, 1, 2), mem=1); add("vcvtsi2sd x1,x2,[mem] (W1)", vexm(0x2A, 3, 1, 1, 2, W=1), mem=1)
+
+# legacy SSE encodings of the same operations
+for pre, nm in (([], "ucomiss"), ([0x66], "ucomisd")):
+    add(f"{nm} x1,x3", sse(pre, 0x2E, 1, 3), ALL); add(f"{nm[1:]} x1,x3", sse(pre, 0x2F, 1, 3), ALL)
+add("ucomiss x0,[mem]", ssem([], 0x2E, 0), ALL, mem=1)
+for op, nm in ((0x54,"andps"),(0x55,"andnps"),(0x56,"orps"),(0x57,"xorps"),(0x14,"unpcklps"),(0x15,"unpckhps")):
+    add(f"{nm} x1,x3", sse([], op, 1, 3)); add(f"{nm[:-2]}pd x1,x3", sse([0x66], op, 1, 3))
+for imm in range(8):
+    add(f"cmpps x1,x3,{imm}", sse([], 0xC2, 1, 3, imm)); add(f"cmpss x1,x3,{imm}", sse([0xF3], 0xC2, 1, 3, imm))
+add("cmpsd x0,[mem],2", ssem([0xF2], 0xC2, 0, 2), mem=1)
+add("shufps x1,x3,1b", sse([], 0xC6, 1, 3, 0x1B)); add("shufpd x1,x3,1", sse([0x66], 0xC6, 1, 3, 1))
+add("pshufd x1,x3,b1", sse([0x66], 0x70, 1, 3, 0xB1)); add("addsubps x1,x3", sse([0xF2], 0xD0, 1, 3))
+add("movd x1,ecx", sse([0x66], 0x6E, 1, 1)); add("movq x1,rcx", sse([0x66], 0x6E, 1, 1, rex=8))
+add("movd ecx,x1", sse([0x66], 0x7E, 1, 1)); add("movq rcx,x1", sse([0x66], 0x7E, 1, 1, rex=8))
+add("movq x1,x3 (f3 7e)", sse([0xF3], 0x7E, 1, 3)); add("movq x3<-x1 (66 d6)", sse([0x66], 0xD6, 1, 3))
+add("movq x0,[mem]", ssem([0xF3], 0x7E, 0), mem=1); add("movdqu x0,[mem]", ssem([0xF3], 0x6F, 0), mem=1)
+add("movdqa [mem],x0", ssem([0x66], 0x7F, 0), mem=1)
+add("movhlps x1,x3", sse([], 0x12, 1, 3)); add("movlhps x1,x3", sse([], 0x16, 1, 3))
+add("movlps x0,[mem]", ssem([], 0x12, 0), mem=1); add("movhps x0,[mem]", ssem([], 0x16, 0), mem=1)
+add("movhps [mem],x0", ssem([], 0x17, 0), mem=1)
+add("movsldup x1,x3", sse([0xF3], 0x12, 1, 3)); add("movshdup x1,x3", sse([0xF3], 0x16, 1, 3)); add("movddup x1,x3", sse([0xF2], 0x12, 1, 3))
+add("insertps x1,x3,9c", sse([0x66], [0x3A, 0x21], 1, 3, 0x9C)); add("blendps x1,x3,6", sse([0x66], [0x3A, 0x0C], 1, 3, 6))
+add("pextrd ecx,x1,3", sse([0x66], [0x3A, 0x16], 1, 1, 3)); add("pinsrq x1,rcx,1", sse([0x66], [0x3A, 0x22], 1, 1, 1, rex=8))
+add("cvtsi2ss x1,ecx", sse([0xF3], 0x2A, 1, 1)); add("cvtsi2sd x1,rcx", sse([0xF2], 0x2A, 1, 1, rex=8))
+add("cvtss2sd x1,x3", sse([0xF3], 0x5A, 1, 3)); add("cvtsd2ss x1,x3", sse([0xF2], 0x5A, 1, 3))
+add("cvttss2si ecx,[mem]", ssem([0xF3], 0x2C, 1), mem=1)
+add("addps x9,x12", sse([], 0x58, 9, 12)); add("mulss x15,x2", sse([0xF3], 0x59, 15, 2))
+add("paddd x1,x3", sse([0x66], 0xFE, 1, 3)); add("psubq x1,x3", sse([0x66], 0xFB, 1, 3)); add("pcmpeqd x1,x3", sse([0x66], 0x76, 1, 3))
+add("punpcklqdq x1,x3", sse([0x66], 0x6C, 1, 3)); add("pxor x1,x3", sse([0x66], 0xEF, 1, 3))
+
 with open("cases.h", "w") as f:
     f.write("// Generated by gen_cases.py -- shared by native.c and emu.cpp.\n#include <stdint.h>\n")
     f.write("struct Case { const char* name; uint8_t len; uint8_t bytes[15]; uint32_t fmask; int mem; int setup; };\n")

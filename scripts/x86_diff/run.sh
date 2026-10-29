@@ -17,7 +17,15 @@ clang++ -std=c++20 -O0 -I"$ROOT/include" -I"$HERE" "$HERE/emu.cpp" "$ROOT/build/
     -framework CoreAudio -framework AudioToolbox -framework GameController -o "$OUT/emu"
 arch -x86_64 "$OUT/native" > "$OUT/native.txt"
 "$OUT/emu" 2>/dev/null | grep -v '^#' | grep '^[0-9]' > "$OUT/interp.txt"
-"$OUT/emu" jit 2>/dev/null | grep -v '^#' | grep '^[0-9]' > "$OUT/jit.txt"
+"$OUT/emu" jit 2>/dev/null > "$OUT/jit_full.txt"
+grep -v '^#' "$OUT/jit_full.txt" | grep '^[0-9]' > "$OUT/jit.txt"
+# Which cases the JIT translated itself (the rest ran in the interpreter).
+python3 - "$HERE/cases.h" "$OUT/jit_full.txt" <<'PY'
+import re, sys
+names = re.findall(r'\{"([^"]*)", \d+,', open(sys.argv[1]).read())
+done = {int(m.group(1)) for m in re.finditer(r'^# jit (\d+) compiled', open(sys.argv[2]).read(), re.M)}
+print(f"JIT compiled {len(done)}/{len(names)} cases")
+PY
 status=0
 python3 "$HERE/compare.py" "$HERE/cases.h" "$OUT/native.txt" "$OUT/interp.txt" "$OUT/jit.txt" || status=1
 echo "outputs in $OUT"
