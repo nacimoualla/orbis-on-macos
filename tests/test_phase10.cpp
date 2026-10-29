@@ -8,6 +8,51 @@
 #include "ps4/pm4.hpp"
 #include "ps4/pm4_translator.hpp"
 
+using namespace ps4;
+
+void test_pm4_rejects_short_payload_without_state_change() {
+    Pm4Translator translator;
+    const u32 payload[] = {PA_CL_VPORT_XSCALE};
+    Pm4Packet packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_CONTEXT_REG, 1)),
+        .payload = {payload, payload + 1},
+    };
+    const GpuViewport before = translator.viewport();
+    assert(!translator.execute_packet(packet));
+    assert(translator.malformed_packet_count() == 1);
+    assert(translator.viewport().width == before.width);
+
+    const u32 draw_payload[] = {3};
+    Pm4Packet draw_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_DRAW_INDEX_2, 1)),
+        .payload = {draw_payload, draw_payload + 1},
+    };
+    assert(!translator.execute_packet(draw_packet));
+    assert(translator.malformed_packet_count() == 2);
+    assert(translator.indexed_draw_count() == 0);
+
+    const u32 unknown_payload[] = {0};
+    Pm4Packet unknown_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(0xFF, 1)),
+        .payload = {unknown_payload, unknown_payload + 1},
+    };
+    assert(!translator.execute_packet(unknown_packet));
+    assert(translator.unsupported_packet_count() == 1);
+
+    Pm4Packet mismatched_packet{
+        .header = decode_pm4_header(encode_pm4_type3_header(IT_SET_CONTEXT_REG, 2)),
+        .payload = {payload, payload + 1},
+    };
+    assert(!translator.execute_packet(mismatched_packet));
+    assert(translator.malformed_packet_count() == 3);
+}
+
+void test_shader_diagnostics_start_empty() {
+    Pm4Translator translator;
+    assert(translator.shader_fallback_count() == 0);
+    assert(translator.shader_status().find("cached_pipelines=0") != std::string::npos);
+}
+
 int main() {
     std::cout << "[PHASE 10] Starting PS4 PM4 GPU Command Processor & Ring Buffer tests...\n";
 
@@ -146,6 +191,7 @@ int main() {
         assert(metal.create_framebuffer(1920, 1080));
 
         ps4::Pm4Translator translator(&metal);
+        assert(translator.begin_frame());
 
         // Set clear color to Red (255, 0, 0, 255)
         // Word 0: R (0xFF) | G (0x00 << 8) = 0x00FF
@@ -173,11 +219,12 @@ int main() {
         draw_pkt.header.count = 2;
         draw_pkt.payload = {
             3, // vertex count
-            static_cast<ps4::u32>(ps4::PrimitiveType::TriangleList)
+            ps4::kDiSrcSelAutoIndex // draw initiator
         };
 
         assert(translator.execute_packet(draw_pkt));
         assert(translator.draw_count() == 1);
+        assert(translator.submit_frame(true));
 
         // Verify pixel readback from Metal framebuffer (should be cleared with Red)
         ps4::u8 r = 0, g = 0, b = 0, a = 0;
@@ -197,6 +244,7 @@ int main() {
 
         ps4::Pm4Translator translator(&metal);
         ps4::GpuRingBuffer ring(256);
+        assert(translator.begin_frame());
 
         // Push:
         // 1. CLEAR_STATE (takes 1 dummy DWORD in PM4)
@@ -211,7 +259,7 @@ int main() {
 
         // 3. DRAW_INDEX_AUTO
         assert(ring.write_type3_packet(ps4::IT_DRAW_INDEX_AUTO, {
-            6, static_cast<ps4::u32>(ps4::PrimitiveType::TriangleList)
+            6, ps4::kDiSrcSelAutoIndex
         }));
 
         // 4. EVENT_WRITE (Flush)
@@ -220,6 +268,7 @@ int main() {
         const ps4::usize executed = translator.execute_ring_buffer(ring);
         assert(executed == 4);
         assert(translator.draw_count() == 1);
+        assert(translator.submit_frame(true));
         assert(ring.available_dwords() == 0);
 
         // Read pixel to verify Blue clear
@@ -231,6 +280,8 @@ int main() {
         std::cout << "  ✓ Test 6: Full PM4 batch executed from ring buffer and verified on GPU\n";
     }
 
+    test_pm4_rejects_short_payload_without_state_change();
+    test_shader_diagnostics_start_empty();
     std::cout << "[PHASE 10] PASS: All PS4 PM4 GPU Command Processor & Ring Buffer tests passed!\n";
     return 0;
 }

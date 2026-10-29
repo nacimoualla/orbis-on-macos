@@ -1,0 +1,43 @@
+#include <string.h>
+struct State { uint8_t ymm[16][32]; uint64_t rax, rcx, rdx, rsi; uint8_t mem[16]; uint64_t flags; };
+static uint64_t rng_s;
+static uint64_t rnd(void){ rng_s ^= rng_s<<13; rng_s ^= rng_s>>7; rng_s ^= rng_s<<17; return rng_s; }
+static void fill(struct State* s, unsigned c, unsigned t){
+  rng_s = 0x9E3779B97F4A7C15ull ^ (c*7919u + t*104729u + 1);
+  for (int r=0;r<16;r++) for (int b=0;b<32;b+=8){ uint64_t v=rnd(); for(int k=0;k<8;k++) s->ymm[r][b+k]=(uint8_t)(v>>(8*k)); }
+  s->rax=rnd(); s->rcx=rnd(); s->rdx=rnd(); s->rsi=rnd()&0xff;
+  for(int k=0;k<16;k++) s->mem[k]=(uint8_t)rnd();
+  s->flags = (rnd() & 0x8D5) | 0x202;
+  // Small shift/rotate counts in cl are more interesting than random ones.
+  if (t & 1) s->rcx = (s->rcx & ~0xffull) | (rnd() % 70);
+  // Division inputs that cannot fault (#DE), per operand width.
+  if (kCases[c].setup) {
+    const char* n = kCases[c].name; int w = 64;
+    if (strstr(n, "div8")) w = 8; else if (strstr(n, "div16")) w = 16; else if (strstr(n, "div32")) w = 32;
+    uint64_t m = w == 64 ? ~0ull : ((1ull << w) - 1);
+    uint64_t d = (s->rcx & m) | 1; if (t & 2) d &= 0x7f;
+    if (kCases[c].setup == 2 && ((d >> (w - 1)) & 1)) d = (d >> 1) | 1;   // keep divisor positive
+    s->rcx = (s->rcx & ~m) | d;
+    if (w == 8) {   // dividend is AX: keep AH < divisor (unsigned) / small (signed)
+      uint64_t ax = s->rax & 0xffff; uint64_t hi = (ax >> 8) % (d & 0xff); if (kCases[c].setup == 2) hi = 0;
+      s->rax = (s->rax & ~0xffffull) | (hi << 8) | (ax & 0xff);
+    } else if (kCases[c].setup == 1) {
+      s->rdx = (s->rdx & ~m) | ((s->rdx & m) % d);
+    } else {        // signed: rdx = sign-extension of rax, so |quotient| fits
+      uint64_t sign = ((s->rax & m) >> (w - 1)) & 1;
+      s->rdx = (s->rdx & ~m) | (sign ? m : 0);
+    }
+  }
+  // Trials 4-5: ordinary floats in every 32-bit lane; 6-7: ordinary doubles.
+  if (t >= 4) for (int r=0;r<16;r++) {
+    if (t < 6) for (int k=0;k<8;k++){ float f=(float)((int)(rnd()%4001)-2000)/8.0f; memcpy(&s->ymm[r][4*k],&f,4); }
+    else for (int k=0;k<4;k++){ double d=(double)((int)(rnd()%4001)-2000)/8.0; memcpy(&s->ymm[r][8*k],&d,8); }
+  }
+}
+static void print_state(const struct State* s, unsigned c, unsigned t, int(*pr)(const char*,...)){
+  pr("%u.%u flags=%llx", c, t, (unsigned long long)(s->flags & kCases[c].fmask));
+  for (int r=0;r<16;r++){ pr(" y%d=",r); for(int b=31;b>=0;b--) pr("%02x",s->ymm[r][b]); }
+  pr(" rax=%llx rcx=%llx rdx=%llx rsi=%llx mem=", (unsigned long long)s->rax,(unsigned long long)s->rcx,(unsigned long long)s->rdx,(unsigned long long)s->rsi);
+  for(int k=0;k<16;k++) pr("%02x",s->mem[k]);
+  pr("\n");
+}

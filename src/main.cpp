@@ -1,14 +1,19 @@
 #include <chrono>
+#include <cstdlib>
+#include <cstdio>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <thread>
 #include "ps4/common.hpp"
 #include "ps4/cpu_context.hpp"
 #include "ps4/display_window.hpp"
+#include "ps4/pm4_translator.hpp"
 #include "ps4/dynamic_linker.hpp"
 #include "ps4/elf_loader.hpp"
 #include "ps4/executor.hpp"
 #include "ps4/jit_compiler.hpp"
+#include "ps4/jit_stats.hpp"
 #include "ps4/memory.hpp"
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
@@ -25,6 +30,11 @@ int main(int argc, char* argv[]) {
     bool enable_jit = true;
     bool enable_trace = false;
     bool enable_strict_hle = false;
+    bool budget_specified = false;
+    // Headless instruction budget. The default (100M) stops inside the guest's
+    // static-initializer phase, well before Unity's Mono bootstrap, so soak and
+    // smoke runs that need the Mono call census must raise it.
+    ps4::usize instruction_budget = 100000000;
     std::filesystem::path elf_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -39,11 +49,15 @@ int main(int argc, char* argv[]) {
             enable_trace = true;
         } else if (arg == "--strict-hle") {
             enable_strict_hle = true;
+        } else if (arg == "--budget" && i + 1 < argc) {
+            instruction_budget = std::strtoull(argv[++i], nullptr, 10);
+            budget_specified = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: ps4-runner [options] <path-to-eboot.bin-or-elf>\n";
             std::cout << "Options:\n";
             std::cout << "  --window, -w     Open interactive macOS display window (60 FPS)\n";
             std::cout << "  --headless       Run headlessly in console only (default)\n";
+            std::cout << "  --budget N       Headless instruction budget (default 100000000, 0 = unlimited)\n";
             std::cout << "  --no-jit         Disable ARM64 JIT dynamic recompiler (interpreter only)\n";
             std::cout << "  --trace, -t      Trace guest instruction execution step-by-step\n";
             std::cout << "  --strict-hle     Fail-loud strict HLE development mode (crash on missing NIDs)\n";
@@ -51,6 +65,10 @@ int main(int argc, char* argv[]) {
         } else {
             elf_path = argv[i];
         }
+    }
+
+    if (enable_window && !budget_specified) {
+        instruction_budget = 0; // Interactive windowed mode runs indefinitely until window is closed
     }
 
     if (elf_path.empty()) {
@@ -120,6 +138,16 @@ int main(int argc, char* argv[]) {
     nid_registry.register_default_libraries();
 
     ps4::DynamicLinker linker(memory, syscalls, nid_registry);
+    // State up front which module-loading mode this run will use, so a log can
+    // never be ambiguous about whether Mono actually executed.
+    {
+        const char* prx = std::getenv("PS4_LOAD_PRX");
+        std::fprintf(stderr, "[prx] mode=%s\n", (prx && prx[0] && std::strcmp(prx, "0") != 0) ? "real" : "hle");
+    }
+    // Hand the linker to HLE handlers: sceKernelLoadStartModule needs it to map
+    // PRX modules for real, and the trampoline dispatcher it owns is what makes
+    // those modules' exports take over from our stubs.
+    ps4::set_active_linker(&linker);
     if (enable_strict_hle) {
         linker.set_strict_hle(true);
         std::cout << "[Linker] Strict HLE mode ENABLED (fail-loud diagnostic crash on missing NIDs)\n";
@@ -175,6 +203,23 @@ int main(int argc, char* argv[]) {
     // Creating overload: the manager may not exist yet (first HLE dispatch
     // creates it lazily), and the no-arg accessor would return null here.
     nid_registry.thread_manager(memory).set_main_context(&cpu.context());
+    // Optional single-address write-watch, for chasing a specific clobber:
+    // PS4_WATCH_ADDR=0x1ffffac40 ./ps4-runner ... reports the first store to that
+    // guest address together with the RIP and TID that made it.
+    if (const char* w = std::getenv("PS4_WATCH_ADDR")) {
+        // The canary slot is NOT deterministic across runs -- it lands wherever
+        // main's frame happens to be -- so allow a range and filter afterwards.
+        const std::size_t wsz = std::getenv("PS4_WATCH_SIZE")
+                              ? std::strtoull(std::getenv("PS4_WATCH_SIZE"), nullptr, 0)
+                              : 8;
+        // base 0: "0x..." is hex, a bare "123" is decimal. Printing the parsed
+        // value matters because a bare decimal string for a module address is a
+        // silently wrong watch (160246468 == 0x98d2ac4, not 0x160246468).
+        const ps4::GuestAddr waddr = std::strtoull(w, nullptr, 0);
+        std::fprintf(stderr, "[watch] PS4_WATCH_ADDR=\"%s\" parsed as 0x%llx (base 0)\n",
+                     w, (unsigned long long)waddr);
+        ps4::set_write_watch(waddr, static_cast<ps4::usize>(wsz));
+    }
     if (enable_jit) {
         cpu.set_jit_compiler(&jit);
         nid_registry.set_jit_compiler(&jit);
@@ -192,6 +237,10 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n================= Guest Execution Output =================\n";
     ps4::RunResult run_res{};
+    // Main does not run through ThreadManager's worker lambda, so t_guest_tid
+    // was never published for it and the write-watch reported main as TID=0.
+    // Publish it here: main is guest TID 1.
+    ps4::t_guest_tid = 1;
     ps4::usize total_instructions = 0;
 
     if (enable_trace) {
@@ -214,29 +263,85 @@ int main(int argc, char* argv[]) {
     if (!syscalls.has_exited() &&
         (run_res.status == ps4::StepResult::Ok || run_res.status == ps4::StepResult::Syscall)) {
         if (window && window->is_open()) {
-            // Interactive 60 FPS Presentation Loop:
+            // Interactive Presentation Loop:
             // Run guest execution batches each frame, pump user input events, and present via Metal
             const ps4::usize frame_slice = 2000000;
-            while (window->is_open() && !syscalls.has_exited()) {
+            auto t_start = std::chrono::steady_clock::now();
+            auto t_last = t_start;
+            ps4::usize instrs_last = 0;
+            constexpr auto frame_period = std::chrono::microseconds(16667);
+            auto next_deadline = std::chrono::steady_clock::now();
+            while (window->is_open() && !syscalls.has_exited() && (instruction_budget == 0 || total_instructions < instruction_budget)) {
+                next_deadline += frame_period;
                 window->poll_events();
                 nid_registry.set_pad_buttons(window->input_buttons());
 
+                ps4::Pm4Translator* gpu = nid_registry.gpu_translator();
+                if (gpu && !gpu->begin_frame()) {
+                    std::cerr << "[GPU] Failed to begin translator frame; stopping guest execution.\n";
+                    run_res.status = ps4::StepResult::MemoryFault;
+                    break;
+                }
                 run_res = cpu.run(frame_slice);
                 total_instructions += run_res.instructions_executed;
+                if (gpu) {
+                    const bool submitted = gpu->submit_frame(false);
+                    if (!submitted) {
+                        std::cerr << "[GPU] Failed to submit translator frame; stopping guest execution.\n";
+                        if (run_res.status == ps4::StepResult::Ok ||
+                            run_res.status == ps4::StepResult::Syscall) {
+                            run_res.status = ps4::StepResult::MemoryFault;
+                        }
+                    }
+                }
                 if (run_res.status != ps4::StepResult::Ok) break;
 
-                window->present_frame();
-                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                const auto now = std::chrono::steady_clock::now();
+                const double dt = std::chrono::duration<double>(now - t_last).count();
+                const double dt_total = std::chrono::duration<double>(now - t_start).count();
+                const double cur_mips = (dt > 0.0) ? ((total_instructions - instrs_last) / dt / 1e6) : 0.0;
+                const double avg_mips = (dt_total > 0.0) ? (total_instructions / dt_total / 1e6) : 0.0;
+                instrs_last = total_instructions;
+                t_last = now;
+
+                std::cout << "[CPU Progress] " << total_instructions << " instrs ("
+                          << std::fixed << std::setprecision(1) << cur_mips << " M instr/s, avg "
+                          << avg_mips << " M instr/s), RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n" << std::flush;
+
+                if (nid_registry.get_flip_count() > 0) {
+                    window->present_frame();
+                }
+
+                const auto deadline_now = std::chrono::steady_clock::now();
+                if (deadline_now > next_deadline + frame_period * 2) {
+                    next_deadline = deadline_now;
+                } else {
+                    std::this_thread::sleep_until(next_deadline);
+                }
             }
         } else {
             // Console / Headless Execution Loop
             const ps4::usize batch = 1000000;
-            const ps4::usize max_total = 100000000;
-            while (total_instructions < max_total && !syscalls.has_exited()) {
+            const ps4::usize max_total = instruction_budget;
+            auto t_start = std::chrono::steady_clock::now();
+            auto t_last = t_start;
+            ps4::usize instrs_last = 0;
+            while ((max_total == 0 || total_instructions < max_total) && !syscalls.has_exited()) {
                 run_res = cpu.run(batch);
                 total_instructions += run_res.instructions_executed;
                 if (run_res.status != ps4::StepResult::Ok) break;
-                std::cout << "[CPU Progress] " << total_instructions << " instrs, RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n";
+
+                const auto now = std::chrono::steady_clock::now();
+                const double dt = std::chrono::duration<double>(now - t_last).count();
+                const double dt_total = std::chrono::duration<double>(now - t_start).count();
+                const double cur_mips = (dt > 0.0) ? ((total_instructions - instrs_last) / dt / 1e6) : 0.0;
+                const double avg_mips = (dt_total > 0.0) ? (total_instructions / dt_total / 1e6) : 0.0;
+                instrs_last = total_instructions;
+                t_last = now;
+
+                std::cout << "[CPU Progress] " << total_instructions << " instrs ("
+                          << std::fixed << std::setprecision(1) << cur_mips << " M instr/s, avg "
+                          << avg_mips << " M instr/s), RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n" << std::flush;
             }
         }
     }
@@ -244,6 +349,46 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[CPU] Execution Status: " << ps4::step_result_to_string(run_res.status) << "\n";
     std::cout << "[CPU] Instructions Executed: " << total_instructions << "\n";
+    // Dump an armed write-watch here too, not only on fault. A run that ends on
+    // the instruction budget reports "executed successfully" and never reaches
+    // the fault handler, so the ring would otherwise be silently discarded --
+    // which is exactly the case where you want to know whether the watched slot
+    // was written at all.
+    if (ps4::write_watch_addr() != 0) {
+        const char* wf = std::getenv("PS4_WATCH_FILTER");
+        ps4::dump_write_watch_ring(wf ? std::strtoull(wf, nullptr, 0)
+                                      : ps4::write_watch_addr(), &memory);
+    }
+    std::fprintf(stderr, "[map] final table at run exit:\n");
+    // PS4_DUMP_CODE=<guest_addr>:<len> writes raw loaded guest bytes to a file.
+    // The SELF's phdr.p_offset values are stale and non-uniform, so llvm-objdump
+    // on the extracted inner ELF maps addresses differently from the runtime.
+    // Dumping what the emulator actually mapped is the only way to disassemble
+    // the image the guest really executed.
+    if (const char* dc = std::getenv("PS4_DUMP_CODE")) {
+        unsigned long long base = 0, len = 0;
+        if (std::sscanf(dc, "%llx:%llx", &base, &len) == 2 && len > 0 && len < (1u << 22)) {
+            std::vector<ps4::u8> buf(static_cast<size_t>(len));
+            if (memory.read_bytes(static_cast<ps4::GuestAddr>(base), buf.data(), buf.size())) {
+                char path[256];
+                std::snprintf(path, sizeof(path), "dump_code_%llx.bin", base);
+                std::FILE* f = std::fopen(path, "wb");
+                if (f) {
+                    std::fwrite(buf.data(), 1, buf.size(), f);
+                    std::fclose(f);
+                    std::fprintf(stderr, "[dumpcode] %llu bytes @ 0x%llx -> %s\n",
+                                 len, base, path);
+                }
+            } else {
+                std::fprintf(stderr, "[dumpcode] read FAILED at 0x%llx\n", base);
+            }
+        }
+    }
+    memory.dump_mappings();
+    ps4::dump_rip_histogram();
+    ps4::dump_hle_histogram();
+    ps4::dump_export_tables();
+    ps4::dump_prx_calls();
     if (enable_jit && jit.cached_block_count() > 0) {
         std::cout << "[CPU] JIT Blocks Cached: " << jit.cached_block_count()
                   << " | Total Invocations: " << jit.total_invocations() << "\n";
@@ -273,6 +418,9 @@ int main(int argc, char* argv[]) {
 
     // Join all guest pthreads before local MemoryManager, SyscallTable, and JitCompiler go out of scope
     nid_registry.shutdown();
+
+    // PS4_JIT_STATS: JIT coverage telemetry (scripts/jit_coverage.py)
+    ps4::write_jit_stats();
 
     return 0;
 }

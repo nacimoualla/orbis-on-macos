@@ -7,7 +7,34 @@
 namespace ps4 {
 
 /// CPU execution register context for x86_64 architecture
+// x87 state. Separate from the GPRs because the stack is 80-bit, which no
+// native register type holds exactly.
+//
+// cw defaults to 0x037F per the Intel SDM: precision control = extended (11),
+// rounding = nearest-even (10), all exception masks set (1111).
+struct X87State {
+    static constexpr u16 kDefaultControlWord = 0x037F;
+
+    u16 cw{kDefaultControlWord};
+    u16 sw{0};
+    u64 st[8]{};   // 80-bit values, stored in the low 64 bits with explicit exponent
+    u16 tag[8]{};  // 0 = valid, non-zero = empty/unused
+    u8  top{0};
+    u16 se_st[8]{};  // sign+exponent word for each stack slot
+
+    [[nodiscard]] bool empty(int i) const noexcept { return tag[i] != 0; }
+
+    void push(u64 mantissa, u16 se) noexcept {
+        top = static_cast<u8>((top - 1) & 7);
+        st[top] = mantissa;
+        se_st[top] = se;
+        tag[top] = 0;
+    }
+};
+
 struct CpuContext {
+    X87State fpu;
+
     // 64-bit General-Purpose Registers (SysV ABI / Orbis OS)
     Reg64 rax{0};
     Reg64 rbx{0};
@@ -53,6 +80,45 @@ struct CpuContext {
         else rflags &= ~flag;
     }
 
+    void update_flags_logic(u64 result, usize bits) noexcept {
+        const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+        const u64 masked = result & mask;
+        set_flag(FLAG_CF, false);
+        set_flag(FLAG_OF, false);
+        set_flag(FLAG_ZF, (masked == 0));
+        set_flag(FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
+        const u64 sign_bit = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
+        set_flag(FLAG_SF, (masked & sign_bit) != 0);
+    }
+
+    void update_flags_add(u64 a, u64 b, u64 result, usize bits) noexcept {
+        const u64 sign_mask = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
+        const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+        const u64 masked = result & mask;
+        set_flag(FLAG_ZF, (masked == 0));
+        set_flag(FLAG_SF, (masked & sign_mask) != 0);
+        set_flag(FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
+        set_flag(FLAG_CF, masked < (a & mask));
+        const bool a_sign = (a & sign_mask) != 0;
+        const bool b_sign = (b & sign_mask) != 0;
+        const bool res_sign = (masked & sign_mask) != 0;
+        set_flag(FLAG_OF, (a_sign == b_sign) && (a_sign != res_sign));
+    }
+
+    void update_flags_sub(u64 a, u64 b, u64 result, usize bits) noexcept {
+        const u64 sign_mask = (bits == 64) ? (1ULL << 63) : (bits == 32) ? (1ULL << 31) : (bits == 16) ? (1ULL << 15) : (1ULL << 7);
+        const u64 mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+        const u64 masked = result & mask;
+        set_flag(FLAG_ZF, (masked == 0));
+        set_flag(FLAG_SF, (masked & sign_mask) != 0);
+        set_flag(FLAG_PF, __builtin_parity(static_cast<u8>(masked & 0xFF)) == 0);
+        set_flag(FLAG_CF, (a & mask) < (b & mask));
+        const bool a_sign = (a & sign_mask) != 0;
+        const bool b_sign = (b & sign_mask) != 0;
+        const bool res_sign = (masked & sign_mask) != 0;
+        set_flag(FLAG_OF, (a_sign != b_sign) && (a_sign != res_sign));
+    }
+
     // Segment base registers (for TLS emulation)
     Reg64 fs_base{0};
     Reg64 gs_base{0};
@@ -70,6 +136,11 @@ struct CpuContext {
         YmmReg() : q{0, 0, 0, 0} {}
     };
     YmmReg ymm[16]{};
+
+    // SSE control/status. Rounding and exception masks are not applied to
+    // host arithmetic; the value round-trips through LDMXCSR/STMXCSR so guest
+    // save/restore code sees what it stored (default: all masked, RN).
+    u32 mxcsr{0x1F80};
 
     void reset() noexcept {
         *this = CpuContext{};

@@ -45,6 +45,30 @@ public:
     /// Submit clear-screen render pass and wait for completion
     bool clear_screen(ColorRGBA color);
 
+    /// Begin recording a frame for deferred submission
+    bool begin_frame();
+
+    /// Encode a clear operation into the active frame
+    bool encode_clear(ColorRGBA color);
+
+    /// Submit the active frame, optionally waiting for completion
+    bool submit_frame(bool wait_for_completion);
+    /// Ensure the active frame has a render encoder, clearing only on its first pass.
+    bool ensure_render_encoder(bool clear, ColorRGBA color);
+    /// Return the active render encoder as an opaque Objective-C pointer.
+    [[nodiscard]] void* active_render_encoder() const noexcept;
+    /// End the active render encoder without submitting the frame.
+    void end_render_encoder();
+
+    /// Wait for the most recently submitted frame when it is incomplete
+    bool wait_for_last_frame();
+
+    /// Whether a frame is currently being recorded
+    [[nodiscard]] bool frame_in_progress() const noexcept;
+
+    /// Number of frames submitted since initialization
+    [[nodiscard]] u64 submitted_frame_count() const noexcept;
+
     /// Read back pixel value at (x, y) into 8-bit RGBA channels
     bool read_pixel(u32 x, u32 y, u8& out_r, u8& out_g, u8& out_b, u8& out_a) const;
 

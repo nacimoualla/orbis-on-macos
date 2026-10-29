@@ -24,6 +24,19 @@ enum class MemoryError {
 
 std::string_view memory_error_to_string(MemoryError error);
 
+// A guest address range claimed by some owner: a module segment, the loader's
+// arena, thread stacks, the HLE trampoline pool.
+//
+// Registered ranges are checked for intersection before anything is written
+// into them. A silent overlap is the worst failure mode available here: it
+// produces a GOT that reads as arbitrary bytes rather than an address, and the
+// symptom surfaces thousands of instructions later at an unrelated fault.
+struct GuestMapping {
+    GuestAddr start{0};
+    GuestAddr size{0};
+    std::string owner;
+};
+
 class MemoryManager {
 public:
     MemoryManager();
@@ -133,11 +146,58 @@ public:
         return memory_error_to_string(m_last_error);
     }
 
+    /// Claim [addr, addr+size) for \p owner. Returns false and reports both
+    /// ranges and both owners if the range intersects an existing mapping.
+    [[nodiscard]] bool reserve_mapping(GuestAddr addr, GuestAddr size, std::string_view owner);
+
+    /// Release a mapping previously claimed by reserve_mapping().
+    void release_mapping(GuestAddr addr);
+
+    /// Every registered mapping, ordered by start address.
+    [[nodiscard]] std::vector<GuestMapping> mappings() const;
+
+    /// Print the mapping table to stderr.
+    void dump_mappings() const;
+
 private:
     u8* m_base{nullptr};
     GuestSize m_total_size{GUEST_MEMORY_SIZE};
     MemoryError m_last_error{MemoryError::None};
     std::unordered_map<u64, u32> m_page_flags;
+    std::vector<GuestMapping> m_mappings;
 };
+
+// Write-watch: arm a guest address range so every store overlapping it is
+// recorded with the guest context responsible. Lives on MemoryManager's write
+// path, not in the executor, so HLE handlers' own stores are caught too.
+struct WatchHit {
+    GuestAddr rip;      // instruction-start RIP of the writing instruction
+    GuestAddr rsp;      // guest rsp at instruction start
+    GuestAddr rbp;      // guest rbp at instruction start
+    GuestAddr rbx;      // guest rbx at instruction start (the job object)
+    int tid;
+    bool from_hle;      // store came from HLE handler code, not the decoder
+    GuestAddr guest_addr;  // start of the store
+    usize size;            // length of the store
+    GuestAddr sample_addr; // first byte of the store/watch overlap (see write_bytes)
+    u64 old_value;         // 8 bytes at sample_addr before the store
+    u64 new_value;         // same 8 bytes after; only `min(overlap,8)` are meaningful
+};
+
+void set_write_watch(GuestAddr addr, usize size = 8);
+
+// The armed watch range, so dump sites can filter on what the operator actually
+// asked for instead of a hardcoded address left over from an earlier chase.
+GuestAddr write_watch_addr() noexcept;
+GuestAddr write_watch_end() noexcept;
+void dump_write_watch_ring(u64 filter_addr = 0, const MemoryManager* mem = nullptr);
+
+// Published per guest thread by the executor; read by the write-watch.
+extern thread_local GuestAddr t_guest_rip;
+extern thread_local GuestAddr t_guest_rsp;
+extern thread_local GuestAddr t_guest_rbp;
+extern thread_local GuestAddr t_guest_rbx;
+extern thread_local int t_guest_tid;
+extern thread_local bool t_guest_in_hle;
 
 } // namespace ps4

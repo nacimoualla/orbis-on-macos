@@ -3,6 +3,33 @@
 #include "ps4/common.hpp"
 #include <string_view>
 
+// Linux's <sys/syscall.h> defines SYS_* as macros with Linux numbers, which
+// would silently replace the Orbis constants below. Include it first and drop
+// those macros (only the Linux/QEMU CPU test harness hits this).
+#if defined(__linux__)
+#include <sys/syscall.h>
+#undef SYS_exit
+#undef SYS_fork
+#undef SYS_read
+#undef SYS_write
+#undef SYS_open
+#undef SYS_close
+#undef SYS_wait4
+#undef SYS_getpid
+#undef SYS_munmap
+#undef SYS_mprotect
+#undef SYS_gettimeofday
+#undef SYS_fstat
+#undef SYS_clock_gettime
+#undef SYS_nanosleep
+#undef SYS_mmap
+#undef SYS_lseek
+#undef SYS_dynlib_dlsym
+#undef SYS_dynlib_get_list
+#undef SYS_dynlib_load_prx
+#undef SYS_dynlib_unload_prx
+#endif
+
 namespace ps4 {
 
 // Orbis OS / FreeBSD 9 Standard System Call Numbers

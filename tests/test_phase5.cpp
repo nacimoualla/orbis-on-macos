@@ -17,6 +17,62 @@ int main() {
     syscalls.register_default_handlers();
     syscalls.set_terminate_on_exit(false);
 
+    // VHADDPS xmm0, xmm1, xmm2 (VEX.128.F2.0F 7C /r)
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x403000ULL;
+        const ps4::u8 code[] = {0xC5, 0xF3, 0x7C, 0xC2, 0xF4};
+        assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        cpu.context().ymm[1].f[0] = 1.0f;
+        cpu.context().ymm[1].f[1] = 2.0f;
+        cpu.context().ymm[1].f[2] = 3.0f;
+        cpu.context().ymm[1].f[3] = 4.0f;
+        cpu.context().ymm[2].f[0] = 5.0f;
+        cpu.context().ymm[2].f[1] = 6.0f;
+        cpu.context().ymm[2].f[2] = 7.0f;
+        cpu.context().ymm[2].f[3] = 8.0f;
+        cpu.set_entry_point(code_addr);
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().ymm[0].f[0] == 3.0f);
+        assert(cpu.context().ymm[0].f[1] == 7.0f);
+        assert(cpu.context().ymm[0].f[2] == 11.0f);
+        assert(cpu.context().ymm[0].f[3] == 15.0f);
+        std::cout << "  ✓ VHADDPS VEX map=1 opcode 0x7c verified\n";
+    }
+
+    // VMOVLPS m64, xmm1 (VEX.128.0F 13 /r).  The VEX.vvvv field is reserved
+    // and VEX.L=1 is invalid for this 64-bit store form.
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x403100ULL;
+        const ps4::GuestAddr data_addr = 0x600000ULL;
+        const ps4::u8 code[] = {
+            0xC5, 0xF8, 0x13, 0x08, // vmovlps [rax], xmm1
+            0xF4
+        };
+        assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        cpu.context().rax = data_addr;
+        cpu.context().ymm[1].q[0] = 0x1122334455667788ULL;
+        cpu.context().ymm[1].q[1] = 0xAABBCCDDEEFF0011ULL;
+        assert(memory.write_value(data_addr, 0xDEADBEEFDEADBEEFULL));
+        cpu.set_entry_point(code_addr);
+        assert(cpu.step() == ps4::StepResult::Ok);
+        ps4::u64 stored = 0;
+        assert(memory.read_value(data_addr, stored));
+        assert(stored == 0x1122334455667788ULL);
+
+        const ps4::GuestAddr invalid_rip = cpu.context().rip;
+        const ps4::u8 invalid_256[] = {
+            0xC5, 0xFC, 0x13, 0x08 // VEX.L=1: invalid VMOVLPS encoding
+        };
+        assert(memory.write_bytes(invalid_rip, invalid_256, sizeof(invalid_256)));
+        assert(cpu.step() == ps4::StepResult::IllegalInstruction);
+        assert(cpu.context().rip == invalid_rip);
+        assert(memory.read_value(data_addr, stored));
+        assert(stored == 0x1122334455667788ULL);
+        std::cout << "  ✓ VMOVLPS VEX map=1 opcode 0x13 128-bit store and 256-bit rejection verified\n";
+    }
+
     // Test 1: Stack initialization
     {
         ps4::CpuExecutor cpu(memory, syscalls);
@@ -376,6 +432,76 @@ int main() {
         assert(read_back == test_val);
     }
 
+    // Test 11: VPCMPEQD and VINSERTF128 (all-ones mask generation)
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x403000ULL;
+        std::vector<ps4::u8> code = {
+            // vpcmpeqd xmm0, xmm0, xmm0 (C5 F9 76 C0)
+            0xC5, 0xF9, 0x76, 0xC0,
+            // vinsertf128 ymm1, ymm0, xmm0, 1 (C4 E3 7D 18 C8 01)
+            0xC4, 0xE3, 0x7D, 0x18, 0xC8, 0x01,
+            // hlt
+            0xF4
+        };
+        assert(memory.write_bytes(code_addr, code.data(), code.size()));
+        cpu.set_entry_point(code_addr);
+
+        ps4::RunResult res = cpu.run();
+        assert(res.status == ps4::StepResult::Halted);
+        // All 4 dwords of xmm0 should be 0xFFFFFFFF
+        for (int i = 0; i < 4; ++i) {
+            assert(cpu.context().ymm[0].d[i] == 0xFFFFFFFFU);
+        }
+        assert(cpu.context().ymm[0].q[2] == 0);
+        assert(cpu.context().ymm[0].q[3] == 0);
+        // All 8 dwords of ymm1 should be 0xFFFFFFFF
+        for (int i = 0; i < 8; ++i) {
+            assert(cpu.context().ymm[1].d[i] == 0xFFFFFFFFU);
+        }
+        std::cout << "  ✓ Test 11: VPCMPEQD and VINSERTF128 all-ones mask verified\n";
+    }
+
+    // Test 12: VPACKSSDW signed saturation and unsupported SIMD failure.
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x409000ULL;
+        const ps4::u8 code[] = {
+            // VPACKSSDW xmm0, xmm1, xmm1
+            0xC5, 0xF1, 0x6B, 0xC1,
+            // VPACKUSWB xmm2, xmm0, xmm0: unsigned saturation of those words
+            0xC5, 0xF9, 0x67, 0xD0,
+            // VPSADBW is still unimplemented and must fail explicitly.
+            0xC5, 0xF9, 0xF6, 0xC0
+        };
+        assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        cpu.context().ymm[1].d[0] = 0x00010000U;
+        cpu.context().ymm[1].d[1] = 0xFFFFFFFFU;
+        cpu.context().ymm[1].d[2] = 0x00000002U;
+        cpu.context().ymm[1].d[3] = 0x80000000U;
+        cpu.set_entry_point(code_addr);
+
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().ymm[0].w[0] == 0x7FFF);
+        assert(cpu.context().ymm[0].w[1] == 0xFFFF);
+        assert(cpu.context().ymm[0].w[2] == 2);
+        assert(cpu.context().ymm[0].w[3] == 0x8000);
+        assert(cpu.context().ymm[0].w[4] == 0x7FFF);
+        assert(cpu.context().ymm[0].w[5] == 0xFFFF);
+        assert(cpu.context().ymm[0].w[6] == 2);
+        assert(cpu.context().ymm[0].w[7] == 0x8000);
+
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().ymm[2].b[0] == 0xFF && cpu.context().ymm[2].b[1] == 0 &&
+               cpu.context().ymm[2].b[2] == 2 && cpu.context().ymm[2].b[3] == 0);
+        assert(cpu.context().ymm[2].b[8] == 0xFF && cpu.context().ymm[2].q[2] == 0);
+
+        const ps4::GuestAddr unsupported_rip = cpu.context().rip;
+        assert(cpu.step() == ps4::StepResult::IllegalInstruction);
+        assert(cpu.context().rip == unsupported_rip);
+
+        std::cout << "  ✓ Test 12: VPACKSSDW, VPACKUSWB and unsupported VEX handling verified\n";
+    }
 
     std::cout << "[PHASE 5] PASS: All CPU Execution and Instruction Dispatch tests passed!\n";
     return 0;

@@ -45,6 +45,11 @@ struct SceKernelEvent {
     u64 udata{0};
 };
 
+// Orbis kqueue filters (SceKernelEvent::filter).
+constexpr i16 kEvFiltUser = -11;         // SCE_KERNEL_EVFILT_USER
+constexpr i16 kEvFiltVideoOut = -13;     // SCE_KERNEL_EVFILT_VIDEO_OUT
+constexpr i16 kEvFiltGraphicsCore = -14; // SCE_KERNEL_EVFILT_GRAPHICS_CORE
+
 struct Equeue {
     u32 id{0};
     std::string name{"equeue"};
@@ -71,6 +76,12 @@ struct GuestThread {
     std::atomic<u64> hle_calls{0};     // HLE dispatches on this thread
     std::atomic<bool> in_hle{false};   // inside a handler right now
     std::atomic<u64> last_nid{0};      // most recent HLE NID
+    // Return address of the call currently being serviced. live_context is only
+    // published at quantum boundaries, so a thread blocked inside a handler has
+    // live_context == nullptr and the dump would otherwise print the entry
+    // context -- making a thread that ran 1,400 instructions look like it never
+    // left its entry point. This pair disambiguates "blocked in HLE" from that.
+    std::atomic<GuestAddr> hle_caller_rip{0};
     // Worker's live executor context, set after each quantum copy-in and
     // cleared on thread exit. Read by the watchdog without locking; atomicity
     // only (tearing documented) — never dereference past thread exit.
@@ -78,7 +89,15 @@ struct GuestThread {
     std::thread host_thread;
     CpuContext context{};
     std::atomic<u64> instructions_executed{0};
+    // Guest exceptions raised at this thread (sceKernelRaiseException),
+    // delivered on its own host thread by ThreadManager::deliver_pending_exceptions.
+    std::mutex pending_signals_mtx;
+    std::vector<int> pending_signals;
+    std::atomic<bool> has_pending_signals{false};
+    bool delivering_signal{false}; // owning host thread only
 };
+
+class CpuExecutor;
 
 class SyscallTable;
 class JitCompiler;
@@ -137,12 +156,26 @@ public:
 
     /// Get pointer to current thread
     [[nodiscard]] GuestThread* current_thread();
+    [[nodiscard]] static GuestThread* current_guest_thread() noexcept;
 
     /// Get pointer to thread by ID
     [[nodiscard]] GuestThread* get_thread(ScePthreadId id);
 
     /// Set current thread's return value and mark terminated
     void exit_current_thread(u64 return_val);
+
+    // --- Guest exceptions (sceKernelInstallExceptionHandler / RaiseException)
+    // Delivery is asynchronous, like a signal: the target thread runs the
+    // handler on its own stack at its next delivery point -- between execution
+    // quanta, or inside a blocking HLE wait -- then resumes where it was.
+    void install_exception_handler(int signum, GuestAddr handler);
+    /// Address of an HLT the handler returns to (end of delivery).
+    void set_exception_return_sentinel(GuestAddr hlt_addr) noexcept { m_exc_sentinel = hlt_addr; }
+    /// Queue `signum` for thread `tid`. Returns false if no such live thread.
+    bool raise_exception(ScePthreadId tid, int signum);
+    /// Run the calling thread's pending handlers on `ex`. Safe to call with no
+    /// locks held from a wait loop; a no-op when nothing is pending.
+    void deliver_pending_exceptions(CpuExecutor& ex);
 
     /// Total number of active threads
     [[nodiscard]] usize active_thread_count() const;
@@ -166,6 +199,7 @@ public:
 
     // Mutex management
     u32 mutex_create(std::string_view name = "mutex");
+    bool mutex_exists(u32 mutex_id);
     bool mutex_lock(u32 mutex_id);
     bool mutex_trylock(u32 mutex_id);
     bool mutex_unlock(u32 mutex_id);
@@ -186,7 +220,6 @@ public:
                      u64 timeout_usec = 0, bool has_timeout = false);
     bool equeue_trigger_user_event(u32 eq_id, i32 event_id, u64 udata);
     bool equeue_signal(u32 eq_id, const SceKernelEvent& ev);
-    void signal_flip_event(i64 flip_arg = 0);
 
 private:
     void dump_stall_snapshot(const char* tag) const;
@@ -198,6 +231,10 @@ private:
     mutable std::mutex m_threads_mutex;
     std::unordered_map<ScePthreadId, std::unique_ptr<GuestThread>> m_threads;
     ScePthreadId m_next_thread_id{1};
+
+    std::mutex m_exc_mutex;
+    std::unordered_map<int, GuestAddr> m_exc_handlers;
+    GuestAddr m_exc_sentinel{0};
 
     // Stacks allocated from high guest memory downward
     GuestAddr m_next_stack_top{0x1D0000000ULL};

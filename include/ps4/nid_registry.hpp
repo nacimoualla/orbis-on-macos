@@ -41,7 +41,7 @@ public:
 
     /// HLE dispatch accounting for the stall watchdog. Const: touches only
     /// globals and thread entries, never the registry itself.
-    void note_hle_dispatch(Nid nid) const;
+    void note_hle_dispatch(Nid nid, GuestAddr caller_rip = 0) const;
     void note_hle_return() const;
 
     /// Total count of registered symbols
@@ -68,6 +68,12 @@ public:
 
     /// Set pad digital buttons bitmask (e.g. from keyboard/mouse input)
     void set_pad_buttons(u32 buttons);
+
+    /// Get total number of video flips performed
+    [[nodiscard]] u64 get_flip_count() const noexcept;
+
+    /// Return the translator used by the registered GNM handlers.
+    [[nodiscard]] class Pm4Translator* gpu_translator() const noexcept;
 
 private:
     std::unordered_map<Nid, HleSymbol> m_symbols_by_nid;

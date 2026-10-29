@@ -1,108 +1,142 @@
 #!/usr/bin/env python3
-"""Local NID cracker: hash every string in the game binaries against target NIDs.
+"""Targeted NID cracker: Mono/IL2CPP combinatorics + POSIX/SCE candidates +
+C identifiers mined from guest binaries, checked big- and little-endian.
 
-Sony NID = first 8 bytes of SHA1(symbol_name + salt), little-endian uint64.
-Sources: eboot.bin, mono-ps4.prx, MonoAssembliesPS4.prx (+ builtin candidate
-names for mono/sce APIs not present as strings).
+The log prints NIDs as little-endian uint64 (int.from_bytes(digest[:8]).
+'LE' hits are the live ones; BE is a safety net in case a trace hex was
+recorded big-endian.
 
 Usage:
     python3 scripts/crack_nids.py
-
-To chase new unknowns, add their NIDs to TARGETS below (and extend EXTRA with
-guessed API names from the relevant subsystem).
+    # chase new unknowns: add their trace hex to TARGETS (either endianness)
 """
+import glob
 import hashlib
+import itertools
+import os
 import re
 import sys
 from pathlib import Path
 
-KEY = bytes.fromhex("518d64a635ded8c1e6b039b1c3e55230")
+SALT = bytes.fromhex("518D64A635DED8C1E6B039B1C3E55230")
 
-# Sanity anchors (must hold or the formula is wrong):
-#   mono_jit_init_version -> 0x9b795b57a3b5e063
-#   sceSysmoduleLoadModule -> 0x83c70cdfd11467aa
-
+# trace-hex -> call-site notes
 TARGETS = {
-    0x12101A8AA03B2607,  # mono_method_get_name (resolved)
-    0x253BC17E58586B34,
-    0x443BB032833D9F45,
-    0x3C4AC6259839E5EB,
-    0xA10C921147E05D10,
-    0x90654B73786D404F,
-    0xA48EE81523CFEB90,
+    "47f74ce8e2982cc4": "0x9878b6 (arena-cookie, 0x4cba40, 0x1adb)",
+    "e2ec8737dab865e5": "0x117645a FMOD (-1, 0, 2)",
+    "1147722929eb0a4c": "0x997891 (cookie, cookie, 1)",
+    "a6b7bd0639320e1b": "0x98a780 (0, 0, stackbuf)",
+    "8cedad79ce1d2763": "0x11763b0 FMOD (-1, path?, 0x38)",
+    "253bc17e58586b34": "0x7ea892 (0, 1, 0x22)",
+    "e03334e94d813446": "0x103fce1 (0x3f, -1, 0)",
+    "64e1abc562e04331": "0x1177452 FMOD (-1, 0, 1)",
+    "2c5314e29c000914": "0x99ad0a (class_cookie, stackbuf, -1)",
+    "4ccb2c2760985faa": "0x99aeef (class_cookie, stackbuf, -1)",
+    "443bb032833d9f45": "ex-SignalSema label, never called",
+    "3c4ac6259839e5eb": "ex-SignalSema label, never called",
+    "a10c921147e05d10": "0x10acf83 PlayerPrefs tail",
+    "90654b73786d404f": "0x10a7b79 video handle",
+    "a48ee81523cfeb90": "0x1065f25 mode struct",
 }
 
-EXTRA = (
-    "mono_class_get mono_class_init mono_class_is_enum mono_class_is_valuetype "
-    "mono_class_get_rank mono_class_get_element_class mono_class_get_nesting "
-    "mono_class_get_interfaces mono_class_get_fields mono_class_get_properties "
-    "mono_class_get_events mono_class_get_method_from_name mono_class_get_field_from_name "
-    "mono_class_get_property_from_name mono_field_get_name mono_field_get_type "
-    "mono_method_get_name mono_method_get_class mono_method_get_header "
-    "mono_method_signature mono_signature_get_params mono_signature_get_return_type "
-    "mono_type_get_name mono_type_get_class mono_image_get_name "
-    "mono_image_get_table_info mono_image_get_table_rows mono_image_get_assembly "
-    "mono_assembly_get_object mono_domain_get_by_id mono_get_root_domain "
-    "mono_jit_init mono_runtime_invoke mono_object_new mono_array_new "
-    "mono_string_new mono_gchandle_new mono_thread_attach mono_thread_current "
-    "mono_object_get_class mono_class_vtable mono_method_desc_new "
-    "mono_method_desc_search_in_class mono_method_desc_search_in_image "
-    "mono_property_get_name mono_property_get_get_method mono_property_get_set_method "
-    "mono_event_get_name mono_custom_attrs_from_class mono_assembly_load_from "
-    "mono_domain_set mono_config_parse mono_set_dirs mono_icall_add "
-    "mono_marshal_get_native_wrapper mono_method_get_flags mono_class_get_flags "
-    "mono_field_get_flags mono_property_get_flags mono_image_get_filename "
-    "mono_assembly_get_main mono_get_exception_argument_null "
-    "mono_get_exception_invalid_operation "
-    "sceSaveDataGetMountInfo sceSaveDataDirNameSearchEx sceSaveDataMount5 "
-    "sceVideoOutGetVblankStatus sceVideoOutGetFlipRate sceVideoOutAdjustColor "
-    "sceVideoOutColorSettings sceVideoOutGetModeStatus sceKernelGetModuleInfo "
-    "sceKernelGetModuleList sceKernelCancelSemaWait sceKernelDeleteSema "
-    "sceKernelSetSemaAttr sceKernelCreateSemaInternal sceSysmoduleLoadModuleByName "
-    "scePthreadMutexattrGettype"
-).split()
+HITS = []
 
+
+def check_symbol(sym: str):
+    h = hashlib.sha1(sym.encode("utf-8") + SALT).digest()[:8]
+    be_hex = h.hex()
+    le_hex = h[::-1].hex()
+    if be_hex in TARGETS:
+        HITS.append((be_hex, "BE", sym))
+        print(f"[MATCH BE] {be_hex} -> {sym}  ({TARGETS[be_hex]})")
+    if le_hex in TARGETS:
+        HITS.append((le_hex, "LE", sym))
+        print(f"[MATCH LE] {le_hex} -> {sym}  ({TARGETS[le_hex]})")
+
+
+# 1. Scripting Bridge (Mono / IL2CPP) combinatorics
+prefixes = ["mono_", "il2cpp_", "mono_unity_", "unity_mono_"]
+nouns = [
+    "class", "image", "domain", "assembly", "assembly_name", "method",
+    "property", "field", "event", "type", "object", "string", "array",
+    "thread", "vtable", "custom_attrs", "metadata", "signature", "gc",
+    "runtime", "security", "profiler", "debug", "dllmap", "config",
+]
+verbs = [
+    "get", "set", "from", "is", "has", "init", "open", "close", "load",
+    "lookup", "find", "iterate", "enum", "alloc", "new", "free", "create",
+    "destroy", "invoke", "compile", "resolve", "verify", "check", "register",
+    "attach", "detach", "walk", "parse", "read", "write", "get_name",
+    "get_namespace", "get_parent", "get_fields", "get_methods", "get_properties",
+    "get_events", "get_interfaces", "get_nested_types", "get_type",
+    "get_element_class", "get_rank", "get_flags", "get_image", "get_assembly",
+    "get_userdata", "set_userdata", "is_subclass_of", "is_assignable_from",
+    "is_valuetype", "is_enum", "is_inflated", "is_generic", "init_internal",
+    "from_mono_type", "from_name", "from_name_case", "from_typeref",
+    "get_method_from_name", "get_method_from_name_flags", "get_property_from_name",
+    "get_field_from_name", "image_get_table_info", "image_get_table_rows",
+    "metadata_decode_row", "metadata_string_heap", "metadata_blob_heap",
+    "metadata_guid_heap", "metadata_user_string_heap", "get_resource",
+    "get_manifest_resource", "get_data", "get_size", "get_table_info",
+]
+
+for p, n, v in itertools.product(prefixes, nouns, verbs):
+    check_symbol(f"{p}{n}_{v}")
+    check_symbol(f"{p}{v}_{n}")
+    check_symbol(f"{p}{v}")
+
+# 2. POSIX / Libc / Syscall / Pthread / FIOS / Kernel / Audio candidates
+posix_and_sce = [
+    "lseek", "_lseek", "__sys_lseek", "lseek64", "fseek", "fseeko", "ftell", "ftello",
+    "read", "_read", "__sys_read", "pread", "pread64", "fread",
+    "open", "_open", "__sys_open", "close", "_close", "fcntl", "_fcntl", "__sys_fcntl",
+    "ioctl", "_ioctl", "__sys_ioctl", "fstat", "_fstat", "__sys_fstat", "stat", "lstat",
+    "ftruncate", "fsync", "fdatasync", "mmap", "munmap", "mprotect", "madvise", "posix_madvise",
+    "sceKernelLseek", "sceKernelRead", "sceKernelPread", "sceKernelOpen", "sceKernelClose",
+    "sceKernelFstat", "sceKernelStat", "sceKernelIoctl", "sceKernelFcntl", "sceKernelMmap",
+    "cpuset_setaffinity", "cpuset_getaffinity", "__sys_cpuset_setaffinity", "__sys_cpuset_getaffinity",
+    "pthread_setaffinity_np", "pthread_getaffinity_np", "scePthreadSetaffinity", "scePthreadGetaffinity",
+    "sceKernelSetThreadDtors", "sceKernelGetCpumode", "scePthreadAttrSetaffinity", "scePthreadAttrGetaffinity",
+    "sched_setaffinity", "sched_getaffinity", "pthread_mutexattr_init", "pthread_mutexattr_settype",
+    "pthread_mutexattr_setpshared", "pthread_condattr_init", "sem_init", "sem_open",
+    "sceAudioOutOpen", "sceAudioOutOutput", "sceAudioOutOutputs", "sceAudioOutSetVolume",
+    "sceAudioOutGetPortState", "sceAudioOutInit", "sceAudioOutClose", "sceAudioOutGetSystemState",
+    "sceAudioOutSetMixLevelPadSpk", "sceAudioOutMasteringInit", "sceAudioOutMasteringSetParam",
+    "sceAudioInOpen", "sceAudioInInput",
+]
+
+for s in posix_and_sce:
+    check_symbol(s)
+
+# 3. C identifiers mined from guest binaries (eboot, mono PRXs, bundled modules)
 ROOT = (
     Path(__file__).resolve().parent.parent
     / "games"
     / "flappy_bird"
     / "ED1633-NPXX51362_00-TER1520000000000"
 )
+ident_re = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{2,120}")
+seen = set()
+rel_paths = ["eboot.bin", "Media/Modules/mono-ps4.prx", "Media/Modules/MonoAssembliesPS4.prx"]
+try:
+    rel_paths += [f"sce_module/{f}" for f in os.listdir(ROOT / "sce_module")]
+except OSError:
+    pass
+for rel in rel_paths:
+    try:
+        with open(ROOT / rel, "rb") as f:
+            data = f.read()
+    except (FileNotFoundError, IsADirectoryError, OSError):
+        continue
+    n = 0
+    for m in ident_re.finditer(data):
+        s = m.group(0).decode("ascii", errors="ignore")
+        if s not in seen:
+            seen.add(s)
+            n += 1
+            check_symbol(s)
+            check_symbol("_" + s)
+            check_symbol("__sys_" + s)
+    print(f"mined {rel}: {n} new strings")
 
-
-def nid(s: bytes) -> int:
-    return int.from_bytes(hashlib.sha1(s + KEY).digest()[:8], "little")
-
-
-def main() -> int:
-    assert nid(b"mono_jit_init_version") == 0x9B795B57A3B5E063
-    assert nid(b"sceSysmoduleLoadModule") == 0x83C70CDFD11467AA
-    print("formula OK")
-    cands = set()
-    for rel in (
-        "eboot.bin",
-        "Media/Modules/mono-ps4.prx",
-        "Media/Modules/MonoAssembliesPS4.prx",
-    ):
-        path = ROOT / rel
-        if not path.exists():
-            print(f"missing: {rel}")
-            continue
-        data = path.read_bytes()
-        print(f"{rel}: {len(data)} bytes")
-        for m in re.finditer(rb"[A-Za-z0-9_]{3,}", data):
-            cands.add(m.group(0))
-    print("unique strings:", len(cands))
-    cands.update(e.encode() for e in EXTRA)
-    hits = {}
-    for c in cands:
-        h = nid(c)
-        if h in TARGETS:
-            hits.setdefault(h, []).append(c.decode("ascii", "replace"))
-    for t in sorted(TARGETS):
-        print(f"0x{t:016X}:", hits.get(t, ["UNRESOLVED"]))
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+print(f"\nDONE: {len(HITS)} total hits")

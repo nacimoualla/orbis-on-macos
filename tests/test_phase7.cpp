@@ -1,7 +1,9 @@
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <thread>
 #include <vector>
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -18,7 +20,10 @@ int main() {
     std::cout << "[PHASE 7] Starting PRX Dynamic Linking & NID Resolution unit tests...\n";
 
     ps4::MemoryManager memory;
-    assert(memory.initialize());
+    if (!memory.initialize()) {
+        std::cerr << "Failed to initialize memory\n";
+        return 1;
+    }
 
     ps4::SyscallTable syscalls(memory);
     syscalls.register_default_handlers();
@@ -28,7 +33,10 @@ int main() {
     registry.register_default_libraries();
 
     ps4::DynamicLinker linker(memory, syscalls, registry);
-    assert(linker.initialize());
+    if (!linker.initialize()) {
+        std::cerr << "Failed to initialize linker\n";
+        return 1;
+    }
 
     // Test 1: NID Registry lookups
     {
@@ -40,8 +48,11 @@ int main() {
 
         const auto* sym_puts = registry.find_by_name("puts");
         assert(sym_puts != nullptr);
-        assert(sym_puts->nid == 0x5C0F663677A000A8ULL);
-        assert(sym_puts->module_name == "libc");
+        // ps4libdoc libkernel.sprx.json: puts is 0x610D276AFA7E6087, exported by
+        // libSceLibcInternal. 0x5C0F663677A000A8 is a second puts NID the
+        // registry serves under an honest unknown_5c0f6636 label.
+        assert(sym_puts->nid == 0x610D276AFA7E6087ULL);
+        assert(sym_puts->module_name == "libSceLibcInternal");
 
         std::cout << "  ✓ Test 1: NID Registry contains core libkernel and libc functions\n";
     }
@@ -127,7 +138,7 @@ int main() {
 
         ps4::RunResult res = cpu.run();
         assert(res.status == ps4::StepResult::Halted);
-        assert(cpu.context().rax >= 0x80000000ULL); // Returned guest heap address from malloc
+        assert(cpu.context().rax >= 0x20000000ULL && cpu.context().rax < 0x40000000ULL); // Returned guest heap address from malloc
         assert(cpu.context().rax % 16 == 0);        // 16-byte aligned
 
         std::cout << "  ✓ Test 4: Guest x86_64 code called HLE malloc via trampoline and returned successfully\n";
@@ -352,25 +363,36 @@ int main() {
 
         assert(memory.write_bytes(code_addr, code.data(), code.size()));
         cpu.set_entry_point(code_addr);
-        cpu.context().rax = 0;
+        cpu.context().rax = 0xdeadbeefULL;
 
         ps4::RunResult res = cpu.run();
         assert(res.status == ps4::StepResult::Halted);
-        assert(cpu.context().rax == ps4::SCE_KERNEL_ERROR_EINVAL);
-        assert(cpu.context().rax == 0x80020016ULL);
+        assert(cpu.context().rax == 0);
 
-        std::cout << "  ✓ Test 10: Unhandled non-whitelisted stubs return 0x80020016ULL (SCE_KERNEL_ERROR_EINVAL)\n";
+        std::cout << "  ✓ Test 10: Unhandled non-whitelisted stubs return 0 (null-bail fallback)\n";
     }
 
-    // Test 11: sceUserServiceGetEvent returns SCE_USER_SERVICE_ERROR_NO_EVENT (0x80960007ULL)
+    // Test 11: sceUserServiceGetEvent reports the initial user's LOGIN once,
+    // then SCE_USER_SERVICE_ERROR_NO_EVENT (0x80960007ULL)
     {
         const auto* sym_event = registry.find_by_name("sceUserServiceGetEvent");
         assert(sym_event != nullptr);
         assert(sym_event->nid == 0xC87D7B43A356B558ULL);
         assert(sym_event->module_name == "libSceUserService");
 
-        // Verify handler directly
+        // Verify handler directly: one LOGIN (type 0) for user 0x10000001...
+        constexpr ps4::GuestAddr kEvent = 0x406800ULL;
         ps4::CpuContext ctx{};
+        ctx.rdi = kEvent;
+        sym_event->handler(ctx, memory);
+        assert(ctx.rax == 0);
+        ps4::i32 type = -1, user = 0;
+        memory.read_value(kEvent, type);
+        memory.read_value(kEvent + 4, user);
+        assert(type == 0 && user == 0x10000001);
+        // ...then no more events.
+        ctx = {};
+        ctx.rdi = kEvent;
         sym_event->handler(ctx, memory);
         assert(ctx.rax == ps4::SCE_USER_SERVICE_ERROR_NO_EVENT);
         assert(ctx.rax == 0x80960007ULL);
@@ -396,7 +418,7 @@ int main() {
         assert(cpu.context().rax == ps4::SCE_USER_SERVICE_ERROR_NO_EVENT);
         assert(cpu.context().rax == 0x80960007ULL);
 
-        std::cout << "  ✓ Test 11: sceUserServiceGetEvent returns 0x80960007ULL (SCE_USER_SERVICE_ERROR_NO_EVENT)\n";
+        std::cout << "  ✓ Test 11: sceUserServiceGetEvent reports one LOGIN, then 0x80960007ULL (SCE_USER_SERVICE_ERROR_NO_EVENT)\n";
     }
 
     // Test 12: Strict HLE mode triggers diagnostic crash (SIGABRT) on unregistered NID
@@ -441,6 +463,115 @@ int main() {
 
         std::cout << "  ✓ Test 12: Strict HLE aborts process on unhandled non-whitelisted stub invocation\n";
 #endif
+    }
+
+    // Test 13: Orbis Semaphore lifecycle and cancellation semantics
+    {
+        const auto* sym_create = registry.find_by_name("sceKernelCreateSema");
+        const auto* sym_wait   = registry.find_by_name("sceKernelWaitSema");
+        const auto* sym_signal = registry.find_by_name("sceKernelSignalSema");
+        const auto* sym_cancel = registry.find_by_name("sceKernelCancelSema");
+        const auto* sym_delete = registry.find_by_name("sceKernelDeleteSema");
+
+        assert(sym_create && sym_wait && sym_signal && sym_cancel && sym_delete);
+
+        // 13a: CreateSema mints handle and sets init_count=0
+        const ps4::GuestAddr sema_slot = 0x408000ULL;
+        ps4::CpuContext ctx{};
+        ctx.rdi = sema_slot;
+        ctx.rsi = 0; // anonymous
+        ctx.rdx = 1;
+        ctx.rcx = 0; // initCount = 0
+        ctx.r8  = 0x7fffffff;
+        sym_create->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+
+        ps4::u32 sema_id = 0;
+        bool ok = memory.read_value(sema_slot, sema_id);
+        assert(ok && sema_id > 0);
+
+        // 13b: CancelSema with 0 waiters must NOT latch a cancellation for future waiters
+        ctx.rdi = sema_id;
+        ctx.rsi = static_cast<ps4::u64>(-1); // setCount = -1
+        ctx.rdx = 0x408010ULL;               // pNumWaitingThreads
+        sym_cancel->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+        ps4::i32 cancelled_count = -1;
+        ok = memory.read_value(0x408010ULL, cancelled_count);
+        assert(ok && cancelled_count == 0);
+
+        // 13c: Timed wait on unsignaled semaphore must time out (ETIMEDOUT), NOT return ECANCELED
+        const ps4::GuestAddr timeout_slot = 0x408020ULL;
+        ok = memory.write_value(timeout_slot, static_cast<ps4::u32>(1000)); // 1ms
+        assert(ok);
+        ctx.rdi = sema_id;
+        ctx.rsi = 1; // need 1
+        ctx.rdx = timeout_slot;
+        sym_wait->handler(ctx, memory);
+        assert(ctx.rax == 0x8002003CULL); // SCE_KERNEL_ERROR_ETIMEDOUT
+
+        // 13d: SignalSema satisfies waiter
+        ctx.rdi = sema_id;
+        ctx.rsi = 1; // sigCount = 1
+        sym_signal->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+
+        ctx.rdi = sema_id;
+        ctx.rsi = 1; // need 1
+        ctx.rdx = timeout_slot;
+        sym_wait->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK); // Consumed the signal
+
+        // 13e: Cancel active waiter in background thread
+        std::atomic<ps4::u64> waiter_res{0};
+        std::atomic<bool> waiter_started{false};
+        std::thread waiter_th([&]() {
+            ps4::CpuContext wctx{};
+            wctx.rdi = sema_id;
+            wctx.rsi = 1;
+            wctx.rdx = 0; // infinite wait
+            waiter_started.store(true);
+            sym_wait->handler(wctx, memory);
+            waiter_res.store(wctx.rax);
+        });
+
+        while (!waiter_started.load()) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+        // Cancel while thread is parked
+        ctx.rdi = sema_id;
+        ctx.rsi = static_cast<ps4::u64>(-1);
+        ctx.rdx = 0x408010ULL;
+        sym_cancel->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+        ok = memory.read_value(0x408010ULL, cancelled_count);
+        assert(ok && cancelled_count == 1);
+
+        waiter_th.join();
+        assert(waiter_res.load() == 0x80020055ULL); // SCE_KERNEL_ERROR_ECANCELED
+
+        // 13f: Subsequent wait after cancel should block normally, not inherit ECANCELED
+        ok = memory.write_value(timeout_slot, static_cast<ps4::u32>(1000));
+        assert(ok);
+        ctx.rdi = sema_id;
+        ctx.rsi = 1;
+        ctx.rdx = timeout_slot;
+        sym_wait->handler(ctx, memory);
+        assert(ctx.rax == 0x8002003CULL); // ETIMEDOUT, NOT ECANCELED
+
+        // 13g: DeleteSema removes from table
+        ctx.rdi = sema_id;
+        sym_delete->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+
+        // Calling WaitSema on deleted id returns ESRCH
+        ctx.rdi = sema_id;
+        ctx.rsi = 1;
+        ctx.rdx = 0;
+        sym_wait->handler(ctx, memory);
+        assert(ctx.rax == 0x80020003ULL); // SCE_KERNEL_ERROR_ESRCH
+
+        std::cout << "  ✓ Test 13: Orbis Semaphore lifecycle and cancellation semantics verified\n";
     }
 
     std::cout << "[PHASE 7] PASS: All PRX Dynamic Linking & NID Resolution tests passed!\n";

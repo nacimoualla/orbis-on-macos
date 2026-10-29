@@ -38,14 +38,15 @@ void note_hle_activity() {
     s_last_hle_us.store(host_now_us(), std::memory_order_relaxed);
 }
 
+thread_local GuestThread* t_current_guest_thread{nullptr};
+
 ScePthreadId current_hle_thread_id() {
     return t_current_thread_id;
 }
 
-// Per-thread last-HLE time for the watchdog trigger. Keyed by guest TID so one
-// chattering thread (e.g. a keepalive) can't veto snapshots of stuck threads.
-std::mutex s_hle_tid_mtx;
-std::unordered_map<ScePthreadId, u64> s_hle_last_us;
+// Per-thread last-HLE time for the watchdog trigger (lock-free atomic array).
+static constexpr usize MAX_HLE_TRACKED_THREADS = 256;
+static std::atomic<u64> s_hle_last_us[MAX_HLE_TRACKED_THREADS]{};
 
 // Post-stall verbose logging (see post_stall_verbose): once the first stall
 // episode dumps, HLE dispatch logs everything except keepalive TID 5.
@@ -65,8 +66,9 @@ std::atomic<bool> s_first_episode_done{false};
 void note_hle_activity_for(ScePthreadId tid) {
     const u64 now = host_now_us();
     s_last_hle_us.store(now, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(s_hle_tid_mtx);
-    s_hle_last_us[tid] = now;
+    if (tid < MAX_HLE_TRACKED_THREADS) {
+        s_hle_last_us[tid].store(now, std::memory_order_relaxed);
+    }
 }
 
 ThreadManager::ThreadManager(MemoryManager& memory, SyscallTable* syscalls)
@@ -78,6 +80,7 @@ ThreadManager::ThreadManager(MemoryManager& memory, SyscallTable* syscalls)
     main_thread->id = 1;
     main_thread->name = "main";
     main_thread->state.store(ThreadState::Running);
+    t_current_guest_thread = main_thread.get();
     m_threads[1] = std::move(main_thread);
 
     note_hle_activity(); // grace period: no stall can predate the manager itself
@@ -211,6 +214,7 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
     GuestThread* raw_thread = thread_ptr.get();
     raw_thread->host_thread = std::thread([this, raw_thread, host_task]() {
         t_current_thread_id = raw_thread->id;
+        t_current_guest_thread = raw_thread;
         m_threads_started.fetch_add(1);
         raw_thread->state.store(ThreadState::Running);
 
@@ -227,10 +231,33 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
             }
             executor.context() = raw_thread->context;
             raw_thread->live_context.store(&executor.context(), std::memory_order_relaxed);
+        t_guest_tid = static_cast<int>(raw_thread->id);
 
             constexpr usize QUANTUM = 20000;
+            // PS4_TRACE_TID=<tid>: run that thread one instruction at a time and
+            // print RIP and key registers (PS4_TRACE_MAX lines, default 20000).
+            static const long s_trace_tid = std::getenv("PS4_TRACE_TID")
+                                                ? std::strtol(std::getenv("PS4_TRACE_TID"), nullptr, 0) : -1;
+            static const long s_trace_max = std::getenv("PS4_TRACE_MAX")
+                                                ? std::strtol(std::getenv("PS4_TRACE_MAX"), nullptr, 0) : 20000;
+            const bool trace_this = s_trace_tid >= 0 && static_cast<long>(raw_thread->id) == s_trace_tid;
+            long traced = 0;
             while (raw_thread->state.load() != ThreadState::Terminated && !m_syscalls->has_exited()) {
-                RunResult rr = executor.run(QUANTUM);
+                RunResult rr{};
+                if (trace_this && traced < s_trace_max) {
+                    for (usize n = 0; n < QUANTUM && traced < s_trace_max; ++n, ++traced) {
+                        const CpuContext& c = executor.context();
+                        std::fprintf(stderr, "[ttrace T%u] 0x%llx rax=0x%llx rdi=0x%llx rsi=0x%llx r12=0x%llx r13=0x%llx\n",
+                                     raw_thread->id, (unsigned long long)c.rip, (unsigned long long)c.rax,
+                                     (unsigned long long)c.rdi, (unsigned long long)c.rsi,
+                                     (unsigned long long)c.r12, (unsigned long long)c.r13);
+                        rr.status = executor.step();
+                        ++rr.instructions_executed;
+                        if (rr.status != StepResult::Ok && rr.status != StepResult::Syscall) break;
+                    }
+                } else {
+                    rr = executor.run(QUANTUM);
+                }
                 raw_thread->run_returns.fetch_add(1, std::memory_order_relaxed);
                 raw_thread->instructions_executed.fetch_add(rr.instructions_executed);
                 m_threads_executed_instructions.fetch_add(rr.instructions_executed);
@@ -248,6 +275,9 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
                     break;
                 }
 
+                if (raw_thread->has_pending_signals.load(std::memory_order_acquire))
+                    deliver_pending_exceptions(executor);
+
                 // Cooperative yield between quanta
                 std::this_thread::yield();
             }
@@ -262,6 +292,90 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
 
     m_threads[tid] = std::move(thread_ptr);
     return tid;
+}
+
+void ThreadManager::install_exception_handler(int signum, GuestAddr handler) {
+    std::lock_guard<std::mutex> lock(m_exc_mutex);
+    if (handler == 0) m_exc_handlers.erase(signum);
+    else m_exc_handlers[signum] = handler;
+}
+
+bool ThreadManager::raise_exception(ScePthreadId tid, int signum) {
+    GuestThread* th = get_thread(tid);
+    if (th == nullptr || th->state.load() == ThreadState::Terminated) return false;
+    {
+        std::lock_guard<std::mutex> lock(th->pending_signals_mtx);
+        th->pending_signals.push_back(signum);
+    }
+    th->has_pending_signals.store(true, std::memory_order_release);
+    return true;
+}
+
+void ThreadManager::deliver_pending_exceptions(CpuExecutor& ex) {
+    GuestThread* th = t_current_guest_thread;
+    if (th == nullptr || th->delivering_signal || m_exc_sentinel == 0 ||
+        !th->has_pending_signals.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<int> sigs;
+    {
+        std::lock_guard<std::mutex> lock(th->pending_signals_mtx);
+        sigs.swap(th->pending_signals);
+        th->has_pending_signals.store(false, std::memory_order_release);
+    }
+    th->delivering_signal = true;
+    const ThreadState prev_state = th->state.load();
+    for (const int sig : sigs) {
+        GuestAddr handler = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_exc_mutex);
+            if (auto it = m_exc_handlers.find(sig); it != m_exc_handlers.end()) handler = it->second;
+        }
+        if (handler == 0) continue;
+
+        const CpuContext saved = ex.context();
+        // Exception context below the interrupted stack's red zone. The GPRs
+        // use FreeBSD's amd64 mcontext layout (mc_rdi at +0x08 ... mc_rsp at
+        // +0xb8); Mono/Boehm's PS4 handler copies the first 0xd8 bytes as
+        // GC roots and takes the thread's stack pointer from +0xf8.
+        constexpr GuestSize kCtxSize = 0x400;
+        const GuestAddr ctx_addr = (saved.rsp - 128 - kCtxSize) & ~0xFULL;
+        std::vector<u8> zeros(kCtxSize, 0);
+        m_memory.write_bytes(ctx_addr, zeros.data(), kCtxSize);
+        const std::pair<u32, u64> fields[] = {
+            {0x08, saved.rdi}, {0x10, saved.rsi}, {0x18, saved.rdx}, {0x20, saved.rcx},
+            {0x28, saved.r8},  {0x30, saved.r9},  {0x38, saved.rax}, {0x40, saved.rbx},
+            {0x48, saved.rbp}, {0x50, saved.r10}, {0x58, saved.r11}, {0x60, saved.r12},
+            {0x68, saved.r13}, {0x70, saved.r14}, {0x78, saved.r15}, {0xa0, saved.rip},
+            {0xb0, saved.rflags}, {0xb8, saved.rsp}, {0xf8, saved.rsp},
+        };
+        for (const auto& [off, v] : fields) m_memory.write_value(ctx_addr + off, v);
+
+        // handler(signum, ctx) returning to the HLT sentinel.
+        const GuestAddr sp = ctx_addr - 8;
+        m_memory.write_value(sp, m_exc_sentinel);
+        CpuContext& c = ex.context();
+        c.rsp = sp;
+        c.rip = handler;
+        c.rdi = static_cast<u64>(sig);
+        c.rsi = ctx_addr;
+        c.rdx = ctx_addr;
+        th->state.store(ThreadState::Running);
+        for (;;) {
+            const RunResult rr = ex.run(200000);
+            if (c.rip == m_exc_sentinel) break;
+            if ((m_syscalls && m_syscalls->has_exited()) || rr.status == StepResult::Exited) break;
+            if (rr.status != StepResult::Ok && rr.status != StepResult::Syscall) {
+                std::fprintf(stderr, "[exc] handler 0x%llx for signal %d on TID %u stopped at RIP=0x%llx (%s)\n",
+                             (unsigned long long)handler, sig, th->id, (unsigned long long)c.rip,
+                             step_result_to_string(rr.status).data());
+                break;
+            }
+        }
+        ex.context() = saved;
+    }
+    th->state.store(prev_state);
+    th->delivering_signal = false;
 }
 
 bool ThreadManager::join_thread(ScePthreadId id, u64* out_return_value) {
@@ -301,7 +415,12 @@ ScePthreadId ThreadManager::current_thread_id() const {
 }
 
 GuestThread* ThreadManager::current_thread() {
+    if (t_current_guest_thread) return t_current_guest_thread;
     return get_thread(t_current_thread_id);
+}
+
+GuestThread* ThreadManager::current_guest_thread() noexcept {
+    return t_current_guest_thread;
 }
 
 GuestThread* ThreadManager::get_thread(ScePthreadId id) {
@@ -402,7 +521,6 @@ void ThreadManager::watchdog_loop() {
         bool any_stuck = false;
         {
             std::lock_guard<std::mutex> lock(m_threads_mutex);
-            std::lock_guard<std::mutex> hle_lock(s_hle_tid_mtx);
             for (const auto& [id, th] : m_threads) {
                 if (!th) continue;
                 if (th->state.load() == ThreadState::Terminated) {
@@ -424,9 +542,9 @@ void ThreadManager::watchdog_loop() {
                 const bool frozen = (rip == it->second.first && instrs == it->second.second);
                 it->second = {rip, instrs};
                 if (!frozen) continue;
-                auto hit = s_hle_last_us.find(id);
-                if (hit == s_hle_last_us.end()) continue;
-                if (now <= hit->second || now - hit->second < kStallThresholdUs) continue;
+                if (id >= MAX_HLE_TRACKED_THREADS) continue;
+                const u64 last = s_hle_last_us[id].load(std::memory_order_relaxed);
+                if (last == 0 || now <= last || now - last < kStallThresholdUs) continue;
                 any_stuck = true;
             }
         }
@@ -479,6 +597,25 @@ void ThreadManager::dump_stall_snapshot(const char* tag) const {
         const CpuContext* live = th->live_context.load(std::memory_order_relaxed);
         const CpuContext* mc = (!live && id == 1) ? m_main_context.load(std::memory_order_relaxed) : nullptr;
         const CpuContext& c = live ? *live : (mc ? *mc : th->context);
+        // live_context is only published at quantum boundaries, so a thread
+        // blocked inside a handler has live_context == nullptr and `c` falls
+        // back to th->context -- the entry snapshot, whose rip is still the
+        // entry point. That made a thread which ran ~1,400 instructions and then
+        // parked in sem_wait look identical to one that never ran at all. Report
+        // the HLE it is actually parked in so the two are distinguishable.
+        const bool blocked_in_hle = th->in_hle.load(std::memory_order_relaxed);
+        if (blocked_in_hle && !live) {
+            std::fprintf(stderr,
+                         "  [Thread %u] '%s' state=%s BLOCKED-IN-HLE nid=0x%llx caller=0x%llx"
+                         " instrs=%llu runs=%llu hles=%llu\n",
+                         th->id, th->name.c_str(), thread_state_name(th->state.load()),
+                         (unsigned long long)th->last_nid.load(std::memory_order_relaxed),
+                         (unsigned long long)th->hle_caller_rip.load(std::memory_order_relaxed),
+                         (unsigned long long)th->instructions_executed.load(),
+                         (unsigned long long)th->run_returns.load(),
+                         (unsigned long long)th->hle_calls.load());
+            continue;
+        }
         std::fprintf(stderr,
                      "  [Thread %u] '%s' state=%s RIP=0x%llx instrs=%llu runs=%llu hles=%llu inhle=%d lastnid=0x%llx\n"
                      "    rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx\n"
@@ -535,6 +672,11 @@ u32 ThreadManager::mutex_create(std::string_view) {
     const u32 id = m_next_mutex_id++;
     m_mutexes[id] = std::make_unique<std::recursive_mutex>();
     return id;
+}
+
+bool ThreadManager::mutex_exists(u32 mutex_id) {
+    std::lock_guard<std::mutex> lock(m_sync_mutex);
+    return m_mutexes.find(mutex_id) != m_mutexes.end();
 }
 
 bool ThreadManager::mutex_lock(u32 mutex_id) {
@@ -725,7 +867,7 @@ bool ThreadManager::equeue_wait(u32 eq_id, std::vector<SceKernelEvent>& out_even
 bool ThreadManager::equeue_trigger_user_event(u32 eq_id, i32 event_id, u64 udata) {
     SceKernelEvent ev{};
     ev.ident = static_cast<u64>(event_id);
-    ev.filter = -1; // EVFILT_USER
+    ev.filter = kEvFiltUser;
     ev.flags = 0;
     ev.fflags = 0;
     ev.data = 0;
@@ -733,6 +875,15 @@ bool ThreadManager::equeue_trigger_user_event(u32 eq_id, i32 event_id, u64 udata
     return equeue_signal(eq_id, ev);
 }
 
+// kqueue semantics: an equeue holds at most one pending event per registered
+// (ident, filter) knote. Re-triggering a knote that has not been consumed yet
+// updates it in place instead of queueing a duplicate, so a producer that runs
+// ahead of its consumer (flips, EOP interrupts) cannot build an unbounded
+// backlog that later satisfies waits for events that are long stale.
+//
+// EVFILT_VIDEO_OUT carries packed data (as decoded by sceVideoOutGetEventData /
+// sceVideoOutGetEventCount): bits [11:0] time, [15:12] trigger count since the
+// event was last consumed (saturating at 15), [63:16] flipArg.
 bool ThreadManager::equeue_signal(u32 eq_id, const SceKernelEvent& ev) {
     std::shared_ptr<Equeue> eq;
     {
@@ -742,26 +893,24 @@ bool ThreadManager::equeue_signal(u32 eq_id, const SceKernelEvent& ev) {
         eq = it->second;
     }
     std::lock_guard<std::mutex> lock(eq->mutex);
-    eq->events.push_back(ev);
-    eq->cv.notify_one();
-    return true;
-}
-
-void ThreadManager::signal_flip_event(i64 flip_arg) {
-    std::lock_guard<std::mutex> lock(m_equeues_mutex);
-    for (auto& [id, eq] : m_equeues) {
-        if (!eq || eq->deleted) continue;
-        std::lock_guard<std::mutex> eq_lock(eq->mutex);
-        SceKernelEvent ev{};
-        ev.ident = 1;
-        ev.filter = 0;
-        ev.flags = 0;
-        ev.fflags = 0;
-        ev.data = flip_arg;
-        ev.udata = 0;
-        eq->events.push_back(ev);
+    if (eq->deleted) return false;
+    for (auto& pending : eq->events) {
+        if (pending.ident != ev.ident || pending.filter != ev.filter) continue;
+        if (ev.filter == kEvFiltVideoOut) {
+            const u64 old_count = (static_cast<u64>(pending.data) >> 12) & 0xF;
+            const u64 count = old_count < 0xF ? old_count + 1 : 0xF;
+            pending.data = static_cast<i64>((static_cast<u64>(ev.data) & ~0xF000ULL) | (count << 12));
+        } else {
+            pending.data = ev.data;
+        }
+        pending.fflags |= ev.fflags;
+        pending.udata = ev.udata;
         eq->cv.notify_all();
+        return true;
     }
+    eq->events.push_back(ev);
+    eq->cv.notify_all();
+    return true;
 }
 
 } // namespace ps4

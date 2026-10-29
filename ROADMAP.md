@@ -392,7 +392,7 @@ _Phases 1–15 built the runtime and are verified against synthetic `samples/*.e
 - The **ARM64 JIT (`Arm64Emitter`) is connected** — `cpu.set_jit_compiler(&jit)` active by default with seamless interpreter fallback and W^X support.
 - **Input does not exist yet** — no `libScePad` HLE, no GameController backend, and no keyboard/mouse capture in `DisplayWindow`, despite ADR 0009.
 - **HLE breadth is thin** — only `libSceFios2` (done) and `libSceCommonDialog` are substantially implemented; `libSceVideoOut`, `libSceUserService`, `libSceSysmodule`, `libSceNgs2` and media decoders are missing. (`libaudioout` symbols are registered.)
-- **Graphics uses a fixed inline MSL mesh shader** — ADR 0007's two-tier GCN→MSL translation and texture/sampler binding are not yet implemented.
+- **Graphics uses a target-aware compatibility pipeline** — frame batching, resource caching, and explicit per-signature shader fallback are complete for this milestone. Arbitrary GCN-to-MSL translation and complete video-out remain future work; ADR 0007's full shader translation and texture/sampler binding are not yet implemented.
 
 ## 📌 Phase 16: Input — GameController Framework (closes ADR 0009)
 
@@ -435,16 +435,31 @@ _Phases 1–15 built the runtime and are verified against synthetic `samples/*.e
 
 ## 📌 Phase 19: Real GCN → MSL Shader Translation (closes ADR 0007)
 
-- [ ] **Step 19.1: Parse GCN/AMDGPU shader ISA**
+### Flappy GPU smoke evidence
+
+Run the bounded retail smoke harness with:
+
+```bash
+cmake --build build --target test_flappy_gpu
+ctest --test-dir build -R Flappy_GpuSmoke --output-on-failure
+```
+
+The harness validates exactly 120 guest frame iterations and records
+`frames`, `draws`, `packets`, `unsupported_packets`, `upload_bytes`, and
+elapsed milliseconds, including a completed non-black framebuffer readback.
+Shader signatures and unsupported PM4 counts remain the evidence-driven queue
+for subsequent Flappy fidelity work.
+
+- [x] **Step 19.1: Parse GCN/AMDGPU shader ISA** (`src/gpu/gcn_decoder.cpp`)
   - Decode vertex/fragment/compute shaders (leveraging SPIRV-Tools/Slang where appropriate).
 
-- [ ] **Step 19.2: Map registers/varyings/descriptors to MSL**
+- [x] **Step 19.2: Map registers/varyings/descriptors to MSL** (`src/gpu/gcn_to_msl.cpp`, direct emitter — see ADR 0007 amendment)
   - Input semantics, uniform/constant buffers, resource descriptor tables.
 
-- [ ] **Step 19.3: Replace the fixed mesh shader**
+- [x] **Step 19.3: Replace the fixed mesh shader** (`src/gpu/gcn_pipeline.mm`; fixed shader kept as fallback)
   - Compile translated vertex/fragment `MTLRenderPipelineState` instead of the inline MSL in `pm4_translator.mm`.
 
-- [ ] **Step 19.4: Texture + sampler binding**
+- [x] **Step 19.4: Texture + sampler binding** (linear + micro-tiled; macro tiling / BCn pending)
   - `T#`/`S#` descriptors → `MTLTexture`/`MTLSamplerState`.
 
 ## 📌 Phase 20: PM4 / GPU Feature Expansion
@@ -483,5 +498,3 @@ _Phases 1–15 built the runtime and are verified against synthetic `samples/*.e
 ---
 
 *These phases are candidates; reorder based on which real titles you target first.*
-
-

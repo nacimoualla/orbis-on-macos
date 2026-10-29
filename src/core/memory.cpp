@@ -1,4 +1,5 @@
 #include "ps4/memory.hpp"
+#include "ps4/dynamic_linker.hpp"
 #include <sys/mman.h>
 #include <cstring>
 #include <iostream>
@@ -122,10 +123,178 @@ bool MemoryManager::protect(GuestAddr addr, GuestSize size, u32 elf_flags) {
     return true;
 }
 
+// Guest address currently being executed on this host thread, published by the
+// executor. MemoryManager needs it so a write-watch can name the instruction
+// that clobbered a location instead of only reporting the corruption later.
+thread_local GuestAddr t_guest_rip = 0;
+thread_local GuestAddr t_guest_rsp = 0;
+thread_local GuestAddr t_guest_rbp = 0;
+thread_local GuestAddr t_guest_rbx = 0;
+thread_local int t_guest_tid = 0;
+thread_local bool t_guest_in_hle = false;
+
+// Optional write-watch. Armed from PS4_WATCH_ADDR. Sits on write_bytes rather
+// than in the executor so it also catches stores made by HLE handler code,
+// which never pass through the instruction decoder.
+//
+// Records into a RING, not the first N: the canary slot is reused stack, so the
+// prologue's install and later activations all write the same address, and a
+// first-hit-only watch reports the benign store and hides the clobber.
+static std::atomic<GuestAddr> g_watch_addr{0};
+static std::atomic<usize> g_watch_size{0};
+static std::atomic<bool> g_watch_armed{false};
+// Large: the watched slot is shared stack, so many unrelated frames write it
+// and a small ring rolls past the activation we actually care about.
+static constexpr usize kWatchRing = 4096;
+static std::atomic<usize> g_watch_count{0};
+static WatchHit g_watch_ring[kWatchRing];
+
+void set_write_watch(GuestAddr addr, usize size) {
+    g_watch_addr.store(addr, std::memory_order_relaxed);
+    g_watch_size.store(size, std::memory_order_relaxed);
+    g_watch_armed.store(addr != 0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[watch] armed on 0x%llx..0x%llx (%zu bytes)\n",
+                 (unsigned long long)addr, (unsigned long long)(addr + size), size);
+}
+
+GuestAddr write_watch_addr() noexcept {
+    return g_watch_addr.load(std::memory_order_relaxed);
+}
+
+GuestAddr write_watch_end() noexcept {
+    return g_watch_addr.load(std::memory_order_relaxed) +
+           g_watch_size.load(std::memory_order_relaxed);
+}
+
+void dump_write_watch_ring(u64 filter_addr, const MemoryManager* mem) {
+    const usize n = g_watch_count.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[watch] ring: %zu writes recorded, capacity %zu, addr filter=0x%llx\n",
+                 n, kWatchRing, (unsigned long long)filter_addr);
+    const usize start = (n > kWatchRing) ? (n - kWatchRing) : 0;
+    usize shown = 0;
+    for (usize i = start; i < n; ++i) {
+        const WatchHit& h = g_watch_ring[i % kWatchRing];
+        // Filter by ADDRESS, not rbp. The clobbering store comes from a callee
+        // prologue whose rbp differs from the failing frame's, so an rbp filter
+        // excludes precisely the culprit.
+        if (filter_addr != 0) {
+            if (!(h.guest_addr <= filter_addr && filter_addr < h.guest_addr + h.size)) continue;
+        }
+        ++shown;
+        std::fprintf(stderr,
+                     "[watch] #%-3zu rip=%s (0x%llx) rsp=0x%llx rbp=0x%llx rbx=0x%llx TID=%d %-3s "
+                     "-> 0x%llx (%zu B)  sampled@0x%llx  old=0x%016llx new=0x%016llx%s\n",
+                     i, describe_guest_addr(h.rip).c_str(), (unsigned long long)h.rip, (unsigned long long)h.rsp,
+                     (unsigned long long)h.rbp, (unsigned long long)h.rbx, h.tid, h.from_hle ? "HLE" : "dec",
+                     (unsigned long long)h.guest_addr, h.size,
+                     (unsigned long long)h.sample_addr,
+                     (unsigned long long)h.old_value, (unsigned long long)h.new_value,
+                     (h.old_value != h.new_value) ? "  <-- CHANGED" : "");
+        // Guest call stack via the frame-pointer chain. rbp is captured at store
+        // time; walking it here is cheaper than recording it per store.
+        if (mem != nullptr) {
+            std::fprintf(stderr, "[watch]   stack:");
+            GuestAddr fp = h.rbp;
+            for (int d = 0; d < 8 && fp != 0; ++d) {
+                u64 saved = 0, ret = 0;
+                if (!mem->read_bytes(fp, &saved, 8) || !mem->read_bytes(fp + 8, &ret, 8)) break;
+                std::fprintf(stderr, " 0x%llx", (unsigned long long)ret);
+                if (saved <= fp) break;
+                fp = saved;
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+    std::fprintf(stderr, "[watch] ring: %zu writes matched filter\n", shown);
+}
+
+bool MemoryManager::reserve_mapping(GuestAddr addr, GuestAddr size, std::string_view owner) {
+    if (size == 0) return true;
+    const GuestAddr end = addr + size;
+    for (const auto& m : m_mappings) {
+        if (addr < m.start + m.size && m.start < end) {
+            std::fprintf(stderr,
+                         "[map] OVERLAP: cannot map '%.*s' [0x%llx,0x%llx) because it "
+                         "intersects '%s' [0x%llx,0x%llx)\n",
+                         (int)owner.size(), owner.data(),
+                         (unsigned long long)addr, (unsigned long long)end,
+                         m.owner.c_str(),
+                         (unsigned long long)m.start, (unsigned long long)(m.start + m.size));
+            return false;
+        }
+    }
+    m_mappings.push_back({addr, size, std::string(owner)});
+    std::sort(m_mappings.begin(), m_mappings.end(),
+              [](const GuestMapping& a, const GuestMapping& b) { return a.start < b.start; });
+    return true;
+}
+
+void MemoryManager::release_mapping(GuestAddr addr) {
+    m_mappings.erase(std::remove_if(m_mappings.begin(), m_mappings.end(),
+                                    [&](const GuestMapping& m) { return m.start == addr; }),
+                     m_mappings.end());
+}
+
+std::vector<GuestMapping> MemoryManager::mappings() const { return m_mappings; }
+
+void MemoryManager::dump_mappings() const {
+    std::fprintf(stderr, "[map] registered guest mappings (%zu):\n", m_mappings.size());
+    std::fprintf(stderr, "  %-34s %14s %14s %12s\n", "owner", "start", "end", "size");
+    for (const auto& m : m_mappings) {
+        std::fprintf(stderr, "  %-34s 0x%09llx 0x%09llx 0x%08llx\n",
+                     m.owner.size() > 34 ? m.owner.substr(0, 31).c_str() : m.owner.c_str(),
+                     (unsigned long long)m.start,
+                     (unsigned long long)(m.start + m.size),
+                     (unsigned long long)m.size);
+    }
+}
+
 bool MemoryManager::write_bytes(GuestAddr addr, const void* src, usize size) {
     if (!is_valid_address(addr, size)) {
         m_last_error = MemoryError::OutOfBounds;
         return false;
+    }
+
+    // Range overlap, not exact equality: a 16/32-byte VEX or movups store that
+    // merely spans the slot must be caught. This code region is full of those.
+    if (g_watch_armed.load(std::memory_order_relaxed)) {
+        const GuestAddr wa = g_watch_addr.load(std::memory_order_relaxed);
+        const usize ws = g_watch_size.load(std::memory_order_relaxed);
+        if (addr < wa + ws && wa < addr + size) {
+            WatchHit h{};
+            h.rip = t_guest_rip;
+            h.rsp = t_guest_rsp;
+            h.rbp = t_guest_rbp;
+            h.rbx = t_guest_rbx;
+            h.tid = t_guest_tid;
+            h.from_hle = t_guest_in_hle;
+            h.guest_addr = addr;
+            h.size = size;
+
+            // Sample old/new at the START OF THE OVERLAP, not at the store base.
+            // A wide store (movups/VEX) that merely spans the watched slot begins
+            // before it, so sampling at `addr` reads 8 bytes that are outside the
+            // watch entirely -- often the same bytes the store happens to rewrite,
+            // which made every range-spanning write report old == new and look
+            // like a no-op. Overlap start is the only address the watch actually
+            // covers, so it is the only one whose before/after is meaningful.
+            const GuestAddr ov_lo = (addr > wa) ? addr : wa;
+            const GuestAddr ov_hi = (wa + ws < addr + size) ? (wa + ws) : (addr + size);
+            usize take = ov_hi - ov_lo;
+            if (take > sizeof(h.new_value)) take = sizeof(h.new_value);
+            // Never sample past the mapped region; a store near the top of memory
+            // would otherwise turn instrumentation into an out-of-bounds read.
+            if (ov_lo + take > m_total_size) take = m_total_size - ov_lo;
+            h.sample_addr = ov_lo;
+            h.old_value = 0;
+            h.new_value = 0;
+            std::memcpy(&h.old_value, m_base + ov_lo, take);
+            // The store's source buffer is indexed from its own base, so shift by
+            // the same offset to land on the same guest byte.
+            std::memcpy(&h.new_value, static_cast<const u8*>(src) + (ov_lo - addr), take);
+            const usize slot = g_watch_count.fetch_add(1, std::memory_order_relaxed);
+            g_watch_ring[slot % kWatchRing] = h;
+        }
     }
 
     std::memcpy(m_base + addr, src, size);
@@ -160,7 +329,20 @@ bool MemoryManager::load_elf_segments(const ElfLoader& loader, std::span<const u
     }
 
     for (const auto& seg : loader.load_segments()) {
-        if (seg.p_offset > file_data.size() || seg.p_filesz > file_data.size() - seg.p_offset || seg.p_memsz < seg.p_filesz) {
+        // Ask the loader where the bytes actually are. In a SELF-wrapped module
+        // seg.p_offset is the pre-packing layout and is stale -- eboot.bin's
+        // PT_LOAD[0] claims 0x4000 but its data starts at 0xaeb0, so copying
+        // from p_offset maps the wrong 0x4000 bytes and the first guest
+        // instruction lands in a string.
+        bool seg_found = false;
+        const usize src_off = loader.segment_file_offset(seg, &seg_found);
+        if (!seg_found) {
+            m_last_error = MemoryError::InvalidSegment;
+            return false;
+        }
+        if (src_off > file_data.size() ||
+            seg.p_filesz > file_data.size() - src_off ||
+            seg.p_memsz < seg.p_filesz) {
             m_last_error = MemoryError::InvalidSegment;
             return false;
         }
@@ -170,9 +352,17 @@ bool MemoryManager::load_elf_segments(const ElfLoader& loader, std::span<const u
             return false;
         }
 
+        char label[64];
+        std::snprintf(label, sizeof(label), "elf-segment@0x%llx",
+                      (unsigned long long)seg.p_vaddr);
+        if (!reserve_mapping(seg.p_vaddr, seg.p_memsz, label)) {
+            m_last_error = MemoryError::InvalidSegment;
+            return false;
+        }
+
         // Copy file content to guest virtual address
         if (seg.p_filesz > 0) {
-            std::memcpy(m_base + seg.p_vaddr, file_data.data() + seg.p_offset, seg.p_filesz);
+            std::memcpy(m_base + seg.p_vaddr, file_data.data() + src_off, seg.p_filesz);
         }
 
         // Zero out .bss region if memsz > filesz

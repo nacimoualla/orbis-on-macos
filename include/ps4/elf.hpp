@@ -51,6 +51,10 @@ inline constexpr u16 ET_CORE          = 4;
 inline constexpr u16 ET_SCE_EXEC      = 0xFE00; // PlayStation 4 executable
 inline constexpr u16 ET_SCE_RELEXEC   = 0xFE04; // PlayStation 4 relocatable executable
 inline constexpr u16 ET_SCE_DYNAMIC   = 0xFE18; // PlayStation 4 PRX dynamic module
+// eboot.elf reports 0xFE10 for its fixed-address executable, which is not the
+// 0xFE00 above. Identify relocatability positively rather than negating an
+// exec value that has more than one spelling in shipped Orbis binaries.
+inline constexpr u16 ET_SCE_EXEC_ALT  = 0xFE10;
 
 // ELF Program Header Segment types
 inline constexpr u32 PT_NULL          = 0;

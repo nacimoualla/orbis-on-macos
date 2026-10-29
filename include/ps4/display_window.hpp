@@ -2,6 +2,7 @@
 
 #include "ps4/common.hpp"
 #include "ps4/metal_backend.hpp"
+#include <chrono>
 #include <memory>
 #include <string>
 

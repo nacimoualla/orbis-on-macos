@@ -47,6 +47,10 @@ void test_jit_buffer_and_execution() {
         0xBB, 0x42, 0x00, 0x00, 0x00  // mov ebx, 0x42
     };
     memory.write_bytes(code_addr, x86_code, sizeof(x86_code));
+    // ret ends the block (the zero bytes after it would otherwise decode as
+    // `add [rax], al`, which the JIT translates)
+    const u8 ret = 0xC3;
+    memory.write_bytes(code_addr + sizeof(x86_code), &ret, 1);
 
     CpuContext ctx{};
     ctx.rip = code_addr;

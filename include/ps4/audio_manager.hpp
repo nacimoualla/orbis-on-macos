@@ -60,6 +60,10 @@ public:
     /// Active port count
     usize active_port_count();
 
+    /// Get configured grain (in frames) and sample rate for a port
+    u32 get_port_grain(i32 handle);
+    u32 get_port_sample_rate(i32 handle);
+
 private:
     std::mutex m_manager_mutex;
     i32 m_next_handle{1};

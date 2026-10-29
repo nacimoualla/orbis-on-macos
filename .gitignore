@@ -45,3 +45,12 @@ __pycache__/
 # Agent working-memory directories (machine-local session notes)
 .agents/
 .superpowers/
+
+# GUI run logs
+Logs/
+.triage_history.jsonl
+
+# scratch run logs from ps4-runner invocations
+*.log
+*.log
+dump_code_*.bin

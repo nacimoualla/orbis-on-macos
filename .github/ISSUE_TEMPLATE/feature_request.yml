@@ -1,0 +1,32 @@
+name: Feature / HLE request
+description: Propose a feature or a new libSce module shim
+title: "[feat]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: Which phase/step (ROADMAP.md) or which libSce module + NIDs does this cover?
+      placeholder: "Phase 18: libSceUserService — sceUserServiceGetInitialUser ..."
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Guest behavior, trace excerpt, or ps4libdoc reference showing the need.
+      placeholder: "[HLE CALL] unknown (NID=0x...) x120 in run log"
+  - type: textarea
+    id: verify
+    attributes:
+      label: Verification
+      description: How will we know it works (new test_phaseN, audit output, headless run)?
+      placeholder: "test_phase18 passes; audit_nids_libdoc.py clean"
+  - type: checkboxes
+    id: cleanroom
+    attributes:
+      label: Clean-room check
+      options:
+        - label: "This is a clean-room reimplementation request — no proprietary code or assets needed"
+          required: true

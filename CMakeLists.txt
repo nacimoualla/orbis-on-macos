@@ -5,6 +5,29 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Default to an optimized build. Without this a bare `cmake -B build ..` leaves
+# CMAKE_BUILD_TYPE empty, and CMake's empty-config fallback adds no -O flag at
+# all -- every translation unit compiles at -O0 with asserts live. That is what
+# this tree was configured with (`CXX_FLAGS = -g -std=c++20 -arch arm64 ...`),
+# and it cost roughly 2 us per guest instruction: the interpreter measured
+# ~467 K guest instr/s, so main covered only 28 M instructions in a 60 s run and
+# never reached first frame. Release resolves to -O3 -DNDEBUG here.
+# Investigate build type: -O2 -g but *without* NDEBUG.
+# The stock types are all wrong for this tree right now: Debug has no -O flag
+# at all, and RelWithDebInfo/Release both define NDEBUG. That matters because
+# tests/test_phase7.cpp has a failing malloc assertion at HEAD -- an allocator
+# invariant violation that -DNDEBUG silently compiles away, in the very same
+# change that made guest memory corruption appear. An allocator bug can corrupt
+# a stack canary indirectly (a bad length field driving an oversized memcpy), so
+# the assert is the best-supported lead and must stay live while we chase it.
+set(CMAKE_CXX_FLAGS_INVESTIGATE "-O2 -g" CACHE STRING "" FORCE)
+set(CMAKE_EXE_LINKER_FLAGS_INVESTIGATE "-O2 -g" CACHE STRING "" FORCE)
+
+# Only sets a default, so -DCMAKE_BUILD_TYPE=Debug/Release still work.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Investigate CACHE STRING "Build type" FORCE)
+endif()
+
 # Enable compiler warnings
 add_compile_options(-Wall -Wextra -Wpedantic)
 
@@ -25,14 +48,19 @@ add_library(ps4_core
     src/core/vfs.cpp
     src/cpu/executor.cpp
     src/cpu/jit_compiler.cpp
+    src/cpu/jit_stats.cpp
     src/gpu/metal_backend.mm
     src/gpu/display_window.mm
     src/gpu/gpu_ring_buffer.cpp
     src/gpu/pm4_translator.mm
+    src/gpu/gcn_decoder.cpp
+    src/gpu/gcn_to_msl.cpp
+    src/gpu/gcn_pipeline.mm
     src/audio/audio_manager.cpp
     src/audio/coreaudio_backend.mm
     src/hle/nid_registry.cpp
     src/hle/thread.cpp
+    src/gui/game_import.cpp
 )
 target_include_directories(ps4_core PUBLIC include)
 target_link_libraries(ps4_core PUBLIC
@@ -46,7 +74,9 @@ target_link_libraries(ps4_core PUBLIC
 set_source_files_properties(src/gpu/metal_backend.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/gpu/display_window.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/gpu/pm4_translator.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+set_source_files_properties(src/gpu/gcn_pipeline.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/audio/coreaudio_backend.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+set_source_files_properties(src/gui/game_library_gui.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 # Main executable runner
 add_executable(ps4-runner
@@ -117,5 +147,97 @@ add_executable(test_phase15 tests/test_phase15.cpp)
 target_link_libraries(test_phase15 PRIVATE ps4_core)
 add_test(NAME Phase15_JitExecutorIntegration COMMAND test_phase15)
 
+add_executable(test_flappy_gpu tests/test_flappy_gpu.cpp)
+target_link_libraries(test_flappy_gpu PRIVATE ps4_core)
+target_compile_definitions(test_flappy_gpu PRIVATE CMAKE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME Flappy_GpuSmoke COMMAND test_flappy_gpu)
+
+# Phase 19: GCN -> MSL translation of Flappy's real shaders, compiled and
+# rendered with Metal.
+add_executable(test_gcn_shader tests/test_gcn_shader.mm)
+target_link_libraries(test_gcn_shader PRIVATE ps4_core)
+set_source_files_properties(tests/test_gcn_shader.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+add_test(NAME Phase19_GcnShader COMMAND test_gcn_shader)
+set_tests_properties(Flappy_GpuSmoke PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_jit_stats tests/test_jit_stats.cpp)
+target_link_libraries(test_jit_stats PRIVATE ps4_core)
+add_test(NAME JitStats COMMAND test_jit_stats)
 
 
+
+
+# Game import / library GUI (AppKit). Separate binary so the runner stays usable
+# headless; it locates ps4-runner next to itself at runtime.
+add_executable(ps4-gui
+    src/gui/game_library_gui.mm
+)
+target_include_directories(ps4-gui PRIVATE include)
+target_link_libraries(ps4-gui PRIVATE ps4_core)
+set_source_files_properties(src/gui/game_library_gui.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+# Scanner test for the game-import GUI: finds the real dump layout on disk.
+add_executable(test_phase16 tests/test_phase16.cpp src/gui/game_import.cpp)
+target_include_directories(test_phase16 PRIVATE include)
+add_test(NAME Phase16_GameImport COMMAND test_phase16)
+# The scanner test inspects the real games/ layout, so it must run from the
+# source root, not the build directory.
+set_tests_properties(Phase16_GameImport PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# x87 rounding / control-word vectors. Drives real instruction bytes through the
+# interpreter so the test and the emulator cannot diverge silently.
+add_executable(test_x87 tests/test_x87.cpp)
+target_include_directories(test_x87 PRIVATE include)
+target_link_libraries(test_x87 PRIVATE ps4_core)
+add_test(NAME Phase17_X87 COMMAND test_x87)
+
+# ---------------------------------------------------------------------------
+# ps4-gui.app bundle
+#
+# A bare binary has no dock icon, no bundle identity and does not survive the
+# terminal closing. Wrapping it gives a real double-clickable app. ps4-runner
+# is copied in alongside it because the GUI resolves the runner relative to its
+# own executable path, which inside a bundle is Contents/MacOS/.
+# ---------------------------------------------------------------------------
+set(GUI_BUNDLE "${CMAKE_BINARY_DIR}/ps4-gui.app")
+set(GUI_BUNDLE_MACOS "${GUI_BUNDLE}/Contents/MacOS")
+set(GUI_BUNDLE_RESOURCES "${GUI_BUNDLE}/Contents/Resources")
+
+add_custom_target(ps4-gui-app ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_MACOS}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_RESOURCES}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:ps4-gui>" "${GUI_BUNDLE_MACOS}/ps4-gui"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:ps4-runner>" "${GUI_BUNDLE_MACOS}/ps4-runner"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/cmake/Info.plist.in" "${GUI_BUNDLE}/Contents/Info.plist"
+    COMMAND ${CMAKE_COMMAND} -E echo "APPL????" > "${GUI_BUNDLE}/Contents/PkgInfo"
+    DEPENDS ps4-gui ps4-runner
+    COMMENT "Assembling ps4-gui.app"
+    VERBATIM
+)
+
+# qsort/bsearch run as guest code (src/hle/guest_libc.c); exercised on the
+# interpreter and the JIT with a guest comparator.
+add_executable(test_guest_libc tests/test_guest_libc.cpp)
+target_link_libraries(test_guest_libc PRIVATE ps4_core)
+add_test(NAME GuestLibc COMMAND test_guest_libc)
+
+# Guest printf formatting (va_list walk, widths, 16-argument GUID format).
+add_executable(test_guest_printf tests/test_guest_printf.cpp)
+target_link_libraries(test_guest_printf PRIVATE ps4_core)
+add_test(NAME GuestPrintf COMMAND test_guest_printf)
+
+# Guest exception delivery (sceKernelInstallExceptionHandler/RaiseException).
+add_executable(test_guest_exceptions tests/test_guest_exceptions.cpp)
+target_link_libraries(test_guest_exceptions PRIVATE ps4_core)
+add_test(NAME GuestExceptions COMMAND test_guest_exceptions)
+
+add_executable(test_jit_mem tests/test_jit_mem.cpp)
+target_link_libraries(test_jit_mem PRIVATE ps4_core)
+add_test(NAME JitMemOperands COMMAND test_jit_mem)
+
+add_executable(test_jit_diff tests/test_jit_diff.cpp)
+target_link_libraries(test_jit_diff PRIVATE ps4_core)
+add_test(NAME JitDifferentialFuzz COMMAND test_jit_diff)

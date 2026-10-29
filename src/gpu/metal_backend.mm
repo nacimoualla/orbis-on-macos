@@ -1,6 +1,7 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include "ps4/metal_backend.hpp"
+#include <iostream>
 
 namespace ps4 {
 
@@ -8,8 +9,18 @@ struct MetalBackend::Impl {
     id<MTLDevice> device{nil};
     id<MTLCommandQueue> command_queue{nil};
     id<MTLTexture> framebuffer{nil};
+    id<MTLCommandBuffer> active_command_buffer{nil};
+    id<MTLRenderCommandEncoder> active_render_encoder{nil};
+    id<MTLCommandBuffer> last_submitted_command_buffer{nil};
+    u64 submitted_frames{0};
+    bool last_frame_completed{true};
     u32 width{0};
     u32 height{0};
+
+    void abort_active_frame() noexcept {
+        active_render_encoder = nil;
+        active_command_buffer = nil;
+    }
 };
 
 MetalBackend::MetalBackend() : m_impl(std::make_unique<Impl>()) {}
@@ -82,7 +93,54 @@ u32 MetalBackend::height() const noexcept {
 }
 
 bool MetalBackend::clear_screen(ColorRGBA color) {
-    if (!is_initialized() || !m_impl->framebuffer) {
+    if (!begin_frame()) {
+        return false;
+    }
+
+    if (!encode_clear(color)) {
+        m_impl->abort_active_frame();
+        return false;
+    }
+
+    return submit_frame(true);
+}
+
+bool MetalBackend::begin_frame() {
+    if (!is_initialized()) {
+        std::cerr << "[Metal] Cannot begin frame before initialization\n";
+        return false;
+    }
+    if (!m_impl->framebuffer) {
+        std::cerr << "[Metal] Cannot begin frame without a framebuffer\n";
+        return false;
+    }
+    if (m_impl->active_command_buffer) {
+        std::cerr << "[Metal] Cannot begin frame while another frame is active\n";
+        return false;
+    }
+
+    @autoreleasepool {
+        m_impl->active_command_buffer = [m_impl->command_queue commandBuffer];
+        if (!m_impl->active_command_buffer) {
+            std::cerr << "[Metal] Failed to create frame command buffer\n";
+            return false;
+        }
+        m_impl->active_render_encoder = nil;
+        return true;
+    }
+}
+
+bool MetalBackend::encode_clear(ColorRGBA color) {
+    if (!is_initialized()) {
+        std::cerr << "[Metal] Cannot encode clear before initialization\n";
+        return false;
+    }
+    if (!m_impl->framebuffer) {
+        std::cerr << "[Metal] Cannot encode clear without a framebuffer\n";
+        return false;
+    }
+    if (!m_impl->active_command_buffer || m_impl->active_render_encoder) {
+        std::cerr << "[Metal] Cannot encode clear without an available active frame\n";
         return false;
     }
 
@@ -93,22 +151,124 @@ bool MetalBackend::clear_screen(ColorRGBA color) {
         pass_desc.colorAttachments[0].clearColor = MTLClearColorMake(color.r, color.g, color.b, color.a);
         pass_desc.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-        id<MTLCommandBuffer> cmd_buffer = [m_impl->command_queue commandBuffer];
-        if (!cmd_buffer) {
+        m_impl->active_render_encoder =
+            [m_impl->active_command_buffer renderCommandEncoderWithDescriptor:pass_desc];
+        if (!m_impl->active_render_encoder) {
+            std::cerr << "[Metal] Failed to create clear render encoder\n";
+            m_impl->abort_active_frame();
             return false;
         }
 
-        id<MTLRenderCommandEncoder> encoder = [cmd_buffer renderCommandEncoderWithDescriptor:pass_desc];
-        if (!encoder) {
-            return false;
-        }
-
-        [encoder endEncoding];
-        [cmd_buffer commit];
-        [cmd_buffer waitUntilCompleted];
-
-        return cmd_buffer.status == MTLCommandBufferStatusCompleted;
+        [m_impl->active_render_encoder endEncoding];
+        m_impl->active_render_encoder = nil;
+        return true;
     }
+}
+
+bool MetalBackend::submit_frame(bool wait_for_completion) {
+    if (!is_initialized()) {
+        std::cerr << "[Metal] Cannot submit frame before initialization\n";
+        return false;
+    }
+
+    if (!m_impl->active_command_buffer) {
+        std::cerr << "[Metal] Cannot submit frame when no frame is active\n";
+        return false;
+    }
+
+    @autoreleasepool {
+        if (m_impl->active_render_encoder) {
+            [m_impl->active_render_encoder endEncoding];
+            m_impl->active_render_encoder = nil;
+        }
+
+        id<MTLCommandBuffer> command_buffer = m_impl->active_command_buffer;
+        [command_buffer commit];
+        if (wait_for_completion) {
+            [command_buffer waitUntilCompleted];
+        }
+
+        m_impl->last_frame_completed =
+            command_buffer.status == MTLCommandBufferStatusCompleted;
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            std::cerr << "[Metal] Frame command buffer failed\n";
+        }
+        m_impl->last_submitted_command_buffer =
+            m_impl->last_frame_completed ? nil : command_buffer;
+        ++m_impl->submitted_frames;
+        m_impl->active_command_buffer = nil;
+        m_impl->active_render_encoder = nil;
+
+        return command_buffer.status != MTLCommandBufferStatusError &&
+               (!wait_for_completion || m_impl->last_frame_completed);
+    }
+}
+
+bool MetalBackend::ensure_render_encoder(bool clear, ColorRGBA color) {
+    if (!is_initialized() || !m_impl->active_command_buffer || !m_impl->framebuffer) {
+        return false;
+    }
+    if (m_impl->active_render_encoder) {
+        return true;
+    }
+    @autoreleasepool {
+        MTLRenderPassDescriptor* pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass_desc.colorAttachments[0].texture = m_impl->framebuffer;
+        pass_desc.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
+        pass_desc.colorAttachments[0].clearColor = MTLClearColorMake(color.r, color.g, color.b, color.a);
+        pass_desc.colorAttachments[0].storeAction = MTLStoreActionStore;
+        m_impl->active_render_encoder =
+            [m_impl->active_command_buffer renderCommandEncoderWithDescriptor:pass_desc];
+        return m_impl->active_render_encoder != nil;
+    }
+}
+
+void* MetalBackend::active_render_encoder() const noexcept {
+    return m_impl ? (__bridge void*)m_impl->active_render_encoder : nullptr;
+}
+
+void MetalBackend::end_render_encoder() {
+    if (m_impl && m_impl->active_render_encoder) {
+        [m_impl->active_render_encoder endEncoding];
+        m_impl->active_render_encoder = nil;
+    }
+}
+
+bool MetalBackend::wait_for_last_frame() {
+    if (!is_initialized()) {
+        std::cerr << "[Metal] Cannot wait for a frame before initialization\n";
+        return false;
+    }
+    if (!m_impl->framebuffer) {
+        std::cerr << "[Metal] Cannot wait for a frame without a framebuffer\n";
+        return false;
+    }
+    if (!m_impl->last_submitted_command_buffer) {
+        return true;
+    }
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> command_buffer = m_impl->last_submitted_command_buffer;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted &&
+            command_buffer.status != MTLCommandBufferStatusError) {
+            [command_buffer waitUntilCompleted];
+        }
+        m_impl->last_frame_completed =
+            command_buffer.status == MTLCommandBufferStatusCompleted;
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            std::cerr << "[Metal] Last frame command buffer failed\n";
+        }
+        m_impl->last_submitted_command_buffer = nil;
+        return m_impl->last_frame_completed;
+    }
+}
+
+bool MetalBackend::frame_in_progress() const noexcept {
+    return m_impl && m_impl->active_command_buffer != nil;
+}
+
+u64 MetalBackend::submitted_frame_count() const noexcept {
+    return m_impl ? m_impl->submitted_frames : 0;
 }
 
 bool MetalBackend::read_pixel(u32 x, u32 y, u8& out_r, u8& out_g, u8& out_b, u8& out_a) const {

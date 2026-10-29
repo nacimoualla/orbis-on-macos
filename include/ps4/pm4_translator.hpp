@@ -5,6 +5,7 @@
 #include "ps4/metal_backend.hpp"
 #include "ps4/pm4.hpp"
 #include <memory>
+#include <string>
 
 namespace ps4 {
 
@@ -26,6 +27,18 @@ struct GpuScissor {
     u32 height{1080};
 };
 
+struct GpuFrameStats {
+    u64 frame_index{0};
+    usize packets{0};
+    usize draws{0};
+    usize indexed_draws{0};
+    usize unsupported_packets{0};
+    usize upload_bytes{0};
+    usize resource_cache_hits{0};
+    usize resource_cache_misses{0};
+    u64 command_buffers_submitted{0};
+};
+
 class Pm4Translator {
 public:
     explicit Pm4Translator(MetalBackend* metal = nullptr);
@@ -39,8 +52,16 @@ public:
     Pm4Translator(const Pm4Translator&) = delete;
     Pm4Translator& operator=(const Pm4Translator&) = delete;
 
+    bool begin_frame();
+    bool submit_frame(bool wait_for_completion = false);
+    [[nodiscard]] bool frame_in_progress() const noexcept;
+    [[nodiscard]] GpuFrameStats frame_stats() const noexcept;
+
     /// Execute a single PM4 packet
     bool execute_packet(const Pm4Packet& packet);
+
+    /// Execute raw command buffer at guest virtual address
+    usize execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_bytes);
 
     /// Drain and execute all pending packets in ring buffer
     usize execute_ring_buffer(GpuRingBuffer& ring_buffer);
@@ -58,15 +79,41 @@ public:
     [[nodiscard]] usize draw_count() const noexcept;
     [[nodiscard]] usize indexed_draw_count() const noexcept;
     [[nodiscard]] usize context_reg_writes() const noexcept;
+    [[nodiscard]] usize unsupported_packet_count() const noexcept;
+    [[nodiscard]] usize malformed_packet_count() const noexcept;
+    [[nodiscard]] usize shader_fallback_count() const noexcept;
+    [[nodiscard]] std::string shader_status() const;
 
     /// 3D Mesh pipeline: memory manager attachment and vertex buffer binding
     void set_memory_manager(MemoryManager* memory) noexcept;
+    void set_draw_diagnostics_enabled(bool enabled) noexcept;
+    void set_resource_cache_budget(usize bytes) noexcept;
+    void invalidate_guest_resources(GuestAddr address, usize size) noexcept;
     void bind_vertex_buffer(GuestAddr vaddr, usize size, usize stride = sizeof(Vertex3D));
     [[nodiscard]] GuestAddr vertex_buffer_address() const noexcept;
     [[nodiscard]] usize vertex_buffer_size() const noexcept;
 
+    /// Index buffer and indirect draw state
+    [[nodiscard]] GuestAddr index_base_address() const noexcept;
+    [[nodiscard]] u32 index_buffer_size() const noexcept;
+    [[nodiscard]] bool is_32bit_index() const noexcept;
+    [[nodiscard]] GuestAddr indirect_base_address() const noexcept;
+    [[nodiscard]] GuestAddr last_dma_dst_address() const noexcept;
+    [[nodiscard]] usize last_dma_size() const noexcept;
+    /// Command-processor state (VGT_PRIMITIVE_TYPE, NUM_INSTANCES, shadow register file)
+    [[nodiscard]] PrimitiveType primitive_type() const noexcept;
+    [[nodiscard]] u32 num_instances() const noexcept;
+    [[nodiscard]] u32 register_value(u32 abs_dword_reg) const noexcept;
+
+    void set_index_base_address(GuestAddr addr) noexcept;
+    void set_indirect_base_address(GuestAddr addr) noexcept;
+    void set_index_32bit(bool is_32bit) noexcept;
+
     /// Direct 3D indexed draw submission
     bool execute_indexed_draw(GuestAddr index_buffer_addr, u32 index_count, PrimitiveType prim_type = PrimitiveType::TriangleList);
+
+    /// Direct 3D auto draw submission
+    bool execute_auto_draw(u32 vtx_count, PrimitiveType prim_type = PrimitiveType::TriangleList, i32 base_vertex = 0, u32 instance_count = 1);
 
 private:
     struct Impl;

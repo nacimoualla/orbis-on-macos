@@ -135,4 +135,18 @@ usize AudioOutManager::active_port_count() {
     return m_ports.size();
 }
 
+u32 AudioOutManager::get_port_grain(i32 handle) {
+    std::lock_guard<std::mutex> lock(m_manager_mutex);
+    auto it = m_ports.find(handle);
+    if (it == m_ports.end()) return 256;
+    return it->second->config.grain > 0 ? it->second->config.grain : 256;
+}
+
+u32 AudioOutManager::get_port_sample_rate(i32 handle) {
+    std::lock_guard<std::mutex> lock(m_manager_mutex);
+    auto it = m_ports.find(handle);
+    if (it == m_ports.end()) return 48000;
+    return it->second->config.sample_rate > 0 ? it->second->config.sample_rate : 48000;
+}
+
 } // namespace ps4

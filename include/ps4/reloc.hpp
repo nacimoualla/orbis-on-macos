@@ -60,6 +60,16 @@ inline constexpr i64 DT_SCE_STRSZ                = 0x61000037;
 inline constexpr i64 DT_SCE_SYMTAB               = 0x61000039;
 inline constexpr i64 DT_SCE_SYMENT               = 0x6100003B;
 
+// DT_SCE_SYMTAB (0x61000039) is the symbol table OFFSET and the tag past
+// SYMENT is its byte SIZE, so the entry count is d_val / sizeof(Elf64_Sym).
+// Verified on both shipped modules: mono-ps4.prx gives 0x38e8 / 0x5400, and
+// 0x5400 is exactly 896 * 24; MonoAssembliesPS4.prx gives 0x268 / 0x2a0 = 28
+// symbols. Reading the size as an offset lands mid-table and silently shifts
+// every st_name, which is what makes a back-scan appear necessary.
+inline constexpr i64 DT_SCE_SYMTABSZ             = 0x6100003F;
+
+
+
 // x86_64 Relocation Types (ELF64_R_TYPE)
 inline constexpr u32 R_X86_64_NONE      = 0;
 inline constexpr u32 R_X86_64_64        = 1;
