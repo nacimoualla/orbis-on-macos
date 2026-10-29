@@ -95,6 +95,15 @@ struct GuestThread {
     std::vector<int> pending_signals;
     std::atomic<bool> has_pending_signals{false};
     bool delivering_signal{false}; // owning host thread only
+    // Condition variable this thread is blocked on inside an HLE wait (set by
+    // the wait for its duration). raise_exception notifies it so a suspend
+    // signal is answered at once instead of on the wait's next poll timeout;
+    // the GC's stop-the-world otherwise stalled every frame for up to ~100 ms.
+    std::mutex wait_cv_mtx;
+    std::condition_variable* wait_cv{nullptr};
+    // Host QoS class wanted for this thread (from its name), applied by the
+    // thread itself at its next quantum boundary; 0 = nothing pending.
+    std::atomic<unsigned> pending_qos{0};
 };
 
 class CpuExecutor;

@@ -169,6 +169,10 @@ public:
     [[nodiscard]] usize cached_block_count() const noexcept;
     [[nodiscard]] usize code_buffer_used() const noexcept;
     [[nodiscard]] usize total_invocations() const noexcept;
+    /// Per-block execution counters (execution_count, total_invocations). On by
+    /// default; they are shared atomics bumped on every block, which costs real
+    /// time when many guest threads run JIT code, so a runner may switch them off.
+    void set_collect_metrics(bool enabled) noexcept { m_collect_metrics = enabled; }
     [[nodiscard]] const JitBlockMetrics* get_block_metrics(GuestAddr guest_rip) const;
 
 private:
@@ -190,6 +194,7 @@ private:
     // cache hits take no lock; a constructor or clear_cache() takes a fresh
     // epoch from a global counter, which drops every thread's copy.
     std::atomic<u64> m_epoch{0};
+    bool m_collect_metrics{true};
 
     JittedBlockFunc compile_block_locked(GuestAddr guest_rip, const MemoryManager& memory);
     void* allocate_code(usize size);

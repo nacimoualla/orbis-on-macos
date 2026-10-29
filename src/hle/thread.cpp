@@ -1,9 +1,30 @@
+#include <pthread.h>
 #include "ps4/thread.hpp"
 #include "ps4/executor.hpp"
 #include "ps4/jit_compiler.hpp"
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+
+namespace {
+// Host scheduling class for a guest thread, by the name the game gave it. The
+// frame's critical path (render, job workers, audio mixer) must stay on the
+// performance cores; with ~8 busy threads on a 4P+6E machine, one of them
+// landing on an efficiency core halved the frame rate for seconds at a time.
+// Loading/background threads yield to them.
+qos_class_t qos_for_thread_name(const std::string& name) {
+    static const char* const kCritical[] = {"UnityGfxDeviceWorker", "Worker Thread", "FMOD mixer", "FMOD AudioOut",
+                                            "Submit Done"};
+    static const char* const kBackground[] = {"BackgroundWorker", "UnityPreload", "AsyncReadManager",
+                                              "BatchDeleteObjects", "UnitySubstance", "Enlighten", "GeoCreate",
+                                              "FMOD stream"};
+    for (const char* n : kCritical)
+        if (name.find(n) != std::string::npos) return QOS_CLASS_USER_INTERACTIVE;
+    for (const char* n : kBackground)
+        if (name.find(n) != std::string::npos) return QOS_CLASS_UTILITY;
+    return QOS_CLASS_USER_INITIATED;
+}
+} // namespace
 
 namespace ps4 {
 
@@ -232,6 +253,9 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
             executor.context() = raw_thread->context;
             raw_thread->live_context.store(&executor.context(), std::memory_order_relaxed);
         t_guest_tid = static_cast<int>(raw_thread->id);
+        // Default-QoS threads may be parked on efficiency cores; pick the
+        // class from the thread's name (renames are applied between quanta).
+        pthread_set_qos_class_self_np(qos_for_thread_name(raw_thread->name), 0);
 
             constexpr usize QUANTUM = 20000;
             // PS4_TRACE_TID=<tid>: run that thread one instruction at a time and
@@ -277,6 +301,8 @@ ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
 
                 if (raw_thread->has_pending_signals.load(std::memory_order_acquire))
                     deliver_pending_exceptions(executor);
+                if (const unsigned qos = raw_thread->pending_qos.exchange(0, std::memory_order_relaxed))
+                    pthread_set_qos_class_self_np(static_cast<qos_class_t>(qos), 0);
 
                 // Cooperative yield between quanta
                 std::this_thread::yield();
@@ -308,6 +334,10 @@ bool ThreadManager::raise_exception(ScePthreadId tid, int signum) {
         th->pending_signals.push_back(signum);
     }
     th->has_pending_signals.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(th->wait_cv_mtx);
+        if (th->wait_cv) th->wait_cv->notify_all();
+    }
     return true;
 }
 
@@ -400,11 +430,13 @@ bool ThreadManager::join_thread(ScePthreadId id, u64* out_return_value) {
     return true;
 }
 
+
 bool ThreadManager::rename_thread(ScePthreadId id, std::string_view name) {
     std::lock_guard<std::mutex> lock(m_threads_mutex);
     auto it = m_threads.find(id);
     if (it != m_threads.end()) {
         it->second->name = std::string(name);
+        it->second->pending_qos.store(static_cast<unsigned>(qos_for_thread_name(it->second->name)));
         return true;
     }
     return false;

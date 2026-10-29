@@ -4,7 +4,9 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <atomic>
 #include <thread>
+#include <pthread.h>
 #include "ps4/common.hpp"
 #include "ps4/cpu_context.hpp"
 #include "ps4/display_window.hpp"
@@ -221,6 +223,9 @@ int main(int argc, char* argv[]) {
         ps4::set_write_watch(waddr, static_cast<ps4::usize>(wsz));
     }
     if (enable_jit) {
+        // Block counters are shared atomics bumped on every block; keep them for
+        // PS4_JIT_STATS runs only.
+        jit.set_collect_metrics(ps4::jit_stats_enabled());
         cpu.set_jit_compiler(&jit);
         nid_registry.set_jit_compiler(&jit);
         std::cout << "[CPU] ARM64 JIT compiler connected to executor (Tier-2 Dynamic Binary Translation active)\n";
@@ -263,61 +268,99 @@ int main(int argc, char* argv[]) {
     if (!syscalls.has_exited() &&
         (run_res.status == ps4::StepResult::Ok || run_res.status == ps4::StepResult::Syscall)) {
         if (window && window->is_open()) {
-            // Interactive Presentation Loop:
-            // Run guest execution batches each frame, pump user input events, and present via Metal
-            const ps4::usize frame_slice = 2000000;
-            auto t_start = std::chrono::steady_clock::now();
-            auto t_last = t_start;
-            ps4::usize instrs_last = 0;
-            constexpr auto frame_period = std::chrono::microseconds(16667);
-            auto next_deadline = std::chrono::steady_clock::now();
-            while (window->is_open() && !syscalls.has_exited() && (instruction_budget == 0 || total_instructions < instruction_budget)) {
-                next_deadline += frame_period;
-                window->poll_events();
-                nid_registry.set_pad_buttons(window->input_buttons());
+            // Interactive presentation. The guest main thread runs on its own
+            // host thread; this (AppKit) thread only pumps input and presents.
+            // It used to run the guest in 2M-instruction slices and present
+            // between them, but a slice spends most of its time blocked in the
+            // game's own vsync/GPU waits, so the window updated ~6 times a
+            // second (and sampled input as rarely) while the game made 60+
+            // frames. Each guest flip now ends the GPU frame and marks a new
+            // frame to present (set_flip_hook).
+            ps4::Pm4Translator* gpu = nid_registry.gpu_translator();
+            if (gpu && !gpu->begin_frame()) {
+                std::cerr << "[GPU] Failed to begin translator frame; stopping guest execution.\n";
+                run_res.status = ps4::StepResult::MemoryFault;
+            } else {
+                std::atomic<ps4::u64> frames_ready{0};
+                nid_registry.set_flip_hook([gpu, &frames_ready] {
+                    if (gpu) {
+                        gpu->submit_frame(false);
+                        gpu->begin_frame();
+                    }
+                    frames_ready.fetch_add(1, std::memory_order_release);
+                });
 
-                ps4::Pm4Translator* gpu = nid_registry.gpu_translator();
-                if (gpu && !gpu->begin_frame()) {
-                    std::cerr << "[GPU] Failed to begin translator frame; stopping guest execution.\n";
-                    run_res.status = ps4::StepResult::MemoryFault;
-                    break;
-                }
-                run_res = cpu.run(frame_slice);
-                total_instructions += run_res.instructions_executed;
-                if (gpu) {
-                    const bool submitted = gpu->submit_frame(false);
-                    if (!submitted) {
-                        std::cerr << "[GPU] Failed to submit translator frame; stopping guest execution.\n";
-                        if (run_res.status == ps4::StepResult::Ok ||
-                            run_res.status == ps4::StepResult::Syscall) {
-                            run_res.status = ps4::StepResult::MemoryFault;
+                std::atomic<bool> stop_guest{false}, guest_done{false};
+                std::atomic<ps4::usize> guest_instructions{0};
+                ps4::RunResult guest_res{};
+                std::thread guest([&] {
+                    ps4::t_guest_tid = 1; // main is guest TID 1
+                    // It used to run on the AppKit thread; keep that thread's
+                    // priority so it is not scheduled onto efficiency cores.
+                    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+                    auto t_report = std::chrono::steady_clock::now();
+                    while (!stop_guest.load() && !syscalls.has_exited() &&
+                           (instruction_budget == 0 || guest_instructions.load() < instruction_budget)) {
+                        const ps4::RunResult r = cpu.run(2000000);
+                        guest_instructions.fetch_add(r.instructions_executed);
+                        guest_res = r;
+                        if (r.status != ps4::StepResult::Ok) break;
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - t_report >= std::chrono::seconds(5)) {
+                            t_report = now;
+                            std::cout << "[CPU Progress] " << guest_instructions.load() << " instrs, RIP=0x" << std::hex
+                                      << cpu.context().rip << std::dec << "\n" << std::flush;
                         }
                     }
+                    guest_done.store(true);
+                });
+
+                ps4::u64 presented = 0;
+                auto t_window = std::chrono::steady_clock::now();
+                int presents = 0;
+                double worst_gap_ms = 0;
+                auto t_prev_present = t_window;
+                static const bool s_flip_stats = std::getenv("PS4_FLIP_STATS") != nullptr;
+                while (window->is_open() && !guest_done.load()) {
+                    window->poll_events();
+                    nid_registry.set_pad_buttons(window->input_buttons());
+                    const ps4::u64 ready = frames_ready.load(std::memory_order_acquire);
+                    if (ready != presented) {
+                        presented = ready;
+                        window->present_frame(); // waits for a drawable: paced by the display
+                        const auto now = std::chrono::steady_clock::now();
+                        if (s_flip_stats) {
+                            worst_gap_ms = std::max(worst_gap_ms,
+                                std::chrono::duration<double, std::milli>(now - t_prev_present).count());
+                            t_prev_present = now;
+                            if (++presents, now - t_window >= std::chrono::seconds(1)) {
+                                std::fprintf(stderr, "[fps] window %d presents/s, worst gap %.1f ms\n", presents,
+                                             worst_gap_ms);
+                                t_window = now;
+                                presents = 0;
+                                worst_gap_ms = 0;
+                            }
+                        }
+                    } else {
+                        // Poll input often so a tap reaches the game within a few ms.
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
                 }
-                if (run_res.status != ps4::StepResult::Ok) break;
 
-                const auto now = std::chrono::steady_clock::now();
-                const double dt = std::chrono::duration<double>(now - t_last).count();
-                const double dt_total = std::chrono::duration<double>(now - t_start).count();
-                const double cur_mips = (dt > 0.0) ? ((total_instructions - instrs_last) / dt / 1e6) : 0.0;
-                const double avg_mips = (dt_total > 0.0) ? (total_instructions / dt_total / 1e6) : 0.0;
-                instrs_last = total_instructions;
-                t_last = now;
-
-                std::cout << "[CPU Progress] " << total_instructions << " instrs ("
-                          << std::fixed << std::setprecision(1) << cur_mips << " M instr/s, avg "
-                          << avg_mips << " M instr/s), RIP=0x" << std::hex << cpu.context().rip << std::dec << "\n" << std::flush;
-
-                if (nid_registry.get_flip_count() > 0) {
-                    window->present_frame();
-                }
-
-                const auto deadline_now = std::chrono::steady_clock::now();
-                if (deadline_now > next_deadline + frame_period * 2) {
-                    next_deadline = deadline_now;
+                // Window closed (or the guest stopped). The guest may be parked in
+                // a blocking HLE wait, so give it a moment to finish its slice and
+                // otherwise leave it: shutdown hard-exits parked threads anyway.
+                stop_guest.store(true);
+                for (int i = 0; i < 50 && !guest_done.load(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                if (guest_done.load()) {
+                    guest.join();
+                    run_res = guest_res;
                 } else {
-                    std::this_thread::sleep_until(next_deadline);
+                    guest.detach();
                 }
+                nid_registry.set_flip_hook(nullptr);
+                total_instructions = guest_instructions.load();
             }
         } else {
             // Console / Headless Execution Loop

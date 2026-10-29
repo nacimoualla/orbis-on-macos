@@ -68,6 +68,9 @@ public:
 
     /// Set pad digital buttons bitmask (e.g. from keyboard/mouse input)
     void set_pad_buttons(u32 buttons);
+    /// Called on the guest thread after every sceVideoOut flip, once the
+    /// frame's GPU work has been encoded (the windowed runner presents here).
+    void set_flip_hook(std::function<void()> hook);
 
     /// Get total number of video flips performed
     [[nodiscard]] u64 get_flip_count() const noexcept;

@@ -66,6 +66,11 @@ for op, nm in ((0x7C, "hadd"), (0x7D, "hsub")):
         add(f"v{nm}{sfx} x5,x4,x2", vex(op, pp, 1, 5, 4, 2))
         add(f"v{nm}{sfx} y5,y4,y2", vex(op, pp, 1, 5, 4, 2, L=1))
 
+# Legacy SSE float -> int conversions (cvtsd2si was skipped as a NOP)
+add("cvtsd2si eax,xmm1", [0xF2,0x0F,0x2D,0xC1]); add("cvtsd2si rax,xmm1", [0xF2,0x48,0x0F,0x2D,0xC1])
+add("cvtss2si eax,xmm1", [0xF3,0x0F,0x2D,0xC1]); add("cvttsd2si eax,xmm1", [0xF2,0x0F,0x2C,0xC1])
+add("cvttss2si rax,xmm1", [0xF3,0x48,0x0F,0x2C,0xC1])
+
 # Scalar / packed float (map 0F)
 for pp, sfx in ((2, "ss"), (3, "sd")):
     for op, nm in ((0x58,"add"),(0x59,"mul"),(0x5C,"sub"),(0x5D,"min"),(0x5E,"div"),(0x5F,"max"),(0x51,"sqrt"),(0x5A,"cvt")):

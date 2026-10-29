@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <fstream>
 #include <map>
 #include <set>
@@ -209,6 +210,7 @@ struct GcnPipelineCache::Impl {
         auto it = pipes.find(key);
         if (it != pipes.end()) return it->second;
         PipeEntry e;
+        const auto t_compile = std::chrono::steady_clock::now();
         e.tp = gcn::translate_pipeline(vs, ps, cntl, opts);
         dump(key, vs, ps, e.tp);
         if (!e.tp.ok) {
@@ -255,8 +257,9 @@ struct GcnPipelineCache::Impl {
                       (unsigned long long)key.ps_hash);
         if (e.pso) {
             ++stats.pipelines_compiled;
-            std::fprintf(stderr, "[GCN] compiled %s (vs %zu insts, ps %zu insts, %u params, %zu textures)\n", hdr,
-                         vs.insts.size(), ps.insts.size(), e.tp.vs_param_count, e.tp.ps_images.size());
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_compile).count();
+            std::fprintf(stderr, "[GCN] compiled %s in %.1f ms (vs %zu insts, ps %zu insts, %u params, %zu textures)\n", hdr,
+                         ms, vs.insts.size(), ps.insts.size(), e.tp.vs_param_count, e.tp.ps_images.size());
         } else {
             ++stats.pipeline_failures;
             std::fprintf(stderr, "[GCN] %s unsupported -> fixed fallback shader: %s\n", hdr, e.error.c_str());
