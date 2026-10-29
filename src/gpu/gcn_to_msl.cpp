@@ -21,6 +21,7 @@
 // generated MSL does not depend on any data values and can be cached by ISA
 // hash.
 
+#include "ps4/bc_decode.hpp"
 #include "ps4/gcn_shader.hpp"
 
 #include <algorithm>
@@ -49,6 +50,11 @@ struct GcnDrawConsts {
     uint pad;
 };
 
+struct GcnComputeConsts {
+    uint cs_user[16];
+    uint pad[16];
+};
+
 #define F(x) as_type<float>(uint(x))
 #define U(x) as_type<uint>(float(x))
 
@@ -75,6 +81,62 @@ static inline uint gcn_ld16(device const uchar* mem, constant GcnDrawConsts& dc,
     return gcn_ld8(mem, dc, a) | (gcn_ld8(mem, dc, a + 1) << 8);
 }
 
+static inline uint gcn_ld8(device const uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    return uint(mem[a]);
+}
+static inline uint gcn_ld8(device uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    return uint(mem[a]);
+}
+
+static inline uint gcn_ld32(device const uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    device const uchar* p = mem + a;
+    return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
+}
+static inline uint gcn_ld32(device uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    device uchar* p = mem + a;
+    return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
+}
+
+static inline uint gcn_ld16(device const uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    return gcn_ld8(mem, dc, a) | (gcn_ld8(mem, dc, a + 1) << 8);
+}
+static inline uint gcn_ld16(device uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    return gcn_ld8(mem, dc, a) | (gcn_ld8(mem, dc, a + 1) << 8);
+}
+
+static inline void gcn_st8(device uchar* mem, constant GcnComputeConsts& dc, ulong a, uint v) {
+    mem[a] = uchar(v);
+}
+static inline void gcn_st16(device uchar* mem, constant GcnComputeConsts& dc, ulong a, uint v) {
+    device uchar* p = mem + a;
+    p[0] = uchar(v); p[1] = uchar(v >> 8);
+}
+static inline void gcn_st32(device uchar* mem, constant GcnComputeConsts& dc, ulong a, uint v) {
+    device uchar* p = mem + a;
+    p[0] = uchar(v); p[1] = uchar(v >> 8); p[2] = uchar(v >> 16); p[3] = uchar(v >> 24);
+}
+
+static inline void gcn_st8(device uchar* mem, constant GcnDrawConsts& dc, ulong a, uint v) {
+    for (uint i = 0; i < dc.range_count; ++i) {
+        ulong b = dc.range_base[i];
+        if (a >= b && a < b + ulong(dc.range_size[i])) { mem[dc.range_off[i] + uint(a - b)] = uchar(v); return; }
+    }
+}
+static inline void gcn_st16(device uchar* mem, constant GcnDrawConsts& dc, ulong a, uint v) {
+    gcn_st8(mem, dc, a, v & 0xffu);
+    gcn_st8(mem, dc, a + 1ul, (v >> 8) & 0xffu);
+}
+static inline void gcn_st32(device uchar* mem, constant GcnDrawConsts& dc, ulong a, uint v) {
+    for (uint i = 0; i < dc.range_count; ++i) {
+        ulong b = dc.range_base[i];
+        if (a >= b && a + 4ul <= b + ulong(dc.range_size[i])) {
+            device uchar* p = mem + dc.range_off[i] + uint(a - b);
+            p[0] = uchar(v); p[1] = uchar(v >> 8); p[2] = uchar(v >> 16); p[3] = uchar(v >> 24);
+            return;
+        }
+    }
+}
+
 static inline ulong gcn_vbase(uint w0, uint w1) { return ulong(w0) | (ulong(w1 & 0xffffu) << 32); }
 static inline uint gcn_vstride(uint w1) { return (w1 >> 16) & 0x3fffu; }
 
@@ -95,7 +157,8 @@ static inline uint gcn_cvt(uint c, uint bits, uint nfmt) {
     }
 }
 
-static inline uint4 gcn_fetch_format(device const uchar* mem, constant GcnDrawConsts& dc,
+template <typename MemT, typename ConstsT>
+static inline uint4 gcn_fetch_format(MemT mem, constant ConstsT& dc,
                                      ulong a, uint dfmt, uint nfmt) {
     bool is_int = (nfmt == 4u || nfmt == 5u);
     uint4 r = uint4(0u, 0u, 0u, is_int ? 1u : as_type<uint>(1.0f));
@@ -187,12 +250,13 @@ public:
     bool uses_exec_write{false};
     bool uses_frag_pos{false};
     u32 max_vgpr{0};
+    u32 max_sgpr{0};
 
 private:
     const Program& prog;
     Stage stage;
     const u32* input_cntl;
-    u32 input_ena;
+    [[maybe_unused]] u32 input_ena;
     const Instruction* cur{nullptr};
 
     void fail(const std::string& why) {
@@ -200,13 +264,14 @@ private:
     }
 
     void track_v(u32 v) { max_vgpr = std::max(max_vgpr, v + 1); }
+    void track_s(u32 s) { if (s < 104) max_sgpr = std::max(max_sgpr, s + 1); }
 
     std::string vreg(u32 r) { track_v(r); return "v[" + std::to_string(r) + "]"; }
 
     // 32-bit source operand as a uint expression.
     std::string usrc(u32 s) {
         if (s >= operand::kVgprBase) return vreg(s - 256);
-        if (s < 128) return "s[" + std::to_string(s) + "]";
+        if (s < 128) { track_s(s); return "s[" + std::to_string(s) + "]"; }
         if (s == operand::kZero) return "0u";
         if (s >= 129 && s <= 192) return std::to_string(s - 128) + "u";
         if (s >= 193 && s <= 208) return "uint(-" + std::to_string(s - 192) + ")";
@@ -231,7 +296,7 @@ private:
 
     // 64-bit scalar source.
     std::string usrc64(u32 s) {
-        if (s < 127) return "gcn_s64(s, " + std::to_string(s) + "u)";
+        if (s < 127) { track_s(s); track_s(s + 1); return "gcn_s64(s, " + std::to_string(s) + "u)"; }
         if (s == operand::kLiteral) return "ulong(" + hex(cur->literal) + ")";
         if (s >= 193 && s <= 208) return "ulong(long(-" + std::to_string(s - 192) + "))";
         return "ulong(" + usrc(s) + ")";
@@ -484,16 +549,22 @@ void Emitter::emit_valu(const Instruction& i) {
 }
 
 void Emitter::emit_salu(const Instruction& i) {
-    const std::string d = "s[" + std::to_string(i.dst) + "]";
     if (i.enc == Encoding::SOPP) {
         switch (i.op) {
-        case 0: case 10: case 12: case 13: case 14: case 15: case 16: case 17: case 19: case 20: case 21: case 22:
+        case 10:
+            if (stage == Stage::Compute) {
+                body << "    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n";
+            }
+            return;
+        case 0: case 12: case 13: case 14: case 15: case 16: case 17: case 19: case 20: case 21: case 22:
             return;
         default:
             fail("unsupported " + mnemonic(i));
             return;
         }
     }
+    const std::string d = "s[" + std::to_string(i.dst) + "]";
+    track_s(i.dst);
     if (i.enc == Encoding::SOPK) {
         const i32 k = i.simm;
         const u32 uk = static_cast<u32>(i.simm) & 0xFFFF;
@@ -627,9 +698,16 @@ void Emitter::emit_smrd(const Instruction& i) {
     static const u32 kCount[] = {1, 2, 4, 8, 16};
     const u32 kind = i.op & 7;
     if (i.op == 29 || i.op == 31) return;            // cache invalidations
-    if (i.op == 30) { body << "    s[" << i.dst << "] = 0u; s[" << i.dst + 1 << "] = 0u;\n"; return; }
+    if (i.op == 30) {
+        track_s(i.dst); track_s(i.dst + 1);
+        body << "    s[" << i.dst << "] = 0u; s[" << i.dst + 1 << "] = 0u;\n";
+        return;
+    }
     if (kind > 4 || (i.op & ~7u) > 8) { fail("unsupported " + mnemonic(i)); return; }
     const u32 n = kCount[kind];
+    for (u32 k = 0; k < n; ++k) track_s(i.dst + k);
+    track_s(i.sbase); track_s(i.sbase + 1);
+    if (!i.imm && i.offset < 128) track_s(i.offset);
     std::string off;
     if (i.imm) off = std::to_string(i.offset * 4) + "ul";
     else if (i.offset == 255) off = std::to_string(static_cast<u64>(i.literal) * 4) + "ul";
@@ -648,8 +726,9 @@ void Emitter::emit_smrd(const Instruction& i) {
 void Emitter::emit_buffer(const Instruction& i) {
     const bool tbuf = i.enc == Encoding::MTBUF;
     const bool is_store = tbuf ? (i.op >= 4) : ((i.op >= 4 && i.op <= 7) || i.op >= 24);
-    if (is_store) { fail("unsupported " + mnemonic(i) + " (stores)"); return; }
+    if (is_store && tbuf) { fail("unsupported " + mnemonic(i) + " (stores)"); return; }
     const u32 r = i.srsrc;
+    track_s(r); track_s(r + 1); track_s(r + 2); track_s(r + 3);
     std::string idx = "0u", off = "0u";
     if (i.idxen) { idx = vreg(i.vaddr); if (i.offen) off = vreg(i.vaddr + 1); }
     else if (i.offen) off = vreg(i.vaddr);
@@ -658,6 +737,29 @@ void Emitter::emit_buffer(const Instruction& i) {
     body << "    { ulong a_ = 0ul; bool in_ = gcn_buf_addr(" << w0 << ", " << w1 << ", " << w2 << ", " << idx << ", "
          << off << " + " << usrc(i.soffset) << " + " << i.offset << "u, a_);\n";
     const std::string g = exec_guard();
+    if (is_store) {
+        switch (i.op) {
+        case 24: body << "      " << g << "if (in_) gcn_st8(mem, dc, a_, " << vreg(i.dst) << ");\n"; break;
+        case 26: body << "      " << g << "if (in_) gcn_st16(mem, dc, a_, " << vreg(i.dst) << ");\n"; break;
+        case 28: body << "      " << g << "if (in_) gcn_st32(mem, dc, a_, " << vreg(i.dst) << ");\n"; break;
+        case 29:
+            body << "      " << g << "if (in_) { gcn_st32(mem, dc, a_, " << vreg(i.dst) << "); gcn_st32(mem, dc, a_ + 4ul, "
+                 << vreg(i.dst + 1) << "); }\n";
+            break;
+        case 31:
+            body << "      " << g << "if (in_) { gcn_st32(mem, dc, a_, " << vreg(i.dst) << "); gcn_st32(mem, dc, a_ + 4ul, "
+                 << vreg(i.dst + 1) << "); gcn_st32(mem, dc, a_ + 8ul, " << vreg(i.dst + 2) << "); }\n";
+            break;
+        case 30:
+            body << "      " << g << "if (in_) { gcn_st32(mem, dc, a_, " << vreg(i.dst) << "); gcn_st32(mem, dc, a_ + 4ul, "
+                 << vreg(i.dst + 1) << "); gcn_st32(mem, dc, a_ + 8ul, " << vreg(i.dst + 2)
+                 << "); gcn_st32(mem, dc, a_ + 12ul, " << vreg(i.dst + 3) << "); }\n";
+            break;
+        default: fail("unsupported " + mnemonic(i) + " (stores)"); break;
+        }
+        body << "    }\n";
+        return;
+    }
     if (tbuf || i.op <= 3) {
         const u32 comps = (i.op & 3) + 1;
         const std::string dfmt = tbuf ? std::to_string(i.dfmt) + "u" : "((" + w3 + " >> 15) & 0xfu)";
@@ -758,6 +860,7 @@ void Emitter::emit_export(const Instruction& i) {
         val = "float4(F(" + src(0) + "), F(" + src(1) + "), F(" + src(2) + "), F(" + src(3) + "))";
     }
     std::string mask;
+    if (stage == Stage::Compute) { fail("exp in compute stage"); return; }
     // Components not enabled keep their previous value (zero initialised).
     if (stage == Stage::Vertex) {
         if (i.target == 12) {
@@ -1074,6 +1177,90 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     return out;
 }
 
+TranslatedComputePipeline translate_compute_pipeline(const Program& cs,
+                                                    const ComputePipelineOptions& opts) {
+    TranslatedComputePipeline out;
+    Emitter ec(cs, Stage::Compute, nullptr, 0);
+    if (!ec.run()) {
+        out.error = "CS: " + ec.error;
+        return out;
+    }
+
+    u32 cs_vgprs = std::max<u32>(ec.max_vgpr, 4);
+    u32 cs_sgprs = std::max<u32>({ec.max_sgpr, 16u, 3u});
+    if (opts.rsrc1 != 0) {
+        const u32 rsrc1_vgprs = (((opts.rsrc1 >> 0) & 0x3fu) + 1u) * 4u;
+        const u32 rsrc1_sgprs = (((opts.rsrc1 >> 6) & 0x0fu) + 1u) * 8u;
+        cs_vgprs = std::max(cs_vgprs, rsrc1_vgprs);
+        cs_sgprs = std::max(cs_sgprs, rsrc1_sgprs);
+    }
+    if (opts.rsrc2 != 0) {
+        const u32 user_sgprs = ((opts.rsrc2 >> 1) & 0x1fu) * 2u;
+        cs_sgprs = std::max(cs_sgprs, user_sgprs);
+    }
+
+    std::ostringstream m;
+    m << kPrelude << "\n";
+    m << "kernel void gcn_cs_main(\n"
+      << "    uint3 tid_in_tg [[thread_position_in_threadgroup]],\n"
+      << "    uint3 tgid [[threadgroup_position_in_grid]],\n"
+      << "    uint3 global_tid [[thread_position_in_grid]],\n"
+      << "    device uchar* mem [[buffer(0)]],\n"
+      << "    constant GcnComputeConsts& dc [[buffer(1)]]"
+      << image_params(ec.images) << ") {\n";
+    m << "  uint s[128];\n";
+    m << "  uint v[" << cs_vgprs << "];\n";
+    m << "  uint scc = 0u;\n";
+    m << "  for (uint k = 0; k < 128u; ++k) s[k] = 0u;\n";
+    m << "  for (uint k = 0; k < " << cs_vgprs << "u; ++k) v[k] = 0u;\n";
+    m << "  for (uint k = 0; k < 16u; ++k) s[k] = dc.cs_user[k];\n";
+    m << "  s[126] = 1u; s[124] = 0u;\n\n";
+
+    m << "  // Setup workgroup ID in SGPRs (by default s[0..2] = tgid.xyz)\n";
+    if (opts.rsrc2 == 0) {
+        m << "  s[0] = tgid.x;\n";
+        m << "  s[1] = tgid.y;\n";
+        m << "  s[2] = tgid.z;\n";
+    } else {
+        const u32 user_sgprs = ((opts.rsrc2 >> 1) & 0x1fu) * 2u;
+        u32 s_idx = user_sgprs;
+        if (opts.rsrc2 & (1u << 7)) { // TGID_X_EN
+            m << "  s[" << s_idx++ << "] = tgid.x;\n";
+        } else if (user_sgprs == 0 && (opts.rsrc2 & 0x380u) == 0) {
+            m << "  s[0] = tgid.x;\n";
+        }
+        if (opts.rsrc2 & (1u << 8)) { // TGID_Y_EN
+            m << "  s[" << s_idx++ << "] = tgid.y;\n";
+        } else if (user_sgprs == 0 && (opts.rsrc2 & 0x380u) == 0) {
+            m << "  s[1] = tgid.y;\n";
+        }
+        if (opts.rsrc2 & (1u << 9)) { // TGID_Z_EN
+            m << "  s[" << s_idx++ << "] = tgid.z;\n";
+        } else if (user_sgprs == 0 && (opts.rsrc2 & 0x380u) == 0) {
+            m << "  s[2] = tgid.z;\n";
+        }
+    }
+
+    m << "\n  // Setup thread ID in VGPR (v[0] = tid_in_tg.x)\n";
+    m << "  v[0] = tid_in_tg.x;\n";
+    if (opts.rsrc2 != 0) {
+        const u32 tidig = (opts.rsrc2 >> 11) & 3u;
+        if (tidig >= 1u) m << "  v[1] = tid_in_tg.y;\n";
+        if (tidig >= 2u) m << "  v[2] = tid_in_tg.z;\n";
+    }
+
+    m << ec.body.str();
+    m << "}\n";
+
+    out.ok = true;
+    out.msl = m.str();
+    out.images = ec.images;
+    out.max_vgpr = cs_vgprs;
+    out.max_sgpr = cs_sgprs;
+    out.uses_exec_write = ec.uses_exec_write;
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Scalar resource pre-pass
 // ---------------------------------------------------------------------------
@@ -1191,7 +1378,7 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
             break;
         case Encoding::SOP2: {
             u32 a = 0, b = 0;
-            const bool k = get(i.src0, i, a) & get(i.src1, i, b);
+            const bool k = get(i.src0, i, a) && get(i.src1, i, b);
             u32 r = 0;
             bool handled = true;
             switch (i.op) {
@@ -1330,11 +1517,30 @@ u32 data_format_bytes(u32 dfmt) {
     case 11: case 12: return 8;
     case 13: return 12;
     case 14: return 16;
-    default: return 0;
+    default: return bc::block_bytes(dfmt);  // BC1-BC7: bytes per 4x4 block
     }
 }
 
+namespace {
+
+/// Tiling index 8 (and 31) is linear; the other supported index is 8x8 micro tiled.
+bool is_linear_tiling(u32 tiling_index) { return tiling_index == 8 || tiling_index == 31; }
+
+} // namespace
+
 usize texture_guest_size(const TextureDesc& td) {
+    if (const u32 block = bc::block_bytes(td.dfmt)) {
+        // Block-compressed: pitch and height count 4x4 blocks. Micro tiles are
+        // 8x8 blocks, mirroring the element path below.
+        const u32 pitch_b = (std::max(td.pitch, td.width) + 3) / 4;
+        u32 h_b = (td.height + 3) / 4;
+        u32 p_b = pitch_b;
+        if (!is_linear_tiling(td.tiling_index)) {
+            p_b = (pitch_b + 7) & ~7u;
+            h_b = (h_b + 7) & ~7u;
+        }
+        return static_cast<usize>(p_b) * h_b * block;
+    }
     const u32 bpp = data_format_bytes(td.dfmt);
     const u32 pitch = std::max(td.pitch, td.width);
     u32 h = td.height;
@@ -1439,6 +1645,63 @@ u32 micro_tile_index(u32 x, u32 y) {
     return (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
 }
 
+/// Writes one texel's RGBA floats as 8 bits per channel, applying the T# dst_sel swizzle.
+void store_texel(u8* o, const u32* dst_sel, const float c[4]) {
+    for (u32 k = 0; k < 4; ++k) {
+        const u32 sel = dst_sel[k];
+        const float v = sel == 0 ? 0.0f : sel == 1 ? 1.0f : (sel >= 4 ? c[sel - 4] : 0.0f);
+        o[k] = to_u8(v);
+    }
+}
+
+/// BC1-BC7 texture. Tiling works as on the element path, with a 4x4 block as
+/// the element (micro tiles are 8x8 blocks). Edge blocks are cropped to the
+/// texture size.
+bool bc_texture_to_rgba8(const TextureDesc& td, const u8* src, bool linear, std::vector<u8>& out,
+                         std::string& error) {
+    const u32 bb = bc::block_bytes(td.dfmt);
+    const u32 blocks_w = (td.width + 3) / 4;
+    const u32 blocks_h = (td.height + 3) / 4;
+    const u32 pitch_b = (std::max(td.pitch, td.width) + 3) / 4;
+    const u32 tiles_per_row = (pitch_b + 7) / 8;
+    // RGBA8Unorm cannot hold negative values, so signed BC4/BC5 data is stored
+    // remapped from [-1,1] to [0,1]. Shaders that expect raw SNORM will see an
+    // offset of 0.5. BC6H is clamped to [0,1] by to_u8 (HDR range is lost), and
+    // SRGB data is kept as-is because the upload is RGBA8Unorm.
+    const bool remap_signed = td.nfmt == 1 && (td.dfmt == 38 || td.dfmt == 39);
+    out.assign(static_cast<usize>(td.width) * td.height * 4, 0);
+    float block[16][4];
+    for (u32 by = 0; by < blocks_h; ++by) {
+        for (u32 bx = 0; bx < blocks_w; ++bx) {
+            usize b;
+            if (linear) {
+                b = static_cast<usize>(by) * pitch_b + bx;
+            } else {
+                const usize tile = static_cast<usize>(by / 8) * tiles_per_row + (bx / 8);
+                b = tile * 64 + micro_tile_index(bx & 7, by & 7);
+            }
+            if (!bc::decode_block(td.dfmt, td.nfmt, src + b * bb, block)) {
+                error = "unsupported BC block, format " + std::to_string(td.dfmt) + "/" +
+                        std::to_string(td.nfmt);
+                return false;
+            }
+            for (u32 py = 0; py < 4; ++py) {
+                for (u32 px = 0; px < 4; ++px) {
+                    const u32 x = bx * 4 + px, y = by * 4 + py;
+                    if (x >= td.width || y >= td.height) continue;
+                    float c[4];
+                    for (u32 k = 0; k < 4; ++k) {
+                        const float v = block[py * 4 + px][k];
+                        c[k] = remap_signed ? v * 0.5f + 0.5f : v;
+                    }
+                    store_texel(out.data() + (static_cast<usize>(y) * td.width + x) * 4, td.dst_sel, c);
+                }
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size, std::vector<u8>& out,
@@ -1448,7 +1711,7 @@ bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size, std:
         error = "unsupported texture data format " + std::to_string(td.dfmt);
         return false;
     }
-    const bool linear = td.tiling_index == 8 || td.tiling_index == 31;
+    const bool linear = is_linear_tiling(td.tiling_index);
     const bool micro = td.tiling_index == 13 || td.tiling_index == 9;
     if (!linear && !micro) {
         error = "unsupported tiling index " + std::to_string(td.tiling_index);
@@ -1458,6 +1721,7 @@ bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size, std:
         error = "texture memory out of range";
         return false;
     }
+    if (bc::block_bytes(td.dfmt) != 0) return bc_texture_to_rgba8(td, src, linear, out, error);
     const u32 pitch = std::max(td.pitch, td.width);
     const u32 tiles_per_row = (pitch + 7) / 8;
     out.assign(static_cast<usize>(td.width) * td.height * 4, 0);
@@ -1475,12 +1739,7 @@ bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size, std:
                 error = "unsupported texture format " + std::to_string(td.dfmt) + "/" + std::to_string(td.nfmt);
                 return false;
             }
-            u8* o = out.data() + (static_cast<usize>(y) * td.width + x) * 4;
-            for (u32 k = 0; k < 4; ++k) {
-                const u32 sel = td.dst_sel[k];
-                float v = sel == 0 ? 0.0f : sel == 1 ? 1.0f : (sel >= 4 ? c[sel - 4] : 0.0f);
-                o[k] = to_u8(v);
-            }
+            store_texel(out.data() + (static_cast<usize>(y) * td.width + x) * 4, td.dst_sel, c);
         }
     }
     return true;

@@ -9,6 +9,8 @@
 #include "ps4/gpu_state.hpp"
 #include "ps4/memory.hpp"
 #include "ps4/metal_backend.hpp"
+#include "ps4/pm4.hpp"
+#include "ps4/pm4_translator.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -686,6 +688,109 @@ void test_render_targets(MemoryManager& mem) {
     CHECK((__bridge id<MTLTexture>)metal.find_color_target(kB) == tb);
 }
 
+void test_compute_shader(MemoryManager& mem, id<MTLDevice> device) {
+    // 1. Transpile simple compute shader with s_barrier and s_endpgm
+    const u32 kCsBytecode[] = {
+        0xbf8a0000, // s_barrier
+        0x7e020200, // v_mov_b32_e32 v1, v0
+        0xbf810000, // s_endpgm
+    };
+    gcn::Program cs;
+    std::string err;
+    CHECK(gcn::decode_program(kCsBytecode, std::size(kCsBytecode), cs, err));
+    gcn::ComputePipelineOptions copts;
+    copts.threads_x = 64;
+    copts.threads_y = 1;
+    copts.threads_z = 1;
+    gcn::TranslatedComputePipeline tcp = gcn::translate_compute_pipeline(cs, copts);
+    if (!tcp.ok) std::fprintf(stderr, "CS translation error: %s\n", tcp.error.c_str());
+    CHECK(tcp.ok);
+    CHECK(tcp.msl.find("kernel void gcn_cs_main") != std::string::npos);
+    CHECK(tcp.msl.find("threadgroup_barrier") != std::string::npos);
+
+    NSError* compile_err = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:tcp.msl.c_str()]
+                                              options:nil
+                                                error:&compile_err];
+    if (!lib) std::fprintf(stderr, "CS Metal compile error: %s\n", [[compile_err localizedDescription] UTF8String]);
+    CHECK(lib != nil);
+    id<MTLFunction> fn = [lib newFunctionWithName:@"gcn_cs_main"];
+    CHECK(fn != nil);
+    id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:fn error:&compile_err];
+    CHECK(pso != nil);
+
+    // 2. Dispatch via GcnPipelineCache
+    MetalBackend metal;
+    CHECK(metal.initialize());
+    CHECK(metal.create_framebuffer(64, 64));
+    GcnPipelineCache cache(metal.raw_device(), &mem);
+
+    constexpr GuestAddr kCsAddr = 0x163000000ULL;
+    write_words(mem, kCsAddr, kCsBytecode, std::size(kCsBytecode));
+
+    CHECK(metal.begin_frame());
+    CHECK(metal.ensure_compute_encoder());
+    void* compute_enc = metal.active_compute_encoder();
+    CHECK(compute_enc != nullptr);
+
+    u32 user_sgprs[16] = {};
+    user_sgprs[0] = 0x12345678;
+    GcnComputeRequest req{};
+    req.cs_addr = kCsAddr;
+    req.threads_x = 64;
+    req.threads_y = 1;
+    req.threads_z = 1;
+    req.grid_x = 2;
+    req.grid_y = 1;
+    req.grid_z = 1;
+    req.cs_user = user_sgprs;
+
+    std::string why;
+    CHECK(cache.encode_dispatch(compute_enc, req, &why));
+    CHECK(metal.submit_frame(true));
+    std::printf("  compute shader dispatch: OK\n");
+
+    // 3. Dispatch via Pm4Translator
+    Pm4Translator pm4(&metal);
+    pm4.set_memory_manager(&mem);
+
+    // Write COMPUTE registers via IT_SET_SH_REG
+    // COMPUTE_PGM_LO/HI (0x020C)
+    const u32 pgm_lo = static_cast<u32>((kCsAddr >> 8) & 0xFFFFFFFF);
+    const u32 pgm_hi = static_cast<u32>((kCsAddr >> 40) & 0xFFFFFFFF);
+    std::vector<u32> set_pgm = {
+        0x020CU, pgm_lo, pgm_hi
+    };
+    Pm4Packet pkt_pgm{};
+    pkt_pgm.header.type = Pm4PacketType::Type3;
+    pkt_pgm.header.opcode = IT_SET_SH_REG;
+    pkt_pgm.header.count = static_cast<u16>(set_pgm.size());
+    pkt_pgm.payload = set_pgm;
+    CHECK(pm4.execute_packet(pkt_pgm));
+
+    // COMPUTE_NUM_THREAD_X/Y/Z (0x0204)
+    std::vector<u32> set_threads = {
+        0x0204U, 64U, 1U, 1U
+    };
+    Pm4Packet pkt_threads{};
+    pkt_threads.header.type = Pm4PacketType::Type3;
+    pkt_threads.header.opcode = IT_SET_SH_REG;
+    pkt_threads.header.count = static_cast<u16>(set_threads.size());
+    pkt_threads.payload = set_threads;
+    CHECK(pm4.execute_packet(pkt_threads));
+
+    // IT_DISPATCH_DIRECT (dim_x=4, dim_y=1, dim_z=1, initiator=1)
+    CHECK(metal.begin_frame());
+    Pm4Packet pkt_disp{};
+    pkt_disp.header.type = Pm4PacketType::Type3;
+    pkt_disp.header.opcode = IT_DISPATCH_DIRECT;
+    pkt_disp.header.count = 4;
+    pkt_disp.payload = {4U, 1U, 1U, 1U};
+    CHECK(pm4.execute_packet(pkt_disp));
+    CHECK(metal.submit_frame(true));
+    std::printf("  PM4 IT_DISPATCH_DIRECT dispatch: OK\n");
+}
+
 } // namespace
 
 int main() {
@@ -708,6 +813,7 @@ int main() {
         test_render_to_texture(mem);
         test_render_targets(mem);
         test_depth_export(device);
+        test_compute_shader(mem, device);
     }
     if (g_failures) {
         std::fprintf(stderr, "GCN shader test: %d failure(s)\n", g_failures);

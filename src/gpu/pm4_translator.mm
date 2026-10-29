@@ -108,6 +108,15 @@ struct Pm4Translator::Impl {
     u32 ps_rsrc1{0};
     u32 ps_rsrc2{0};
 
+    GuestAddr cs_shader_addr{0};
+    u32 cs_pgm_lo{0};
+    u32 cs_pgm_hi{0};
+    u32 cs_rsrc1{0};
+    u32 cs_rsrc2{0};
+    u32 cs_num_threads_x{64};
+    u32 cs_num_threads_y{1};
+    u32 cs_num_threads_z{1};
+
     struct VSharpBuffer {
         GuestAddr base_addr{0};
         u32 stride{0};
@@ -213,6 +222,7 @@ struct Pm4Translator::Impl {
     bool gcn_enabled{GcnPipelineCache::enabled_by_env()};
     bool try_gcn_draw(bool indexed, u32 count, GuestAddr idx_addr, MTLIndexType idx_type,
                       PrimitiveType prim_type, i32 base_vertex, u32 instance_count);
+    bool try_gcn_dispatch(u32 dim_x, u32 dim_y, u32 dim_z);
 
     bool init_mesh_pipeline();
     id<MTLRenderPipelineState> pipeline_for_current_shader();
@@ -1169,6 +1179,43 @@ bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_ad
             PM4_LOG("[GCN] draw #%zu %s count=%u prim=%u VS=0x%llx PS=0x%llx (translated)\n",
                          draw_count + 1, indexed ? "indexed" : "auto", count, static_cast<u32>(prim_type),
                          (unsigned long long)vs_shader_addr, (unsigned long long)ps_shader_addr);
+        }
+        return true;
+    }
+}
+
+bool Pm4Translator::Impl::try_gcn_dispatch(u32 dim_x, u32 dim_y, u32 dim_z) {
+    if (!gcn_enabled || !memory || !metal || cs_shader_addr <= 0x1000) return false;
+    @autoreleasepool {
+        if (!gcn_cache) gcn_cache = std::make_unique<GcnPipelineCache>(metal->raw_device(), memory);
+        gcn_cache->set_memory(memory);
+        gcn_cache->set_metal_backend(metal);
+
+        if (!metal->ensure_compute_encoder()) return false;
+        void* compute_enc = metal->active_compute_encoder();
+        if (!compute_enc) return false;
+
+        GcnComputeRequest req;
+        req.cs_addr = cs_shader_addr;
+        req.cs_rsrc1 = cs_rsrc1;
+        req.cs_rsrc2 = cs_rsrc2;
+        req.threads_x = cs_num_threads_x ? cs_num_threads_x : 64;
+        req.threads_y = cs_num_threads_y ? cs_num_threads_y : 1;
+        req.threads_z = cs_num_threads_z ? cs_num_threads_z : 1;
+        req.grid_x = dim_x;
+        req.grid_y = dim_y;
+        req.grid_z = dim_z;
+        req.cs_user = reg_file.data() + kPm4ShRegBase + COMPUTE_USER_DATA_0;
+
+        std::string why;
+        if (!gcn_cache->encode_dispatch(compute_enc, req, &why)) {
+            PM4_LOG("[GCN] dispatch failed: %s\n", why.c_str());
+            return false;
+        }
+        if (draw_diagnostics_enabled) {
+            PM4_LOG("[GCN] dispatch direct (%u, %u, %u) threads (%u, %u, %u) CS=0x%llx (translated)\n",
+                         dim_x, dim_y, dim_z, req.threads_x, req.threads_y, req.threads_z,
+                         (unsigned long long)cs_shader_addr);
         }
         return true;
     }
@@ -2383,6 +2430,27 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                             if (i + 3 < packet.payload.size()) m_impl->ps_rsrc2 = packet.payload[i + 3];
                             PM4_LOG("[PM4 SH_REG] PS Shader ISA Addr: 0x%llx (lo=0x%08x, hi=0x%08x, rsrc1=0x%08x, rsrc2=0x%08x)\n",
                                          (unsigned long long)isa, lo, hi, m_impl->ps_rsrc1, m_impl->ps_rsrc2);
+                        } else if (reg == COMPUTE_PGM_LO && i + 1 < packet.payload.size()) {
+                            const u32 lo = val;
+                            const u32 hi = packet.payload[i + 1];
+                            const GuestAddr isa = ((static_cast<u64>(hi) << 32) | lo) << 8;
+                            m_impl->cs_shader_addr = isa;
+                            m_impl->cs_pgm_lo = lo;
+                            m_impl->cs_pgm_hi = hi;
+                            if (i + 2 < packet.payload.size()) m_impl->cs_rsrc1 = packet.payload[i + 2];
+                            if (i + 3 < packet.payload.size()) m_impl->cs_rsrc2 = packet.payload[i + 3];
+                            PM4_LOG("[PM4 SH_REG] CS Shader ISA Addr: 0x%llx (lo=0x%08x, hi=0x%08x, rsrc1=0x%08x, rsrc2=0x%08x)\n",
+                                         (unsigned long long)isa, lo, hi, m_impl->cs_rsrc1, m_impl->cs_rsrc2);
+                        } else if (reg == COMPUTE_PGM_RSRC1) {
+                            m_impl->cs_rsrc1 = val;
+                        } else if (reg == COMPUTE_PGM_RSRC2) {
+                            m_impl->cs_rsrc2 = val;
+                        } else if (reg == COMPUTE_NUM_THREAD_X) {
+                            m_impl->cs_num_threads_x = val ? val : 1;
+                        } else if (reg == COMPUTE_NUM_THREAD_Y) {
+                            m_impl->cs_num_threads_y = val ? val : 1;
+                        } else if (reg == COMPUTE_NUM_THREAD_Z) {
+                            m_impl->cs_num_threads_z = val ? val : 1;
                         } else if ((reg >= 0x004C && reg <= 0x005B) || reg == SPI_SHADER_USER_DATA_VS_0_LEGACY) {
                             if (reg == SPI_SHADER_USER_DATA_VS_0 || reg == SPI_SHADER_USER_DATA_VS_0_LEGACY) {
                                 const u32 vaddr_lo = val;
@@ -2448,6 +2516,17 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 m_impl->mark_pipeline_dirty();
                 m_impl->mark_resource_dirty();
                 return true;
+            }
+
+            case IT_DISPATCH_DIRECT: {
+                if (!st.require_payload(packet, 3, "IT_DISPATCH_DIRECT")) return false;
+                const u32 dim_x = packet.payload[0];
+                const u32 dim_y = packet.payload[1];
+                const u32 dim_z = packet.payload[2];
+                const u32 initiator = packet.payload.size() > 3 ? packet.payload[3] : 1;
+                PM4_LOG("[PM4 Dispatch] IT_DISPATCH_DIRECT: grid=(%u, %u, %u) initiator=0x%08x\n",
+                             dim_x, dim_y, dim_z, initiator);
+                return st.try_gcn_dispatch(dim_x, dim_y, dim_z);
             }
 
             case IT_DRAW_INDEX_AUTO: {

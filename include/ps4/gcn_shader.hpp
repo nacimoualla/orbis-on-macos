@@ -105,7 +105,7 @@ bool load_program(const MemReader& read, u64 addr, const u32* user_sgprs,
 /// Decode an in-memory program (no fetch-shader inlining). For tests.
 bool decode_program(const u32* words, usize count, Program& out, std::string& error);
 
-enum class Stage : u8 { Vertex, Pixel };
+enum class Stage : u8 { Vertex, Pixel, Compute };
 
 /// Static description of the image (T#/S#) slots a program samples from.
 struct ImageSlot {
@@ -113,6 +113,8 @@ struct ImageSlot {
     u32 ssamp{0};   // first SGPR of the S# (~0u for image_load)
     bool sampled{true};
 };
+
+using ImageDesc = ImageSlot;
 
 struct TranslateOptions {
     /// How the VS is driven: vertex ids are remapped for RectList/QuadList
@@ -145,12 +147,40 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps,
                                       const u32* ps_input_cntl,
                                       const TranslateOptions& opts);
 
+struct ComputePipelineOptions {
+    u32 threads_x{64};
+    u32 threads_y{1};
+    u32 threads_z{1};
+    u32 rsrc1{0};
+    u32 rsrc2{0};
+};
+
+struct TranslatedComputePipeline {
+    bool ok{false};
+    std::string error;
+    std::string msl;
+    std::vector<ImageDesc> images;
+    u32 max_vgpr{0};
+    u32 max_sgpr{0};
+    bool uses_exec_write{false};
+};
+
+TranslatedComputePipeline translate_compute_pipeline(
+    const Program& cs,
+    const ComputePipelineOptions& opts = {});
+
 /// MSL binding contract shared with gcn_pipeline.mm.
 namespace binding {
 inline constexpr u32 kMemBuffer = 0;     // device const uchar* (resource arena)
 inline constexpr u32 kDrawConsts = 1;    // constant GcnDrawConsts&
+inline constexpr u32 kComputeConsts = 1; // constant GcnComputeConsts&
 inline constexpr u32 kMaxRanges = 16;
 } // namespace binding
+
+struct ComputeConsts {
+    u32 cs_user[16];
+    u32 pad[16];
+};
 
 /// Layout of the per-draw constant block (must match the MSL struct emitted
 /// by the translator).
@@ -216,11 +246,13 @@ struct SamplerDesc {
 
 SamplerDesc decode_ssharp(const u32* s);
 
-/// Bytes per element for a T#/V# data format, 0 if unsupported.
+/// Bytes per element for a T#/V# data format, 0 if unsupported. For BC1-BC7
+/// this is the size of one 4x4 block (see ps4/bc_decode.hpp).
 u32 data_format_bytes(u32 dfmt);
 
 /// Convert texture memory to linear RGBA8 (R in byte 0). Supports linear and
-/// 1D/2D-thin micro tiled 32bpp/16bpp/8bpp layouts plus the common formats.
+/// 1D/2D-thin micro tiled 32bpp/16bpp/8bpp layouts plus the common formats and
+/// BC1-BC7 (decoded per 4x4 block; see ps4/bc_decode.hpp for the covered modes).
 /// Returns false (with `error`) when the layout or format is unsupported.
 bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size,
                       std::vector<u8>& out, std::string& error);

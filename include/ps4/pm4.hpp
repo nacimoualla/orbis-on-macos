@@ -248,7 +248,15 @@ enum ShaderRegOffset : u16 {
     SPI_SHADER_USER_DATA_VS_1_LEGACY = 0x0201,
     SPI_SHADER_USER_DATA_VS_2_LEGACY = 0x0202,
     SPI_SHADER_USER_DATA_VS_3_LEGACY = 0x0203,
-    SPI_SHADER_USER_DATA_PS_0_LEGACY = 0x020C
+    COMPUTE_NUM_THREAD_X             = 0x0204,
+    COMPUTE_NUM_THREAD_Y             = 0x0205,
+    COMPUTE_NUM_THREAD_Z             = 0x0206,
+    SPI_SHADER_USER_DATA_PS_0_LEGACY = 0x020C,
+    COMPUTE_PGM_LO                   = 0x020C,
+    COMPUTE_PGM_HI                   = 0x020D,
+    COMPUTE_PGM_RSRC1                = 0x0212,
+    COMPUTE_PGM_RSRC2                = 0x0213,
+    COMPUTE_USER_DATA_0              = 0x0240
 };
 
 // Standard 3D colored vertex structure (28 bytes)

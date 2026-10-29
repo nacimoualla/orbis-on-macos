@@ -116,6 +116,25 @@ struct GcnPipelineCache::Impl {
     };
     std::map<PipeKey, PipeEntry> pipes;
 
+    struct ComputeKey {
+        u64 cs_hash{0};
+        u32 threads_x{0};
+        u32 threads_y{0};
+        u32 threads_z{0};
+        u32 rsrc1{0};
+        u32 rsrc2{0};
+        bool operator<(const ComputeKey& o) const noexcept {
+            return std::tie(cs_hash, threads_x, threads_y, threads_z, rsrc1, rsrc2) <
+                   std::tie(o.cs_hash, o.threads_x, o.threads_y, o.threads_z, o.rsrc1, o.rsrc2);
+        }
+    };
+    struct ComputeEntry {
+        id<MTLComputePipelineState> pso{nil};
+        gcn::TranslatedComputePipeline tp;
+        std::string error;
+    };
+    std::map<ComputeKey, ComputeEntry> compute_pipes;
+
     struct TexEntry {
         id<MTLTexture> tex{nil};
         u64 content_hash{0};
@@ -619,6 +638,119 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         }
     }
     ++im.stats.translated_draws;
+    return true;
+}
+
+bool GcnPipelineCache::encode_dispatch(void* compute_encoder, const GcnComputeRequest& req,
+                                       std::string* why) {
+    Impl& im = *m_impl;
+    auto fail = [&](const std::string& msg) {
+        if (why) *why = msg;
+        return false;
+    };
+    if (!im.device || !compute_encoder) return fail("not configured");
+    if (req.cs_addr < 0x1000) return fail("no compute shader bound");
+
+    const gcn::MemReader read = im.reader();
+    const u32 cs_user_count = (req.cs_rsrc2 >> 1) & 0x1F;
+
+    gcn::Program cs;
+    std::string err;
+    if (!gcn::load_program(read, req.cs_addr, req.cs_user, std::min<u32>(cs_user_count, 16), cs, err)) {
+        im.log_once("CS 0x" + std::to_string(req.cs_addr) + " load failed: " + err);
+        return fail("CS load: " + err);
+    }
+
+    gcn::ComputePipelineOptions opts{};
+    opts.threads_x = req.threads_x;
+    opts.threads_y = req.threads_y;
+    opts.threads_z = req.threads_z;
+    opts.rsrc1 = req.cs_rsrc1;
+    opts.rsrc2 = req.cs_rsrc2;
+
+    Impl::ComputeKey key;
+    key.cs_hash = cs.hash;
+    key.threads_x = req.threads_x;
+    key.threads_y = req.threads_y;
+    key.threads_z = req.threads_z;
+    key.rsrc1 = req.cs_rsrc1;
+    key.rsrc2 = req.cs_rsrc2;
+
+    auto it = im.compute_pipes.find(key);
+    Impl::ComputeEntry* pe = nullptr;
+    if (it != im.compute_pipes.end()) {
+        pe = &it->second;
+    } else {
+        Impl::ComputeEntry e;
+        const auto t_compile = std::chrono::steady_clock::now();
+        e.tp = gcn::translate_compute_pipeline(cs, opts);
+        if (!e.tp.ok) {
+            e.error = "translate: " + e.tp.error;
+        } else @autoreleasepool {
+            NSError* compile_err = nil;
+            NSString* src = [NSString stringWithUTF8String:e.tp.msl.c_str()];
+            MTLCompileOptions* co = [[MTLCompileOptions alloc] init];
+            id<MTLLibrary> lib = [im.device newLibraryWithSource:src options:co error:&compile_err];
+            if (!lib) {
+                e.error = std::string("MSL compile: ") + (compile_err ? [[compile_err localizedDescription] UTF8String] : "?");
+            } else {
+                id<MTLFunction> fn = [lib newFunctionWithName:@"gcn_cs_main"];
+                if (!fn) {
+                    e.error = "entry point gcn_cs_main not found";
+                } else {
+                    e.pso = [im.device newComputePipelineStateWithFunction:fn error:&compile_err];
+                    if (!e.pso) {
+                        e.error = std::string("compute pipeline: ") + (compile_err ? [[compile_err localizedDescription] UTF8String] : "?");
+                    }
+                }
+            }
+        }
+        if (e.pso) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_compile).count();
+            std::fprintf(stderr, "[GCN] compiled compute pipeline CS#%016llx in %.1f ms (cs %zu insts)\n",
+                         (unsigned long long)key.cs_hash, ms, cs.insts.size());
+        } else {
+            std::fprintf(stderr, "[GCN] compute pipeline CS#%016llx unsupported: %s\n",
+                         (unsigned long long)key.cs_hash, e.error.c_str());
+        }
+        pe = &im.compute_pipes.emplace(key, std::move(e)).first->second;
+    }
+
+    if (!pe->pso) return fail(pe->error);
+
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)compute_encoder;
+        [enc setComputePipelineState:pe->pso];
+
+        id<MTLBuffer> mem = nil;
+        if (im.memory && im.memory->base_address()) {
+            NSUInteger max_len = [im.device maxBufferLength];
+            NSUInteger buf_len = std::min<NSUInteger>(im.memory->total_size(), max_len);
+            buf_len = buf_len & ~16383UL;
+            mem = [im.device newBufferWithBytesNoCopy:im.memory->base_address()
+                                               length:buf_len
+                                              options:MTLResourceStorageModeShared
+                                          deallocator:nil];
+        }
+        if (!mem) {
+            mem = [im.device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+        }
+        [enc setBuffer:mem offset:0 atIndex:gcn::binding::kMemBuffer];
+
+        gcn::ComputeConsts cc{};
+        if (req.cs_user) {
+            std::memcpy(cc.cs_user, req.cs_user, sizeof(cc.cs_user));
+        }
+        [enc setBytes:&cc length:sizeof(cc) atIndex:gcn::binding::kDrawConsts];
+
+        MTLSize threadgroups = MTLSizeMake(std::max<u32>(1, req.grid_x),
+                                           std::max<u32>(1, req.grid_y),
+                                           std::max<u32>(1, req.grid_z));
+        MTLSize threadsPerGroup = MTLSizeMake(std::max<u32>(1, req.threads_x),
+                                              std::max<u32>(1, req.threads_y),
+                                              std::max<u32>(1, req.threads_z));
+        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
+    }
     return true;
 }
 

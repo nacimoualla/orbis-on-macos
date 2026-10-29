@@ -39,6 +39,19 @@ struct GcnDrawRequest {
     u32 fb_height{0};
 };
 
+struct GcnComputeRequest {
+    GuestAddr cs_addr{0};
+    u32 cs_rsrc1{0};
+    u32 cs_rsrc2{0};
+    u32 threads_x{64};
+    u32 threads_y{1};
+    u32 threads_z{1};
+    u32 grid_x{1};
+    u32 grid_y{1};
+    u32 grid_z{1};
+    const u32* cs_user{nullptr};      // 16 compute user SGPRs
+};
+
 struct GcnPipelineStats {
     usize translated_draws{0};
     usize fallback_draws{0};
@@ -65,6 +78,11 @@ public:
     /// MTLPixelFormat.
     bool encode_draw(void* render_encoder, u32 color_format, const GcnDrawRequest& req,
                      std::string* why = nullptr);
+
+    /// Encode a compute dispatch with the game's translated compute shader.
+    /// `compute_encoder` is an id<MTLComputeCommandEncoder>.
+    bool encode_dispatch(void* compute_encoder, const GcnComputeRequest& req,
+                         std::string* why = nullptr);
 
     [[nodiscard]] const GcnPipelineStats& stats() const noexcept;
     [[nodiscard]] static bool enabled_by_env() noexcept;

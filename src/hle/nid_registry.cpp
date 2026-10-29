@@ -1277,13 +1277,24 @@ void NidRegistry::register_default_libraries() {
             const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
                                    ? mem.to_host_ptr<char>(path_addr) : "unknown";
 
-            // Without PS4_LOAD_PRX the Mono modules are not loaded and every
-            // mono-ps4 NID is served by the HLE cookie stubs (no managed code
-            // runs, so Unity never reaches its render phase). With
-            // PS4_LOAD_PRX=1 the real runtime and AOT assemblies load and run:
-            // they initialise, register their AOT modules and reach Gnm setup,
-            // but do not yet render within the smoke-test interval.
-            if (!std::getenv("PS4_LOAD_PRX")) {
+            auto& vfs = get_vfs();
+            auto resolved = vfs.resolve_path(path);
+            std::string host_path = resolved ? resolved->string() : std::string(path);
+            if (host_path.ends_with(".sprx")) {
+                std::string prx_cand = host_path.substr(0, host_path.length() - 5) + ".prx";
+                if (std::filesystem::exists(prx_cand)) {
+                    host_path = prx_cand;
+                }
+            }
+
+            // Real PRX loading is enabled by default when the target module file exists on disk,
+            // unless explicitly disabled via PS4_LOAD_PRX=0. If the PRX is missing, it falls
+            // back to HLE stub mode.
+            const char* prx_env = std::getenv("PS4_LOAD_PRX");
+            const bool force_hle = (prx_env && std::strcmp(prx_env, "0") == 0);
+            const bool prx_exists = std::filesystem::exists(host_path);
+
+            if (force_hle || !prx_exists) {
                 static u32 s_module_id = 0x2000;
                 const u32 handle = ++s_module_id;
                 std::fprintf(stderr, "[HLE] sceKernelLoadStartModule('%s') -> handle 0x%x (HLE mode)\n", path, handle);
@@ -1291,10 +1302,6 @@ void NidRegistry::register_default_libraries() {
                 ctx.rax = handle;
                 return;
             }
-
-            auto& vfs = get_vfs();
-            auto resolved = vfs.resolve_path(path);
-            const std::string host_path = resolved ? resolved->string() : std::string(path);
 
             DynamicLinker* linker = ps4::active_linker();
             if (linker == nullptr) {
@@ -1312,6 +1319,48 @@ void NidRegistry::register_default_libraries() {
                          path, host_path.c_str(), handle);
             ensure_unity_screen_resolution(mem);
             ctx.rax = handle;
+        });
+
+    // sceKernelDlsym(SceKernelModule handle, const char* symbol, void** addrp)
+    // NID: 0x2F01BC8379E2AB00
+    //
+    // Mono's pinvoke loader resolves the native plugins' entry points by name
+    // through this (e.g. _OSKPlugin_GetScreenScale, then the ...A variant). The
+    // name is hashed to the NID the exporting module stores, then looked up among
+    // that module's own exports. A handle that is not a loaded module falls back
+    // to the global export map. On a miss *addrp is left alone and ESRCH returns.
+    register_symbol(0x2F01BC8379E2AB00ULL, "sceKernelDlsym", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const u32 handle = static_cast<u32>(ctx.rdi);
+            const GuestAddr name_addr = ctx.rsi;
+            const GuestAddr out_addr = ctx.rdx;
+
+            // Bounded copy of the guest name; a bad pointer just ends the string.
+            std::string symbol;
+            for (GuestAddr p = name_addr; symbol.size() < 256 && mem.is_valid_address(p, 1); ++p) {
+                const char c = *mem.to_host_ptr<char>(p);
+                if (c == '\0') break;
+                symbol.push_back(c);
+            }
+
+            DynamicLinker* linker = ps4::active_linker();
+            GuestAddr addr = 0;
+            if (linker != nullptr && !symbol.empty()) {
+                const Nid nid = nid_from_name(symbol);
+                addr = linker->module(handle) != nullptr
+                           ? linker->find_module_export(handle, nid)
+                           : linker->find_export(nid);
+            }
+            if (addr == 0) {
+                std::fprintf(stderr, "[HLE] sceKernelDlsym(handle 0x%x, '%s') -> not found\n",
+                             handle, symbol.c_str());
+                ctx.rax = 0x80020003ULL; // SCE_KERNEL_ERROR_ESRCH
+                return;
+            }
+            if (out_addr != 0) mem.write_value(out_addr, addr);
+            std::fprintf(stderr, "[HLE] sceKernelDlsym(handle 0x%x, '%s') -> 0x%llx\n",
+                         handle, symbol.c_str(), (unsigned long long)addr);
+            ctx.rax = SCE_OK;
         });
 
     // sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t length, size_t align, int type, off_t* out_addr)
@@ -2024,6 +2073,21 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x7E16B7B8361BD5BBULL, "free", "libc", free_handler);
     register_symbol(0xB4886CAA3D2AB051ULL, "free", "libc", free_handler);
 
+    // C++ operator new / delete (libc++ mangled names). The loaded PRX plugins
+    // import these; with no handler every new came back NULL. Backed by the same
+    // heap as malloc, so memory from either side can be freed by the other.
+    auto new_handler = [](CpuContext& ctx, MemoryManager&) {
+        ctx.rax = bump_alloc(ctx.rdi, 16);
+    };
+    register_symbol(0x7C99E9B955416CA9ULL, "_Znwm", "libc++", new_handler);  // operator new(size_t)
+    register_symbol(0x85D9B461F31AED34ULL, "_Znam", "libc++", new_handler);  // operator new[](size_t)
+    auto delete_handler = [](CpuContext& ctx, MemoryManager&) {
+        heap_free(ctx.rdi);
+        ctx.rax = 0;
+    };
+    register_symbol(0xCFE3FEC429D62C19ULL, "_ZdlPv", "libc++", delete_handler);  // operator delete(void*)
+    register_symbol(0x30B5A5F7448558D1ULL, "_ZdaPv", "libc++", delete_handler);  // operator delete[](void*)
+
     // realloc(void* ptr, size_t size) -- NID: 0x63B689D6EC9D3CCAULL per
     // ps4libdoc. This NID is imported by eboot.bin and mono-ps4.prx but was
     // registered as a third "free", so every realloc silently returned NULL.
@@ -2052,6 +2116,37 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = allocated;
         });
 
+    // reallocalign(void* ptr, size_t size, size_t alignment)
+    // NID: 0x386c9b56e3c08406ULL ("OGybVuPAhAY")
+    auto reallocalign_handler = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr old_ptr = ctx.rdi;
+        const GuestSize size = ctx.rsi;
+        const GuestSize align = ctx.rdx > 0 ? ctx.rdx : 16;
+        if (size == 0) {
+            heap_free(old_ptr);
+            ctx.rax = 0;
+            return;
+        }
+        if (old_ptr == 0) {
+            ctx.rax = bump_alloc(size, align);
+            return;
+        }
+        const GuestSize old_size = bump_size_of(old_ptr);
+        if (old_size >= size && (old_ptr & (align - 1)) == 0) {
+            ctx.rax = old_ptr;
+            return;
+        }
+        const GuestAddr allocated = bump_alloc(size, align);
+        if (allocated != 0 && old_size > 0 && mem.is_valid_address(old_ptr, old_size)) {
+            std::memcpy(mem.to_host_ptr<void>(allocated), mem.to_host_ptr<void>(old_ptr),
+                        old_size < size ? old_size : size);
+            heap_free(old_ptr);
+        }
+        ctx.rax = allocated;
+    };
+    register_symbol(0x386c9b56e3c08406ULL, "reallocalign", "libc", reallocalign_handler);
+    register_symbol(0x0684c0e3569b6c38ULL, "reallocalign", "libc", reallocalign_handler);
+
     // 0xB50228F8620F925AULL is _ZSt14_Xlength_errorPKc per ps4libdoc, i.e. the
     // C++ std::length_error thrower -- it was registered here as "calloc".
     // eboot.bin and libSceSmart.prx import this NID, but only reach it when an
@@ -2063,6 +2158,37 @@ void NidRegistry::register_default_libraries() {
             const GuestSize num = ctx.rdi;
             const GuestSize size = ctx.rsi;
             ctx.rax = bump_alloc(num * size, 16);
+        });
+
+    // C++ standard stream initializers (std::ios_base::Init and std::_Winit)
+    register_symbol(0xB2A5B2B678587448ULL, "_ZNSt8ios_base4InitC1Ev", "libstdc++",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = ctx.rdi; // constructor returns this
+        });
+
+    register_symbol(0x9315C2BDC6ADD5C3ULL, "_ZNSt8ios_base4InitD1Ev", "libstdc++",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = ctx.rdi;
+        });
+
+    register_symbol(0xFC197DFD26769E87ULL, "_ZNSt6_WinitC1Ev", "libstdc++",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = ctx.rdi; // constructor returns this
+        });
+
+    register_symbol(0x530DCE4D914F36DEULL, "_ZNSt6_WinitD1Ev", "libstdc++",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = ctx.rdi;
+        });
+
+    register_symbol(0x6F3404C72D7CF592ULL, "_init_env", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 0;
+        });
+
+    register_symbol(0xF06D8B07E037AF38ULL, "atexit", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 0;
         });
 
     // =========================================================================
@@ -2996,7 +3122,13 @@ void NidRegistry::register_default_libraries() {
             }
             auto& vfs = get_vfs();
             auto resolved = vfs.resolve_path(path);
-            const std::string host_path = resolved ? resolved->string() : std::string(path);
+            std::string host_path = resolved ? resolved->string() : std::string(path);
+            if (host_path.ends_with(".sprx")) {
+                std::string prx_cand = host_path.substr(0, host_path.length() - 5) + ".prx";
+                if (std::filesystem::exists(prx_cand)) {
+                    host_path = prx_cand;
+                }
+            }
             FILE* fp = std::fopen(host_path.c_str(), mode);
             std::fprintf(stderr, "[LIBC fopen] fopen('%s' -> '%s', '%s') -> %p\n", path, host_path.c_str(), mode, static_cast<void*>(fp));
             ctx.rax = reinterpret_cast<u64>(fp);
@@ -5514,6 +5646,64 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
+    // sceSysmoduleUnloadModule(id) / sceSysmoduleIsLoaded(id): every module id is
+    // reported loaded and unload is a no-op, so the plugins' load/unload pairs and
+    // their "is it up" checks all pass.
+    register_symbol(0x791D9B6450005344ULL, "sceSysmoduleUnloadModule", "libSceSysmodule",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x7CC3F934750E68C9ULL, "sceSysmoduleIsLoaded", "libSceSysmodule",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+
+    // libSceImeDialog. There is no on-screen keyboard, so the dialog never waits
+    // for a user: Init finishes it at once, GetStatus reports FINISHED and
+    // GetResult reports a cancel. A plugin that polls GetStatus therefore leaves
+    // its loop instead of spinning forever. Status values (NONE=0, FINISHED=2) and
+    // the USER_CANCELED end status follow the Orbis SDK as remembered; they are not
+    // checked against a header in this repo.
+    static std::atomic<u32> s_ime_dialog_status{0};
+    // sceImeDialogInit(const SceImeDialogParam* param, ...) -- NID 0x354781ACDEE1CDFD
+    register_symbol(0x354781ACDEE1CDFDULL, "sceImeDialogInit", "libSceImeDialog",
+        [](CpuContext& ctx, MemoryManager&) {
+            s_ime_dialog_status.store(2);   // FINISHED
+            ctx.rax = SCE_OK;
+        });
+    // sceImeDialogTerm() -- NID 0x8324F2567F9B5CCC
+    register_symbol(0x8324F2567F9B5CCCULL, "sceImeDialogTerm", "libSceImeDialog",
+        [](CpuContext& ctx, MemoryManager&) {
+            s_ime_dialog_status.store(0);   // NONE
+            ctx.rax = SCE_OK;
+        });
+    // sceImeDialogGetStatus() -- NID 0x2000E60F8B527016
+    register_symbol(0x2000E60F8B527016ULL, "sceImeDialogGetStatus", "libSceImeDialog",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = s_ime_dialog_status.load();
+        });
+    // sceImeDialogGetResult(SceImeDialogResult* result) -- NID 0xC74D63C6EFAFC657
+    // Writes only the leading end-status word, USER_CANCELED (1).
+    register_symbol(0xC74D63C6EFAFC657ULL, "sceImeDialogGetResult", "libSceImeDialog",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr result_addr = ctx.rdi;
+            if (mem.is_valid_address(result_addr, sizeof(u32))) {
+                mem.write_value<u32>(result_addr, 1);
+            }
+            ctx.rax = SCE_OK;
+        });
+    // sceImeDialogGetPanelSize(...) -- NID 0xC2AB09BD15F0979F
+    // No panel is drawn, so the reported size is zero. Argument layout is not
+    // confirmed; the output pointers in rsi/rdx are cleared when they look valid.
+    register_symbol(0xC2AB09BD15F0979FULL, "sceImeDialogGetPanelSize", "libSceImeDialog",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            for (const GuestAddr out : {ctx.rsi, ctx.rdx}) {
+                if (out > 0x10000 && mem.is_valid_address(out, sizeof(u32))) {
+                    mem.write_value<u32>(out, 0);
+                }
+            }
+            ctx.rax = SCE_OK;
+        });
     register_symbol(0x5260AF8D29AE648CULL, "sceAudio3dInitialize", "libSceAudio3d",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
@@ -6235,7 +6425,6 @@ void NidRegistry::register_default_libraries() {
     static const DcbWriterStub kDcbWriterStubs[] = {
         {0x7050A9D0D5FCC1FDULL, "sceGnmSetVgtControl", "libSceGnm"},
         {0x103F7F163AFC4DAEULL, "sceGnmDrawIndexIndirect", "libSceGnm"},
-        {0xD01CCB1A58DCC01AULL, "sceGnmDispatchDirect", "libSceGnm"},
         {0x678DEF2A9E64EEBDULL, "sceGnmDispatchIndirect", "libSceGnm"},
         {0xF8016F3845EB2899ULL, "sceGnmSetEmbeddedVsShader", "libSceGnm"},
         {0x5FD3A6C3D770BF93ULL, "sceGnmSetEmbeddedPsShader", "libSceGnm"},
@@ -6255,7 +6444,6 @@ void NidRegistry::register_default_libraries() {
         {0x31846D621A2329D0ULL, "sceGnmResetVgtControl", "libSceGnm"},
         {0x7DFACD40EB21A30BULL, "sceGnmComputeWaitOnAddress", "libSceGnm"},
         {0x1096A9365DBEA605ULL, "sceGnmComputeWaitSemaphore", "libSceGnm"},
-        {0x2B1FE1FE759027C0ULL, "sceGnmSetCsShaderWithModifier", "libSceGnm"},
         {0xBDC91DCDB438E922ULL, "sceGnmSetLsShader", "libSceGnm"},
         {0x9CB3368B6FBAE610ULL, "sceGnmUpdateGsShader", "libSceGnm"},
         {0x18D971FB2EF13DD1ULL, "sceGnmUpdateHsShader", "libSceGnm"},
@@ -6489,6 +6677,96 @@ void NidRegistry::register_default_libraries() {
         register_symbol(w.nid, name, "libSceGnm",
             [ps_shader_handler, name](CpuContext& ctx, MemoryManager& mem) { ps_shader_handler(name, ctx, mem); });
     }
+
+    // sceGnmSetCsShaderWithModifier -- writes IT_SET_SH_REG for COMPUTE registers + NOP padding
+    // rdx points to Gnm::CsStageRegisters in guest memory:
+    // +0x00: m_computePgmLo, +0x04: m_computePgmHi
+    // +0x08: m_computePgmRsrc1, +0x0C: m_computePgmRsrc2
+    // +0x10: m_computeNumThreadX, +0x14: m_computeNumThreadY, +0x18: m_computeNumThreadZ
+    auto cs_shader_handler = [write_dcb_nop_padding](const char* func_name, CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr dcb_addr = ctx.rdi;
+        const u32 num_dwords = static_cast<u32>(ctx.rsi);
+        const GuestAddr cs_regs_addr = ctx.rdx;
+        const u32 modifier = static_cast<u32>(ctx.rcx);
+
+        u32 pgm_lo = 0, pgm_hi = 0, rsrc1 = 0, rsrc2 = 0;
+        u32 threads_x = 64, threads_y = 1, threads_z = 1;
+        if (cs_regs_addr && mem.is_valid_address(cs_regs_addr, 28)) {
+            mem.read_value(cs_regs_addr + 0x00, pgm_lo);
+            mem.read_value(cs_regs_addr + 0x04, pgm_hi);
+            mem.read_value(cs_regs_addr + 0x08, rsrc1);
+            mem.read_value(cs_regs_addr + 0x0C, rsrc2);
+            mem.read_value(cs_regs_addr + 0x10, threads_x);
+            mem.read_value(cs_regs_addr + 0x14, threads_y);
+            mem.read_value(cs_regs_addr + 0x18, threads_z);
+        }
+        const u64 isa_addr = ((static_cast<u64>(pgm_hi) << 32) | pgm_lo) << 8;
+        PM4_LOG("[HLE %s] dcb=0x%llx dwords=%u cs_regs=0x%llx mod=0x%x -> CS ISA: 0x%llx (lo=0x%08x hi=0x%08x rsrc1=0x%08x rsrc2=0x%08x threads=%u,%u,%u)\n",
+                     func_name, (unsigned long long)dcb_addr, num_dwords, (unsigned long long)cs_regs_addr, modifier,
+                     (unsigned long long)isa_addr, pgm_lo, pgm_hi, rsrc1, rsrc2, threads_x, threads_y, threads_z);
+
+        if (num_dwords >= 13 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+            std::vector<u32> pkt;
+            // 1. COMPUTE_NUM_THREAD_X/Y/Z (0x0204, count=3)
+            pkt.push_back(0xC0037600U); // IT_SET_SH_REG, count=3 (4 payload dwords)
+            pkt.push_back(0x0204U);     // mmCOMPUTE_NUM_THREAD_X
+            pkt.push_back(threads_x ? threads_x : 64);
+            pkt.push_back(threads_y ? threads_y : 1);
+            pkt.push_back(threads_z ? threads_z : 1);
+
+            // 2. COMPUTE_PGM_LO/HI (0x020C, count=2)
+            pkt.push_back(0xC0027600U); // IT_SET_SH_REG, count=2 (3 payload dwords)
+            pkt.push_back(0x020CU);     // mmCOMPUTE_PGM_LO
+            pkt.push_back(pgm_lo);
+            pkt.push_back(pgm_hi);
+
+            // 3. COMPUTE_PGM_RSRC1/RSRC2 (0x0212, count=2)
+            pkt.push_back(0xC0027600U); // IT_SET_SH_REG, count=2 (3 payload dwords)
+            pkt.push_back(0x0212U);     // mmCOMPUTE_PGM_RSRC1
+            pkt.push_back(rsrc1);
+            pkt.push_back(rsrc2);
+
+            mem.write_bytes(dcb_addr, pkt.data(), pkt.size() * sizeof(u32));
+            write_dcb_nop_padding(mem, dcb_addr + pkt.size() * sizeof(u32), num_dwords - static_cast<u32>(pkt.size()));
+        } else if (num_dwords > 0 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+            write_dcb_nop_padding(mem, dcb_addr, num_dwords);
+        }
+        ctx.rax = SCE_OK;
+    };
+
+    register_symbol(0x2B1FE1FE759027C0ULL, "sceGnmSetCsShaderWithModifier", "libSceGnm",
+        [cs_shader_handler](CpuContext& ctx, MemoryManager& mem) {
+            cs_shader_handler("sceGnmSetCsShaderWithModifier", ctx, mem);
+        });
+
+    // sceGnmDispatchDirect -- writes IT_DISPATCH_DIRECT (0x15, 5 DWORDs) + NOP padding
+    register_symbol(0xD01CCB1A58DCC01AULL, "sceGnmDispatchDirect", "libSceGnm",
+        [write_dcb_nop_padding](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dcb_addr = ctx.rdi;
+            const u32 num_dwords = static_cast<u32>(ctx.rsi);
+            const u32 dim_x = static_cast<u32>(ctx.rdx);
+            const u32 dim_y = static_cast<u32>(ctx.rcx);
+            const u32 dim_z = static_cast<u32>(ctx.r8);
+            const u32 initiator = static_cast<u32>(ctx.r9 ? ctx.r9 : 1);
+
+            PM4_LOG("[HLE sceGnmDispatchDirect] dcb=0x%llx dwords=%u grid=(%u, %u, %u) init=0x%x\n",
+                         (unsigned long long)dcb_addr, num_dwords, dim_x, dim_y, dim_z, initiator);
+
+            if (num_dwords >= 5 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+                const u32 pkt[] = {
+                    0xC0031500U, // Type 3, count=3 (4 payload dwords), opcode=0x15 (IT_DISPATCH_DIRECT)
+                    dim_x,
+                    dim_y,
+                    dim_z,
+                    initiator
+                };
+                mem.write_bytes(dcb_addr, pkt, sizeof(pkt));
+                write_dcb_nop_padding(mem, dcb_addr + sizeof(pkt), num_dwords - 5);
+            } else if (num_dwords > 0 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
+                write_dcb_nop_padding(mem, dcb_addr, num_dwords);
+            }
+            ctx.rax = SCE_OK;
+        });
 
     // sceGnmSubmitDone -- NID: 0xCAF67BDEE414AAB9ULL, per ps4libdoc. This NID was
     // registered as sceVideoOutWaitVblank; ps4libdoc resolves it to the GNM
