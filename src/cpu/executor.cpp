@@ -4820,23 +4820,31 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // 0x0F 0x2C: CVTTSS2SI (rep=0xF3) / CVTTSD2SI (rep=0xF2)
-        if (op1 == 0x2C) {
+        // 0x0F 0x2C: CVTTSS2SI (rep=0xF3) / CVTTSD2SI (rep=0xF2), truncating
+        // 0x0F 0x2D: CVTSS2SI / CVTSD2SI, rounding per MXCSR.RC
+        if (op1 == 0x2C || op1 == 0x2D) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
-            if (rep_prefix == 0xF2) { // CVTTSD2SI
-                double dval = 0.0;
-                if (m.is_reg) std::memcpy(&dval, &m_context.ymm[m.rm_id & 15].q[0], 8);
-                else m_memory.read_bytes(m.mem_addr, &dval, 8);
-                if (rex_w) set_gpr64(m_context, m.reg_id, x86_cvt_i64(dval));
-                else set_gpr32(m_context, m.reg_id, x86_cvt_i32(dval));
-            } else { // CVTTSS2SI
+            double v = 0.0;
+            if (rep_prefix == 0xF2) {
+                if (m.is_reg) std::memcpy(&v, &m_context.ymm[m.rm_id & 15].q[0], 8);
+                else m_memory.read_bytes(m.mem_addr, &v, 8);
+            } else {
                 float fval = 0.0f;
                 if (m.is_reg) std::memcpy(&fval, &m_context.ymm[m.rm_id & 15].d[0], 4);
                 else m_memory.read_bytes(m.mem_addr, &fval, 4);
-                if (rex_w) set_gpr64(m_context, m.reg_id, x86_cvt_i64(fval));
-                else set_gpr32(m_context, m.reg_id, x86_cvt_i32(fval));
+                v = fval;
             }
+            if (op1 == 0x2D) {
+                switch ((m_context.mxcsr >> 13) & 3) {
+                    case 0: v = std::nearbyint(v); break;
+                    case 1: v = std::floor(v); break;
+                    case 2: v = std::ceil(v); break;
+                    default: v = std::trunc(v); break;
+                }
+            }
+            if (rex_w) set_gpr64(m_context, m.reg_id, x86_cvt_i64(v));
+            else set_gpr32(m_context, m.reg_id, x86_cvt_i32(v));
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
         }

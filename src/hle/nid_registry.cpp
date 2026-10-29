@@ -435,6 +435,30 @@ static void deliver_guest_exceptions(MemoryManager& mem) {
     if (CpuExecutor* ex = current_executor()) get_thread_manager(mem).deliver_pending_exceptions(*ex);
 }
 
+// True when a guest exception is queued for the calling thread.
+static bool guest_signal_pending() {
+    const GuestThread* th = ThreadManager::current_guest_thread();
+    return th != nullptr && th->has_pending_signals.load(std::memory_order_acquire);
+}
+
+// Publishes the condition variable a wait loop sleeps on, so raise_exception
+// can wake it (see GuestThread::wait_cv).
+struct SignalWakeScope {
+    GuestThread* th;
+    explicit SignalWakeScope(std::condition_variable& cv) : th(ThreadManager::current_guest_thread()) {
+        if (!th) return;
+        std::lock_guard<std::mutex> lock(th->wait_cv_mtx);
+        th->wait_cv = &cv;
+    }
+    ~SignalWakeScope() {
+        if (!th) return;
+        std::lock_guard<std::mutex> lock(th->wait_cv_mtx);
+        th->wait_cv = nullptr;
+    }
+    SignalWakeScope(const SignalWakeScope&) = delete;
+    SignalWakeScope& operator=(const SignalWakeScope&) = delete;
+};
+
 // True when an armed write-watch overlaps [addr, addr + n); host-side bulk
 // copies route through write_bytes then so the watch records them.
 static bool watch_overlaps(GuestAddr addr, GuestSize n) {
@@ -451,6 +475,8 @@ void NidRegistry::set_vfs(VirtualFileSystem* vfs) {
 static MetalBackend* g_metal_backend = nullptr;
 static std::unique_ptr<Pm4Translator> g_pm4_translator;
 static std::atomic<u32> g_pad_buttons{0};
+// Runs after every guest flip (see NidRegistry::set_flip_hook).
+static std::function<void()> g_flip_hook;
 // Buttons pressed since the guest last read the pad. The host samples input
 // once per frame and the game reads on its own schedule, so a short tap can
 // begin and end between two guest reads; it is reported down once regardless.
@@ -593,6 +619,10 @@ void NidRegistry::note_hle_return() const {
     if (GuestThread* th = ThreadManager::current_guest_thread()) {
         th->in_hle.store(false, std::memory_order_relaxed);
     }
+}
+
+void NidRegistry::set_flip_hook(std::function<void()> hook) {
+    g_flip_hook = std::move(hook);
 }
 
 void NidRegistry::set_pad_buttons(u32 buttons) {
@@ -3395,8 +3425,10 @@ void NidRegistry::register_default_libraries() {
                              id, need, sema->count, sema->deleted ? 1 : 0,
                              (unsigned long long)start_cancel_gen, (int)t_guest_tid,
                              (unsigned long long)t_guest_rip);
+                SignalWakeScope wake(sema->cv);
                 while (!pred()) {
-                    sema->cv.wait_for(lock, std::chrono::milliseconds(50), pred);
+                    sema->cv.wait_for(lock, std::chrono::milliseconds(50),
+                                      [&] { return pred() || guest_signal_pending(); });
                     if (!pred()) {
                         lock.unlock();
                         deliver_guest_exceptions(mem);
@@ -3657,7 +3689,7 @@ void NidRegistry::register_default_libraries() {
                 evf->bits |= bits;
             }
             evf->cv.notify_all();
-            std::fprintf(stderr, "[EventFlag] Set(%u, 0x%x)\n", id, bits);
+            if (sema_log_enabled()) std::fprintf(stderr, "[EventFlag] Set(%u, 0x%x)\n", id, bits);
             ctx.rax = SCE_OK;
         });
 
@@ -3812,7 +3844,7 @@ void NidRegistry::register_default_libraries() {
                 ctx.rax = 0x8002003CULL; // SCE_KERNEL_ERROR_ETIMEDOUT
                 return;
             }
-            std::fprintf(stderr, "[EventFlag] Wait(%u, want=0x%x, mode=0x%x) -> matched 0x%x\n",
+            if (sema_log_enabled()) std::fprintf(stderr, "[EventFlag] Wait(%u, want=0x%x, mode=0x%x) -> matched 0x%x\n",
                          id, want, wait_mode, matched);
             ctx.rax = SCE_OK;
         });
@@ -4032,7 +4064,10 @@ void NidRegistry::register_default_libraries() {
                     }
                     if (g_syscalls && g_syscalls->has_exited()) break;
                     if (s_sem_shutdown.load(std::memory_order_relaxed)) break;
-                    s_sem_cv.wait_for(lock, std::chrono::milliseconds(20));
+                    {
+                        SignalWakeScope wake(s_sem_cv);
+                        if (!guest_signal_pending()) s_sem_cv.wait_for(lock, std::chrono::milliseconds(20));
+                    }
                     lock.unlock();
                     deliver_guest_exceptions(mem);
                     lock.lock();
@@ -5047,6 +5082,29 @@ void NidRegistry::register_default_libraries() {
     static std::vector<FlipSubscription> s_flip_subscriptions;
 
     auto perform_flip = [](MemoryManager& mem, u32 buffer_index, i64 flip_arg) {
+        // VBlank pacing. A PS4 flips at the next 60 Hz vblank and the game
+        // paces itself on that; completing every flip at once let frame times
+        // drift between 16 and 22 ms (judder). With a presenter attached
+        // (the windowed runner sets the flip hook), hold each flip until the
+        // next 16.67 ms tick; a frame that runs long resyncs instead of being
+        // followed by a burst. PS4_NO_VSYNC=1 turns this off.
+        static const bool s_vsync = std::getenv("PS4_NO_VSYNC") == nullptr;
+        if (s_vsync && g_flip_hook) {
+            using clock = std::chrono::steady_clock;
+            constexpr auto kVblank = std::chrono::nanoseconds(16'666'667);
+            static clock::time_point s_next_vblank{};
+            const auto now = clock::now();
+            if (s_next_vblank.time_since_epoch().count() == 0 || now > s_next_vblank + kVblank) {
+                s_next_vblank = now; // first flip, or more than a frame late: resync
+            } else if (now < s_next_vblank) {
+                // sleep_until oversleeps by 1-2 ms on macOS; sleep to just short
+                // of the tick and spin the remainder so frames stay evenly spaced.
+                const auto coarse = s_next_vblank - std::chrono::microseconds(1500);
+                if (now < coarse) std::this_thread::sleep_until(coarse);
+                while (clock::now() < s_next_vblank) std::this_thread::yield();
+            }
+            s_next_vblank += kVblank;
+        }
         const u64 count = s_flip_state.flip_count.fetch_add(1) + 1;
         const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -5054,8 +5112,30 @@ void NidRegistry::register_default_libraries() {
         s_flip_state.last_flip_arg.store(flip_arg);
         s_flip_state.current_buffer.store(buffer_index);
 
-        std::fprintf(stderr, "[VideoOut] perform_flip #%llu: buffer=%u, flipArg=0x%llx\n",
+        PM4_LOG("[VideoOut] perform_flip #%llu: buffer=%u, flipArg=0x%llx\n",
                      (unsigned long long)count, buffer_index, (unsigned long long)flip_arg);
+        // PS4_FLIP_STATS=1: once a second, the guest's frame rate and its worst
+        // flip-to-flip gap (frame pacing, not just the average).
+        static const bool s_flip_stats = std::getenv("PS4_FLIP_STATS") != nullptr;
+        if (s_flip_stats) {
+            static u64 s_prev_us = 0, s_window_start_us = 0, s_max_gap_us = 0;
+            static u32 s_frames = 0, s_hitches = 0;
+            if (s_prev_us != 0) {
+                const u64 gap = now_us - s_prev_us;
+                s_max_gap_us = std::max(s_max_gap_us, gap);
+                if (gap > 20000) ++s_hitches;
+            }
+            s_prev_us = now_us;
+            if (s_window_start_us == 0) s_window_start_us = now_us;
+            ++s_frames;
+            if (now_us - s_window_start_us >= 1000000) {
+                std::fprintf(stderr, "[fps] guest %u fps, worst frame %.1f ms, frames >20ms: %u\n", s_frames,
+                             s_max_gap_us / 1000.0, s_hitches);
+                s_window_start_us = now_us;
+                s_frames = s_hitches = 0;
+                s_max_gap_us = 0;
+            }
+        }
 
         // If the GPU PM4 command processor executed draw calls, Metal already has
         // the rendered scene in its framebuffer. Only upload from guest memory if
@@ -5103,6 +5183,7 @@ void NidRegistry::register_default_libraries() {
                 g_thread_manager->equeue_signal(sub.eq_id, ev);
             }
         }
+        if (g_flip_hook) g_flip_hook();
     };
 
     // sceVideoOutRegisterBuffers(int handle, int startIndex, void* const* addresses, int bufferCount, ...)
@@ -6252,7 +6333,7 @@ void NidRegistry::register_default_libraries() {
             const u32 base_vertex = static_cast<u32>(ctx.r8);
             const u32 instance_count = static_cast<u32>(ctx.r9 ? ctx.r9 : 1);
 
-            std::fprintf(stderr, "[HLE sceGnmDrawIndex] dcb=0x%llx dwords=%u idx_count=%u idx_buf=0x%llx (rcx) base_vtx=%u instances=%u\n",
+            PM4_LOG("[HLE sceGnmDrawIndex] dcb=0x%llx dwords=%u idx_count=%u idx_buf=0x%llx (rcx) base_vtx=%u instances=%u\n",
                          (unsigned long long)dcb_addr, num_dwords, index_count,
                          (unsigned long long)index_buffer_addr, base_vertex, instance_count);
 
@@ -6295,7 +6376,7 @@ void NidRegistry::register_default_libraries() {
             mem.read_value(vs_regs_addr + 0x18, pa_cl);
         }
         const u64 isa_addr = ((static_cast<u64>(pgm_hi) << 32) | pgm_lo) << 8;
-        std::fprintf(stderr, "[HLE %s] dcb=0x%llx dwords=%u vs_regs=0x%llx mod=0x%x -> VS ISA: 0x%llx (lo=0x%08x hi=0x%08x rsrc1=0x%08x rsrc2=0x%08x out_cfg=0x%08x pos_fmt=0x%08x pa_cl=0x%08x)\n",
+        PM4_LOG("[HLE %s] dcb=0x%llx dwords=%u vs_regs=0x%llx mod=0x%x -> VS ISA: 0x%llx (lo=0x%08x hi=0x%08x rsrc1=0x%08x rsrc2=0x%08x out_cfg=0x%08x pos_fmt=0x%08x pa_cl=0x%08x)\n",
                      func_name, (unsigned long long)dcb_addr, num_dwords, (unsigned long long)vs_regs_addr, modifier,
                      (unsigned long long)isa_addr, pgm_lo, pgm_hi, rsrc1, rsrc2, out_cfg, pos_fmt, pa_cl);
 
@@ -6360,7 +6441,7 @@ void NidRegistry::register_default_libraries() {
                 mem.read_value(ps_regs_addr + 0x2C, cb_mask);
             }
             const u64 isa_addr = ((static_cast<u64>(pgm_hi) << 32) | pgm_lo) << 8;
-            std::fprintf(stderr, "[HLE %s] dcb=0x%llx dwords=%u ps_regs=0x%llx mod=0x%x -> PS ISA: 0x%llx (lo=0x%08x hi=0x%08x rsrc1=0x%08x rsrc2=0x%08x z_fmt=0x%x col_fmt=0x%x in_ena=0x%x in_addr=0x%x in_ctrl=0x%x baryc=0x%x db_ctrl=0x%x cb_mask=0x%x)\n",
+            PM4_LOG("[HLE %s] dcb=0x%llx dwords=%u ps_regs=0x%llx mod=0x%x -> PS ISA: 0x%llx (lo=0x%08x hi=0x%08x rsrc1=0x%08x rsrc2=0x%08x z_fmt=0x%x col_fmt=0x%x in_ena=0x%x in_addr=0x%x in_ctrl=0x%x baryc=0x%x db_ctrl=0x%x cb_mask=0x%x)\n",
                          func_name, (unsigned long long)dcb_addr, num_dwords, (unsigned long long)ps_regs_addr, modifier,
                          (unsigned long long)isa_addr, pgm_lo, pgm_hi, rsrc1, rsrc2, z_fmt, col_fmt, in_ena, in_addr, in_ctrl, baryc, db_ctrl, cb_mask);
 
@@ -6630,7 +6711,10 @@ void NidRegistry::register_default_libraries() {
         std::unique_lock<std::mutex> l(pm.m);
         while (pm.count > 0 && pm.owner != self) {
             if (g_syscalls && g_syscalls->has_exited()) break;
-            pm.cv.wait_for(l, std::chrono::milliseconds(20));
+            {
+                SignalWakeScope wake(pm.cv);
+                if (!guest_signal_pending()) pm.cv.wait_for(l, std::chrono::milliseconds(20));
+            }
             l.unlock();
             deliver_guest_exceptions(mem);
             l.lock();
@@ -6736,7 +6820,10 @@ void NidRegistry::register_default_libraries() {
         while (pc->seq == gen) {
             if (g_syscalls && g_syscalls->has_exited()) break;
             if (deadline && std::chrono::system_clock::now() >= *deadline) { timed_out = true; break; }
-            pc->cv.wait_for(cl, std::chrono::milliseconds(20));
+            {
+                SignalWakeScope wake(pc->cv);
+                if (!guest_signal_pending()) pc->cv.wait_for(cl, std::chrono::milliseconds(20));
+            }
             if (pc->seq != gen) break;
             cl.unlock();
             deliver_guest_exceptions(mem);

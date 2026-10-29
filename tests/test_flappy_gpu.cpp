@@ -88,6 +88,7 @@ int main() {
     }
 
     ps4::JitCompiler jit;
+    jit.set_collect_metrics(ps4::jit_stats_enabled());
     ps4::CpuExecutor cpu(memory, syscalls);
     // PS4_NO_JIT=1 runs every guest thread on the interpreter (A/B a JIT bug).
     if (!std::getenv("PS4_NO_JIT")) {

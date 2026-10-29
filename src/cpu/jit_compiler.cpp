@@ -5,6 +5,7 @@
 #include "ps4/x86_decode.hpp"
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <iostream>
 #if defined(__APPLE__)
 #include <libkern/OSCacheControl.h>
@@ -1489,6 +1490,10 @@ void *JitCompiler::allocate_code(usize size) {
   return ptr;
 }
 
+// MAP_JIT write protection is per thread and only commit_code() switches it
+// off (and back on); toggling it before every block was a measurable cost.
+static thread_local bool t_jit_executable = false;
+
 void JitCompiler::commit_code(void *dest, const u32 *src, usize size_bytes) {
   // 1. Enable write permission for Apple Silicon JIT thread
   pthread_jit_write_protect_np(0);
@@ -1498,6 +1503,7 @@ void JitCompiler::commit_code(void *dest, const u32 *src, usize size_bytes) {
 
   // 3. Restore executable permission
   pthread_jit_write_protect_np(1);
+  t_jit_executable = true;
 
   // 4. Invalidate instruction cache
   sys_icache_invalidate(dest, size_bytes);
@@ -1679,8 +1685,17 @@ struct ThreadBlockCache {
     JittedBlockFunc fn;      // nullptr: compiling this rip failed
     usize *execution_count;  // the block's JitBlockMetrics counter
   };
+  // Direct-mapped front for the hot loop: one compare instead of a hash-map
+  // probe per block. Misses fall back to `map`.
+  static constexpr usize kFastSlots = 1u << 16;
+  struct Slot {
+    GuestAddr rip;
+    Entry entry;
+  };
   u64 epoch = 0;
+  std::unique_ptr<Slot[]> fast;
   std::unordered_map<GuestAddr, Entry> map;
+  static usize slot_of(GuestAddr rip) { return static_cast<usize>((rip ^ (rip >> 16)) & (kFastSlots - 1)); }
 };
 thread_local ThreadBlockCache t_block_cache;
 } // namespace
@@ -1693,12 +1708,23 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
   usize *exec_count = nullptr;
   ThreadBlockCache &tc = t_block_cache;
   const u64 epoch = m_epoch.load(std::memory_order_acquire);
-  if (tc.epoch != epoch) {
+  if (tc.epoch != epoch || !tc.fast) {
     tc.map.clear();
+    if (!tc.fast)
+      tc.fast = std::make_unique<ThreadBlockCache::Slot[]>(ThreadBlockCache::kFastSlots);
+    for (usize i = 0; i < ThreadBlockCache::kFastSlots; ++i)
+      tc.fast[i].rip = ~GuestAddr{0};
     tc.epoch = epoch;
   }
-  if (auto it = tc.map.find(ctx.rip); it != tc.map.end()) {
+  ThreadBlockCache::Slot &slot = tc.fast[ThreadBlockCache::slot_of(ctx.rip)];
+  if (slot.rip == ctx.rip) {
+    if (!slot.entry.fn)
+      return false;
+    fn = slot.entry.fn;
+    exec_count = slot.entry.execution_count;
+  } else if (auto it = tc.map.find(ctx.rip); it != tc.map.end()) {
     // Fastest path: this thread has seen the block (or its failure) before.
+    slot = {ctx.rip, it->second};
     if (!it->second.fn)
       return false;
     fn = it->second.fn;
@@ -1728,12 +1754,18 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
       exec_count = &m_metrics[ctx.rip].execution_count;
     }
     tc.map.emplace(ctx.rip, ThreadBlockCache::Entry{fn, exec_count});
+    slot = {ctx.rip, ThreadBlockCache::Entry{fn, exec_count}};
   }
-  std::atomic_ref<usize>(*exec_count).fetch_add(1, std::memory_order_relaxed);
-  std::atomic_ref<usize>(m_total_invocations).fetch_add(1, std::memory_order_relaxed);
+  if (m_collect_metrics) {
+    std::atomic_ref<usize>(*exec_count).fetch_add(1, std::memory_order_relaxed);
+    std::atomic_ref<usize>(m_total_invocations).fetch_add(1, std::memory_order_relaxed);
+  }
 
-  // Enforce execute mode for MAP_JIT on Apple Silicon
-  pthread_jit_write_protect_np(1);
+  // Enforce execute mode for MAP_JIT on Apple Silicon (once per thread).
+  if (!t_jit_executable) {
+    pthread_jit_write_protect_np(1);
+    t_jit_executable = true;
+  }
 
   // Compiled code stores to guest memory: the MemoryManager is only const
   // because compilation does not modify it.

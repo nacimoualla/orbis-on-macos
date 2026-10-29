@@ -145,6 +145,8 @@ Unity PS4 games ship their scripting runtime as PRX modules (`mono-ps4.prx`, `Mo
 PS4_LOAD_PRX=1 ./build/ps4-runner --window games/<Title>/eboot.elf
 ```
 
+The window runs the game's main thread on its own host thread and presents every frame the game flips, paced to a 60 Hz vblank, so Flappy holds a steady 60 FPS.
+
 **Controls:** left click, `Space`, `Enter`, `↑` or `→` press **Cross** and the **touch pad** together (games that say "touch pad to start" read the touch pad). `Esc` closes the window.
 
 What this path exercises: full-AOT Mono with Boehm GC stop-the-world (guest exception delivery via `sceKernelRaiseException`), Unity's preload/scene-load threads, FMOD audio paced by `sceAudioOutOutput`, the user-service login that opens the pad, Gnm command-buffer building (`sceGnmSet/Update*Shader*`, draws, EOP interrupts) and AVX-heavy engine math in the JIT.
@@ -169,7 +171,10 @@ PS4_LOAD_PRX=1 PS4_FRAMES=300 PS4_AUTO_TAP=130,2,1 PS4_GPU_READBACK=/tmp/frames 
 | `PS4_WATCH_ADDR=a` `PS4_WATCH_SIZE=n` | Record every store to a guest range (dumped on malformed GPU packets and at exit). |
 | `PS4_DUMP_QWORDS=a,b,…` | Print guest qwords at exit. |
 | `PS4_DUMP_TRAMPOLINES=1` | Map HLE trampoline addresses to NIDs/names. |
-| `PS4_LOG_SEMA=1` | Log every `sceKernelWaitSema`/`SignalSema`. |
+| `PS4_LOG_SEMA=1` | Log every semaphore and event-flag wait/signal. |
+| `PS4_LOG_PM4=1` | Trace every PM4 packet, draw, shader dump, Gnm call and flip (very verbose). |
+| `PS4_FLIP_STATS=1` | Once a second: game FPS, worst frame time, frames over 20 ms, and window presents. |
+| `PS4_NO_VSYNC=1` | Windowed runner: complete flips immediately instead of pacing them to 60 Hz vblank. |
 | `PS4_JIT_STATS=1` | JIT vs. interpreter coverage telemetry (see below). |
 
 ## 🧪 Testing
