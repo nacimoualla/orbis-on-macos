@@ -347,7 +347,11 @@ void test_benchmark_triangle_orbis_and_compute() {
         0x48, 0x01, 0xCB, // add rbx, rcx
         0x48, 0x29, 0xCB, // sub rbx, rcx
         0x48, 0x01, 0xD3, // add rbx, rdx
-        0x48, 0x29, 0xD3  // sub rbx, rdx
+        0x48, 0x29, 0xD3, // sub rbx, rdx
+        // HLT ends the block. Without it the block runs on into the zeroed
+        // memory after it, where 00 00 decodes as `add [rax], al`, and each
+        // run executes 128 instructions instead of the 8 counted below.
+        0xF4              // hlt
     };
     assert(memory.write_bytes(compute_addr, compute_block, sizeof(compute_block)));
 

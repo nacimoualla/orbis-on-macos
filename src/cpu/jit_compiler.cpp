@@ -1535,8 +1535,7 @@ usize JitCompiler::code_buffer_used() const noexcept {
 
 usize JitCompiler::total_invocations() const noexcept {
   std::shared_lock lock(m_cache_mutex);
-  return std::atomic_ref<usize>(const_cast<usize &>(m_total_invocations))
-      .load(std::memory_order_relaxed);
+  return __atomic_load_n(&m_total_invocations, __ATOMIC_RELAXED);
 }
 
 const JitBlockMetrics *
@@ -1757,8 +1756,10 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
     slot = {ctx.rip, ThreadBlockCache::Entry{fn, exec_count}};
   }
   if (m_collect_metrics) {
-    std::atomic_ref<usize>(*exec_count).fetch_add(1, std::memory_order_relaxed);
-    std::atomic_ref<usize>(m_total_invocations).fetch_add(1, std::memory_order_relaxed);
+    // __atomic builtins: the macos-14 CI runner's libc++ has no C++20
+    // atomic reference type.
+    __atomic_fetch_add(exec_count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&m_total_invocations, 1, __ATOMIC_RELAXED);
   }
 
   // Enforce execute mode for MAP_JIT on Apple Silicon (once per thread).
