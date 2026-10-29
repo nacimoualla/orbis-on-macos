@@ -59,32 +59,6 @@ static_assert(offsetof(OrbisStat, st_size) == 0x48);
 static_assert(offsetof(OrbisStat, st_birthtime_sec) == 0x68);
 static_assert(sizeof(OrbisStat) == 0x78);
 
-// Save data structures
-inline constexpr i32 SCE_SAVE_DATA_MOUNT_MODE_RDONLY = 1;
-inline constexpr i32 SCE_SAVE_DATA_MOUNT_MODE_RDWR   = 2;
-inline constexpr i32 SCE_SAVE_DATA_MOUNT_MODE_CREATE = 4;
-
-#pragma pack(push, 1)
-struct SceSaveDataDirName {
-    char data[32];
-};
-
-struct SceSaveDataMount {
-    u32 user_id;
-    SceSaveDataDirName dir_name;
-    GuestAddr fingerprint;
-    u32 blocks;
-    u32 mount_mode;
-    u8 reserved[32];
-};
-
-struct SceSaveDataMountResult {
-    char mount_path[16];
-    u32 required_blocks;
-    u8 reserved[32];
-};
-#pragma pack(pop)
-
 struct VfsMountPoint {
     std::string guest_prefix;
     std::filesystem::path host_path;
@@ -146,12 +120,6 @@ public:
     /// Check if guest path exists
     bool exists(std::string_view guest_path) const;
 
-    /// Mount a save data directory
-    i32 mount_savedata(u32 user_id, const std::string& dir_name, u32 mount_mode, SceSaveDataMountResult& out_result);
-
-    /// Unmount a save data directory
-    i32 unmount_savedata(const std::string& mount_path);
-
     /// Get current sandbox root
     [[nodiscard]] const std::filesystem::path& sandbox_root() const noexcept { return m_sandbox_root; }
 
@@ -166,7 +134,6 @@ private:
     std::vector<VfsMountPoint> m_mounts;
     std::unordered_map<i32, VfsFileDescriptor> m_fd_table;
     i32 m_next_fd{3}; // 0, 1, 2 reserved for stdio
-    i32 m_next_savedata_mount_idx{0};
     mutable std::mutex m_mutex;
 
     void setup_default_mounts();

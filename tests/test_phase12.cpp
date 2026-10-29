@@ -1,6 +1,7 @@
 #include "ps4/dynamic_linker.hpp"
 #include "ps4/memory.hpp"
 #include "ps4/nid_registry.hpp"
+#include "ps4/save_data.hpp"
 #include "ps4/syscall_table.hpp"
 #include "ps4/vfs.hpp"
 #include <cassert>
@@ -216,7 +217,12 @@ void test_savedata_hle() {
     MemoryManager memory;
     assert(memory.initialize());
 
+    const auto temp_dir = std::filesystem::temp_directory_path() / "ps4_test_vfs_5";
+    std::filesystem::remove_all(temp_dir);
+    VirtualFileSystem vfs(temp_dir);
+
     NidRegistry nid_reg;
+    nid_reg.set_vfs(&vfs);
     nid_reg.register_default_libraries();
 
     const auto* mount_sym = nid_reg.find_by_name("sceSaveDataMount");
@@ -225,13 +231,19 @@ void test_savedata_hle() {
     const auto* umount_sym = nid_reg.find_by_name("sceSaveDataUmount");
     assert(umount_sym != nullptr);
 
-    // Prepare SceSaveDataMount structure in guest memory
+    // Prepare SceSaveDataMount and its dir name in guest memory
     const GuestAddr mount_req_addr = 0x30000;
+    const GuestAddr dir_name_addr = 0x30800;
     const GuestAddr mount_res_addr = 0x31000;
+
+    SceSaveDataDirName dir_name{};
+    std::strncpy(dir_name.data, "PROFILE00", sizeof(dir_name.data) - 1);
+    memory.write_bytes(dir_name_addr, &dir_name, sizeof(dir_name));
 
     SceSaveDataMount req{};
     req.user_id = 0x10000001;
-    std::strncpy(req.dir_name.data, "PROFILE00", sizeof(req.dir_name.data) - 1);
+    req.dir_name = dir_name_addr;
+    req.blocks = 96;
     req.mount_mode = SCE_SAVE_DATA_MOUNT_MODE_CREATE | SCE_SAVE_DATA_MOUNT_MODE_RDWR;
     memory.write_bytes(mount_req_addr, &req, sizeof(req));
 
@@ -245,14 +257,17 @@ void test_savedata_hle() {
 
     SceSaveDataMountResult res{};
     memory.read_bytes(mount_res_addr, &res, sizeof(res));
-    assert(std::string(res.mount_path).find("/savedata") != std::string::npos);
-    assert(res.required_blocks > 0);
+    assert(std::string(res.mount_point.data) == "/savedata0");
+    assert(vfs.resolve_path("/savedata0").has_value());
 
-    // Call sceSaveDataUmount
+    // Call sceSaveDataUmount with the mount point (the result's first member)
     ctx.rdi = mount_res_addr;
     umount_sym->handler(ctx, memory);
     assert(ctx.rax == SCE_OK);
+    assert(!vfs.resolve_path("/savedata0").has_value());
 
+    nid_reg.set_vfs(nullptr);
+    std::filesystem::remove_all(temp_dir);
     std::cout << "  -> Save data HLE mounting and unmounting passed!\n";
 }
 
