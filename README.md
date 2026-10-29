@@ -13,6 +13,8 @@
 `orbis-on-macos` is an open-source **PlayStation 4 emulator** — a clean-room **userland compatibility layer & runtime** that runs PS4 (Orbis OS) games and apps **natively on Apple Silicon macOS**. Instead of emulating the whole console, it loads a PS4 `eboot.bin`/ELF or PRX module, maps the guest's 8 GB address space into the Mac's unified memory, dynamically recompiles guest `x86_64` code to native `ARM64`, translates the GNM/Metal GPU command stream and delivers audio through CoreAudio — all on top of Darwin/Mach and Apple frameworks.
 
 > **Status:** Phases 1–15 implemented and verified (see [ROADMAP.md](ROADMAP.md)). CPU interpreter + ARM64 JIT, PRX/NID dynamic linker, Orbis syscall HLE, VFS, Metal graphics pipeline, CoreAudio, and threading are all in place.
+>
+> **Milestone:** a retail Unity title (Flappy Bird, `NPXX51362`) boots on the **real Mono runtime** (`mono-ps4.prx`, full-AOT, Boehm GC), loads its first scene, renders through the GCN → MSL path and is **playable at ~60 FPS** in the window — title screen, touch-pad input, gameplay, game over and restart. See [Running a real Unity title](#-running-a-real-unity-title).
 
 ## 🗺️ Progress & Roadmap
 
@@ -100,7 +102,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-This builds the `ps4_core` library, the `ps4-runner` CLI, and the 15 `test_phase*` binaries.
+This builds the `ps4_core` library, the `ps4-runner` CLI, the `test_phase*` binaries and the focused regression tests (guest exceptions, printf/scanf, Flappy GPU smoke, …).
 
 ## ▶️ Running
 
@@ -110,11 +112,6 @@ This builds the `ps4_core` library, the `ps4-runner` CLI, and the 15 `test_phase
 
 Options: `--window/-w`, `--headless`, `--budget N` (headless instruction budget,
 default 100 M), `--no-jit`, `--trace/-t`, `--strict-hle`.
-
-> **JIT caveat:** with the JIT enabled (the default) the guest stalls in a
-> vectorised loop at `0x58d1b2` before the Mono bootstrap and never reaches the
-> engine. `--no-jit` gets through. Use `--no-jit` plus a raised `--budget` for
-> Mono-phase smoke tests. See `docs/nid-audit.md`.
 
 | Option | Meaning |
 |---|---|
@@ -140,9 +137,44 @@ MTL_HUD_ENABLED=1 ./build/ps4-runner --window <path-to-eboot>
 
 **Bring your own titles.** Drop legally obtained game files under `games/<Title>/` (that directory is git-ignored) and point `ps4-runner` at an `eboot.bin`/`.elf`. No game data is included in this repository.
 
+## 🎮 Running a real Unity title
+
+Unity PS4 games ship their scripting runtime as PRX modules (`mono-ps4.prx`, `MonoAssembliesPS4.prx`). Set `PS4_LOAD_PRX=1` to load and run them for real instead of the HLE Mono shim:
+
+```bash
+PS4_LOAD_PRX=1 ./build/ps4-runner --window games/<Title>/eboot.elf
+```
+
+**Controls:** left click, `Space`, `Enter`, `↑` or `→` press **Cross** and the **touch pad** together (games that say "touch pad to start" read the touch pad). `Esc` closes the window.
+
+What this path exercises: full-AOT Mono with Boehm GC stop-the-world (guest exception delivery via `sceKernelRaiseException`), Unity's preload/scene-load threads, FMOD audio paced by `sceAudioOutOutput`, the user-service login that opens the pad, Gnm command-buffer building (`sceGnmSet/Update*Shader*`, draws, EOP interrupts) and AVX-heavy engine math in the JIT.
+
+**Headless smoke test.** `test_flappy_gpu` drives the same title offscreen; it expects the game at `games/flappy_bird/ED1633-NPXX51362_00-TER1520000000000/` and fails without it (exclude it with `ctest -E Flappy`):
+
+```bash
+PS4_LOAD_PRX=1 PS4_FRAMES=300 PS4_AUTO_TAP=130,2,1 PS4_GPU_READBACK=/tmp/frames ./build/test_flappy_gpu
+```
+
+| Variable | Effect |
+|---|---|
+| `PS4_LOAD_PRX=1` | Load and execute the game's own PRX modules (real Mono). |
+| `PS4_FRAMES=N` | Host frames to run (`test_flappy_gpu`). |
+| `PS4_AUTO_TAP=start,period[,hold]` | Press touch pad + Cross on a schedule so a headless run can play. |
+| `PS4_GPU_READBACK=/dir` | Dump every drawn frame as `frame_N_gcn.ppm`. |
+| `PS4_FRAME_TIMES=1` | Per-frame wall time vs. the main thread's guest slice. |
+| `PS4_SAMPLE_MAIN=1` | One main-thread RIP + frame-pointer chain sample per frame. |
+| `PS4_HLE_HIST=1` | HLE call histogram plus wall time spent in each handler, per guest thread. |
+| `PS4_TRACE_RANGE=lo,hi` / `PS4_TRACE_AFTER=addr` | Single-step the main thread and print RIPs in a range / after an address. |
+| `PS4_TRACE_TID=n` | Per-instruction trace of guest thread `n`. |
+| `PS4_WATCH_ADDR=a` `PS4_WATCH_SIZE=n` | Record every store to a guest range (dumped on malformed GPU packets and at exit). |
+| `PS4_DUMP_QWORDS=a,b,…` | Print guest qwords at exit. |
+| `PS4_DUMP_TRAMPOLINES=1` | Map HLE trampoline addresses to NIDs/names. |
+| `PS4_LOG_SEMA=1` | Log every `sceKernelWaitSema`/`SignalSema`. |
+| `PS4_JIT_STATS=1` | JIT vs. interpreter coverage telemetry (see below). |
+
 ## 🧪 Testing
 
-The suite is headless — it exercises CPU translation, memory mapping, the linker, and offscreen Metal rendering without opening a window:
+The suite is headless — it exercises CPU translation, memory mapping, the linker, and offscreen Metal rendering without opening a window (24 CTest targets):
 
 ```bash
 cd build && ctest --output-on-failure
@@ -164,6 +196,10 @@ A standalone Python suite audits the HLE NID registry (hash vectors, tag round-t
 ```bash
 python3 tests/test_verify_nids_adversarial.py
 ```
+
+### x86 differential check against real hardware
+
+`scripts/x86_diff/run.sh` runs every case in `scripts/x86_diff/cases.h` (generated by `gen_cases.py`, 500+ instruction encodings) natively under Rosetta 2 and through the interpreter and the JIT from identical random state, and reports any register, flag or memory difference. Add a case whenever an instruction is implemented or fixed.
 
 ### CPU/JIT testing off-Mac
 
