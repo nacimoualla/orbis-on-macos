@@ -12,6 +12,7 @@
 namespace ps4 {
 
 class MemoryManager;
+class MetalBackend;
 
 struct GcnDrawRequest {
     GuestAddr vs_addr{0};
@@ -32,6 +33,8 @@ struct GcnDrawRequest {
     u32 instances{1};
 
     u32 depth_format{0};              // MTLPixelFormat of the pass depth attachment, 0 = none
+    u32 color_formats[8]{};           // MTLPixelFormat of colour attachments 1-7 (0 = none);
+                                      // attachment 0 is encode_draw's color_format
     u32 fb_width{0};                  // render target size; 0 leaves viewport/scissor alone
     u32 fb_height{0};
 };
@@ -53,6 +56,7 @@ public:
     GcnPipelineCache& operator=(const GcnPipelineCache&) = delete;
 
     void set_memory(MemoryManager* memory) noexcept;
+    void set_metal_backend(MetalBackend* metal) noexcept;
 
     /// Encode a draw with the game's translated shaders. Returns false (and
     /// leaves the encoder state untouched apart from nothing) when anything

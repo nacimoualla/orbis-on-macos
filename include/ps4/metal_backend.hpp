@@ -57,6 +57,12 @@ public:
     bool ensure_render_encoder(bool clear, ColorRGBA color);
     /// Return the active render encoder as an opaque Objective-C pointer.
     [[nodiscard]] void* active_render_encoder() const noexcept;
+    /// Ensure active frame has a compute command encoder. If a render encoder was open, ends it first.
+    bool ensure_compute_encoder();
+    /// End active compute command encoder without submitting frame.
+    void end_compute_encoder();
+    /// Return active compute command encoder as opaque Objective-C pointer.
+    [[nodiscard]] void* active_compute_encoder() const noexcept;
     /// Depth/stencil attachment format (MTLPixelFormat) of every pass that
     /// ensure_render_encoder() opens; pipelines drawing there must match it.
     [[nodiscard]] u32 depth_stencil_format() const noexcept;
@@ -64,6 +70,29 @@ public:
     /// of the game's depth surface (host-only textures, framebuffer sized).
     /// Switching ends the open pass; the next one loads the new buffer.
     void set_depth_target(u64 key);
+
+    /// Register guest address of display framebuffer (e.g. from VideoOut)
+    void register_display_buffer(u64 addr);
+    [[nodiscard]] bool is_display_buffer(u64 addr) const noexcept;
+
+    /// Bind colour attachment `slot` (0-7) for later passes. `key` is the
+    /// guest surface address: 0 or a registered display buffer means the
+    /// screen framebuffer (slot 0; nothing for the other slots), anything else
+    /// a host texture of `width` x `height` (0: framebuffer size) and
+    /// `pixel_format` (MTLPixelFormat, 0: BGRA8Unorm). The texture keeps its
+    /// contents until its size or format changes. A change of binding ends
+    /// the open pass.
+    void set_color_target(u32 slot, u64 key, u32 width = 0, u32 height = 0, u32 pixel_format = 0);
+    /// Unbind every slot (slot 0 back to the screen).
+    void reset_color_targets();
+
+    /// Find color target texture by guest key
+    [[nodiscard]] void* find_color_target(u64 key) const noexcept;
+    [[nodiscard]] void* color_target_texture(u32 slot) const noexcept;
+
+    /// Read back pixel from a specific color target (or main framebuffer if key == 0)
+    bool read_color_pixel(u64 key, u32 x, u32 y, u8& out_r, u8& out_g, u8& out_b, u8& out_a) const;
+
     /// End the active render encoder without submitting the frame.
     void end_render_encoder();
 

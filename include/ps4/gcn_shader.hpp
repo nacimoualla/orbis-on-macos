@@ -134,7 +134,8 @@ struct TranslatedPipeline {
     std::vector<ImageSlot> vs_images;
     u32 vs_param_count{0};
     u32 ps_attr_mask{0};
-    bool ps_writes_color{false};
+    bool ps_writes_color{false};     // exports mrt0
+    u8 ps_color_mask{0};             // exported colour targets (bit n = mrt<n>)
     bool ps_writes_depth{false};     // exp mrtz
 };
 

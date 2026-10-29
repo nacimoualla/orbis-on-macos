@@ -44,6 +44,32 @@ GpuRenderState decode_render_state(const u32* ctx, usize count, u32 fb_width, u3
     };
     GpuRenderState st;
 
+    // Color render targets: CB_COLOR<n>_BASE, PITCH, SLICE, VIEW, INFO, ...
+    // at 0x318 + 15 * n (CIK). CB_TARGET_MASK has 4 write bits per slot; 0 is
+    // a pass that writes no colour (depth-only, e.g. a shadow map).
+    const u32 target_mask = reg(ctx_reg::kCbTargetMask);
+    const u32 screen_br = reg(ctx_reg::kPaScScreenScissorBr);
+    for (u32 k = 0; k < ctx_reg::kMaxColorTargets; ++k) {
+        ColorTarget& ct = st.color[k];
+        const u32 r = ctx_reg::kCbColor0BaseGfx7 + k * ctx_reg::kCbColorStrideGfx7;
+        const u32 base = reg(r), pitch = reg(r + 1), slice = reg(r + 2), info = reg(r + 4);
+        ct.write_mask = static_cast<u8>((target_mask >> (k * 4)) & 0xF);
+        ct.base = static_cast<GuestAddr>(base) << 8;
+        ct.format = (info >> 2) & 0x1F;    // CB_COLOR_INFO.FORMAT
+        ct.num_format = (info >> 8) & 0x7; // NUMBER_TYPE
+        ct.comp_swap = (info >> 11) & 0x3; // COMP_SWAP
+        ct.pitch = ((pitch & 0x7FF) + 1) * 8;                    // PITCH.TILE_MAX: 8-pixel tiles
+        const u64 slice_px = (static_cast<u64>(slice & 0x3FFFFF) + 1) * 64; // SLICE.TILE_MAX: 8x8 tiles
+        ct.width = ct.pitch;
+        ct.height = static_cast<u32>(slice_px / ct.pitch);
+        // The surface is padded to whole tiles; the screen scissor is the
+        // area actually rendered (Gnm sets it to the target size).
+        const u32 sx = screen_br & 0x7FFF, sy = (screen_br >> 16) & 0x7FFF;
+        if (sx && sx < ct.width) ct.width = sx;
+        if (sy && sy < ct.height) ct.height = sy;
+        ct.enabled = base != 0 && ct.format != 0 && ct.write_mask != 0;
+    }
+
     // Depth target.
     DepthTarget& dt = st.depth;
     dt.z_format = reg(ctx_reg::kDbZInfo) & 3;

@@ -37,6 +37,7 @@ std::vector<u32> unity_regs() {
     };
     set(0x000C, {0x00000000, 0x04380780});
     set(0x0010, {0xa0000003, 0x20000001, 0x0160ff00, 0x01618f00, 0x0160ff00, 0x01618f00, 0x000478ff, 0x00008fff});
+    set(0x008E, {0x0000000F});
     set(0x0090, {0x80000000, 0x3fff3fff});
     set(0x0094, {0x80000000, 0x0fff0fff});
     set(0x00B4, {0x00000000, 0x3f800000});
@@ -45,12 +46,21 @@ std::vector<u32> unity_regs() {
     set(0x0200, {0x00000062});
     set(0x0204, {0x00080000, 0x00000244, 0x0000043f});
     set(0x0292, {0x00000002});
+    set(0x0318, {0x01607f80, 0x0ef000ef, 0x00007f7f, 0x00000000, 0x00008828, 0x0000014a});
     return c;
 }
 
 void test_unity_draw() {
     const std::vector<u32> c = unity_regs();
     const GpuRenderState s = decode_render_state(c.data(), c.size(), 1920, 1080);
+    // CB_COLOR0_INFO 0x8828: FORMAT 8_8_8_8 (10), NUMBER_TYPE UNORM (0),
+    // COMP_SWAP ALT (1, BGRA). PITCH 0xef -> 1920; SLICE 0x7f7f -> 1088 rows,
+    // clipped to 1080 by the screen scissor.
+    CHECK(s.color[0].enabled && s.color[0].base == 0x1607f8000ull);
+    CHECK(s.color[0].pitch == 1920 && s.color[0].width == 1920 && s.color[0].height == 1080);
+    CHECK(s.color[0].format == 10 && s.color[0].num_format == 0 && s.color[0].comp_swap == 1);
+    CHECK(s.color[0].write_mask == 0xF);
+    CHECK(!s.color[1].enabled);
     CHECK(s.depth.has_depth && s.depth.has_stencil && s.depth.z_format == 3);
     CHECK(s.depth.base == 0x160ff0000ull);
     CHECK(s.depth.width == 2048 && s.depth.height == 1152);
@@ -153,6 +163,46 @@ void test_viewport_and_scissor() {
     CHECK(s.scissor.width == 64 && !s.skip_draw);
 }
 
+void test_mrt_and_offscreen_color() {
+    std::vector<u32> c(ctx_reg::kCount, 0);
+    c[ctx_reg::kCbTargetMask] = 0x000000FF; // slots 0 and 1
+    // Slot 0: 512x512 RGBA8 UNORM (STD swap). PITCH.TILE_MAX = 512/8 - 1,
+    // SLICE.TILE_MAX = 512*512/64 - 1.
+    const u32 s0 = ctx_reg::kCbColor0BaseGfx7;
+    c[s0] = 0x0160bb00;
+    c[s0 + 1] = 63;
+    c[s0 + 2] = 4095;
+    c[s0 + 4] = 10u << 2;
+    // Slot 1: 512x256 RGBA16 FLOAT: FORMAT 16_16_16_16 (12), NUMBER_TYPE FLOAT (7).
+    const u32 s1 = s0 + ctx_reg::kCbColorStrideGfx7;
+    c[s1] = 0x0160cc00;
+    c[s1 + 1] = 63;
+    c[s1 + 2] = 2047;
+    c[s1 + 4] = (12u << 2) | (7u << 8);
+    // Registers 0xB0-0x112 (viewport scissors / Z ranges / viewport) must not
+    // be read as colour targets.
+    for (u32 r = 0xB0; r <= 0x112; ++r) c[r] = 0x3f800000;
+
+    GpuRenderState s = decode_render_state(c.data(), c.size(), 1920, 1080);
+    CHECK(s.color[0].enabled && s.color[0].base == 0x160bb0000ull);
+    CHECK(s.color[0].width == 512 && s.color[0].height == 512 && s.color[0].pitch == 512);
+    CHECK(s.color[0].format == 10 && s.color[0].num_format == 0 && s.color[0].comp_swap == 0);
+    CHECK(s.color[1].enabled && s.color[1].base == 0x160cc0000ull);
+    CHECK(s.color[1].width == 512 && s.color[1].height == 256);
+    CHECK(s.color[1].format == 12 && s.color[1].num_format == 7);
+    for (u32 k = 2; k < 8; ++k) CHECK(!s.color[k].enabled);
+
+    // The screen scissor bounds the rendered area of a padded surface.
+    c[ctx_reg::kPaScScreenScissorBr] = 300 | (200u << 16);
+    s = decode_render_state(c.data(), c.size(), 1920, 1080);
+    CHECK(s.color[0].width == 300 && s.color[0].height == 200);
+
+    // CB_TARGET_MASK 0 (depth-only pass): no colour target is written.
+    c[ctx_reg::kCbTargetMask] = 0;
+    s = decode_render_state(c.data(), c.size(), 1920, 1080);
+    for (u32 k = 0; k < 8; ++k) CHECK(!s.color[k].enabled && s.color[k].write_mask == 0);
+}
+
 } // namespace
 
 int main() {
@@ -160,6 +210,7 @@ int main() {
     test_unity_clear();
     test_raster_and_stencil();
     test_viewport_and_scissor();
+    test_mrt_and_offscreen_color();
     if (g_failures) {
         std::fprintf(stderr, "GPU state test: %d failure(s)\n", g_failures);
         return 1;

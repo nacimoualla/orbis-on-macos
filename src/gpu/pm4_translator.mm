@@ -1053,6 +1053,50 @@ void Pm4Translator::Impl::log_draw_diagnostics(const char* draw_type, u32 count,
     std::fprintf(stderr, "========================================================\n\n");
 }
 
+// Metal pixel format of a GCN colour target (CB_COLOR_INFO FORMAT,
+// NUMBER_TYPE, COMP_SWAP), or Invalid when there is none.
+static MTLPixelFormat mtl_color_format(const ColorTarget& c) {
+    enum { UNORM = 0, SNORM = 1, UINT = 4, SINT = 5, SRGB = 6, FLOAT = 7 };
+    const u32 nt = c.num_format;
+    auto pick = [nt](MTLPixelFormat un, MTLPixelFormat sn, MTLPixelFormat ui, MTLPixelFormat si,
+                     MTLPixelFormat fl, MTLPixelFormat srgb = MTLPixelFormatInvalid) {
+        switch (nt) {
+        case UNORM: return un;
+        case SNORM: return sn;
+        case UINT: return ui;
+        case SINT: return si;
+        case FLOAT: return fl;
+        case SRGB: return srgb;
+        default: return MTLPixelFormatInvalid;
+        }
+    };
+    constexpr MTLPixelFormat X = MTLPixelFormatInvalid;
+    if (c.format == 10) { // 8_8_8_8: STD = RGBA, ALT = BGRA
+        if (c.comp_swap == 0)
+            return pick(MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA8Snorm, MTLPixelFormatRGBA8Uint,
+                        MTLPixelFormatRGBA8Sint, X, MTLPixelFormatRGBA8Unorm_sRGB);
+        if (c.comp_swap == 1) return pick(MTLPixelFormatBGRA8Unorm, X, X, X, X, MTLPixelFormatBGRA8Unorm_sRGB);
+        return X;
+    }
+    if (c.comp_swap != 0) return X;
+    switch (c.format) {
+    case 1: return pick(MTLPixelFormatR8Unorm, MTLPixelFormatR8Snorm, MTLPixelFormatR8Uint, MTLPixelFormatR8Sint, X);
+    case 2: return pick(MTLPixelFormatR16Unorm, MTLPixelFormatR16Snorm, MTLPixelFormatR16Uint, MTLPixelFormatR16Sint,
+                        MTLPixelFormatR16Float);
+    case 3: return pick(MTLPixelFormatRG8Unorm, MTLPixelFormatRG8Snorm, MTLPixelFormatRG8Uint, MTLPixelFormatRG8Sint, X);
+    case 4: return pick(X, X, MTLPixelFormatR32Uint, MTLPixelFormatR32Sint, MTLPixelFormatR32Float);
+    case 5: return pick(MTLPixelFormatRG16Unorm, MTLPixelFormatRG16Snorm, MTLPixelFormatRG16Uint, MTLPixelFormatRG16Sint,
+                        MTLPixelFormatRG16Float);
+    case 6: return nt == FLOAT ? MTLPixelFormatRG11B10Float : X; // 10_11_11: R11 G11 B10 from the low bits
+    case 9: return pick(MTLPixelFormatRGB10A2Unorm, X, MTLPixelFormatRGB10A2Uint, X, X); // 2_10_10_10
+    case 11: return pick(X, X, MTLPixelFormatRG32Uint, MTLPixelFormatRG32Sint, MTLPixelFormatRG32Float);
+    case 12: return pick(MTLPixelFormatRGBA16Unorm, MTLPixelFormatRGBA16Snorm, MTLPixelFormatRGBA16Uint,
+                         MTLPixelFormatRGBA16Sint, MTLPixelFormatRGBA16Float);
+    case 14: return pick(X, X, MTLPixelFormatRGBA32Uint, MTLPixelFormatRGBA32Sint, MTLPixelFormatRGBA32Float);
+    default: return X;
+    }
+}
+
 // Phase 19: draw with the game's own GCN shaders translated to MSL. Returns
 // false (nothing encoded) when the translated path is disabled or anything
 // is unsupported, so the caller falls through to the fixed mesh shader.
@@ -1062,13 +1106,38 @@ bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_ad
     @autoreleasepool {
         if (!gcn_cache) gcn_cache = std::make_unique<GcnPipelineCache>(metal->raw_device(), memory);
         gcn_cache->set_memory(memory);
+        gcn_cache->set_metal_backend(metal);
         // Bind the game's depth surface before the pass opens; draws without
         // one keep the current buffer with depth testing off.
         const u32* ctx = reg_file.data() + kPm4ContextRegBase;
-        if (ctx[ctx_reg::kDbZInfo] & 3) metal->set_depth_target(static_cast<u64>(ctx[ctx_reg::kDbZReadBase]) << 8);
+        const usize ctx_count = kPm4UconfigRegBase - kPm4ContextRegBase;
+        const GpuRenderState rs = decode_render_state(ctx, ctx_count, metal->width(), metal->height());
+        if (rs.depth.has_depth) metal->set_depth_target(rs.depth.base);
+
+        // Colour targets 0-7. A disabled slot 0 (depth-only pass) still
+        // binds the screen: the pipeline then writes no colour.
+        for (u32 slot = 0; slot < 8; ++slot) {
+            const ColorTarget& c = rs.color[slot];
+            if (!c.enabled) {
+                metal->set_color_target(slot, 0);
+                continue;
+            }
+            MTLPixelFormat f = mtl_color_format(c);
+            if (f == MTLPixelFormatInvalid) {
+                static std::set<u32> s_logged;
+                const u32 id = c.format | (c.num_format << 8) | (c.comp_swap << 12);
+                if (s_logged.insert(id).second)
+                    std::fprintf(stderr, "[GCN] colour target format %u number %u swap %u has no Metal equivalent; using BGRA8\n",
+                                 c.format, c.num_format, c.comp_swap);
+                f = MTLPixelFormatBGRA8Unorm;
+            }
+            metal->set_color_target(slot, c.base, c.width, c.height, static_cast<u32>(f));
+        }
+
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
         id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
-        id<MTLTexture> fb = (__bridge id<MTLTexture>)metal->raw_framebuffer();
+        id<MTLTexture> fb = (__bridge id<MTLTexture>)metal->color_target_texture(0);
+        if (!fb) fb = (__bridge id<MTLTexture>)metal->raw_framebuffer();
         if (!enc || !fb) return false;
         GcnDrawRequest req;
         req.vs_addr = vs_shader_addr;
@@ -1090,6 +1159,10 @@ bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_ad
         req.depth_format = metal->depth_stencil_format();
         req.fb_width = static_cast<u32>(fb.width);
         req.fb_height = static_cast<u32>(fb.height);
+        for (u32 slot = 1; slot < 8; ++slot) {
+            id<MTLTexture> t = (__bridge id<MTLTexture>)metal->color_target_texture(slot);
+            req.color_formats[slot] = t ? static_cast<u32>(t.pixelFormat) : 0;
+        }
         std::string why;
         if (!gcn_cache->encode_draw((__bridge void*)enc, static_cast<u32>(fb.pixelFormat), req, &why)) return false;
         if (draw_diagnostics_enabled) {
@@ -1238,6 +1311,8 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         id<MTLBuffer> idx_buf = cached_buffer(device, idx_addr, required_idx_size, idx_ptr);
         if (!idx_buf) return false;
 
+        // The fixed mesh pipeline has one BGRA colour attachment: draw to the screen.
+        metal->reset_color_targets();
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
         id<MTLRenderCommandEncoder> enc =
             (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
@@ -1488,6 +1563,8 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
             }
         }
 
+        // The fixed mesh pipeline has one BGRA colour attachment: draw to the screen.
+        metal->reset_color_targets();
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
         id<MTLRenderCommandEncoder> enc =
             (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();

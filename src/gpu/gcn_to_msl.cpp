@@ -182,6 +182,7 @@ public:
     std::map<u32, u32> ps_attrs;          // PS attr index -> locn (VS param)
     std::set<u32> flat_attrs;
     bool ps_color{false};
+    u8 ps_color_mask{0};
     bool ps_depth{false};
     bool uses_exec_write{false};
     bool uses_frag_pos{false};
@@ -775,13 +776,15 @@ void Emitter::emit_export(const Instruction& i) {
         // pos1..3 / null: ignored.
         return;
     }
-    if (i.target == 0) {
-        ps_color = true;
+    if (i.target < 8) { // mrt0..7
+        const std::string c = "color" + std::to_string(i.target);
+        ps_color_mask |= static_cast<u8>(1u << i.target);
+        if (i.target == 0) ps_color = true;
         body << "    { float4 e_ = " << val << ";\n";
         static const char* comp = "xyzw";
         const u32 en = i.compr ? ((i.en & 1 ? 3u : 0u) | (i.en & 4 ? 12u : 0u)) : i.en;
         for (u32 k = 0; k < 4; ++k)
-            if (en & (1u << k)) body << "      color0." << comp[k] << " = e_." << comp[k] << ";\n";
+            if (en & (1u << k)) body << "      " << c << "." << comp[k] << " = e_." << comp[k] << ";\n";
         body << "    }\n";
     }
     if (i.target == 8 && (i.en & 1) && !i.compr) {
@@ -789,7 +792,7 @@ void Emitter::emit_export(const Instruction& i) {
         ps_depth = true;
         body << "    depth0 = F(" << src(0) << ");\n";
     }
-    // mrt1..7 and null exports are ignored (single render target).
+    // null exports are ignored.
 }
 
 void Emitter::emit_one(const Instruction& i, bool structured) {
@@ -1024,8 +1027,17 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     m << "  return out;\n}\n\n";
 
     const u32 ps_vgprs = std::max<u32>(ep.max_vgpr, 4);
-    if (ep.ps_depth) m << "struct GcnPsOut {\n    float4 color [[color(0)]];\n    float depth [[depth(any)]];\n};\n\n";
-    m << "fragment " << (ep.ps_depth ? "GcnPsOut" : "float4") << " gcn_ps_main(GcnPsIn in [[stage_in]],\n"
+    // One float4 return for mrt0 alone; a struct for more targets or depth.
+    const u8 cmask = ep.ps_color_mask | 1; // color0 is always returned
+    const bool ps_struct = ep.ps_depth || cmask != 1;
+    if (ps_struct) {
+        m << "struct GcnPsOut {\n";
+        for (u32 n = 0; n < 8; ++n)
+            if ((cmask >> n) & 1) m << "    float4 c" << n << " [[color(" << n << ")]];\n";
+        if (ep.ps_depth) m << "    float depth [[depth(any)]];\n";
+        m << "};\n\n";
+    }
+    m << "fragment " << (ps_struct ? "GcnPsOut" : "float4") << " gcn_ps_main(GcnPsIn in [[stage_in]],\n"
       << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]]"
       << (uses_front_face ? ", bool front_face [[front_facing]]" : "")
       << image_params(ep.images) << ") {\n";
@@ -1035,12 +1047,20 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     m << "  for (uint k = 0; k < 16u; ++k) s[k] = dc.ps_user[k];\n";
     m << "  s[126] = 1u; s[124] = 0u;\n";
     m << preload.str();
-    m << "  float4 color0 = float4(0.0f);\n";
+    for (u32 n = 0; n < 8; ++n)
+        if ((cmask >> n) & 1) m << "  float4 color" << n << " = float4(0.0f);\n";
     if (ep.ps_depth) m << "  float depth0 = in.position.z;\n";
     m << ep.body.str();
     if (ep.uses_exec_write) m << "  if ((s[126] & 1u) == 0u) discard_fragment();\n";
-    if (ep.ps_depth) m << "  GcnPsOut o_;\n  o_.color = color0;\n  o_.depth = depth0;\n  return o_;\n}\n";
-    else m << "  return color0;\n}\n";
+    if (ps_struct) {
+        m << "  GcnPsOut o_;\n";
+        for (u32 n = 0; n < 8; ++n)
+            if ((cmask >> n) & 1) m << "  o_.c" << n << " = color" << n << ";\n";
+        if (ep.ps_depth) m << "  o_.depth = depth0;\n";
+        m << "  return o_;\n}\n";
+    } else {
+        m << "  return color0;\n}\n";
+    }
 
     out.ok = true;
     out.msl = m.str();
@@ -1049,6 +1069,7 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     out.vs_param_count = nparams;
     for (auto [attr, locn] : ep.ps_attrs) out.ps_attr_mask |= 1u << (attr & 31);
     out.ps_writes_color = ep.ps_color;
+    out.ps_color_mask = ep.ps_color_mask;
     out.ps_writes_depth = ep.ps_depth;
     return out;
 }

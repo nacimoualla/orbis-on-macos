@@ -5197,6 +5197,9 @@ void NidRegistry::register_default_libraries() {
                 GuestAddr buf_addr = 0;
                 mem.read_value(addrs_ptr + i * sizeof(GuestAddr), buf_addr);
                 s_registered_buffers.push_back(buf_addr);
+                if (g_metal_backend) {
+                    g_metal_backend->register_display_buffer(buf_addr);
+                }
                 std::fprintf(stderr, "[VideoOut] Registered framebuffer #%u at guest 0x%llx\n", i, (unsigned long long)buf_addr);
             }
         }

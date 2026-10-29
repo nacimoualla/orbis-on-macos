@@ -4,6 +4,7 @@
 #include "ps4/gcn_shader.hpp"
 #include "ps4/gpu_state.hpp"
 #include "ps4/memory.hpp"
+#include "ps4/metal_backend.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -95,15 +96,17 @@ MTLSamplerAddressMode address_mode(u32 c) {
 struct GcnPipelineCache::Impl {
     id<MTLDevice> device{nil};
     MemoryManager* memory{nullptr};
+    MetalBackend* metal{nullptr};
     GcnPipelineStats stats{};
 
     struct PipeKey {
         u64 vs_hash{0}, ps_hash{0}, cntl_hash{0};
         u32 remap{0}, blend{0}, mask{0}, format{0}, depth_format{0}, ps_inputs{0};
+        u64 mrt{0}; // formats and blend controls of attachments 1-7
         bool operator<(const PipeKey& o) const noexcept {
-            return std::tie(vs_hash, ps_hash, cntl_hash, remap, blend, mask, format, depth_format, ps_inputs) <
+            return std::tie(vs_hash, ps_hash, cntl_hash, remap, blend, mask, format, depth_format, ps_inputs, mrt) <
                    std::tie(o.vs_hash, o.ps_hash, o.cntl_hash, o.remap, o.blend, o.mask, o.format, o.depth_format,
-                            o.ps_inputs);
+                            o.ps_inputs, o.mrt);
         }
     };
     struct PipeEntry {
@@ -205,6 +208,18 @@ struct GcnPipelineCache::Impl {
             log_once("unsupported image type " + std::to_string(td.type) + " (only 1D/2D); using white");
             return white_texture();
         }
+        // A texture at the address of an offscreen render target samples what
+        // was rendered there (the guest copy is never written by the GPU path).
+        if (metal && td.base > 0x1000) {
+            id<MTLTexture> offscreen = (__bridge id<MTLTexture>)metal->find_color_target(td.base);
+            if (offscreen) {
+                if (offscreen.width != td.width || offscreen.height != td.height)
+                    log_once("texture " + std::to_string(td.width) + "x" + std::to_string(td.height) +
+                             " samples a " + std::to_string(offscreen.width) + "x" +
+                             std::to_string(offscreen.height) + " render target");
+                return offscreen;
+            }
+        }
         const usize size = gcn::texture_guest_size(td);
         if (size == 0 || size > 64u * 1024 * 1024 || !memory || !memory->is_valid_address(td.base, size)) {
             log_once("texture memory unavailable/unsupported (dfmt " + std::to_string(td.dfmt) + "); using white");
@@ -265,8 +280,10 @@ struct GcnPipelineCache::Impl {
         }
     }
 
+    /// formats[n] / blends[n]: MTLPixelFormat (0 = not attached) and
+    /// CB_BLEND<n>_CONTROL of colour attachment n; mask: CB_TARGET_MASK.
     PipeEntry& pipeline(const PipeKey& key, const gcn::Program& vs, const gcn::Program& ps, const u32* cntl,
-                        gcn::TranslateOptions opts, u32 blend, u32 mask, u32 format, u32 depth_format) {
+                        gcn::TranslateOptions opts, const u32* blends, u32 mask, const u32* formats, u32 depth_format) {
         auto it = pipes.find(key);
         if (it != pipes.end()) return it->second;
         PipeEntry e;
@@ -286,32 +303,39 @@ struct GcnPipelineCache::Impl {
                 MTLRenderPipelineDescriptor* d = [[MTLRenderPipelineDescriptor alloc] init];
                 d.vertexFunction = [lib newFunctionWithName:@"gcn_vs_main"];
                 d.fragmentFunction = [lib newFunctionWithName:@"gcn_ps_main"];
-                d.colorAttachments[0].pixelFormat = static_cast<MTLPixelFormat>(format);
                 if (depth_format) {
                     const MTLPixelFormat df = static_cast<MTLPixelFormat>(depth_format);
                     d.depthAttachmentPixelFormat = df;
                     if (df == MTLPixelFormatDepth32Float_Stencil8 || df == MTLPixelFormatDepth24Unorm_Stencil8)
                         d.stencilAttachmentPixelFormat = df;
                 }
-                MTLColorWriteMask wm = MTLColorWriteMaskNone;
-                if (e.tp.ps_writes_color) {
-                    if (mask & 1) wm |= MTLColorWriteMaskRed;
-                    if (mask & 2) wm |= MTLColorWriteMaskGreen;
-                    if (mask & 4) wm |= MTLColorWriteMaskBlue;
-                    if (mask & 8) wm |= MTLColorWriteMaskAlpha;
-                }
-                d.colorAttachments[0].writeMask = wm;
-                if (blend & (1u << 30)) {
-                    const bool separate = (blend >> 29) & 1;
-                    auto* ca = d.colorAttachments[0];
-                    ca.blendingEnabled = YES;
-                    ca.sourceRGBBlendFactor = blend_factor(blend & 0x1F);
-                    ca.rgbBlendOperation = blend_op((blend >> 5) & 7);
-                    ca.destinationRGBBlendFactor = blend_factor((blend >> 8) & 0x1F);
-                    ca.sourceAlphaBlendFactor = blend_factor(separate ? ((blend >> 16) & 0x1F) : (blend & 0x1F));
-                    ca.alphaBlendOperation = blend_op(separate ? ((blend >> 21) & 7) : ((blend >> 5) & 7));
-                    ca.destinationAlphaBlendFactor =
-                        blend_factor(separate ? ((blend >> 24) & 0x1F) : ((blend >> 8) & 0x1F));
+                // Every attachment of the pass must be declared; one the PS
+                // does not export (mrt<n>) is left unwritten.
+                for (u32 n = 0; n < 8; ++n) {
+                    if (!formats[n]) continue;
+                    auto* ca = d.colorAttachments[n];
+                    ca.pixelFormat = static_cast<MTLPixelFormat>(formats[n]);
+                    const u32 m = (mask >> (4 * n)) & 0xF;
+                    MTLColorWriteMask wm = MTLColorWriteMaskNone;
+                    if ((e.tp.ps_color_mask >> n) & 1) {
+                        if (m & 1) wm |= MTLColorWriteMaskRed;
+                        if (m & 2) wm |= MTLColorWriteMaskGreen;
+                        if (m & 4) wm |= MTLColorWriteMaskBlue;
+                        if (m & 8) wm |= MTLColorWriteMaskAlpha;
+                    }
+                    ca.writeMask = wm;
+                    const u32 blend = blends[n];
+                    if (blend & (1u << 30)) {
+                        const bool separate = (blend >> 29) & 1;
+                        ca.blendingEnabled = YES;
+                        ca.sourceRGBBlendFactor = blend_factor(blend & 0x1F);
+                        ca.rgbBlendOperation = blend_op((blend >> 5) & 7);
+                        ca.destinationRGBBlendFactor = blend_factor((blend >> 8) & 0x1F);
+                        ca.sourceAlphaBlendFactor = blend_factor(separate ? ((blend >> 16) & 0x1F) : (blend & 0x1F));
+                        ca.alphaBlendOperation = blend_op(separate ? ((blend >> 21) & 7) : ((blend >> 5) & 7));
+                        ca.destinationAlphaBlendFactor =
+                            blend_factor(separate ? ((blend >> 24) & 0x1F) : ((blend >> 8) & 0x1F));
+                    }
                 }
                 e.pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
                 if (!e.pso)
@@ -342,6 +366,7 @@ GcnPipelineCache::GcnPipelineCache(void* mtl_device, MemoryManager* memory) : m_
 GcnPipelineCache::~GcnPipelineCache() = default;
 
 void GcnPipelineCache::set_memory(MemoryManager* memory) noexcept { m_impl->memory = memory; }
+void GcnPipelineCache::set_metal_backend(MetalBackend* metal) noexcept { m_impl->metal = metal; }
 
 const GcnPipelineStats& GcnPipelineCache::stats() const noexcept { return m_impl->stats; }
 
@@ -409,6 +434,9 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
     for (u32 k = 0; k < 32; ++k) cntl[k] = k;
     u32 blend = 0;
     u32 mask = 0xF;
+    u32 blends[8] = {};
+    u32 formats[8] = {color_format};
+    for (u32 n = 1; n < 8; ++n) formats[n] = req.color_formats[n];
     const bool have_ctx = req.ctx_regs && req.ctx_reg_count > kSpiPsInputCntl0 + 32;
     if (have_ctx) {
         for (u32 k = 0; k < 32; ++k) cntl[k] = req.ctx_regs[kSpiPsInputCntl0 + k];
@@ -417,8 +445,8 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
             opts.ps_input_addr = req.ctx_regs[ctx_reg::kSpiPsInputAddr] & 0xFFFF;
         }
         blend = req.ctx_regs[kCbBlend0Control];
-        mask = req.ctx_regs[kCbTargetMask] & 0xF;
-        if (mask == 0) mask = 0xF;   // shadow not populated yet
+        for (u32 n = 1; n < 8; ++n) blends[n] = req.ctx_regs[kCbBlend0Control + n];
+        mask = req.ctx_regs[kCbTargetMask]; // 0: no colour writes (depth-only pass)
     } else {
         blend = (1u << 30) | (5u << 8) | 4u;   // fixed path behaviour: src-alpha blending
     }
@@ -433,6 +461,12 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
     key.format = color_format;
     key.depth_format = req.depth_format;
     key.ps_inputs = opts.ps_input_ena | (opts.ps_input_addr << 16);
+    blends[0] = blend;
+    {
+        u32 mrt[14];
+        for (u32 n = 1; n < 8; ++n) { mrt[n - 1] = formats[n]; mrt[6 + n] = blends[n]; }
+        key.mrt = gcn::hash_words(mrt, 14);
+    }
 
     // Fixed-function 3D state. Without a known render target size the
     // viewport and scissor are left as the caller set them.
@@ -444,7 +478,7 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         return true;   // nothing would be rasterised
     }
 
-    Impl::PipeEntry& pe = im.pipeline(key, vs, ps, cntl, opts, blend, mask, color_format, req.depth_format);
+    Impl::PipeEntry& pe = im.pipeline(key, vs, ps, cntl, opts, blends, mask, formats, req.depth_format);
     if (!pe.pso) return fail(pe.error);
 
     // Resources.
