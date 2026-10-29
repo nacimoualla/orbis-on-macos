@@ -466,6 +466,8 @@ for subsequent Flappy fidelity work.
 
 - [ ] **Step 20.1: Full context-register handling**
   - Depth/stencil, scissor, multiple render targets, viewport from `IT_SET_CONTEXT_REG`.
+  - Done (`src/gpu/gpu_state.cpp`, `tests/test_gpu_state.cpp`): depth/stencil buffers and tests (incl. `DB_RENDER_CONTROL` clears), culling and winding, depth bias and clamp, viewport with Z range and Y flip, screen/generic/window/viewport scissor, PS depth export and fragment position / front-face inputs.
+  - Pending: multiple and offscreen render targets (render-to-texture), sampling a depth buffer.
 
 - [ ] **Step 20.2: Textures & samplers**
   - Texture upload path, sampler states, cubemaps.

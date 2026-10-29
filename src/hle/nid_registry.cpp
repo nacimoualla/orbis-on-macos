@@ -29,6 +29,7 @@ static bool pm4_verbose() {
 #define PM4_LOG(...) do { if (pm4_verbose()) std::fprintf(stderr, __VA_ARGS__); } while (0)
 
 #include <unordered_map>
+#include <vector>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -6381,15 +6382,20 @@ void NidRegistry::register_default_libraries() {
                      (unsigned long long)isa_addr, pgm_lo, pgm_hi, rsrc1, rsrc2, out_cfg, pos_fmt, pa_cl);
 
         if (num_dwords >= 6 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
-            u32 pkt[6];
-            pkt[0] = 0xC0047600U; // Type 3, count=4 (5 payload dwords), opcode=0x76 (IT_SET_SH_REG)
-            pkt[1] = 0x0048U;      // mmSPI_SHADER_PGM_LO_VS
-            pkt[2] = pgm_lo;
-            pkt[3] = pgm_hi;
-            pkt[4] = rsrc1;
-            pkt[5] = rsrc2;
-            mem.write_bytes(dcb_addr, pkt, sizeof(pkt));
-            write_dcb_nop_padding(mem, dcb_addr + sizeof(pkt), num_dwords - 6);
+            std::vector<u32> pkt = {
+                0xC0047600U, // Type 3, count=4 (5 payload dwords), opcode=0x76 (IT_SET_SH_REG)
+                0x0048U,     // mmSPI_SHADER_PGM_LO_VS
+                pgm_lo, pgm_hi, rsrc1, rsrc2,
+            };
+            // The stage's context registers, as the real library writes them.
+            const std::vector<u32> ctx_regs = {
+                0xC0016900U, 0x01B1U, out_cfg,   // SPI_VS_OUT_CONFIG
+                0xC0016900U, 0x01C3U, pos_fmt,   // SPI_SHADER_POS_FORMAT
+                0xC0016900U, 0x0207U, pa_cl,     // PA_CL_VS_OUT_CNTL
+            };
+            if (num_dwords >= pkt.size() + ctx_regs.size()) pkt.insert(pkt.end(), ctx_regs.begin(), ctx_regs.end());
+            mem.write_bytes(dcb_addr, pkt.data(), pkt.size() * sizeof(u32));
+            write_dcb_nop_padding(mem, dcb_addr + pkt.size() * sizeof(u32), num_dwords - static_cast<u32>(pkt.size()));
         } else if (num_dwords > 0 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
             write_dcb_nop_padding(mem, dcb_addr, num_dwords);
         }
@@ -6446,15 +6452,24 @@ void NidRegistry::register_default_libraries() {
                          (unsigned long long)isa_addr, pgm_lo, pgm_hi, rsrc1, rsrc2, z_fmt, col_fmt, in_ena, in_addr, in_ctrl, baryc, db_ctrl, cb_mask);
 
             if (num_dwords >= 6 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
-                u32 pkt[6];
-                pkt[0] = 0xC0047600U; // Type 3, count=4 (5 payload dwords), opcode=0x76 (IT_SET_SH_REG)
-                pkt[1] = 0x0008U;      // mmSPI_SHADER_PGM_LO_PS
-                pkt[2] = pgm_lo;
-                pkt[3] = pgm_hi;
-                pkt[4] = rsrc1;
-                pkt[5] = rsrc2;
-                mem.write_bytes(dcb_addr, pkt, sizeof(pkt));
-                write_dcb_nop_padding(mem, dcb_addr + sizeof(pkt), num_dwords - 6);
+                std::vector<u32> pkt = {
+                    0xC0047600U, // Type 3, count=4 (5 payload dwords), opcode=0x76 (IT_SET_SH_REG)
+                    0x0008U,     // mmSPI_SHADER_PGM_LO_PS
+                    pgm_lo, pgm_hi, rsrc1, rsrc2,
+                };
+                // The stage's context registers (PS input layout, export
+                // formats, DB_SHADER_CONTROL), as the real library writes them.
+                const std::vector<u32> ctx_regs = {
+                    0xC0026900U, 0x01C4U, z_fmt, col_fmt,    // SPI_SHADER_Z_FORMAT, SPI_SHADER_COL_FORMAT
+                    0xC0026900U, 0x01B3U, in_ena, in_addr,   // SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR
+                    0xC0016900U, 0x01B6U, in_ctrl,           // SPI_PS_IN_CONTROL
+                    0xC0016900U, 0x01B8U, baryc,             // SPI_BARYC_CNTL
+                    0xC0016900U, 0x0203U, db_ctrl,           // DB_SHADER_CONTROL
+                    0xC0016900U, 0x008FU, cb_mask,           // CB_SHADER_MASK
+                };
+                if (num_dwords >= pkt.size() + ctx_regs.size()) pkt.insert(pkt.end(), ctx_regs.begin(), ctx_regs.end());
+                mem.write_bytes(dcb_addr, pkt.data(), pkt.size() * sizeof(u32));
+                write_dcb_nop_padding(mem, dcb_addr + pkt.size() * sizeof(u32), num_dwords - static_cast<u32>(pkt.size()));
             } else if (num_dwords > 0 && mem.is_valid_address(dcb_addr, static_cast<GuestSize>(num_dwords) * sizeof(u32))) {
                 write_dcb_nop_padding(mem, dcb_addr, num_dwords);
             }

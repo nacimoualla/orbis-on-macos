@@ -56,6 +56,7 @@ add_library(ps4_core
     src/gpu/gcn_decoder.cpp
     src/gpu/gcn_to_msl.cpp
     src/gpu/gcn_pipeline.mm
+    src/gpu/gpu_state.cpp
     src/audio/audio_manager.cpp
     src/audio/coreaudio_backend.mm
     src/hle/nid_registry.cpp
@@ -158,6 +159,10 @@ add_executable(test_gcn_shader tests/test_gcn_shader.mm)
 target_link_libraries(test_gcn_shader PRIVATE ps4_core)
 set_source_files_properties(tests/test_gcn_shader.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 add_test(NAME Phase19_GcnShader COMMAND test_gcn_shader)
+
+add_executable(test_gpu_state tests/test_gpu_state.cpp)
+target_link_libraries(test_gpu_state PRIVATE ps4_core)
+add_test(NAME Phase20_GpuState COMMAND test_gpu_state)
 set_tests_properties(Flappy_GpuSmoke PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(test_jit_stats tests/test_jit_stats.cpp)

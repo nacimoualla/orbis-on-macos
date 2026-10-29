@@ -57,6 +57,13 @@ public:
     bool ensure_render_encoder(bool clear, ColorRGBA color);
     /// Return the active render encoder as an opaque Objective-C pointer.
     [[nodiscard]] void* active_render_encoder() const noexcept;
+    /// Depth/stencil attachment format (MTLPixelFormat) of every pass that
+    /// ensure_render_encoder() opens; pipelines drawing there must match it.
+    [[nodiscard]] u32 depth_stencil_format() const noexcept;
+    /// Select the depth buffer for later passes, keyed by the guest address
+    /// of the game's depth surface (host-only textures, framebuffer sized).
+    /// Switching ends the open pass; the next one loads the new buffer.
+    void set_depth_target(u64 key);
     /// End the active render encoder without submitting the frame.
     void end_render_encoder();
 

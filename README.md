@@ -59,6 +59,7 @@ See [LICENSE](LICENSE) for terms.
 - **Orbis syscall HLE table** + **NID registry / dynamic linker** for symbol resolution and trampolines.
 - **Virtual File System** (`/app0`, `/data`, `/savedata`) and save-data subsystem.
 - **Direct Metal graphics backend** with a **PM4 command processor**, ring buffer, and a **two-tier GCN → MSL shader** path; offscreen framebuffer + interactive window presenter.
+- **3D fixed-function state** from the GCN context registers: depth/stencil buffers and tests, depth/stencil clears, back-face culling, depth bias, viewport depth range and scissors.
 - **CoreAudio** output with a lock-free SPSC ring between the guest audio thread and the host callback.
 - **Threading HLE** (`libkernel`) mapping guest threads onto host pthreads.
 - **Headless test suite** — CPU, memory, linker, and offscreen Metal rendering tested without a GUI.
@@ -179,7 +180,7 @@ PS4_LOAD_PRX=1 PS4_FRAMES=300 PS4_AUTO_TAP=130,2,1 PS4_GPU_READBACK=/tmp/frames 
 
 ## 🧪 Testing
 
-The suite is headless — it exercises CPU translation, memory mapping, the linker, and offscreen Metal rendering without opening a window (24 CTest targets):
+The suite is headless — it exercises CPU translation, memory mapping, the linker, and offscreen Metal rendering without opening a window (26 CTest targets):
 
 ```bash
 cd build && ctest --output-on-failure
@@ -195,6 +196,7 @@ cd build && ctest --output-on-failure
 | 7 | Dynamic linker & NID resolution |
 | 9–11 | Threading (libkernel), PM4 GPU processor, audio (CoreAudio) |
 | 12–15 | Virtual File System, ARM64 JIT recompiler, 3D mesh pipeline, JIT-executor integration |
+| 19–20 | GCN → MSL shaders (`test_gcn_shader`, incl. depth/stencil/culling renders), 3D register state (`test_gpu_state`) |
 
 A standalone Python suite audits the HLE NID registry (hash vectors, tag round-trips, malformed inputs, registry + eboot cross-reference) without the CTest harness:
 
