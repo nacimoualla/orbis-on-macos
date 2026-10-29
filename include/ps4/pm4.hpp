@@ -209,12 +209,12 @@ enum class PrimitiveType : u8 {
 // Context Register Offsets (relative to 0xA000)
 enum ContextRegOffset : u16 {
     PA_SC_WINDOW_OFFSET    = 0x0080,
-    PA_SC_SCREEN_SCISSOR_TL= 0x0082,
-    PA_SC_SCREEN_SCISSOR_BR= 0x0083,
-    PA_CL_VPORT_XSCALE     = 0x0084,
-    PA_CL_VPORT_XOFFSET    = 0x0085,
-    PA_CL_VPORT_YSCALE     = 0x0086,
-    PA_CL_VPORT_YOFFSET    = 0x0087,
+    PA_SC_SCREEN_SCISSOR_TL= 0x000C,
+    PA_SC_SCREEN_SCISSOR_BR= 0x000D,
+    PA_CL_VPORT_XSCALE     = 0x010F,
+    PA_CL_VPORT_XOFFSET    = 0x0110,
+    PA_CL_VPORT_YSCALE     = 0x0111,
+    PA_CL_VPORT_YOFFSET    = 0x0112,
     CB_COLOR0_BASE         = 0x00B0,
     CB_COLOR0_VIEW         = 0x00B1,
     CB_COLOR0_INFO         = 0x00B2,

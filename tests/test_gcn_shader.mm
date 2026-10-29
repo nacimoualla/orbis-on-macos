@@ -6,6 +6,7 @@
 
 #include "ps4/gcn_pipeline.hpp"
 #include "ps4/gcn_shader.hpp"
+#include "ps4/gpu_state.hpp"
 #include "ps4/memory.hpp"
 #include "ps4/metal_backend.hpp"
 
@@ -321,6 +322,171 @@ void test_render(MemoryManager& mem) {
     CHECK(cache.stats().pipelines_compiled == 2);
 }
 
+// Rewrite the sprite quad: square of half-size `half` at depth `z`, vertex
+// colour `rgba` (the PS outputs 2 * texture * colour).
+void write_quad(MemoryManager& m, float half, float z, const float rgba[4]) {
+    const float px[4] = {-half, half, half, -half}, py[4] = {half, half, -half, -half};
+    const float uvx[4] = {0, 1, 1, 0}, uvy[4] = {0, 0, 1, 1};
+    for (u32 v = 0; v < 4; ++v) {
+        float rec[22] = {};
+        rec[0] = px[v]; rec[1] = py[v]; rec[2] = z;
+        std::memcpy(&rec[3], rgba, 16);
+        rec[7] = uvx[v]; rec[8] = uvy[v];
+        CHECK(m.write_bytes(kVerts + v * 88, rec, sizeof(rec)));
+    }
+}
+
+u32 fbits(float f) {
+    u32 u;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
+
+// Phase 20: depth/stencil buffer, depth clear, culling and stencil test on
+// the translated path, with the register values Unity programs.
+void test_render_depth(MemoryManager& mem) {
+    MetalBackend metal;
+    CHECK(metal.initialize());
+    CHECK(metal.create_framebuffer(64, 64));
+    u32 vs_user[16], ps_user[16];
+    setup_sprite_scene(mem, vs_user, ps_user);
+    const u32 clear_vs[16] = {};
+    const u32 clear_ps[16] = {static_cast<u32>(kClearColor), 0x00100000, 1, 0x20077fac};
+    write_words(mem, kClearVsAddr, kClearVs, std::size(kClearVs));
+    write_words(mem, kClearPsAddr, kClearPs, std::size(kClearPs));
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    CHECK(mem.write_bytes(kClearColor, black, 16));
+
+    GcnPipelineCache cache(metal.raw_device(), &mem);
+    CHECK(metal.begin_frame());
+    metal.set_depth_target(0x160ff0000ull);
+    CHECK(metal.ensure_render_encoder(true, ColorRGBA{0, 0, 0, 1}));
+    void* enc = metal.active_render_encoder();
+    std::vector<u32> ctx(ctx_reg::kCount, 0);
+    ctx[0x8E] = 0xF;
+    for (u32 k = 0; k < 32; ++k) ctx[0x191 + k] = k;
+    ctx[ctx_reg::kDbZInfo] = 0xa0000003;        // Z_32_FLOAT
+    ctx[ctx_reg::kDbStencilInfo] = 0x20000001;  // STENCIL_8
+    ctx[ctx_reg::kDbZReadBase] = 0x0160ff00;
+    ctx[ctx_reg::kPaSuScModeCntl] = 0x244;      // Unity: no culling, CW front
+
+    auto draw = [&](bool clear_draw) {
+        GcnDrawRequest r{};
+        if (clear_draw) {
+            r.vs_addr = kClearVsAddr; r.ps_addr = kClearPsAddr;
+            r.vs_rsrc2 = 0x00; r.ps_rsrc2 = 0x08;
+            r.vs_user = clear_vs; r.ps_user = clear_ps;
+            r.prim = PrimitiveType::RectList; r.count = 3;
+        } else {
+            r.vs_addr = kVsAddr; r.ps_addr = kPsAddr;
+            r.vs_rsrc2 = 0x20; r.ps_rsrc2 = 0x18;
+            r.vs_user = vs_user; r.ps_user = ps_user;
+            r.prim = PrimitiveType::QuadList; r.count = 4;
+        }
+        r.ctx_regs = ctx.data(); r.ctx_reg_count = ctx.size();
+        r.depth_format = metal.depth_stencil_format();
+        r.fb_width = 64; r.fb_height = 64;
+        std::string why;
+        const bool ok = cache.encode_draw(enc, MTLPixelFormatBGRA8Unorm, r, &why);
+        if (!ok) std::fprintf(stderr, "depth draw fallback: %s\n", why.c_str());
+        CHECK(ok);
+    };
+
+    // Clear depth to 1.0 and stencil to 5 with a DB_RENDER_CONTROL clear draw.
+    ctx[ctx_reg::kDbRenderControl] = 3;
+    ctx[ctx_reg::kDbDepthClear] = fbits(1.0f);
+    ctx[ctx_reg::kDbStencilClear] = 5;
+    ctx[ctx_reg::kDbDepthControl] = 0x776;
+    draw(true);
+    ctx[ctx_reg::kDbRenderControl] = 0;
+
+    // Near quad (z 0.3, red) then a far full-screen-ish quad (z 0.7, green):
+    // with LESS the far one only shows around the near one.
+    ctx[ctx_reg::kDbDepthControl] = 0x2 | 0x4 | (1u << 4);   // Z_ENABLE | Z_WRITE | LESS
+    const float red[4] = {1.0f, 0.0f, 0.0f, 0.5f}, green[4] = {0.0f, 0.5f, 0.0f, 0.5f};
+    write_quad(mem, 0.5f, 0.3f, red);
+    draw(false);
+    write_quad(mem, 0.9f, 0.7f, green);
+    draw(false);
+
+    // Back-face culling. The quad winds clockwise on screen: a cyan one is
+    // culled while CCW is the front face, a smaller blue one drawn once CW is.
+    const float cyan[4] = {0.0f, 1.0f, 1.0f, 0.5f}, blue[4] = {0.0f, 0.0f, 1.0f, 0.5f};
+    write_quad(mem, 0.25f, 0.1f, cyan);
+    ctx[ctx_reg::kPaSuScModeCntl] = 0x2;          // CULL_BACK, FACE = CCW
+    draw(false);
+    const usize skipped_before = cache.stats().skipped_draws;
+    ctx[ctx_reg::kPaSuScModeCntl] = 0x3;          // front and back: nothing drawn
+    draw(false);
+    CHECK(cache.stats().skipped_draws == skipped_before + 1);
+
+    // Stencil (cleared to 5): NOTEQUAL 5 rejects, EQUAL 5 passes. The pass
+    // quad is small so the culling result above stays visible around it.
+    ctx[ctx_reg::kPaSuScModeCntl] = 0x6;          // CULL_BACK, FACE = CW
+    write_quad(mem, 0.15f, 0.1f, blue);
+    draw(false);
+    const float white[4] = {1.0f, 1.0f, 1.0f, 0.5f};
+    write_quad(mem, 0.1f, 0.05f, white);
+    ctx[ctx_reg::kDbDepthControl] = 0x1 | 0x2 | (7u << 4) | (5u << 8);   // stencil NOTEQUAL, z ALWAYS
+    ctx[ctx_reg::kDbStencilRefMask] = 0x05 | (0xFF << 8);
+    draw(false);
+    u8 r, g, b, a;
+    CHECK(metal.submit_frame(true));
+    CHECK(metal.read_pixel(32, 32, r, g, b, a));
+    std::printf("  depth: centre after NOTEQUAL stencil: %u %u %u\n", r, g, b);
+    CHECK(r == 0 && g == 0 && b == 255);         // blue quad, white rejected
+
+    CHECK(metal.begin_frame());
+    CHECK(metal.ensure_render_encoder(false, ColorRGBA{0, 0, 0, 1}));
+    enc = metal.active_render_encoder();
+    ctx[ctx_reg::kDbDepthControl] = 0x1 | 0x2 | (7u << 4) | (2u << 8);   // stencil EQUAL
+    draw(false);
+    CHECK(metal.submit_frame(true));
+
+    CHECK(metal.read_pixel(32, 32, r, g, b, a));
+    std::printf("  depth: centre (stencil EQUAL pass): %u %u %u\n", r, g, b);
+    CHECK(r == 200 && g == 100 && b == 255);
+    CHECK(metal.read_pixel(32, 28, r, g, b, a));   // blue quad, outside white
+    std::printf("  depth: CW-front quad: %u %u %u\n", r, g, b);
+    CHECK(r == 0 && g == 0 && b == 255);
+    CHECK(metal.read_pixel(32, 25, r, g, b, a));   // culled cyan quad only: still red
+    std::printf("  depth: culled quad region: %u %u %u\n", r, g, b);
+    CHECK(r == 200 && g == 0 && b == 0);
+    CHECK(metal.read_pixel(32, 18, r, g, b, a));   // inside red quad only
+    std::printf("  depth: red quad (far quad occluded): %u %u %u\n", r, g, b);
+    CHECK(r == 200 && g == 0 && b == 0);
+    CHECK(metal.read_pixel(4, 4, r, g, b, a));     // far quad only
+    std::printf("  depth: far quad: %u %u %u\n", r, g, b);
+    CHECK(r == 0 && g == 50 && b == 0);
+    CHECK(metal.read_pixel(1, 1, r, g, b, a));     // outside everything: clear colour
+    CHECK(r == 0 && g == 0 && b == 0);
+}
+
+// Depth export and PS system-value inputs translate and compile.
+void test_depth_export(id<MTLDevice> device) {
+    const u32 ps_words[] = {
+        0x7e0002f0,               // v_mov_b32 v0, 0.5
+        0x7e020302,               // v_mov_b32 v1, v2   (POS_X)
+        0xf8000081, 0x00000000,   // exp mrtz v0 (en x)
+        0xf800180f, 0x01010101,   // exp mrt0 v1, v1, v1, v1 done vm
+        0xbf810000,               // s_endpgm
+    };
+    gcn::Program vs = decode(kClearVs), ps = decode(ps_words);
+    gcn::TranslateOptions opts;
+    opts.remap = gcn::TranslateOptions::VertexRemap::RectList;
+    opts.ps_input_ena = opts.ps_input_addr = 0x2 | 0x100 | 0x1000;   // PERSP_CENTER, POS_X, FRONT_FACE
+    const gcn::TranslatedPipeline tp = gcn::translate_pipeline(vs, ps, nullptr, opts);
+    if (!tp.ok) std::fprintf(stderr, "depth export translate: %s\n", tp.error.c_str());
+    CHECK(tp.ok && tp.ps_writes_depth && tp.ps_writes_color);
+    CHECK(tp.msl.find("[[depth(any)]]") != std::string::npos);
+    CHECK(tp.msl.find("v[2] = U(in.position.x)") != std::string::npos);
+    CHECK(tp.msl.find("v[3] = front_face ? 0x3f800000u : 0xbf800000u") != std::string::npos);
+    NSError* e = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:tp.msl.c_str()] options:nil error:&e];
+    if (!lib) std::fprintf(stderr, "depth export MSL: %s\n%s\n", [[e localizedDescription] UTF8String], tp.msl.c_str());
+    CHECK(lib != nil);
+}
+
 void test_texture_detile() {
     // 16x8 micro-tiled RGBA8: element (x,y) stored at tile*64 + interleave.
     gcn::TextureDesc td;
@@ -362,6 +528,8 @@ int main() {
         }
         test_translate_and_compile(mem, device);
         test_render(mem);
+        test_render_depth(mem);
+        test_depth_export(device);
     }
     if (g_failures) {
         std::fprintf(stderr, "GCN shader test: %d failure(s)\n", g_failures);

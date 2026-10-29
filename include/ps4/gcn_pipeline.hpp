@@ -30,6 +30,10 @@ struct GcnDrawRequest {
     bool index32{false};
     i32 base_vertex{0};
     u32 instances{1};
+
+    u32 depth_format{0};              // MTLPixelFormat of the pass depth attachment, 0 = none
+    u32 fb_width{0};                  // render target size; 0 leaves viewport/scissor alone
+    u32 fb_height{0};
 };
 
 struct GcnPipelineStats {
@@ -38,6 +42,7 @@ struct GcnPipelineStats {
     usize pipelines_compiled{0};
     usize pipeline_failures{0};
     usize textures_uploaded{0};
+    usize skipped_draws{0};           // empty scissor or front+back culling
 };
 
 class GcnPipelineCache {

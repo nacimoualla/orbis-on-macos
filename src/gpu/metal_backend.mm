@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #include "ps4/metal_backend.hpp"
 #include <iostream>
+#include <map>
 
 namespace ps4 {
 
@@ -16,6 +17,32 @@ struct MetalBackend::Impl {
     bool last_frame_completed{true};
     u32 width{0};
     u32 height{0};
+
+    // Depth/stencil buffers by guest depth-surface address (0 = none bound
+    // yet). A new buffer is cleared to 0 by the first pass that uses it.
+    struct DepthBuffer {
+        id<MTLTexture> texture{nil};
+        bool initialized{false};
+    };
+    std::map<u64, DepthBuffer> depth_buffers;
+    u64 depth_key{0};
+    u64 encoder_depth_key{0};
+
+    DepthBuffer& depth_buffer(u64 key) {
+        DepthBuffer& db = depth_buffers[key];
+        if (!db.texture) {
+            MTLTextureDescriptor* d =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                                                   width:width
+                                                                  height:height
+                                                               mipmapped:NO];
+            d.usage = MTLTextureUsageRenderTarget;
+            d.storageMode = MTLStorageModePrivate;
+            db.texture = [device newTextureWithDescriptor:d];
+            db.initialized = false;
+        }
+        return db;
+    }
 
     void abort_active_frame() noexcept {
         active_render_encoder = nil;
@@ -80,6 +107,7 @@ bool MetalBackend::create_framebuffer(u32 width, u32 height) {
 
         m_impl->width = width;
         m_impl->height = height;
+        m_impl->depth_buffers.clear();
         return true;
     }
 }
@@ -217,14 +245,47 @@ bool MetalBackend::ensure_render_encoder(bool clear, ColorRGBA color) {
         pass_desc.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
         pass_desc.colorAttachments[0].clearColor = MTLClearColorMake(color.r, color.g, color.b, color.a);
         pass_desc.colorAttachments[0].storeAction = MTLStoreActionStore;
+        Impl::DepthBuffer& db = m_impl->depth_buffer(m_impl->depth_key);
+        if (db.texture) {
+            // The host buffer stands in for the guest depth surface, so its
+            // contents persist across passes and frames.
+            const MTLLoadAction load = db.initialized ? MTLLoadActionLoad : MTLLoadActionClear;
+            pass_desc.depthAttachment.texture = db.texture;
+            pass_desc.depthAttachment.loadAction = load;
+            pass_desc.depthAttachment.clearDepth = 0.0;
+            pass_desc.depthAttachment.storeAction = MTLStoreActionStore;
+            pass_desc.stencilAttachment.texture = db.texture;
+            pass_desc.stencilAttachment.loadAction = load;
+            pass_desc.stencilAttachment.clearStencil = 0;
+            pass_desc.stencilAttachment.storeAction = MTLStoreActionStore;
+            db.initialized = true;
+        }
         m_impl->active_render_encoder =
             [m_impl->active_command_buffer renderCommandEncoderWithDescriptor:pass_desc];
+        m_impl->encoder_depth_key = m_impl->depth_key;
         return m_impl->active_render_encoder != nil;
     }
 }
 
 void* MetalBackend::active_render_encoder() const noexcept {
     return m_impl ? (__bridge void*)m_impl->active_render_encoder : nullptr;
+}
+
+u32 MetalBackend::depth_stencil_format() const noexcept {
+    return static_cast<u32>(MTLPixelFormatDepth32Float_Stencil8);
+}
+
+void MetalBackend::set_depth_target(u64 key) {
+    if (!m_impl || key == m_impl->depth_key) return;
+    m_impl->depth_key = key;
+    if (m_impl->active_render_encoder && m_impl->encoder_depth_key != key) end_render_encoder();
+    // Bound the number of host depth buffers a game can make us keep.
+    if (m_impl->depth_buffers.size() > 32) {
+        for (auto it = m_impl->depth_buffers.begin(); it != m_impl->depth_buffers.end();) {
+            if (it->first != key && it->first != m_impl->encoder_depth_key) it = m_impl->depth_buffers.erase(it);
+            else ++it;
+        }
+    }
 }
 
 void MetalBackend::end_render_encoder() {

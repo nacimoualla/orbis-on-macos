@@ -3,6 +3,7 @@
 #include "ps4/memory.hpp"
 #include "ps4/pm4_translator.hpp"
 #include "ps4/gcn_pipeline.hpp"
+#include "ps4/gpu_state.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -177,6 +178,16 @@ struct Pm4Translator::Impl {
     id<MTLTexture> default_white_texture{nil};
     id<MTLSamplerState> sampler_state{nil};
     id<MTLTexture> active_metal_texture{nil};
+    // Fixed mesh shader draws ignore depth and stencil.
+    id<MTLDepthStencilState> no_depth_state{nil};
+    void disable_depth(id<MTLRenderCommandEncoder> enc) {
+        if (!no_depth_state) {
+            MTLDepthStencilDescriptor* d = [[MTLDepthStencilDescriptor alloc] init];
+            no_depth_state = [enc.device newDepthStencilStateWithDescriptor:d];
+        }
+        [enc setDepthStencilState:no_depth_state];
+        [enc setDepthClipMode:MTLDepthClipModeClip];
+    }
 
     GuestAddr ps_texture_base{0};
     u32 ps_texture_width{0};
@@ -202,7 +213,6 @@ struct Pm4Translator::Impl {
     bool gcn_enabled{GcnPipelineCache::enabled_by_env()};
     bool try_gcn_draw(bool indexed, u32 count, GuestAddr idx_addr, MTLIndexType idx_type,
                       PrimitiveType prim_type, i32 base_vertex, u32 instance_count);
-    void apply_viewport_scissor(id<MTLRenderCommandEncoder> enc);
 
     bool init_mesh_pipeline();
     id<MTLRenderPipelineState> pipeline_for_current_shader();
@@ -328,6 +338,9 @@ bool Pm4Translator::Impl::init_mesh_pipeline() {
         desc.vertexFunction = vs;
         desc.fragmentFunction = fs;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        const MTLPixelFormat depth_format = static_cast<MTLPixelFormat>(metal->depth_stencil_format());
+        desc.depthAttachmentPixelFormat = depth_format;
+        desc.stencilAttachmentPixelFormat = depth_format;
         desc.colorAttachments[0].blendingEnabled = YES;
         desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
         desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
@@ -1040,28 +1053,6 @@ void Pm4Translator::Impl::log_draw_diagnostics(const char* draw_type, u32 count,
     std::fprintf(stderr, "========================================================\n\n");
 }
 
-void Pm4Translator::Impl::apply_viewport_scissor(id<MTLRenderCommandEncoder> enc) {
-    const u32 fb_w = metal->width() > 0 ? metal->width() : 1920;
-    const u32 fb_h = metal->height() > 0 ? metal->height() : 1080;
-    const f32 origin_x = (viewport.width > 0.0f && viewport.x >= (viewport.width / 2.0f))
-                             ? (viewport.x - (viewport.width / 2.0f)) : viewport.x;
-    const f32 origin_y = (viewport.height > 0.0f && viewport.y >= (viewport.height / 2.0f))
-                             ? (viewport.y - (viewport.height / 2.0f)) : viewport.y;
-    [enc setViewport:MTLViewport{
-        .originX = origin_x,
-        .originY = origin_y,
-        .width = viewport.width > 0.0f ? std::min<f32>(viewport.width, static_cast<f32>(fb_w)) : static_cast<f32>(fb_w),
-        .height = viewport.height > 0.0f ? std::min<f32>(viewport.height, static_cast<f32>(fb_h)) : static_cast<f32>(fb_h),
-        .znear = viewport.min_depth,
-        .zfar = viewport.max_depth
-    }];
-    const u32 sc_x = std::min<u32>(scissor.x, fb_w - 1);
-    const u32 sc_y = std::min<u32>(scissor.y, fb_h - 1);
-    const u32 sc_w = (scissor.width > 0 && sc_x + scissor.width <= fb_w) ? scissor.width : (fb_w - sc_x);
-    const u32 sc_h = (scissor.height > 0 && sc_y + scissor.height <= fb_h) ? scissor.height : (fb_h - sc_y);
-    [enc setScissorRect:MTLScissorRect{.x = sc_x, .y = sc_y, .width = sc_w, .height = sc_h}];
-}
-
 // Phase 19: draw with the game's own GCN shaders translated to MSL. Returns
 // false (nothing encoded) when the translated path is disabled or anything
 // is unsupported, so the caller falls through to the fixed mesh shader.
@@ -1071,6 +1062,10 @@ bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_ad
     @autoreleasepool {
         if (!gcn_cache) gcn_cache = std::make_unique<GcnPipelineCache>(metal->raw_device(), memory);
         gcn_cache->set_memory(memory);
+        // Bind the game's depth surface before the pass opens; draws without
+        // one keep the current buffer with depth testing off.
+        const u32* ctx = reg_file.data() + kPm4ContextRegBase;
+        if (ctx[ctx_reg::kDbZInfo] & 3) metal->set_depth_target(static_cast<u64>(ctx[ctx_reg::kDbZReadBase]) << 8);
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
         id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
         id<MTLTexture> fb = (__bridge id<MTLTexture>)metal->raw_framebuffer();
@@ -1092,7 +1087,9 @@ bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_ad
         req.index32 = idx_type == MTLIndexTypeUInt32;
         req.base_vertex = base_vertex;
         req.instances = instance_count;
-        apply_viewport_scissor(enc);
+        req.depth_format = metal->depth_stencil_format();
+        req.fb_width = static_cast<u32>(fb.width);
+        req.fb_height = static_cast<u32>(fb.height);
         std::string why;
         if (!gcn_cache->encode_draw((__bridge void*)enc, static_cast<u32>(fb.pixelFormat), req, &why)) return false;
         if (draw_diagnostics_enabled) {
@@ -1248,6 +1245,7 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
 
         [enc setRenderPipelineState:pipeline];
         [enc setCullMode:MTLCullModeNone];
+        disable_depth(enc);
 
         const u32 fb_w = metal->width() > 0 ? metal->width() : 1920;
         const u32 fb_h = metal->height() > 0 ? metal->height() : 1080;
@@ -1497,6 +1495,7 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
 
         [enc setRenderPipelineState:pipeline];
         [enc setCullMode:MTLCullModeNone];
+        disable_depth(enc);
 
         const u32 fb_w = metal->width() > 0 ? metal->width() : 1920;
         const u32 fb_h = metal->height() > 0 ? metal->height() : 1080;

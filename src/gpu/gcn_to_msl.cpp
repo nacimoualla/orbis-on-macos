@@ -45,7 +45,8 @@ struct GcnDrawConsts {
     uint base_vertex;
     uint vs_user[16];
     uint ps_user[16];
-    uint pad[2];
+    uint flags;
+    uint pad;
 };
 
 #define F(x) as_type<float>(uint(x))
@@ -181,6 +182,7 @@ public:
     std::map<u32, u32> ps_attrs;          // PS attr index -> locn (VS param)
     std::set<u32> flat_attrs;
     bool ps_color{false};
+    bool ps_depth{false};
     bool uses_exec_write{false};
     bool uses_frag_pos{false};
     u32 max_vgpr{0};
@@ -782,7 +784,12 @@ void Emitter::emit_export(const Instruction& i) {
             if (en & (1u << k)) body << "      color0." << comp[k] << " = e_." << comp[k] << ";\n";
         body << "    }\n";
     }
-    // mrt1..7, mrtz and null exports are ignored (single render target).
+    if (i.target == 8 && (i.en & 1) && !i.compr) {
+        // mrtz: x is the fragment depth (stencil/mask in y/z/w are ignored).
+        ps_depth = true;
+        body << "    depth0 = F(" << src(0) << ");\n";
+    }
+    // mrt1..7 and null exports are ignored (single render target).
 }
 
 void Emitter::emit_one(const Instruction& i, bool structured) {
@@ -933,6 +940,40 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     for (u32 p = 0; p < nparams; ++p) m << "    float4 p" << p << " [[user(locn" << p << ")]];\n";
     m << "};\n\n";
 
+    // System values the hardware preloads into PS VGPRs (SPI_PS_INPUT_ADDR
+    // allocates them in this order, SPI_PS_INPUT_ENA says which are loaded).
+    // Barycentrics stay zero: v_interp reads the interpolated stage_in.
+    std::ostringstream preload;
+    bool uses_front_face = false;
+    {
+        static const u32 kSlots[16] = {2, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+        const u32 layout = opts.ps_input_addr ? opts.ps_input_addr : opts.ps_input_ena;
+        const u32 loaded = opts.ps_input_ena ? opts.ps_input_ena : layout;
+        const u32 ps_vgprs = std::max<u32>(ep.max_vgpr, 4);
+        u32 vg = 0;
+        for (u32 bit = 0; bit < 16; ++bit) {
+            if (!(layout & (1u << bit))) continue;
+            const u32 k = vg;
+            vg += kSlots[bit];
+            if (!(loaded & (1u << bit)) || k >= ps_vgprs) continue;
+            const std::string dst = "  v[" + std::to_string(k) + "] = ";
+            switch (bit) {
+            case 8: preload << dst << "U(in.position.x);\n"; break;
+            case 9: preload << dst << "U(in.position.y);\n"; break;
+            case 10: preload << dst << "U(in.position.z);\n"; break;
+            // POS_W_FLOAT is clip-space w; Metal's [[position]].w is 1/w.
+            case 11: preload << dst << "U(1.0f / in.position.w);\n"; break;
+            case 12:
+                uses_front_face = true;
+                preload << dst << "front_face ? 0x3f800000u : 0xbf800000u;\n";
+                break;
+            case 14: preload << dst << "1u;\n"; break;   // SAMPLE_COVERAGE: one sample
+            case 15: preload << dst << "(uint(in.position.x) & 0xFFFFu) | (uint(in.position.y) << 16);\n"; break;
+            default: break;
+            }
+        }
+    }
+
     m << "struct GcnPsIn {\n    float4 position [[position]];\n";
     for (auto [attr, locn] : ep.ps_attrs) {
         m << "    float4 a" << attr << " [[user(locn" << locn << ")]]";
@@ -979,21 +1020,27 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
         for (u32 p = 0; p < nparams; ++p) m << "    out.p" << p << " = o1.p" << p << " + o2.p" << p << " - o0.p" << p << ";\n";
         m << "  }\n";
     }
+    m << "  if ((dc.flags & " << kDrawFlipY << "u) != 0u) out.position.y = -out.position.y;\n";
     m << "  return out;\n}\n\n";
 
     const u32 ps_vgprs = std::max<u32>(ep.max_vgpr, 4);
-    m << "fragment float4 gcn_ps_main(GcnPsIn in [[stage_in]],\n"
+    if (ep.ps_depth) m << "struct GcnPsOut {\n    float4 color [[color(0)]];\n    float depth [[depth(any)]];\n};\n\n";
+    m << "fragment " << (ep.ps_depth ? "GcnPsOut" : "float4") << " gcn_ps_main(GcnPsIn in [[stage_in]],\n"
       << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]]"
+      << (uses_front_face ? ", bool front_face [[front_facing]]" : "")
       << image_params(ep.images) << ") {\n";
     m << "  uint s[128]; uint v[" << ps_vgprs << "]; uint scc = 0u;\n";
     m << "  for (uint k = 0; k < 128u; ++k) s[k] = 0u;\n";
     m << "  for (uint k = 0; k < " << ps_vgprs << "u; ++k) v[k] = 0u;\n";
     m << "  for (uint k = 0; k < 16u; ++k) s[k] = dc.ps_user[k];\n";
     m << "  s[126] = 1u; s[124] = 0u;\n";
+    m << preload.str();
     m << "  float4 color0 = float4(0.0f);\n";
+    if (ep.ps_depth) m << "  float depth0 = in.position.z;\n";
     m << ep.body.str();
     if (ep.uses_exec_write) m << "  if ((s[126] & 1u) == 0u) discard_fragment();\n";
-    m << "  return color0;\n}\n";
+    if (ep.ps_depth) m << "  GcnPsOut o_;\n  o_.color = color0;\n  o_.depth = depth0;\n  return o_;\n}\n";
+    else m << "  return color0;\n}\n";
 
     out.ok = true;
     out.msl = m.str();
@@ -1002,6 +1049,7 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     out.vs_param_count = nparams;
     for (auto [attr, locn] : ep.ps_attrs) out.ps_attr_mask |= 1u << (attr & 31);
     out.ps_writes_color = ep.ps_color;
+    out.ps_writes_depth = ep.ps_depth;
     return out;
 }
 

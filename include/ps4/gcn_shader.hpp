@@ -118,6 +118,10 @@ struct TranslateOptions {
     /// How the VS is driven: vertex ids are remapped for RectList/QuadList
     /// expansion (the 4th rect corner is synthesised in the shader).
     enum class VertexRemap : u8 { None, RectList, QuadList } remap{VertexRemap::None};
+    /// SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR: which system values (barycentrics,
+    /// fragment position, front face) the hardware preloads into PS VGPRs.
+    u32 ps_input_ena{0};
+    u32 ps_input_addr{0};
 };
 
 struct TranslatedPipeline {
@@ -131,6 +135,7 @@ struct TranslatedPipeline {
     u32 vs_param_count{0};
     u32 ps_attr_mask{0};
     bool ps_writes_color{false};
+    bool ps_writes_depth{false};     // exp mrtz
 };
 
 /// Translate a VS/PS pair to MSL. `ps_input_cntl` holds SPI_PS_INPUT_CNTL_n
@@ -156,8 +161,13 @@ struct DrawConsts {
     u32 base_vertex;
     u32 vs_user[16];
     u32 ps_user[16];
-    u32 pad[2];
+    u32 flags;        // kDrawFlipY
+    u32 pad;
 };
+
+/// DrawConsts::flags: the viewport has a positive YSCALE, which Metal cannot
+/// express, so the VS negates clip-space y instead.
+inline constexpr u32 kDrawFlipY = 1;
 
 /// Guest memory a draw's shader will touch, discovered by evaluating the
 /// scalar (uniform) part of the program on the CPU with the real user SGPRs.

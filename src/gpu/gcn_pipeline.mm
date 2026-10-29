@@ -2,11 +2,13 @@
 
 #include "ps4/gcn_pipeline.hpp"
 #include "ps4/gcn_shader.hpp"
+#include "ps4/gpu_state.hpp"
 #include "ps4/memory.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <array>
 #include <chrono>
 #include <fstream>
 #include <map>
@@ -57,6 +59,27 @@ MTLBlendOperation blend_op(u32 f) {
     }
 }
 
+// GCN and Metal number their compare functions identically (NEVER..ALWAYS).
+MTLCompareFunction compare_fn(CompareFunc f) { return static_cast<MTLCompareFunction>(f); }
+
+MTLStencilOperation stencil_op(StencilOp op) {
+    switch (op) {
+    case StencilOp::Keep: return MTLStencilOperationKeep;
+    case StencilOp::Zero: return MTLStencilOperationZero;
+    // ONES and REPLACE_OP have no Metal equivalent; replacing with the
+    // reference value is the closest single operation.
+    case StencilOp::Ones:
+    case StencilOp::ReplaceTest:
+    case StencilOp::ReplaceOp: return MTLStencilOperationReplace;
+    case StencilOp::AddClamp: return MTLStencilOperationIncrementClamp;
+    case StencilOp::SubClamp: return MTLStencilOperationDecrementClamp;
+    case StencilOp::Invert: return MTLStencilOperationInvert;
+    case StencilOp::AddWrap: return MTLStencilOperationIncrementWrap;
+    case StencilOp::SubWrap: return MTLStencilOperationDecrementWrap;
+    default: return MTLStencilOperationKeep;   // bitwise ops
+    }
+}
+
 MTLSamplerAddressMode address_mode(u32 c) {
     switch (c) {
     case 0: return MTLSamplerAddressModeRepeat;
@@ -76,10 +99,11 @@ struct GcnPipelineCache::Impl {
 
     struct PipeKey {
         u64 vs_hash{0}, ps_hash{0}, cntl_hash{0};
-        u32 remap{0}, blend{0}, mask{0}, format{0};
+        u32 remap{0}, blend{0}, mask{0}, format{0}, depth_format{0}, ps_inputs{0};
         bool operator<(const PipeKey& o) const noexcept {
-            return std::tie(vs_hash, ps_hash, cntl_hash, remap, blend, mask, format) <
-                   std::tie(o.vs_hash, o.ps_hash, o.cntl_hash, o.remap, o.blend, o.mask, o.format);
+            return std::tie(vs_hash, ps_hash, cntl_hash, remap, blend, mask, format, depth_format, ps_inputs) <
+                   std::tie(o.vs_hash, o.ps_hash, o.cntl_hash, o.remap, o.blend, o.mask, o.format, o.depth_format,
+                            o.ps_inputs);
         }
     };
     struct PipeEntry {
@@ -96,6 +120,42 @@ struct GcnPipelineCache::Impl {
     };
     std::map<std::vector<u32>, TexEntry> textures;
     std::map<u64, id<MTLSamplerState>> samplers;
+    std::map<std::array<u32, 3>, id<MTLDepthStencilState>> depth_states;
+
+    id<MTLDepthStencilState> depth_stencil(const DepthStencilState& ds) {
+        auto face_bits = [](const StencilFace& f) {
+            return static_cast<u32>(f.func) | (static_cast<u32>(f.fail) << 3) | (static_cast<u32>(f.zpass) << 7) |
+                   (static_cast<u32>(f.zfail) << 11) | (static_cast<u32>(f.read_mask) << 15) |
+                   (static_cast<u32>(f.write_mask) << 23);
+        };
+        const CompareFunc zf = ds.depth_test ? ds.depth_func : CompareFunc::Always;
+        const std::array<u32, 3> key{
+            static_cast<u32>(ds.depth_test && ds.depth_write) | (static_cast<u32>(zf) << 1) |
+                (static_cast<u32>(ds.stencil_test) << 4),
+            ds.stencil_test ? face_bits(ds.front) : 0u, ds.stencil_test ? face_bits(ds.back) : 0u};
+        auto it = depth_states.find(key);
+        if (it != depth_states.end()) return it->second;
+        MTLDepthStencilDescriptor* d = [[MTLDepthStencilDescriptor alloc] init];
+        d.depthCompareFunction = compare_fn(zf);
+        d.depthWriteEnabled = ds.depth_test && ds.depth_write;
+        if (ds.stencil_test) {
+            auto face = [](const StencilFace& f) {
+                MTLStencilDescriptor* sd = [[MTLStencilDescriptor alloc] init];
+                sd.stencilCompareFunction = compare_fn(f.func);
+                sd.stencilFailureOperation = stencil_op(f.fail);
+                sd.depthFailureOperation = stencil_op(f.zfail);
+                sd.depthStencilPassOperation = stencil_op(f.zpass);
+                sd.readMask = f.read_mask;
+                sd.writeMask = f.write_mask;
+                return sd;
+            };
+            d.frontFaceStencil = face(ds.front);
+            d.backFaceStencil = face(ds.back);
+        }
+        id<MTLDepthStencilState> st = [device newDepthStencilStateWithDescriptor:d];
+        depth_states[key] = st;
+        return st;
+    }
     id<MTLTexture> white{nil};
     std::set<std::string> logged;
     u64 clock{0};
@@ -206,7 +266,7 @@ struct GcnPipelineCache::Impl {
     }
 
     PipeEntry& pipeline(const PipeKey& key, const gcn::Program& vs, const gcn::Program& ps, const u32* cntl,
-                        gcn::TranslateOptions opts, u32 blend, u32 mask, u32 format) {
+                        gcn::TranslateOptions opts, u32 blend, u32 mask, u32 format, u32 depth_format) {
         auto it = pipes.find(key);
         if (it != pipes.end()) return it->second;
         PipeEntry e;
@@ -227,6 +287,12 @@ struct GcnPipelineCache::Impl {
                 d.vertexFunction = [lib newFunctionWithName:@"gcn_vs_main"];
                 d.fragmentFunction = [lib newFunctionWithName:@"gcn_ps_main"];
                 d.colorAttachments[0].pixelFormat = static_cast<MTLPixelFormat>(format);
+                if (depth_format) {
+                    const MTLPixelFormat df = static_cast<MTLPixelFormat>(depth_format);
+                    d.depthAttachmentPixelFormat = df;
+                    if (df == MTLPixelFormatDepth32Float_Stencil8 || df == MTLPixelFormatDepth24Unorm_Stencil8)
+                        d.stencilAttachmentPixelFormat = df;
+                }
                 MTLColorWriteMask wm = MTLColorWriteMaskNone;
                 if (e.tp.ps_writes_color) {
                     if (mask & 1) wm |= MTLColorWriteMaskRed;
@@ -346,6 +412,10 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
     const bool have_ctx = req.ctx_regs && req.ctx_reg_count > kSpiPsInputCntl0 + 32;
     if (have_ctx) {
         for (u32 k = 0; k < 32; ++k) cntl[k] = req.ctx_regs[kSpiPsInputCntl0 + k];
+        if (req.ctx_reg_count > ctx_reg::kSpiPsInputAddr) {
+            opts.ps_input_ena = req.ctx_regs[ctx_reg::kSpiPsInputEna] & 0xFFFF;
+            opts.ps_input_addr = req.ctx_regs[ctx_reg::kSpiPsInputAddr] & 0xFFFF;
+        }
         blend = req.ctx_regs[kCbBlend0Control];
         mask = req.ctx_regs[kCbTargetMask] & 0xF;
         if (mask == 0) mask = 0xF;   // shadow not populated yet
@@ -361,7 +431,20 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
     key.blend = blend;
     key.mask = mask;
     key.format = color_format;
-    Impl::PipeEntry& pe = im.pipeline(key, vs, ps, cntl, opts, blend, mask, color_format);
+    key.depth_format = req.depth_format;
+    key.ps_inputs = opts.ps_input_ena | (opts.ps_input_addr << 16);
+
+    // Fixed-function 3D state. Without a known render target size the
+    // viewport and scissor are left as the caller set them.
+    const bool have_fb = req.fb_width && req.fb_height;
+    const GpuRenderState rs = decode_render_state(have_ctx ? req.ctx_regs : nullptr, have_ctx ? req.ctx_reg_count : 0,
+                                                  have_fb ? req.fb_width : 16384, have_fb ? req.fb_height : 16384);
+    if (rs.skip_draw) {
+        ++im.stats.skipped_draws;
+        return true;   // nothing would be rasterised
+    }
+
+    Impl::PipeEntry& pe = im.pipeline(key, vs, ps, cntl, opts, blend, mask, color_format, req.depth_format);
     if (!pe.pso) return fail(pe.error);
 
     // Resources.
@@ -413,6 +496,7 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         }
     }
     dc.base_vertex = req.base_vertex > 0 ? static_cast<u32>(req.base_vertex) : 0;
+    dc.flags = rs.viewport.flip_y ? gcn::kDrawFlipY : 0;
     std::memcpy(dc.vs_user, req.vs_user, sizeof(dc.vs_user));
     std::memcpy(dc.ps_user, req.ps_user, sizeof(dc.ps_user));
     if (arena.empty()) arena.resize(16);
@@ -451,7 +535,22 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         }
 
         [enc setRenderPipelineState:pe.pso];
-        [enc setCullMode:MTLCullModeNone];
+        [enc setCullMode:rs.raster.cull == CullMode::Front  ? MTLCullModeFront
+                         : rs.raster.cull == CullMode::Back ? MTLCullModeBack
+                                                            : MTLCullModeNone];
+        [enc setFrontFacingWinding:rs.raster.front_ccw ? MTLWindingCounterClockwise : MTLWindingClockwise];
+        if (req.depth_format) {
+            [enc setDepthStencilState:im.depth_stencil(rs.ds)];
+            [enc setStencilFrontReferenceValue:rs.ds.front.ref backReferenceValue:rs.ds.back.ref];
+            [enc setDepthBias:rs.raster.depth_bias slopeScale:rs.raster.depth_bias_slope clamp:rs.raster.depth_bias_clamp];
+            [enc setDepthClipMode:rs.raster.depth_clamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+        }
+        if (have_fb) {
+            const RenderViewport& v = rs.viewport;
+            [enc setViewport:MTLViewport{v.x, v.y, v.width, v.height, v.znear, v.zfar}];
+            const RenderScissor& sc = rs.scissor;
+            [enc setScissorRect:MTLScissorRect{sc.x, sc.y, sc.width, sc.height}];
+        }
         [enc setVertexBuffer:mem offset:0 atIndex:gcn::binding::kMemBuffer];
         [enc setVertexBytes:&dc length:sizeof(dc) atIndex:gcn::binding::kDrawConsts];
         [enc setFragmentBuffer:mem offset:0 atIndex:gcn::binding::kMemBuffer];
