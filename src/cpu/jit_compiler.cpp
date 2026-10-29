@@ -1410,8 +1410,13 @@ private:
 
 } // namespace
 
+namespace {
+std::atomic<u64> g_jit_epoch{1};
+} // namespace
+
 JitCompiler::JitCompiler(usize code_cache_size)
     : m_code_buffer_size(code_cache_size) {
+  m_epoch.store(g_jit_epoch.fetch_add(1, std::memory_order_relaxed), std::memory_order_release);
   m_code_buffer = static_cast<u8 *>(
       ::mmap(nullptr, m_code_buffer_size, PROT_READ | PROT_WRITE | PROT_EXEC,
              MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0));
@@ -1439,6 +1444,8 @@ JitCompiler::JitCompiler(JitCompiler &&other) noexcept
   other.m_code_buffer = nullptr;
   other.m_code_buffer_size = 0;
   other.m_code_buffer_offset = 0;
+  m_epoch.store(g_jit_epoch.fetch_add(1, std::memory_order_relaxed), std::memory_order_release);
+  other.m_epoch.store(g_jit_epoch.fetch_add(1, std::memory_order_relaxed), std::memory_order_release);
 }
 
 JitCompiler &JitCompiler::operator=(JitCompiler &&other) noexcept {
@@ -1457,6 +1464,8 @@ JitCompiler &JitCompiler::operator=(JitCompiler &&other) noexcept {
     other.m_code_buffer = nullptr;
     other.m_code_buffer_size = 0;
     other.m_code_buffer_offset = 0;
+    m_epoch.store(g_jit_epoch.fetch_add(1, std::memory_order_relaxed), std::memory_order_release);
+    other.m_epoch.store(g_jit_epoch.fetch_add(1, std::memory_order_relaxed), std::memory_order_release);
   }
   return *this;
 }
@@ -1468,7 +1477,11 @@ void *JitCompiler::allocate_code(usize size) {
   // Align to 16 bytes
   m_code_buffer_offset = (m_code_buffer_offset + 15) & ~15ULL;
   if (m_code_buffer_offset + size > m_code_buffer_size) {
-    return nullptr; // Code cache exhausted
+    static std::atomic<bool> s_warned{false};
+    if (!s_warned.exchange(true))
+      std::fprintf(stderr, "[JIT] code cache exhausted (%zu bytes); new blocks will run interpreted\n",
+                   m_code_buffer_size);
+    return nullptr;
   }
 
   void *ptr = m_code_buffer + m_code_buffer_offset;
@@ -1501,6 +1514,7 @@ void JitCompiler::clear_cache() {
   m_metrics.clear();
   m_failed.clear();
   m_code_buffer_offset = 0;
+  m_epoch.store(g_jit_epoch.fetch_add(1, std::memory_order_relaxed), std::memory_order_release);
 }
 
 usize JitCompiler::cached_block_count() const noexcept {
@@ -1658,33 +1672,65 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
   return fn;
 }
 
+namespace {
+
+struct ThreadBlockCache {
+  struct Entry {
+    JittedBlockFunc fn;      // nullptr: compiling this rip failed
+    usize *execution_count;  // the block's JitBlockMetrics counter
+  };
+  u64 epoch = 0;
+  std::unordered_map<GuestAddr, Entry> map;
+};
+thread_local ThreadBlockCache t_block_cache;
+} // namespace
+
 bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
                                 usize *retired) {
   if (retired)
     *retired = 0;
   JittedBlockFunc fn = nullptr;
-  {
-    // Fast path: cache hit (or a known compile failure) under the shared lock.
-    std::shared_lock lock(m_cache_mutex);
-    if (auto it = m_blocks.find(ctx.rip); it != m_blocks.end()) {
-      fn = it->second;
-      std::atomic_ref<usize>(m_metrics.find(ctx.rip)->second.execution_count)
-          .fetch_add(1, std::memory_order_relaxed);
-      std::atomic_ref<usize>(m_total_invocations)
-          .fetch_add(1, std::memory_order_relaxed);
-    } else if (m_failed.count(ctx.rip) != 0) {
-      return false;
-    }
+  usize *exec_count = nullptr;
+  ThreadBlockCache &tc = t_block_cache;
+  const u64 epoch = m_epoch.load(std::memory_order_acquire);
+  if (tc.epoch != epoch) {
+    tc.map.clear();
+    tc.epoch = epoch;
   }
-  if (!fn) {
-    std::unique_lock lock(m_cache_mutex);
-    fn = compile_block_locked(ctx.rip, memory);
+  if (auto it = tc.map.find(ctx.rip); it != tc.map.end()) {
+    // Fastest path: this thread has seen the block (or its failure) before.
+    if (!it->second.fn)
+      return false;
+    fn = it->second.fn;
+    exec_count = it->second.execution_count;
+  } else {
+    {
+      // Another thread may have compiled it: look it up under the shared lock.
+      std::shared_lock lock(m_cache_mutex);
+      if (auto b = m_blocks.find(ctx.rip); b != m_blocks.end()) {
+        fn = b->second;
+        exec_count = &m_metrics.find(ctx.rip)->second.execution_count;
+      } else if (m_failed.count(ctx.rip) != 0) {
+        tc.map.emplace(ctx.rip, ThreadBlockCache::Entry{nullptr, nullptr});
+        return false;
+      }
+    }
     if (!fn) {
-      return false;
+      std::unique_lock lock(m_cache_mutex);
+      fn = compile_block_locked(ctx.rip, memory);
+      if (!fn) {
+        // Remember only permanent failures; a full code cache is reported
+        // by allocate_code and may be cleared later.
+        if (m_failed.count(ctx.rip) != 0)
+          tc.map.emplace(ctx.rip, ThreadBlockCache::Entry{nullptr, nullptr});
+        return false;
+      }
+      exec_count = &m_metrics[ctx.rip].execution_count;
     }
-    m_metrics[ctx.rip].execution_count++;
-    m_total_invocations++;
+    tc.map.emplace(ctx.rip, ThreadBlockCache::Entry{fn, exec_count});
   }
+  std::atomic_ref<usize>(*exec_count).fetch_add(1, std::memory_order_relaxed);
+  std::atomic_ref<usize>(m_total_invocations).fetch_add(1, std::memory_order_relaxed);
 
   // Enforce execute mode for MAP_JIT on Apple Silicon
   pthread_jit_write_protect_np(1);

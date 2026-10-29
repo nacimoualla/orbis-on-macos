@@ -202,7 +202,9 @@ u64 execute_alu_op(CpuContext& ctx, u8 op, u64 a, u64 b, usize bits) {
             const u64 cf = ctx.flag_cf() ? 1 : 0;
             res = (a + b + cf) & mask;
             const bool new_cf = ((res & mask) < (a & mask)) || (((res & mask) == (a & mask)) && (cf != 0));
-            update_flags_add(ctx, a, b + cf, res, bits);
+            // OF and AF come from the operands' and result's bits; folding the
+            // carry into b first wraps 0x7F+1 to 0x80 and flips OF.
+            update_flags_add(ctx, a, b, res, bits);
             ctx.set_flag(CpuContext::FLAG_CF, new_cf);
             return res;
         }
@@ -2286,9 +2288,9 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // VHADDPS (VEX.128/256.0F 7C): horizontal packed single-precision
-        // addition, independently within each 128-bit lane.
-        if (vex_map == 1 && vex_op == 0x7C) {
+        // VHADDPD (66 7C) / VHADDPS (F2 7C) / VHSUBPD (66 7D) / VHSUBPS (F2 7D):
+        // horizontal add/subtract of adjacent pairs, within each 128-bit lane.
+        if (vex_map == 1 && (vex_op == 0x7C || vex_op == 0x7D) && (vex_pp == 1 || vex_pp == 3)) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex,
                                   vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
@@ -2302,14 +2304,21 @@ StepResult CpuExecutor::step() {
             }
             CpuContext::YmmReg result{};
             const usize lanes = vex_l ? 2 : 1;
+            const bool sub = vex_op == 0x7D;
+            const CpuContext::YmmReg a = m_context.ymm[src1];
+            auto pair = [sub](auto x, auto y) { return x86_nan(sub ? x - y : x + y, x, y); };
             for (usize lane = 0; lane < lanes; ++lane) {
-                const usize base = lane * 4;
-                const auto& a = m_context.ymm[src1].f;
-                const auto& b = src2.f;
-                result.f[base + 0] = a[base + 0] + a[base + 1];
-                result.f[base + 1] = a[base + 2] + a[base + 3];
-                result.f[base + 2] = b[base + 0] + b[base + 1];
-                result.f[base + 3] = b[base + 2] + b[base + 3];
+                if (vex_pp == 1) {
+                    const usize base = lane * 2;
+                    result.df[base + 0] = pair(a.df[base + 0], a.df[base + 1]);
+                    result.df[base + 1] = pair(src2.df[base + 0], src2.df[base + 1]);
+                } else {
+                    const usize base = lane * 4;
+                    result.f[base + 0] = pair(a.f[base + 0], a.f[base + 1]);
+                    result.f[base + 1] = pair(a.f[base + 2], a.f[base + 3]);
+                    result.f[base + 2] = pair(src2.f[base + 0], src2.f[base + 1]);
+                    result.f[base + 3] = pair(src2.f[base + 2], src2.f[base + 3]);
+                }
             }
             m_context.ymm[dest] = result;
             m_context.rip = start_rip + cursor + m.bytes_consumed;

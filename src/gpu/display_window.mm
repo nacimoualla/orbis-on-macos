@@ -196,8 +196,10 @@ void DisplayWindow::poll_events() {
                 break;
             }
 
-            // Map Space bar (keyCode 49), Enter (keyCode 36), or Left Click / Touch to PS4 Cross (0x4000)
-            constexpr u32 PS4_BUTTON_CROSS = 0x4000;
+            // Map Space bar (keyCode 49), Enter (keyCode 36), or Left Click / Touch to PS4 Cross
+            // (0x4000) plus a touch-pad press (0x100000): games that say "touch pad to start"
+            // read the touch pad, others read Cross.
+            constexpr u32 PS4_BUTTON_CROSS = 0x4000 | 0x100000;
             if ([event type] == NSEventTypeKeyDown) {
                 const unsigned short code = [event keyCode];
                 if (code == 49 || code == 36 || code == 126 /* Up */ || code == 124 /* Right */) {

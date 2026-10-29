@@ -112,13 +112,27 @@ int main() {
         trace_lo = std::strtoull(r, &end, 0);
         trace_hi = (*end == ',') ? std::strtoull(end + 1, nullptr, 0) : trace_lo + 1;
     }
+    int auto_tap_start = 0, auto_tap_period = 0, auto_tap_hold = 2;
+    if (const char* t = std::getenv("PS4_AUTO_TAP"))
+        std::sscanf(t, "%d,%d,%d", &auto_tap_start, &auto_tap_period, &auto_tap_hold);
     const auto start = std::chrono::steady_clock::now();
     ps4::usize packets = 0;
     ps4::RunResult result{};
     // PS4_FRAMES=<n> runs longer (or shorter) than the default smoke interval.
     const int kFrames = std::getenv("PS4_FRAMES") ? std::atoi(std::getenv("PS4_FRAMES")) : kDefaultFrames;
     for (int frame = 0; frame < kFrames; ++frame) {
+        const auto t_frame = std::chrono::steady_clock::now();
+        double run_ms = 0;
         window.poll_events();
+        // PS4_AUTO_TAP=start,period[,hold]: from frame `start`, press the touch
+        // pad (and Cross) for `hold` frames (default 2) every `period` frames,
+        // so a headless run can play. Otherwise forward the window's input.
+        if (auto_tap_period > 0 && frame >= auto_tap_start) {
+            const bool down = (frame - auto_tap_start) % auto_tap_period < auto_tap_hold;
+            registry.set_pad_buttons(down ? 0x4000u | 0x100000u : 0u);
+        } else {
+            registry.set_pad_buttons(window.input_buttons());
+        }
         if (!translator->begin_frame()) return fail("GPU frame begin failed");
         if (trace_lo != 0 || trace_after != 0) {
             // PS4_TRACE_RANGE=lo,hi: single-step the main thread and print every
@@ -132,9 +146,11 @@ int main() {
                     const auto& c = cpu.context();
                     ps4::u64 ret = 0;
                     memory.read_value(c.rsp, ret);
-                    std::fprintf(stderr, "[trace] 0x%llx rax=0x%llx rdi=0x%llx rsi=0x%llx [rsp]=0x%llx\n",
+                    std::fprintf(stderr, "[trace] 0x%llx rax=0x%llx rdi=0x%llx rsi=0x%llx [rsp]=0x%llx xmm0=%g/%g rcx=0x%llx "
+                                 "xmm1=%g/%g xmm2=%g/%g\n",
                                  (unsigned long long)rip, (unsigned long long)c.rax, (unsigned long long)c.rdi,
-                                 (unsigned long long)c.rsi, (unsigned long long)ret);
+                                 (unsigned long long)c.rsi, (unsigned long long)ret, c.ymm[0].f[0], c.ymm[0].df[0],
+                                 (unsigned long long)c.rcx, c.ymm[1].f[0], c.ymm[1].df[0], c.ymm[2].f[0], c.ymm[2].df[0]);
                     ++traced;
                 }
                 result.status = cpu.step();
@@ -142,7 +158,9 @@ int main() {
                 if (result.status != ps4::StepResult::Ok && result.status != ps4::StepResult::Syscall) break;
             }
         } else {
+            const auto t_run = std::chrono::steady_clock::now();
             result = cpu.run(2'000'000);
+            run_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_run).count();
         }
         packets += translator->frame_stats().packets;
         // PS4_SAMPLE_MAIN=1: one sample per frame of where the main thread is
@@ -162,6 +180,13 @@ int main() {
         }
         if (!translator->submit_frame(false)) return fail("GPU frame submission failed");
         if (!window.present_frame()) return fail("headless frame presentation failed");
+        // PS4_FRAME_TIMES=1: per-frame wall time split into the main thread's
+        // guest slice and everything else (GPU submit, present, readback).
+        if (std::getenv("PS4_FRAME_TIMES")) {
+            const double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_frame).count();
+            std::fprintf(stderr, "[ftime] %d total=%.1fms main_slice=%.1fms instrs=%zu flips=%llu\n", frame, total, run_ms,
+                         (size_t)result.instructions_executed, (unsigned long long)registry.get_flip_count());
+        }
         if (result.status != ps4::StepResult::Ok &&
             result.status != ps4::StepResult::Syscall) {
             std::fprintf(stderr, "[Flappy test] Main CPU RIP=0x%llx\n", (unsigned long long)cpu.context().rip);

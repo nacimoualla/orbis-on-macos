@@ -372,15 +372,27 @@ int main() {
         std::cout << "  ✓ Test 10: Unhandled non-whitelisted stubs return 0 (null-bail fallback)\n";
     }
 
-    // Test 11: sceUserServiceGetEvent returns SCE_USER_SERVICE_ERROR_NO_EVENT (0x80960007ULL)
+    // Test 11: sceUserServiceGetEvent reports the initial user's LOGIN once,
+    // then SCE_USER_SERVICE_ERROR_NO_EVENT (0x80960007ULL)
     {
         const auto* sym_event = registry.find_by_name("sceUserServiceGetEvent");
         assert(sym_event != nullptr);
         assert(sym_event->nid == 0xC87D7B43A356B558ULL);
         assert(sym_event->module_name == "libSceUserService");
 
-        // Verify handler directly
+        // Verify handler directly: one LOGIN (type 0) for user 0x10000001...
+        constexpr ps4::GuestAddr kEvent = 0x406800ULL;
         ps4::CpuContext ctx{};
+        ctx.rdi = kEvent;
+        sym_event->handler(ctx, memory);
+        assert(ctx.rax == 0);
+        ps4::i32 type = -1, user = 0;
+        memory.read_value(kEvent, type);
+        memory.read_value(kEvent + 4, user);
+        assert(type == 0 && user == 0x10000001);
+        // ...then no more events.
+        ctx = {};
+        ctx.rdi = kEvent;
         sym_event->handler(ctx, memory);
         assert(ctx.rax == ps4::SCE_USER_SERVICE_ERROR_NO_EVENT);
         assert(ctx.rax == 0x80960007ULL);
@@ -406,7 +418,7 @@ int main() {
         assert(cpu.context().rax == ps4::SCE_USER_SERVICE_ERROR_NO_EVENT);
         assert(cpu.context().rax == 0x80960007ULL);
 
-        std::cout << "  ✓ Test 11: sceUserServiceGetEvent returns 0x80960007ULL (SCE_USER_SERVICE_ERROR_NO_EVENT)\n";
+        std::cout << "  ✓ Test 11: sceUserServiceGetEvent reports one LOGIN, then 0x80960007ULL (SCE_USER_SERVICE_ERROR_NO_EVENT)\n";
     }
 
     // Test 12: Strict HLE mode triggers diagnostic crash (SIGABRT) on unregistered NID

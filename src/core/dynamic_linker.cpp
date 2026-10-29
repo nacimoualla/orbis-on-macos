@@ -9,6 +9,7 @@
 #include <mutex>
 #include <map>
 #include <string>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -17,6 +18,17 @@ namespace ps4 {
 // dispatcher below. Keyed by NID; the name is filled in on first sight.
 struct HleCounts { u64 registered = 0; u64 fallback = 0; };
 static std::map<std::string, HleCounts> g_hle_hist;
+// PS4_HLE_HIST: wall time spent inside each HLE handler, per guest thread, to
+// find what a stalled thread is waiting on.
+static std::mutex g_hle_time_mtx;
+static std::map<std::pair<std::string, u32>, std::pair<u64, u64>> g_hle_time; // (name,tid) -> (ns, calls)
+static void record_hle_time(const std::string& name, u32 tid, std::chrono::steady_clock::duration d) {
+    const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+    std::lock_guard<std::mutex> lock(g_hle_time_mtx);
+    auto& e = g_hle_time[{name, tid}];
+    e.first += ns;
+    ++e.second;
+}
 // Per-NID call counts for trampolines that route into a loaded PRX export.
 static std::map<Nid, u64> g_prx_call_count;
 static u64 g_prx_total = 0;
@@ -89,6 +101,19 @@ void dump_hle_histogram() {
                      (unsigned long long)rows[i].reg,
                      (unsigned long long)rows[i].fb,
                      rows[i].name.c_str());
+    std::vector<std::pair<u64, std::string>> times;
+    {
+        std::lock_guard<std::mutex> lock(g_hle_time_mtx);
+        for (const auto& [key, v] : g_hle_time) {
+            char b[160];
+            std::snprintf(b, sizeof(b), "T%-3u %-40s calls=%llu avg=%.3fms", key.second, key.first.c_str(),
+                          (unsigned long long)v.second, v.second ? v.first / 1e6 / v.second : 0.0);
+            times.emplace_back(v.first, b);
+        }
+    }
+    std::sort(times.begin(), times.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (usize i = 0; i < times.size() && i < 25; ++i)
+        std::fprintf(stderr, "[HLETIME] %9.1fms  %s\n", times[i].first / 1e6, times[i].second.c_str());
 }
 
 
@@ -391,7 +416,11 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             const GuestAddr initial_rip = cur_cpu->rip;
             m_registry.note_hle_dispatch(nid, ret_addr);
             t_guest_in_hle = true;
+            static const bool s_time_hle = std::getenv("PS4_HLE_HIST") != nullptr;
+            const auto t_hle = s_time_hle ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             sym->handler(*cur_cpu, m_memory);
+            if (s_time_hle) record_hle_time(sym->name, hle_tid,
+                                            std::chrono::steady_clock::now() - t_hle);
             t_guest_in_hle = false;
             m_registry.note_hle_return();
             sctx.rax = cur_cpu->rax;

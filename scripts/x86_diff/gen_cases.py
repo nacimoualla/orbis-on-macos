@@ -60,6 +60,12 @@ add("vcvtph2ps x5,x2", vex(0x13, 1, 2, 5, 0, 2)); add("vcvtph2ps y5,x2", vex(0x1
 add("vcvtsd2si ecx,x2", vex(0x2D, 3, 1, 1, 0, 2)); add("vcvtss2si rcx,x2", vex(0x2D, 2, 1, 1, 0, 2, W=1))
 add("vpblendw y5,y4,y2,a5", vex(0x0E, 1, 3, 5, 4, 2, L=1, imm=0xa5))
 
+# Horizontal add/sub: 66 = packed double, F2 = packed single (Unity's u64->double tick conversion)
+for op, nm in ((0x7C, "hadd"), (0x7D, "hsub")):
+    for pp, sfx in ((1, "pd"), (3, "ps")):
+        add(f"v{nm}{sfx} x5,x4,x2", vex(op, pp, 1, 5, 4, 2))
+        add(f"v{nm}{sfx} y5,y4,y2", vex(op, pp, 1, 5, 4, 2, L=1))
+
 # Scalar / packed float (map 0F)
 for pp, sfx in ((2, "ss"), (3, "sd")):
     for op, nm in ((0x58,"add"),(0x59,"mul"),(0x5C,"sub"),(0x5D,"min"),(0x5E,"div"),(0x5F,"max"),(0x51,"sqrt"),(0x5A,"cvt")):

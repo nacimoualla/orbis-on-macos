@@ -17,11 +17,11 @@ int main() {
     syscalls.register_default_handlers();
     syscalls.set_terminate_on_exit(false);
 
-    // VHADDPS xmm0, xmm1, xmm2 (VEX.128.0F 7C /r)
+    // VHADDPS xmm0, xmm1, xmm2 (VEX.128.F2.0F 7C /r)
     {
         ps4::CpuExecutor cpu(memory, syscalls);
         const ps4::GuestAddr code_addr = 0x403000ULL;
-        const ps4::u8 code[] = {0xC5, 0xF4, 0x7C, 0xC2, 0xF4};
+        const ps4::u8 code[] = {0xC5, 0xF3, 0x7C, 0xC2, 0xF4};
         assert(memory.write_bytes(code_addr, code, sizeof(code)));
         cpu.context().ymm[1].f[0] = 1.0f;
         cpu.context().ymm[1].f[1] = 2.0f;
@@ -469,9 +469,10 @@ int main() {
         const ps4::u8 code[] = {
             // VPACKSSDW xmm0, xmm1, xmm1
             0xC5, 0xF1, 0x6B, 0xC1,
-            // VPACKUSWB is a distinct unsupported VEX opcode and must fail
-            // explicitly.
-            0xC5, 0xF9, 0x67, 0xC0
+            // VPACKUSWB xmm2, xmm0, xmm0: unsigned saturation of those words
+            0xC5, 0xF9, 0x67, 0xD0,
+            // VPSADBW is still unimplemented and must fail explicitly.
+            0xC5, 0xF9, 0xF6, 0xC0
         };
         assert(memory.write_bytes(code_addr, code, sizeof(code)));
         cpu.context().ymm[1].d[0] = 0x00010000U;
@@ -490,11 +491,16 @@ int main() {
         assert(cpu.context().ymm[0].w[6] == 2);
         assert(cpu.context().ymm[0].w[7] == 0x8000);
 
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().ymm[2].b[0] == 0xFF && cpu.context().ymm[2].b[1] == 0 &&
+               cpu.context().ymm[2].b[2] == 2 && cpu.context().ymm[2].b[3] == 0);
+        assert(cpu.context().ymm[2].b[8] == 0xFF && cpu.context().ymm[2].q[2] == 0);
+
         const ps4::GuestAddr unsupported_rip = cpu.context().rip;
         assert(cpu.step() == ps4::StepResult::IllegalInstruction);
         assert(cpu.context().rip == unsupported_rip);
 
-        std::cout << "  ✓ Test 12: VPACKSSDW and unsupported VEX handling verified\n";
+        std::cout << "  ✓ Test 12: VPACKSSDW, VPACKUSWB and unsupported VEX handling verified\n";
     }
 
     std::cout << "[PHASE 5] PASS: All CPU Execution and Instruction Dispatch tests passed!\n";

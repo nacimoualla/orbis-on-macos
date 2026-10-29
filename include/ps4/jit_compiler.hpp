@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -133,7 +134,10 @@ private:
 
 class JitCompiler {
 public:
-    static constexpr usize DEFAULT_CODE_CACHE_SIZE = 16 * 1024 * 1024; // 16 MB executable buffer
+    // Reserved, not committed: pages are only backed once code is written.
+    // 16 MB filled up during Unity gameplay, after which every new block
+    // retried its compile under the exclusive lock and ran interpreted.
+    static constexpr usize DEFAULT_CODE_CACHE_SIZE = 256 * 1024 * 1024;
 
     explicit JitCompiler(usize code_cache_size = DEFAULT_CODE_CACHE_SIZE);
     ~JitCompiler();
@@ -181,6 +185,11 @@ private:
     // compiles and cache-wide changes. Hit counters are bumped atomically under
     // the shared lock.
     mutable std::shared_mutex m_cache_mutex;
+    // Identifies this cache's current contents. Each guest thread keeps a
+    // private rip -> block map tagged with the epoch it was filled under, so
+    // cache hits take no lock; a constructor or clear_cache() takes a fresh
+    // epoch from a global counter, which drops every thread's copy.
+    std::atomic<u64> m_epoch{0};
 
     JittedBlockFunc compile_block_locked(GuestAddr guest_rip, const MemoryManager& memory);
     void* allocate_code(usize size);

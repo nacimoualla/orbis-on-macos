@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <algorithm>
 #include <set>
 #include <tuple>
@@ -47,6 +48,10 @@ struct ShaderSignature {
 };
 
 struct Pm4Translator::Impl {
+    // The host frame loop (begin_frame/submit_frame) and the guest thread that
+    // submits command buffers both drive the same Metal encoder. Recursive
+    // because indirect buffers re-enter execute_command_buffer.
+    std::recursive_mutex frame_mutex;
     MetalBackend* metal{nullptr};
     MemoryManager* memory{nullptr};
     GpuViewport viewport{};
@@ -1553,6 +1558,7 @@ Pm4Translator& Pm4Translator::operator=(Pm4Translator&&) noexcept = default;
 
 bool Pm4Translator::begin_frame() {
     if (!m_impl) return false;
+    std::lock_guard<std::recursive_mutex> frame_lock(m_impl->frame_mutex);
     if (!m_impl->metal) return true;
     if (!m_impl->metal->begin_frame()) return false;
     m_impl->frame_draw_encoded = false;
@@ -1570,6 +1576,7 @@ bool Pm4Translator::begin_frame() {
 
 bool Pm4Translator::submit_frame(bool wait_for_completion) {
     if (!m_impl) return false;
+    std::lock_guard<std::recursive_mutex> frame_lock(m_impl->frame_mutex);
     if (!m_impl->metal) return true;
     if (!m_impl->metal->frame_in_progress()) return false;
     m_impl->metal->end_render_encoder();
@@ -2826,14 +2833,19 @@ usize Pm4Translator::execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_b
     if (!m_impl || !m_impl->memory || dcb_gpu_addr == 0 || size_bytes < sizeof(u32)) {
         return 0;
     }
+    std::lock_guard<std::recursive_mutex> frame_lock(m_impl->frame_mutex);
     if (!m_impl->memory->is_valid_address(dcb_gpu_addr, size_bytes)) {
         return 0;
     }
 
-    const u32* dcb_dwords = m_impl->memory->to_host_ptr<u32>(dcb_gpu_addr);
-    if (!dcb_dwords) return 0;
+    const u32* live_dwords = m_impl->memory->to_host_ptr<u32>(dcb_gpu_addr);
+    if (!live_dwords) return 0;
 
     const usize num_dwords = size_bytes / sizeof(u32);
+    // Parse a copy taken at submit: executing packets can take long enough
+    // (shader translation, DMA) for the live buffer to change under us.
+    const std::vector<u32> snapshot(live_dwords, live_dwords + num_dwords);
+    const u32* dcb_dwords = snapshot.data();
 
     usize offset = 0;
     usize pkts_executed = 0;
@@ -2853,6 +2865,26 @@ usize Pm4Translator::execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_b
         Pm4Header hdr = decode_pm4_header(hdr_dword);
         Pm4Packet pkt{};
         pkt.header = hdr;
+        // A packet that runs past the buffer ends parsing; say where, since
+        // everything after it (fences, EOP interrupts) is lost with it.
+        auto report_truncated = [&] {
+            std::fprintf(stderr, "[PM4 DCB] 0x%llx: malformed packet at +%zu (hdr=0x%08x count=%u, %zu dwords left):",
+                         (unsigned long long)dcb_gpu_addr, (offset - 1) * 4, hdr_dword, (unsigned)hdr.count,
+                         num_dwords - offset);
+            const usize from = offset - 1 >= 16 ? offset - 1 - 16 : 0;
+            for (usize i = from; i < offset - 1 + 8 && i < num_dwords; ++i)
+                std::fprintf(stderr, "%s%08x", i == offset - 1 ? " | " : " ", dcb_dwords[i]);
+            std::fprintf(stderr, "\n");
+            usize changed = 0, first = 0;
+            for (usize i = 0; i < num_dwords; ++i)
+                if (live_dwords[i] != snapshot[i] && changed++ == 0) first = i;
+            if (changed)
+                std::fprintf(stderr, "[PM4 DCB]   %zu dwords changed in guest memory since submit (first at +%zu)\n",
+                             changed, first * 4);
+            // PS4_WATCH_ADDR on the buffer: show who wrote it, now, since the
+            // guest usually stalls on the lost fence and never reaches the end-of-run dump.
+            if (write_watch_addr() != 0) dump_write_watch_ring(0, m_impl->memory);
+        };
 
         if (hdr.type == Pm4PacketType::Type0) {
             t0_count++;
@@ -2860,6 +2892,7 @@ usize Pm4Translator::execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_b
                 pkt.payload.assign(dcb_dwords + offset, dcb_dwords + offset + hdr.count);
                 offset += hdr.count;
             } else {
+                report_truncated();
                 break;
             }
         } else if (hdr.type == Pm4PacketType::Type2) {
@@ -2872,6 +2905,7 @@ usize Pm4Translator::execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_b
                 pkt.payload.assign(dcb_dwords + offset, dcb_dwords + offset + hdr.count);
                 offset += hdr.count;
             } else {
+                report_truncated();
                 break;
             }
         } else {
