@@ -16,8 +16,11 @@ struct VertexOut {
 };
 
 vertex VertexOut displayVertexShader(uint vertexID [[vertex_id]]) {
-    // Fullscreen triangle covering clip space [-1, 1] with UV mapping [0, 1]
-    float2 uvs[3] = { float2(0.0, 2.0), float2(0.0, 0.0), float2(2.0, 0.0) };
+    // Fullscreen triangle covering clip space [-1, 1] with UV mapping [0, 1].
+    // Clip-space y points up but texture v = 0 is the framebuffer's top row
+    // (as on the PS4), so v = (1 - y) / 2; the old (y + 1) / 2 mapping showed
+    // every game upside down in the window while offscreen readbacks were fine.
+    float2 uvs[3] = { float2(0.0, -1.0), float2(0.0, 1.0), float2(2.0, 1.0) };
     float4 positions[3] = { float4(-1.0, 3.0, 0.0, 1.0), float4(-1.0, -1.0, 0.0, 1.0), float4(3.0, -1.0, 0.0, 1.0) };
     VertexOut out;
     out.position = positions[vertexID];
@@ -65,6 +68,9 @@ struct DisplayWindow::Impl {
     CAMetalLayer* metal_layer{nil};
     PS4WindowDelegate* delegate{nil};
     u32 buttons{0};
+    // Buttons pressed since the last input_buttons() query: a click whose
+    // down and up arrive in the same event batch would otherwise never be seen.
+    mutable u32 pressed_latch{0};
 };
 
 DisplayWindow::DisplayWindow() : m_impl(std::make_unique<Impl>()) {}
@@ -204,6 +210,7 @@ void DisplayWindow::poll_events() {
                 const unsigned short code = [event keyCode];
                 if (code == 49 || code == 36 || code == 126 /* Up */ || code == 124 /* Right */) {
                     m_impl->buttons |= PS4_BUTTON_CROSS;
+                    m_impl->pressed_latch |= PS4_BUTTON_CROSS;
                 }
             } else if ([event type] == NSEventTypeKeyUp) {
                 const unsigned short code = [event keyCode];
@@ -212,6 +219,7 @@ void DisplayWindow::poll_events() {
                 }
             } else if ([event type] == NSEventTypeLeftMouseDown) {
                 m_impl->buttons |= PS4_BUTTON_CROSS;
+                m_impl->pressed_latch |= PS4_BUTTON_CROSS;
             } else if ([event type] == NSEventTypeLeftMouseUp) {
                 m_impl->buttons &= ~PS4_BUTTON_CROSS;
             }
@@ -223,7 +231,10 @@ void DisplayWindow::poll_events() {
 }
 
 u32 DisplayWindow::input_buttons() const noexcept {
-    return m_impl ? m_impl->buttons : 0;
+    if (!m_impl) return 0;
+    const u32 b = m_impl->buttons | m_impl->pressed_latch;
+    m_impl->pressed_latch = 0;
+    return b;
 }
 
 bool DisplayWindow::present_frame() {

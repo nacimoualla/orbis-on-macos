@@ -104,6 +104,7 @@ class CommandRunner:
         log_file: Optional[str] = None,
         timeout: Optional[int] = None,
         capture: bool = False,
+        env: Optional[dict] = None,
     ) -> Tuple[bool, int, str]:
         """
         Run a command, stream output to console, optionally tee to log_file,
@@ -118,14 +119,20 @@ class CommandRunner:
             log_handle.write(f"Command: {cmd}\n\n")
 
         output_lines = []
+        process = None
         try:
+            # Guest code prints arbitrary bytes (Unity logs, printf of binary
+            # data), so decode leniently: one stray byte must not kill the session.
             process = subprocess.Popen(
                 cmd,
                 shell=True,
                 cwd=cwd,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
 
@@ -161,6 +168,8 @@ class CommandRunner:
 
         except Exception as e:
             ui.fail(f"Execution error: {e}")
+            if process is not None and process.poll() is None:
+                process.kill()  # don't leave the runner going without a reader
             return False, -1, str(e)
         finally:
             if log_handle:
@@ -448,8 +457,10 @@ class GameRunner:
         trace: bool = False,
         strict_hle: bool = False,
         no_jit: bool = False,
+        hle_mono: bool = False,
     ) -> bool:
-        """Launch game with runner."""
+        """Launch game with runner. Unity titles run their own Mono PRX modules
+        (PS4_LOAD_PRX=1) unless hle_mono asks for the HLE Mono shim."""
         ui.header("Launching PS4 Game / Application")
 
         runner_exe = self.find_executable(use_gui=use_gui)
@@ -501,6 +512,13 @@ class GameRunner:
         cmd_parts.append(f'"{game_path}"')
         cmd = " ".join(cmd_parts)
 
+        env = os.environ.copy()
+        if hle_mono:
+            env.pop("PS4_LOAD_PRX", None)
+        else:
+            env["PS4_LOAD_PRX"] = "1"
+        ui.info(f"Mono: {'HLE shim' if hle_mono else 'real (PS4_LOAD_PRX=1)'}")
+
         latest_log = os.path.join(self.logs_dir, "runner_latest.log")
         success, _, _ = CommandRunner.run(
             cmd,
@@ -508,6 +526,7 @@ class GameRunner:
             cwd=self.root_dir,
             log_file=latest_log,
             timeout=timeout,
+            env=env,
         )
         if success:
             ui.success(f"Game session ended. Full log teed to: {os.path.relpath(latest_log, self.root_dir)}")
@@ -728,12 +747,13 @@ class InteractiveMenu:
         if sel.isdigit() and 1 <= int(sel) <= len(games):
             chosen = games[int(sel) - 1]
 
-        mode = input("Run mode: [1] Console Headless (default)  [2] macOS Window: ").strip()
-        window = (mode == "2")
+        mode = input("Run mode: [1] macOS Window (default)  [2] Console Headless: ").strip()
+        window = (mode != "2")
         budget_str = input("Instruction budget [default=unlimited for window, 10M for headless]: ").strip()
         budget = int(budget_str) if budget_str.isdigit() else (None if window else 10000000)
+        mono = input("Mono: [1] Real Mono PRX (default)  [2] HLE shim: ").strip()
 
-        self.runner.launch(game_path=chosen["path"], window=window, budget=budget)
+        self.runner.launch(game_path=chosen["path"], window=window, budget=budget, hle_mono=(mono == "2"))
 
     def _menu_diagnostics(self):
         ui.section("Diagnostics & Logs")
@@ -823,6 +843,8 @@ def main():
     p_run.add_argument("--trace", "-t", action="store_true", help="Trace guest instruction execution")
     p_run.add_argument("--strict-hle", action="store_true", help="Fail-loud strict HLE mode")
     p_run.add_argument("--no-jit", action="store_true", help="Disable ARM64 JIT recompiler")
+    p_run.add_argument("--hle-mono", action="store_true",
+                       help="Use the HLE Mono shim instead of the game's own Mono PRX modules")
 
     # --- Logs subcommand ---
     p_logs = subparsers.add_parser("logs", aliases=["diagnose"], help="Inspect logs and crash diagnostics")
@@ -884,6 +906,7 @@ def main():
             trace=args.trace,
             strict_hle=args.strict_hle,
             no_jit=args.no_jit,
+            hle_mono=args.hle_mono,
         )
         sys.exit(0 if success else 1)
 

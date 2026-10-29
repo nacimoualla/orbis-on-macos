@@ -344,7 +344,9 @@ GuestAddr DynamicLinker::get_or_create_trampoline(Nid nid) {
             static std::atomic<u64> s_logged{0};
 
             static const bool s_log_hle = (std::getenv("PS4_LOG_HLE") != nullptr && std::strcmp(std::getenv("PS4_LOG_HLE"), "1") == 0);
-            const bool is_gnm = (sym->name.rfind("sceGnm", 0) == 0);
+            // Gnm calls are logged with the PM4 trace (PS4_LOG_PM4), not always.
+            static const bool s_log_pm4 = std::getenv("PS4_LOG_PM4") != nullptr;
+            const bool is_gnm = s_log_pm4 && (sym->name.rfind("sceGnm", 0) == 0);
             // PS4_LOG_HLE_TID=<tid>: log every HLE call from that guest thread,
             // unsampled and unfiltered.
             static const long s_log_tid = std::getenv("PS4_LOG_HLE_TID")

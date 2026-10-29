@@ -10,6 +10,16 @@
 #include <map>
 #include <mutex>
 #include <algorithm>
+
+// PS4_LOG_PM4=1: trace every PM4 packet, draw and shader. Off by default:
+// at 60 FPS it is megabytes per second, and when stderr is a pipe to a slow
+// terminal the writes block the guest's GPU thread.
+static bool pm4_verbose() {
+    static const bool on = std::getenv("PS4_LOG_PM4") != nullptr;
+    return on;
+}
+#define PM4_LOG(...) do { if (pm4_verbose()) std::fprintf(stderr, __VA_ARGS__); } while (0)
+
 #include <set>
 #include <tuple>
 #include <vector>
@@ -1086,7 +1096,7 @@ bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_ad
         std::string why;
         if (!gcn_cache->encode_draw((__bridge void*)enc, static_cast<u32>(fb.pixelFormat), req, &why)) return false;
         if (draw_diagnostics_enabled) {
-            std::fprintf(stderr, "[GCN] draw #%zu %s count=%u prim=%u VS=0x%llx PS=0x%llx (translated)\n",
+            PM4_LOG("[GCN] draw #%zu %s count=%u prim=%u VS=0x%llx PS=0x%llx (translated)\n",
                          draw_count + 1, indexed ? "indexed" : "auto", count, static_cast<u32>(prim_type),
                          (unsigned long long)vs_shader_addr, (unsigned long long)ps_shader_addr);
         }
@@ -1106,7 +1116,7 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         return true;
     }
     if (!metal->frame_in_progress()) {
-        std::fprintf(stderr, "[PM4] draw outside frame\n");
+        PM4_LOG("[PM4] draw outside frame\n");
         return false;
     }
 
@@ -1322,7 +1332,7 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         return true;
     }
     if (!metal->frame_in_progress()) {
-        std::fprintf(stderr, "[PM4] draw outside frame\n");
+        PM4_LOG("[PM4] draw outside frame\n");
         return false;
     }
 
@@ -1817,7 +1827,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
     auto set_index_type = [&](u32 val, const char* src) {
         const u32 t = val & kIndexTypeMask;
         if (t == 2) {
-            std::fprintf(stderr, "[PM4] %s: 8-bit index type is not valid on CIK; using 16-bit\n", src);
+            PM4_LOG("[PM4] %s: 8-bit index type is not valid on CIK; using 16-bit\n", src);
         }
         st.index_type = (t == 1) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
         st.dirty_bits |= Impl::DirtyVertexLayout;
@@ -1829,7 +1839,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             case kPm4ConfigRegBase + 0x256: // SI mmVGT_PRIMITIVE_TYPE (0x8958)
                 st.primitive_type = static_cast<PrimitiveType>(val & 0x3F);
                 st.dirty_bits |= Impl::DirtyPipeline;
-                std::fprintf(stderr, "[PM4] VGT_PRIMITIVE_TYPE = 0x%02x\n", val & 0x3F);
+                PM4_LOG("[PM4] VGT_PRIMITIVE_TYPE = 0x%02x\n", val & 0x3F);
                 break;
             case kPm4UconfigRegBase + UCONFIG_VGT_INDEX_TYPE:
                 set_index_type(val, "VGT_INDEX_TYPE");
@@ -1947,6 +1957,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
     // Per-draw diagnostics (VS/PS ISA, V# contents, first indices). Other
     // subsystems read these lines from logs, so they are kept verbatim.
     auto dump_draw_state = [&](const char* tag, GuestAddr idx_addr, u32 count, MTLIndexType idx_type) {
+        if (!pm4_verbose()) return;
         std::fprintf(stderr, "      VS ISA: 0x%llx | PS ISA: 0x%llx | RT: 0x%llx (vp: %.0fx%.0f [%.0f,%.0f], sc: %u,%u %ux%u) prim=0x%02x inst=%u\n",
                      (unsigned long long)st.vs_shader_addr, (unsigned long long)st.ps_shader_addr,
                      (unsigned long long)st.cb_color0_base,
@@ -2050,14 +2061,14 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                             std::snprintf(buf, sizeof(buf), "0x%08x ", packet.payload[d]);
                             dwords_str += buf;
                         }
-                        std::fprintf(stderr, "[PM4] IT_NOP (tag=0x%08x, len=%zu): [%s]\n",
+                        PM4_LOG("[PM4] IT_NOP (tag=0x%08x, len=%zu): [%s]\n",
                                      tag, packet.payload.size(), dwords_str.c_str());
 
                         // Scan for potential 64-bit GPU base addresses in payload
                         for (size_t d = 0; d + 1 < packet.payload.size(); ++d) {
                             const u64 addr = (static_cast<u64>(packet.payload[d + 1]) << 32) | packet.payload[d];
                             if (addr > 0x1000000 && m_impl->memory && m_impl->memory->is_valid_address(addr, 20)) {
-                                std::fprintf(stderr, "[PM4]   -> Found valid GPU addr in NOP[%zu]: 0x%llx\n",
+                                PM4_LOG("[PM4]   -> Found valid GPU addr in NOP[%zu]: 0x%llx\n",
                                              d, (unsigned long long)addr);
                                 m_impl->gnm_base_addr = addr;
                             }
@@ -2074,7 +2085,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 const u32 base_index = packet.payload[0] & 0xF;
                 const GuestAddr base_addr =
                     (static_cast<u64>(packet.payload[2] & 0xFFFFu) << 32) | (packet.payload[1] & ~7u);
-                std::fprintf(stderr, "[PM4] IT_SET_BASE: index=%u, addr=0x%llx\n",
+                PM4_LOG("[PM4] IT_SET_BASE: index=%u, addr=0x%llx\n",
                              base_index, (unsigned long long)base_addr);
                 if (base_index == 1) {
                     st.indirect_base_addr = base_addr;
@@ -2114,7 +2125,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 if (!st.require_payload(packet, 2, "IT_INDEX_BASE")) return false;
                 st.index_base_addr =
                     (static_cast<u64>(packet.payload[1] & 0xFFFFu) << 32) | (packet.payload[0] & ~1u);
-                std::fprintf(stderr, "[PM4] IT_INDEX_BASE: addr=0x%llx\n",
+                PM4_LOG("[PM4] IT_INDEX_BASE: addr=0x%llx\n",
                              (unsigned long long)st.index_base_addr);
                 return true;
             }
@@ -2195,7 +2206,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                     std::snprintf(buf, sizeof(buf), "0x%08x ", packet.payload[d]);
                     cb_vals += buf;
                 }
-                std::fprintf(stderr, "[PM4 Context] base_reg=0x%04x count=%zu: [%s]\n",
+                PM4_LOG("[PM4 Context] base_reg=0x%04x count=%zu: [%s]\n",
                              base_reg, packet.payload.size() - 1, cb_vals.c_str());
                 for (usize i = 1; i < packet.payload.size(); ++i) {
                     const u16 reg = base_reg + static_cast<u16>(i - 1);
@@ -2232,24 +2243,24 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                     } else if (reg == CB_COLOR0_BASE || reg == CB_COLOR0_BASE_GFX7) {
                         m_impl->dirty_bits |= Impl::DirtyRenderTarget;
                         m_impl->cb_color0_base = static_cast<GuestAddr>(val) << 8;
-                        std::fprintf(stderr, "[PM4 Context] CB_COLOR0_BASE: 0x%llx (raw=0x%08x)\n",
+                        PM4_LOG("[PM4 Context] CB_COLOR0_BASE: 0x%llx (raw=0x%08x)\n",
                                      (unsigned long long)m_impl->cb_color0_base, val);
                     } else if (reg == CB_COLOR0_VIEW || reg == CB_COLOR0_VIEW_GFX7) {
                         m_impl->dirty_bits |= Impl::DirtyRenderTarget;
                         m_impl->cb_color0_view = val;
-                        std::fprintf(stderr, "[PM4 Context] CB_COLOR0_VIEW: 0x%08x\n", val);
+                        PM4_LOG("[PM4 Context] CB_COLOR0_VIEW: 0x%08x\n", val);
                     } else if (reg == CB_COLOR0_INFO || reg == CB_COLOR0_INFO_GFX7) {
                         m_impl->dirty_bits |= Impl::DirtyRenderTarget;
                         m_impl->cb_color0_info = val;
-                        std::fprintf(stderr, "[PM4 Context] CB_COLOR0_INFO: 0x%08x\n", val);
+                        PM4_LOG("[PM4 Context] CB_COLOR0_INFO: 0x%08x\n", val);
                     } else if (reg == VGT_DMA_MAX_SIZE_REG) {
                         m_impl->dirty_bits |= Impl::DirtyVertexLayout;
                         m_impl->index_buffer_size = val;
-                        std::fprintf(stderr, "[PM4 Context] VGT_DMA_MAX_SIZE: %u\n", val);
+                        PM4_LOG("[PM4 Context] VGT_DMA_MAX_SIZE: %u\n", val);
                     } else if (reg == VGT_DMA_INDEX_TYPE_REG) {
                         m_impl->dirty_bits |= Impl::DirtyVertexLayout;
                         m_impl->index_type = (val & 1) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
-                        std::fprintf(stderr, "[PM4 Context] VGT_DMA_INDEX_TYPE: %s (%u)\n",
+                        PM4_LOG("[PM4 Context] VGT_DMA_INDEX_TYPE: %s (%u)\n",
                                      (val & 1) ? "UInt32" : "UInt16", val);
                     }
                     // Note: VGT_PRIMITIVE_TYPE is not a context register on GCN;
@@ -2269,7 +2280,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                         std::snprintf(buf, sizeof(buf), "0x%08x ", packet.payload[d]);
                         vals_str += buf;
                     }
-                    std::fprintf(stderr, "[PM4 SH_REG] base_reg=0x%04x count=%zu: [%s]\n",
+                    PM4_LOG("[PM4 SH_REG] base_reg=0x%04x count=%zu: [%s]\n",
                                  base_reg, packet.payload.size() - 1, vals_str.c_str());
                     for (usize i = 1; i < packet.payload.size(); ++i) {
                         const u16 reg = base_reg + static_cast<u16>(i - 1);
@@ -2283,7 +2294,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                             m_impl->vs_pgm_hi = hi;
                             if (i + 2 < packet.payload.size()) m_impl->vs_rsrc1 = packet.payload[i + 2];
                             if (i + 3 < packet.payload.size()) m_impl->vs_rsrc2 = packet.payload[i + 3];
-                            std::fprintf(stderr, "[PM4 SH_REG] VS Shader ISA Addr: 0x%llx (lo=0x%08x, hi=0x%08x, rsrc1=0x%08x, rsrc2=0x%08x)\n",
+                            PM4_LOG("[PM4 SH_REG] VS Shader ISA Addr: 0x%llx (lo=0x%08x, hi=0x%08x, rsrc1=0x%08x, rsrc2=0x%08x)\n",
                                          (unsigned long long)isa, lo, hi, m_impl->vs_rsrc1, m_impl->vs_rsrc2);
                         } else if (reg == SPI_SHADER_PGM_LO_PS && i + 1 < packet.payload.size()) {
                             const u32 lo = val;
@@ -2294,7 +2305,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                             m_impl->ps_pgm_hi = hi;
                             if (i + 2 < packet.payload.size()) m_impl->ps_rsrc1 = packet.payload[i + 2];
                             if (i + 3 < packet.payload.size()) m_impl->ps_rsrc2 = packet.payload[i + 3];
-                            std::fprintf(stderr, "[PM4 SH_REG] PS Shader ISA Addr: 0x%llx (lo=0x%08x, hi=0x%08x, rsrc1=0x%08x, rsrc2=0x%08x)\n",
+                            PM4_LOG("[PM4 SH_REG] PS Shader ISA Addr: 0x%llx (lo=0x%08x, hi=0x%08x, rsrc1=0x%08x, rsrc2=0x%08x)\n",
                                          (unsigned long long)isa, lo, hi, m_impl->ps_rsrc1, m_impl->ps_rsrc2);
                         } else if ((reg >= 0x004C && reg <= 0x005B) || reg == SPI_SHADER_USER_DATA_VS_0_LEGACY) {
                             if (reg == SPI_SHADER_USER_DATA_VS_0 || reg == SPI_SHADER_USER_DATA_VS_0_LEGACY) {
@@ -2325,7 +2336,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                                     if (num_records > 0 && base_addr > 0x1000) {
                                         const u32 eff_stride = (stride > 0) ? stride : 16;
                                         m_impl->vs_user_sgpr_buffers[slot] = {base_addr, eff_stride, num_records, d3};
-                                        std::fprintf(stderr, "[PM4 SH_REG] VS User SGPR s[%u..%u] V# Buffer: base=0x%llx stride=%u records=%u (sz=%u) fmt=0x%08x\n",
+                                        PM4_LOG("[PM4 SH_REG] VS User SGPR s[%u..%u] V# Buffer: base=0x%llx stride=%u records=%u (sz=%u) fmt=0x%08x\n",
                                                      slot, slot + 3,
                                                      (unsigned long long)base_addr, eff_stride, num_records, eff_stride * num_records, d3);
                                     }
@@ -2351,7 +2362,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                                     m_impl->ps_texture_w1 = w1;
                                     m_impl->ps_texture_w2 = w2;
                                     m_impl->ps_texture_w3 = w3;
-                                    std::fprintf(stderr, "[PM4 SH_REG] PS T# Texture: base=0x%llx dim=%ux%u w1=0x%08x w3=0x%08x\n",
+                                    PM4_LOG("[PM4 SH_REG] PS T# Texture: base=0x%llx dim=%ux%u w1=0x%08x w3=0x%08x\n",
                                                  (unsigned long long)tex_base, w_m1 + 1, h_m1 + 1, w1, w3);
                                 }
                             }
@@ -2369,10 +2380,10 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 if (!st.require_payload(packet, 2, "IT_DRAW_INDEX_AUTO")) return false;
                 const u32 count = packet.payload[0];
                 const u32 initiator = packet.payload[1];
-                std::fprintf(stderr, "[PM4 Draw #%zu] IT_DRAW_INDEX_AUTO: count=%u initiator=0x%08x\n",
+                PM4_LOG("[PM4 Draw #%zu] IT_DRAW_INDEX_AUTO: count=%u initiator=0x%08x\n",
                              st.draw_count + 1, count, initiator);
                 if ((initiator & 3) != kDiSrcSelAutoIndex) {
-                    std::fprintf(stderr, "[PM4]   DRAW_INDEX_AUTO with SOURCE_SELECT=%u (expected AUTO_INDEX)\n",
+                    PM4_LOG("[PM4]   DRAW_INDEX_AUTO with SOURCE_SELECT=%u (expected AUTO_INDEX)\n",
                                  initiator & 3);
                 }
                 dump_draw_state("DRAW_INDEX_AUTO", 0, 0, st.index_type);
@@ -2389,12 +2400,12 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                     (static_cast<u64>(packet.payload[2] & 0xFFFFu) << 32) | (packet.payload[1] & ~1u);
                 const u32 count = packet.payload[3];
                 const u32 initiator = packet.payload[4];
-                std::fprintf(stderr, "[PM4 Draw #%zu] IT_DRAW_INDEX_2: idx_addr=0x%llx count=%u max=%u initiator=0x%08x prim=0x%02x %s\n",
+                PM4_LOG("[PM4 Draw #%zu] IT_DRAW_INDEX_2: idx_addr=0x%llx count=%u max=%u initiator=0x%08x prim=0x%02x %s\n",
                              st.draw_count + 1, (unsigned long long)idx_addr, count, max_size, initiator,
                              static_cast<u32>(st.primitive_type),
                              st.index_type == MTLIndexTypeUInt32 ? "u32" : "u16");
                 if (count > max_size) {
-                    std::fprintf(stderr, "[PM4]   DRAW_INDEX_2: index_count %u exceeds MAX_SIZE %u\n", count, max_size);
+                    PM4_LOG("[PM4]   DRAW_INDEX_2: index_count %u exceeds MAX_SIZE %u\n", count, max_size);
                 }
                 st.index_buffer_size = max_size;
                 dump_draw_state("DRAW_INDEX_2", idx_addr, count, st.index_type);
@@ -2408,7 +2419,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 const usize esz = (st.index_type == MTLIndexTypeUInt32) ? 4 : 2;
                 const GuestAddr idx_addr = st.index_base_addr + static_cast<GuestAddr>(packet.payload[1]) * esz;
                 const u32 count = packet.payload[2];
-                std::fprintf(stderr, "[PM4 Draw #%zu] IT_DRAW_INDEX_OFFSET_2: idx_addr=0x%llx count=%u max=%u\n",
+                PM4_LOG("[PM4 Draw #%zu] IT_DRAW_INDEX_OFFSET_2: idx_addr=0x%llx count=%u max=%u\n",
                              st.draw_count + 1, (unsigned long long)idx_addr, count, packet.payload[0]);
                 st.index_buffer_size = packet.payload[0];
                 dump_draw_state("DRAW_INDEX_OFFSET_2", idx_addr, count, st.index_type);
@@ -2432,7 +2443,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 if (!st.require_payload(packet, 3, name)) return false;
                 const u32 data_offset = packet.payload[0];
                 const GuestAddr args_addr = st.indirect_base_addr + data_offset;
-                std::fprintf(stderr, "[PM4 Draw #%zu] %s: base=0x%llx offset=0x%x payload=[%s]\n",
+                PM4_LOG("[PM4 Draw #%zu] %s: base=0x%llx offset=0x%x payload=[%s]\n",
                              st.draw_count + 1, name, (unsigned long long)st.indirect_base_addr, data_offset,
                              hex_payload(packet, 4).c_str());
                 const usize args_size = indexed ? 20 : 16;
@@ -2448,7 +2459,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                     // {index_count, instance_count, start_index, base_vertex, start_instance}
                     const usize esz = (st.index_type == MTLIndexTypeUInt32) ? 4 : 2;
                     const GuestAddr idx_start = st.index_base_addr + static_cast<GuestAddr>(a[2]) * esz;
-                    std::fprintf(stderr, "[PM4]   -> args@0x%llx: idxCount=%u instCount=%u firstIdx=%u vtxOffset=%d firstInst=%u\n",
+                    PM4_LOG("[PM4]   -> args@0x%llx: idxCount=%u instCount=%u firstIdx=%u vtxOffset=%d firstInst=%u\n",
                                  (unsigned long long)args_addr, a[0], a[1], a[2], static_cast<i32>(a[3]), a[4]);
                     if (a[0] == 0 || a[1] == 0) return true; // empty draw
                     dump_draw_state(name, idx_start, a[0], st.index_type);
@@ -2456,7 +2467,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                                                   static_cast<i32>(a[3]), a[1]);
                 }
                 // {vertex_count, instance_count, start_vertex, start_instance}
-                std::fprintf(stderr, "[PM4]   -> args@0x%llx: vtxCount=%u instCount=%u firstVtx=%u firstInst=%u\n",
+                PM4_LOG("[PM4]   -> args@0x%llx: vtxCount=%u instCount=%u firstVtx=%u firstInst=%u\n",
                              (unsigned long long)args_addr, a[0], a[1], a[2], a[3]);
                 if (a[0] == 0 || a[1] == 0) return true;
                 dump_draw_state(name, 0, 0, st.index_type);
@@ -2525,7 +2536,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 if (!is_mem) {
                     const u32 reg = packet.payload[1] & 0xFFFF;
                     if (!passes(read_reg(reg))) {
-                        std::fprintf(stderr, "[PM4] IT_WAIT_REG_MEM: register 0x%04x=0x%08x never satisfies func=%u ref=0x%08x mask=0x%08x; continuing\n",
+                        PM4_LOG("[PM4] IT_WAIT_REG_MEM: register 0x%04x=0x%08x never satisfies func=%u ref=0x%08x mask=0x%08x; continuing\n",
                                      reg, read_reg(reg), func, ref, mask);
                     }
                     return true;
@@ -2545,7 +2556,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 // can never be satisfied by a later packet of this stream. The
                 // GPU never writes the polled location itself, so neither do
                 // we: report the unsatisfied wait and continue.
-                std::fprintf(stderr, "[PM4] IT_WAIT_REG_MEM: unsatisfied wait on 0x%llx (cur=0x%08x func=%u ref=0x%08x mask=0x%08x); continuing\n",
+                PM4_LOG("[PM4] IT_WAIT_REG_MEM: unsatisfied wait on 0x%llx (cur=0x%08x func=%u ref=0x%08x mask=0x%08x); continuing\n",
                              (unsigned long long)poll_addr, cur, func, ref, mask);
                 return true;
             }
@@ -2574,7 +2585,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 const GuestAddr addr = (static_cast<u64>(dw2 & 0xFFFFu) << 32) | packet.payload[1];
                 const u32 data_sel = (dw2 >> 29) & 0x7;
                 const u32 int_sel = (dw2 >> 24) & 0x3;
-                std::fprintf(stderr, "[PM4] IT_EVENT_WRITE_EOP: event=0x%02x addr=0x%llx data_sel=%u int_sel=%u data=0x%08x_%08x\n",
+                PM4_LOG("[PM4] IT_EVENT_WRITE_EOP: event=0x%02x addr=0x%llx data_sel=%u int_sel=%u data=0x%08x_%08x\n",
                              packet.payload[0] & 0x3F, (unsigned long long)addr, data_sel, int_sel,
                              packet.payload[4], packet.payload[3]);
                 // Interrupt delivery (INT_SEL) is owned by the HLE equeue path.
@@ -2603,7 +2614,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 const u32 dw1 = packet.payload[1];
                 const GuestAddr addr = (static_cast<u64>(packet.payload[3]) << 32) | packet.payload[2];
                 const u32 data_sel = (dw1 >> 29) & 0x7;
-                std::fprintf(stderr, "[PM4] IT_RELEASE_MEM: event=0x%02x addr=0x%llx data_sel=%u int_sel=%u data=0x%08x_%08x\n",
+                PM4_LOG("[PM4] IT_RELEASE_MEM: event=0x%02x addr=0x%llx data_sel=%u int_sel=%u data=0x%08x_%08x\n",
                              packet.payload[0] & 0x3F, (unsigned long long)addr, data_sel, (dw1 >> 24) & 0x7,
                              packet.payload[5], packet.payload[4]);
                 return write_end_of_pipe("IT_RELEASE_MEM", addr, data_sel, packet.payload[4], packet.payload[5]);
@@ -2623,7 +2634,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 const usize bytes = command & 0x1FFFFF;
                 const bool sas = (command >> 26) & 1, das = (command >> 27) & 1;
                 const bool saic = (command >> 28) & 1, daic = (command >> 29) & 1;
-                std::fprintf(stderr, "[PM4] IT_DMA_DATA: src_sel=%u dst_sel=%u src=0x%llx%s dst=0x%llx%s bytes=%zu\n",
+                PM4_LOG("[PM4] IT_DMA_DATA: src_sel=%u dst_sel=%u src=0x%llx%s dst=0x%llx%s bytes=%zu\n",
                              src_sel, dst_sel, (unsigned long long)src, sas ? "(reg)" : "",
                              (unsigned long long)dst, das ? "(reg)" : "", bytes);
                 return run_dma("IT_DMA_DATA", src_sel, dst_sel, src, dst, bytes, sas, das, saic, daic,
@@ -2815,7 +2826,7 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
             default:
                 if (st.metal && st.metal->frame_in_progress()) {
                     st.frame_stats.unsupported_packets++;
-                    std::fprintf(stderr, "[PM4 UNIMPL] op=0x%02x(%s) count=%zu d0=0x%08x d1=0x%08x\n",
+                    PM4_LOG("[PM4 UNIMPL] op=0x%02x(%s) count=%zu d0=0x%08x d1=0x%08x\n",
                                  packet.header.opcode, pm4_opcode_to_name(packet.header.opcode),
                                  packet.payload.size(),
                                  packet.payload.size() > 0 ? packet.payload[0] : 0,
@@ -2879,7 +2890,7 @@ usize Pm4Translator::execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_b
             for (usize i = 0; i < num_dwords; ++i)
                 if (live_dwords[i] != snapshot[i] && changed++ == 0) first = i;
             if (changed)
-                std::fprintf(stderr, "[PM4 DCB]   %zu dwords changed in guest memory since submit (first at +%zu)\n",
+                PM4_LOG("[PM4 DCB]   %zu dwords changed in guest memory since submit (first at +%zu)\n",
                              changed, first * 4);
             // PS4_WATCH_ADDR on the buffer: show who wrote it, now, since the
             // guest usually stalls on the lost fence and never reaches the end-of-run dump.
@@ -2923,7 +2934,7 @@ usize Pm4Translator::execute_command_buffer(GuestAddr dcb_gpu_addr, usize size_b
         std::snprintf(b, sizeof(b), "0x%02x(%s):%zu ", op, pm4_opcode_to_name(op), cnt);
         hist_str += b;
     }
-    std::fprintf(stderr, "[PM4 DCB] 0x%llx: pkts=%zu (T0:%zu T2:%zu T3:%zu) Ops: [%s]\n",
+    PM4_LOG("[PM4 DCB] 0x%llx: pkts=%zu (T0:%zu T2:%zu T3:%zu) Ops: [%s]\n",
                  (unsigned long long)dcb_gpu_addr, pkts_executed, t0_count, t2_count, t3_count, hist_str.c_str());
 
     return pkts_executed;

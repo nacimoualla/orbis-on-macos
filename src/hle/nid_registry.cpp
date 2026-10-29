@@ -18,6 +18,16 @@
 #include <map>
 #include <mutex>
 #include <thread>
+
+// PS4_LOG_PM4=1: trace every PM4 packet, draw and shader. Off by default:
+// at 60 FPS it is megabytes per second, and when stderr is a pipe to a slow
+// terminal the writes block the guest's GPU thread.
+static bool pm4_verbose() {
+    static const bool on = std::getenv("PS4_LOG_PM4") != nullptr;
+    return on;
+}
+#define PM4_LOG(...) do { if (pm4_verbose()) std::fprintf(stderr, __VA_ARGS__); } while (0)
+
 #include <unordered_map>
 #include <sys/time.h>
 #include <unistd.h>
@@ -441,6 +451,14 @@ void NidRegistry::set_vfs(VirtualFileSystem* vfs) {
 static MetalBackend* g_metal_backend = nullptr;
 static std::unique_ptr<Pm4Translator> g_pm4_translator;
 static std::atomic<u32> g_pad_buttons{0};
+// Buttons pressed since the guest last read the pad. The host samples input
+// once per frame and the game reads on its own schedule, so a short tap can
+// begin and end between two guest reads; it is reported down once regardless.
+static std::atomic<u32> g_pad_pressed_latch{0};
+static u32 read_pad_buttons() {
+    return g_pad_buttons.load(std::memory_order_relaxed) |
+           g_pad_pressed_latch.exchange(0, std::memory_order_relaxed);
+}
 
 // ScePadData (0x78 bytes): buttons, left/right stick (u8 x,y), analog L2/R2,
 // orientation quaternion (+0x0C), acceleration (+0x1C), angular velocity
@@ -578,7 +596,8 @@ void NidRegistry::note_hle_return() const {
 }
 
 void NidRegistry::set_pad_buttons(u32 buttons) {
-    g_pad_buttons.store(buttons, std::memory_order_relaxed);
+    const u32 prev = g_pad_buttons.exchange(buttons, std::memory_order_relaxed);
+    g_pad_pressed_latch.fetch_or(buttons & ~prev, std::memory_order_relaxed);
 }
 
 u64 NidRegistry::get_flip_count() const noexcept {
@@ -1020,7 +1039,7 @@ static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_
                 case IT_EVENT_WRITE_EOS:
                 case IT_RELEASE_MEM:
                 case IT_WRITE_DATA: {
-                    std::fprintf(stderr, "[GnmSync] dcb=0x%llx +%zu %s:", (unsigned long long)dcb,
+                    PM4_LOG("[GnmSync] dcb=0x%llx +%zu %s:", (unsigned long long)dcb,
                                  (off - 1) * 4, pm4_opcode_to_name(hdr.opcode));
                     for (u16 i = 0; i < hdr.count && i < 8; ++i) std::fprintf(stderr, " %08x", p[i]);
                     std::fprintf(stderr, "\n");
@@ -1062,7 +1081,7 @@ static void execute_submitted_dcbs(MemoryManager& mem, u32 count, GuestAddr dcb_
         if (g_pm4_translator) {
             const usize pkts_in_dcb = g_pm4_translator->execute_command_buffer(dcb_gpu_addr, dcb_size_bytes);
             auto cc = g_pm4_translator->clear_color();
-            std::fprintf(stderr, "[Gnm] Executed DCB #%u at 0x%llx (%u bytes, %zu pkts, total_draws=%zu, reg_writes=%zu, clear=(%.2f,%.2f,%.2f,%.2f))\n",
+            PM4_LOG("[Gnm] Executed DCB #%u at 0x%llx (%u bytes, %zu pkts, total_draws=%zu, reg_writes=%zu, clear=(%.2f,%.2f,%.2f,%.2f))\n",
                          i, (unsigned long long)dcb_gpu_addr, dcb_size_bytes, pkts_in_dcb,
                          g_pm4_translator->draw_count(), g_pm4_translator->context_reg_writes(),
                          cc.r, cc.g, cc.b, cc.a);
@@ -1126,7 +1145,7 @@ static void ensure_unity_screen_resolution(MemoryManager& mem) {
     // ensure its cached dimensions are initialized to 1920x1080.
     GuestAddr sm_ptr = 0;
     const bool read_ok = mem.read_value(0x1563a00, sm_ptr);
-    std::fprintf(stderr, "[ScreenManager] ensure_unity_screen_resolution: *0x1563a00 = 0x%llx (ok=%d)\n",
+    PM4_LOG("[ScreenManager] ensure_unity_screen_resolution: *0x1563a00 = 0x%llx (ok=%d)\n",
                  (unsigned long long)sm_ptr, read_ok ? 1 : 0);
     if (read_ok && sm_ptr > 0x1000 && mem.is_valid_address(sm_ptr, 0x300)) {
         u32 old_w = 0, old_h = 0;
@@ -1138,7 +1157,7 @@ static void ensure_unity_screen_resolution(MemoryManager& mem) {
         mem.write_value(sm_ptr + 0x2c0, static_cast<u32>(1080)); // m_TargetHeight
         mem.write_value(sm_ptr + 0x2e4, static_cast<u32>(1920)); // m_VideoWidth
         mem.write_value(sm_ptr + 0x2e8, static_cast<u32>(1080)); // m_VideoHeight
-        std::fprintf(stderr, "[ScreenManager] Fixed sm=0x%llx from %ux%u to 1920x1080\n",
+        PM4_LOG("[ScreenManager] Fixed sm=0x%llx from %ux%u to 1920x1080\n",
                      (unsigned long long)sm_ptr, old_w, old_h);
     }
 }
@@ -5301,7 +5320,7 @@ void NidRegistry::register_default_libraries() {
     auto pad_read_state_handler = [](CpuContext& ctx, MemoryManager& mem) {
         const GuestAddr data_ptr = ctx.rsi;
         if (data_ptr > 0x1000 && mem.is_valid_address(data_ptr, kScePadDataSize)) {
-            write_pad_data(mem, data_ptr, g_pad_buttons.load(std::memory_order_relaxed));
+            write_pad_data(mem, data_ptr, read_pad_buttons());
         }
         ctx.rax = SCE_OK;
     };
@@ -6504,7 +6523,7 @@ void NidRegistry::register_default_libraries() {
                 mem.read_value(ctx.rsp + 24, flip_arg);
             }
 
-            std::fprintf(stderr, "[Gnm] SubmitAndFlip(count=%u, dcbAddrs=0x%llx, dcbSizes=0x%llx, bufIdx=%u, flipArg=0x%llx)\n",
+            PM4_LOG("[Gnm] SubmitAndFlip(count=%u, dcbAddrs=0x%llx, dcbSizes=0x%llx, bufIdx=%u, flipArg=0x%llx)\n",
                          count, (unsigned long long)dcb_addrs_ptr, (unsigned long long)dcb_sizes_ptr,
                          buffer_index, (unsigned long long)flip_arg);
 
@@ -6560,7 +6579,7 @@ void NidRegistry::register_default_libraries() {
             const u64 udata = ctx.rdx;
             std::lock_guard<std::mutex> lock(s_gnm_eq_mtx);
             s_gnm_eq_subscriptions.push_back({eq_id, event_id, udata});
-            std::fprintf(stderr, "[Gnm] AddEqEvent: eq=%u, id=%d, udata=0x%llx\n",
+            PM4_LOG("[Gnm] AddEqEvent: eq=%u, id=%d, udata=0x%llx\n",
                          eq_id, event_id, (unsigned long long)udata);
             ctx.rax = SCE_OK;
         });
@@ -6803,7 +6822,7 @@ void NidRegistry::register_default_libraries() {
                 ctx.rax = num < 1 ? 0 : 0x80920001ULL; // SCE_PAD_ERROR_INVALID_ARG
                 return;
             }
-            write_pad_data(mem, ctx.rsi, g_pad_buttons.load(std::memory_order_relaxed));
+            write_pad_data(mem, ctx.rsi, read_pad_buttons());
             ctx.rax = 1;
         });
     // scePadGetControllerInformation(handle, ScePadControllerInformation*):
