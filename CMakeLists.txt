@@ -55,6 +55,7 @@ add_library(ps4_core
     src/gpu/pm4_translator.mm
     src/gpu/gcn_decoder.cpp
     src/gpu/gcn_to_msl.cpp
+    src/gpu/bc_decode.cpp
     src/gpu/gcn_pipeline.mm
     src/gpu/gpu_state.cpp
     src/audio/audio_manager.cpp
@@ -164,6 +165,10 @@ add_executable(test_gpu_state tests/test_gpu_state.cpp)
 target_link_libraries(test_gpu_state PRIVATE ps4_core)
 add_test(NAME Phase20_GpuState COMMAND test_gpu_state)
 set_tests_properties(Flappy_GpuSmoke PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_bc_decode tests/test_bc_decode.cpp)
+target_link_libraries(test_bc_decode PRIVATE ps4_core)
+add_test(NAME BcDecode COMMAND test_bc_decode)
 
 add_executable(test_jit_stats tests/test_jit_stats.cpp)
 target_link_libraries(test_jit_stats PRIVATE ps4_core)
