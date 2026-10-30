@@ -1007,6 +1007,7 @@ void DynamicLinker::build_export_table(std::span<const u8> file_data, const ElfL
         // First definition wins, so an earlier module is not shadowed.
         const GuestAddr real = base + sym.st_value;
         if (!m_module_exports.emplace(nid, real).second && g_ms) ++g_ms->dup;
+        m_module_symbols[handle].emplace(nid, real);
         ++defined;
 
         // Replace any trampoline already written for this NID.
@@ -1195,6 +1196,7 @@ u32 DynamicLinker::load_module(const std::string& path, GuestAddr base, bool run
             }
         }
         m_modules.erase(handle);
+        m_module_symbols.erase(handle);
         for (auto it = m_nid_to_slots.begin(); it != m_nid_to_slots.end();) {
             auto& slots = it->second;
             slots.erase(std::remove_if(slots.begin(), slots.end(),
@@ -1217,11 +1219,22 @@ u32 DynamicLinker::load_module(const std::string& path, GuestAddr base, bool run
     // Relocate before reading exports: the symbol values we record are the
     // pre-relocation ones, but the import bindings written here are what make
     // the module's own calls land somewhere sane.
+    const usize unresolved_before = m_unresolved_nids.size();
     if (!resolve_relocations(data, loader, base)) {
         std::fprintf(stderr, "[module] 0x%x %s: relocation failed: %s\n",
                      handle, path.c_str(), relocation_diagnostics().c_str());
         rollback_mapping();
         return 0;
+    }
+    // Imports this module needs that neither the HLE registry nor a loaded
+    // module provides. Each one is a trampoline that will report as unimplemented.
+    if (m_unresolved_nids.size() > unresolved_before) {
+        std::fprintf(stderr, "[module] 0x%x %s: %zu unresolved import(s):",
+                     handle, path.c_str(), m_unresolved_nids.size() - unresolved_before);
+        for (usize i = unresolved_before; i < m_unresolved_nids.size(); ++i) {
+            std::fprintf(stderr, " 0x%016llx", (unsigned long long)m_unresolved_nids[i]);
+        }
+        std::fprintf(stderr, "\n");
     }
     build_export_table(data, loader, base, handle, span);
 
@@ -1245,6 +1258,13 @@ bool DynamicLinker::run_module_init(u32 handle) {
 GuestAddr DynamicLinker::find_export(Nid nid) const noexcept {
     const auto it = m_module_exports.find(nid);
     return it == m_module_exports.end() ? 0 : it->second;
+}
+
+GuestAddr DynamicLinker::find_module_export(u32 handle, Nid nid) const noexcept {
+    const auto mod = m_module_symbols.find(handle);
+    if (mod == m_module_symbols.end()) return 0;
+    const auto it = mod->second.find(nid);
+    return it == mod->second.end() ? 0 : it->second;
 }
 
 const LoadedModule* DynamicLinker::module(u32 handle) const noexcept {
@@ -1286,6 +1306,65 @@ GuestAddr g_next_module_base = 0x04000000ULL;
 constexpr GuestAddr kModuleBaseCeiling = 0x10000000ULL;
 constexpr GuestAddr kModuleBaseAlign = 0x200000ULL;
 } // namespace
+
+namespace {
+
+// SHA-1 (FIPS 180-4). Only used to derive Orbis NIDs, so it lives here rather
+// than pulling a crypto dependency in for one 20-byte digest.
+void sha1(const u8* data, usize len, u8 out[20]) {
+    auto rotl = [](u32 x, unsigned n) { return (x << n) | (x >> (32 - n)); };
+    u32 h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+
+    // Pad: 0x80, zeros to 56 mod 64, then the bit length as big-endian u64.
+    std::vector<u8> msg(data, data + len);
+    msg.push_back(0x80);
+    while (msg.size() % 64 != 56) msg.push_back(0);
+    const u64 bit_len = static_cast<u64>(len) * 8;
+    for (int i = 7; i >= 0; --i) msg.push_back(static_cast<u8>(bit_len >> (i * 8)));
+
+    for (usize off = 0; off < msg.size(); off += 64) {
+        u32 w[80];
+        for (int i = 0; i < 16; ++i) {
+            const u8* p = &msg[off + static_cast<usize>(i) * 4];
+            w[i] = (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | u32(p[3]);
+        }
+        for (int i = 16; i < 80; ++i) w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+
+        u32 a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; ++i) {
+            u32 f, k;
+            if (i < 20)      { f = (b & c) | (~b & d);         k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d;                  k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else             { f = b ^ c ^ d;                  k = 0xCA62C1D6; }
+            const u32 t = rotl(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = rotl(b, 30); b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        out[i * 4 + 0] = static_cast<u8>(h[i] >> 24);
+        out[i * 4 + 1] = static_cast<u8>(h[i] >> 16);
+        out[i * 4 + 2] = static_cast<u8>(h[i] >> 8);
+        out[i * 4 + 3] = static_cast<u8>(h[i]);
+    }
+}
+
+constexpr u8 kNidSalt[16] = {0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1,
+                             0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5, 0x52, 0x30};
+
+} // namespace
+
+Nid nid_from_name(std::string_view name) noexcept {
+    std::vector<u8> buf(name.begin(), name.end());
+    buf.insert(buf.end(), kNidSalt, kNidSalt + sizeof(kNidSalt));
+    u8 digest[20];
+    sha1(buf.data(), buf.size(), digest);
+    Nid nid = 0;
+    for (int i = 7; i >= 0; --i) nid = (nid << 8) | digest[i];   // little-endian
+    return nid;
+}
 
 DynamicLinker* active_linker() noexcept { return g_active_linker; }
 void set_active_linker(DynamicLinker* linker) noexcept { g_active_linker = linker; }

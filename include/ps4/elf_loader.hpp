@@ -28,9 +28,12 @@ std::string_view elf_error_to_string(ElfError error);
 // ---------------------------------------------------------------------------
 // PS4 SELF/PRX container.
 //
-// A shipped .prx (and eboot.bin) is not a bare ELF: it is a 352-byte SELF
-// header followed by the ELF image. The magic below is what the dump actually
-// starts with, and the plaintext ELF begins at kSelfElfOffset.
+// A shipped .prx (and eboot.bin) is not a bare ELF: it is a SELF header
+// followed by the ELF image. The magic below is what the dump actually
+// starts with, and the plaintext ELF begins right after the entry table
+// (see self_elf_offset()). The entry count varies per file: 10 entries for
+// mono-ps4.prx-style modules (ELF at 0x160), 8 for the Media/Plugins PRXs
+// (ELF at 0x120).
 //
 // The program headers inside that ELF are NOT trustworthy for reading the file.
 // They describe the layout the module had before Sony's packing; the SELF entry
@@ -45,10 +48,14 @@ std::string_view elf_error_to_string(ElfError error);
 // ---------------------------------------------------------------------------
 
 inline constexpr u32 SELF_MAGIC = 0x1D3D154FULL;
-inline constexpr usize SELF_HEADER_SIZE = 0x160;   // 352
-inline constexpr usize SELF_ELF_OFFSET  = 0x160;   // plaintext ELF starts here
 inline constexpr usize SELF_ENTRY_COUNT_OFF = 0x18; // u16 number of entries
 inline constexpr usize SELF_ENTRY_TABLE_OFF = 0x20; // 32-byte entries
+
+/// File offset of the plaintext ELF inside a SELF container: the entry table
+/// sits right after the fixed header, so the ELF follows it.
+inline constexpr usize self_elf_offset(u16 entry_count) {
+    return SELF_ENTRY_TABLE_OFF + static_cast<usize>(entry_count) * 32;
+}
 
 struct SelfEntry {
     u32 type;
@@ -106,7 +113,7 @@ public:
     [[nodiscard]] bool is_self_container() const noexcept { return m_is_self; }
 
     /// Offset within the raw file at which the plaintext ELF image begins
-    /// (0 for a bare ELF, kSelfElfOffset for a SELF container).
+    /// (0 for a bare ELF, self_elf_offset(count) for a SELF container).
     [[nodiscard]] usize elf_file_offset() const noexcept { return m_elf_file_offset; }
 
     /// The SELF entry table (empty for a bare ELF).
