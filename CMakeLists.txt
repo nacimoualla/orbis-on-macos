@@ -246,3 +246,9 @@ add_test(NAME JitMemOperands COMMAND test_jit_mem)
 add_executable(test_jit_diff tests/test_jit_diff.cpp)
 target_link_libraries(test_jit_diff PRIVATE ps4_core)
 add_test(NAME JitDifferentialFuzz COMMAND test_jit_diff)
+
+# libSceSaveData (host-folder saves, search, save-data memory) and
+# libSceNpTrophy HLE round trips.
+add_executable(test_save_data_trophy tests/test_save_data_trophy.cpp)
+target_link_libraries(test_save_data_trophy PRIVATE ps4_core)
+add_test(NAME SaveDataTrophy COMMAND test_save_data_trophy)
