@@ -3000,6 +3000,37 @@ void NidRegistry::register_default_libraries() {
     };
     register_symbol(0xE19F218ECFDE29A6ULL, "sinf", "libc", sinf_handler);
 
+    // _FSin(float x, unsigned int idx)
+    // Dinkumware C runtime: idx=0 -> sin(x), idx=1 -> cos(x), idx=2 -> -sin(x), idx=3 -> -cos(x)
+    auto fsin_handler = [](CpuContext& ctx, MemoryManager&) {
+        const float x = ctx.ymm[0].f[0];
+        const u32 idx = static_cast<u32>(ctx.rdi);
+        float res = 0.0f;
+        switch (idx & 3) {
+            case 0: res = std::sin(x); break;
+            case 1: res = std::cos(x); break;
+            case 2: res = -std::sin(x); break;
+            case 3: res = -std::cos(x); break;
+        }
+        ctx.ymm[0].f[0] = res;
+    };
+    register_symbol(0x66D8ECA64250FAFCULL, "_FSin", "libc", fsin_handler);
+
+    // _Sin(double x, unsigned int idx)
+    auto sin_dinkum_handler = [](CpuContext& ctx, MemoryManager&) {
+        const double x = ctx.ymm[0].d[0];
+        const u32 idx = static_cast<u32>(ctx.rdi);
+        double res = 0.0;
+        switch (idx & 3) {
+            case 0: res = std::sin(x); break;
+            case 1: res = std::cos(x); break;
+            case 2: res = -std::sin(x); break;
+            case 3: res = -std::cos(x); break;
+        }
+        ctx.ymm[0].d[0] = res;
+    };
+    register_symbol(0x7025E353BD99D0ECULL, "_Sin", "libc", sin_dinkum_handler);
+
     // cosf(float x)
     auto cosf_handler = [](CpuContext& ctx, MemoryManager&) {
         ctx.ymm[0].f[0] = std::cos(ctx.ymm[0].f[0]);
@@ -3352,6 +3383,28 @@ void NidRegistry::register_default_libraries() {
                 }
             }
             ctx.rax = dest;
+        });
+
+    // strncat(char* dest, const char* src, size_t n)
+    // NID: 0x907838E6A3C2E9FDULL ("kHg45qPC6f0")
+    register_symbol(0x907838E6A3C2E9FDULL, "strncat", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dest = ctx.rdi;
+            const GuestAddr src  = ctx.rsi;
+            const GuestSize max_src = ctx.rdx;
+            ctx.rax = dest;
+            if (dest == 0 || src == 0) return;
+            GuestAddr d = dest;
+            u8 b = 0;
+            while (mem.read_value(d, b) && b != 0) {
+                ++d;
+            }
+            for (GuestSize i = 0; i < max_src; ++i) {
+                u8 sb = 0;
+                if (!mem.read_value(src + i, sb) || sb == 0) break;
+                mem.write_value(d++, sb);
+            }
+            mem.write_value<u8>(d, 0);
         });
 
     // strncmp(const char* s1, const char* s2, size_t n)
