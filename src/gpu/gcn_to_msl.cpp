@@ -1482,7 +1482,8 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
 
 TextureDesc decode_tsharp(const u32* t) {
     TextureDesc d;
-    d.base = (static_cast<u64>(t[0]) | (static_cast<u64>(t[1] & 0xFF) << 32)) << 8;
+    // Word 0 holds bits 39:8 of the base address; Word 1 bits 3:0 hold bits 43:40.
+    d.base = (static_cast<u64>(t[0]) << 8) | (static_cast<u64>(t[1] & 0x0F) << 40);
     d.dfmt = (t[1] >> 20) & 0x3F;
     d.nfmt = (t[1] >> 26) & 0xF;
     d.width = (t[2] & 0x3FFF) + 1;

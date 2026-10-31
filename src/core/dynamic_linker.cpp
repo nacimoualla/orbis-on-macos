@@ -761,6 +761,40 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
             mem.write_value(patch_location, DISPLAY_CFG_ADDR + 0x0C);
             return true;
         }
+
+        // Standard I/O streams and runtime data symbols:
+        // stdin (_Stdin, _Files[0])
+        constexpr GuestAddr STDIO_STDIN_ADDR = 0x3FF2000ULL;
+        if (sym_str.find("1TDo-ImqkJc") != std::string_view::npos ||
+            nid == 0xd530e8fc89aa9097ULL || sym_str == "__stdinp" || sym_str == "stdin") {
+            mem.zero_memory(STDIO_STDIN_ADDR, 456);
+            mem.write_value(patch_location, STDIO_STDIN_ADDR);
+            return true;
+        }
+        // stdout (_Stdout, _Files[1])
+        constexpr GuestAddr STDIO_STDOUT_ADDR = 0x3FF2200ULL;
+        if (sym_str.find("2sWzhYqFH4E") != std::string_view::npos ||
+            nid == 0xdac5b3858a851f81ULL || sym_str == "__stdoutp" || sym_str == "stdout") {
+            mem.zero_memory(STDIO_STDOUT_ADDR, 456);
+            mem.write_value(patch_location, STDIO_STDOUT_ADDR);
+            return true;
+        }
+        // stderr (_Stderr, _Files[2])
+        constexpr GuestAddr STDIO_STDERR_ADDR = 0x3FF2400ULL;
+        if (sym_str.find("H8AprKeZtNg") != std::string_view::npos ||
+            nid == 0x1fc029aca799b4d8ULL || sym_str == "__stderrp" || sym_str == "stderr") {
+            mem.zero_memory(STDIO_STDERR_ADDR, 456);
+            mem.write_value(patch_location, STDIO_STDERR_ADDR);
+            return true;
+        }
+        // __mb_cur_max (P330P3dFF68)
+        constexpr GuestAddr MBCURMAX_ADDR = 0x3FF2600ULL;
+        if (sym_str.find("P330P3dFF68") != std::string_view::npos ||
+            nid == 0x3f7df43f774517afULL || sym_str == "__mb_cur_max") {
+            mem.write_value<u32>(MBCURMAX_ADDR, 1);
+            mem.write_value(patch_location, MBCURMAX_ADDR);
+            return true;
+        }
         return false;
     };
 

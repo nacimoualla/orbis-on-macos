@@ -221,10 +221,10 @@ void DisplayWindow::poll_events() {
                 }
 
                 u32 pressed = 0;
-                if (code == 49 || code == 36) pressed |= kPadCross;
-                if (code == 51 || code == 8)  pressed |= kPadCircle;
-                if (code == 3  || code == 7)  pressed |= kPadSquare;
-                if (code == 14 || code == 15) pressed |= kPadTriangle;
+                if (code == 49 || code == 36 || code == 6) pressed |= kPadCross;
+                if (code == 51 || code == 8  || code == 7) pressed |= kPadCircle;
+                if (code == 3  || code == 7  || code == 8) pressed |= kPadSquare;
+                if (code == 14 || code == 15 || code == 8) pressed |= kPadTriangle;
                 if (code == 12)               pressed |= kPadL1;
                 if (code == 48)               pressed |= kPadTouchPadClick;
                 if (code == 53)               pressed |= kPadStart;
@@ -322,10 +322,10 @@ void DisplayWindow::poll_events() {
         if (m_impl->key_down[125]) btns |= kPadDown;
         if (m_impl->key_down[123]) btns |= kPadLeft;
         if (m_impl->key_down[124]) btns |= kPadRight;
-        if (m_impl->key_down[49] || m_impl->key_down[36]) btns |= kPadCross;
-        if (m_impl->key_down[51] || m_impl->key_down[8])  btns |= kPadCircle;
-        if (m_impl->key_down[3]  || m_impl->key_down[7])  btns |= kPadSquare;
-        if (m_impl->key_down[14] || m_impl->key_down[15]) btns |= kPadTriangle;
+        if (m_impl->key_down[49] || m_impl->key_down[36] || m_impl->key_down[6]) btns |= kPadCross;
+        if (m_impl->key_down[51] || m_impl->key_down[8]  || m_impl->key_down[7])  btns |= kPadCircle;
+        if (m_impl->key_down[3]  || m_impl->key_down[7]  || m_impl->key_down[8])  btns |= kPadSquare;
+        if (m_impl->key_down[14] || m_impl->key_down[15] || m_impl->key_down[8])  btns |= kPadTriangle;
         if (m_impl->key_down[12] || m_impl->key_down[56]) btns |= kPadL1;
         if (m_impl->key_down[48]) btns |= kPadTouchPadClick;
         if (m_impl->key_down[53]) btns |= kPadStart;

@@ -37,6 +37,7 @@ static bool pm4_verbose() {
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cwctype>
 
 namespace ps4 {
 
@@ -215,6 +216,23 @@ struct FiosFile {
 };
 static std::unordered_map<i32, FiosFile> s_fios_files;
 static i32 s_next_fios_fd = 200;
+
+static std::mutex g_guest_stdio_mtx;
+static std::unordered_set<uintptr_t> g_guest_open_files;
+
+inline FILE* resolve_guest_stream(GuestAddr addr) {
+    if (addr == 0) return nullptr;
+    if (addr == 1 || (addr >= 0x3FF2200ULL && addr < 0x3FF2400ULL)) return stdout;
+    if (addr == 2 || (addr >= 0x3FF2400ULL && addr < 0x3FF2600ULL)) return stderr;
+    if (addr >= 0x3FF2000ULL && addr < 0x3FF2200ULL) return stdin;
+
+    std::lock_guard<std::mutex> lock(g_guest_stdio_mtx);
+    if (g_guest_open_files.contains(static_cast<uintptr_t>(addr))) {
+        return reinterpret_cast<FILE*>(addr);
+    }
+    // Safe fallback for unmapped streams or trampolines: write to stderr rather than crashing host flockfile
+    return stderr;
+}
 
 // PS4_LOG_SEMA=1: log every sceKernelWaitSema/SignalSema (FMOD hits these
 // hundreds of times a second, so they are off by default).
@@ -1777,6 +1795,42 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x3230BAEFBC36C18BULL, "sceKernelUsleep", "libkernel", usleep_handler);
     register_symbol(0xD637D72D15738AC7ULL, "sceKernelUsleep", "libkernel", usleep_handler);
 
+    // nanosleep(const struct timespec* req, struct timespec* rem)
+    // NID: 0xC92F14D931827B50ULL ("yS8U2TGCe1A")
+    register_symbol(0xC92F14D931827B50ULL, "nanosleep", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr req_ptr = ctx.rdi;
+            if (req_ptr > 0x1000 && mem.is_valid_address(req_ptr, 16)) {
+                u64 sec = 0, nsec = 0;
+                mem.read_value(req_ptr, sec);
+                mem.read_value(req_ptr + 8, nsec);
+                const u64 usec = sec * 1'000'000ULL + nsec / 1'000ULL;
+                auto& tm = get_thread_manager(mem);
+                GuestThread* cur_th = tm.current_thread();
+                if (cur_th) {
+                    cur_th->state.store(ThreadState::WaitingSleep);
+                    const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                    cur_th->sleep_until_us.store(now_us + usec);
+                }
+                if (usec > 0) {
+                    std::mutex m;
+                    std::condition_variable cv;
+                    std::unique_lock<std::mutex> lock(m);
+                    SignalWakeScope wake(cv);
+                    cv.wait_for(lock, std::chrono::microseconds(usec), [] { return guest_signal_pending(); });
+                } else {
+                    std::this_thread::yield();
+                }
+                if (cur_th) {
+                    cur_th->sleep_until_us.store(0);
+                    cur_th->state.store(ThreadState::Running);
+                }
+                if (guest_signal_pending()) deliver_guest_exceptions(mem);
+            }
+            ctx.rax = 0;
+        });
+
     // sceKernelVirtualQuery(const void* addr, int flags, void* info, size_t size)
     // NID: 0xAD58D1BC72745FA7ULL ("rVjRvHJ0X6c")
     register_symbol(0xAD58D1BC72745FA7ULL, "sceKernelVirtualQuery", "libkernel",
@@ -2644,6 +2698,36 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = dst;
         });
 
+    // strdup(const char* s)
+    // NID: 0x83BCF3CCB0D81B0DULL ("g7zzzLDYGw0")
+    register_symbol(0x83BCF3CCB0D81B0DULL, "strdup", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr str_addr = ctx.rdi;
+            if (str_addr == 0 || !mem.is_valid_address(str_addr, 1)) {
+                ctx.rax = 0;
+                return;
+            }
+            std::string s;
+            if (!read_guest_cstring(mem, str_addr, s)) {
+                ctx.rax = 0;
+                return;
+            }
+            const usize len = s.size() + 1;
+            const GuestAddr dst = mspace_alloc(len, 16);
+            if (dst != 0) {
+                mem.write_bytes(dst, s.c_str(), len);
+            }
+            ctx.rax = dst;
+        });
+
+    // srand(unsigned int seed)
+    // NID: 0x54F6C9C130A0304DULL ("VPbJwTCgME0")
+    register_symbol(0x54F6C9C130A0304DULL, "srand", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            std::srand(static_cast<unsigned int>(ctx.rdi));
+            ctx.rax = ctx.rdi;
+        });
+
     // strrchr(const char* s, int c) -> last match (the terminator counts), or NULL
     register_symbol(0xF720D63311057495ULL, "strrchr", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
@@ -2873,6 +2957,18 @@ void NidRegistry::register_default_libraries() {
             const i32 r = get_vfs().close(static_cast<i32>(ctx.rdi));
             ctx.rax = r < 0 ? sce_err(r) : 0;
         });
+    register_symbol(0xD7F2C52E6445C713ULL, "sceKernelMkdir", "libkernel",
+        [sce_err](CpuContext& ctx, MemoryManager& mem) {
+            std::string path;
+            if (!read_guest_cstring(mem, ctx.rdi, path)) {
+                ctx.rax = sce_err(-14);
+                return;
+            }
+            const i32 mode = static_cast<i32>(ctx.rsi);
+            const i32 res = get_vfs().mkdir(path, mode);
+            std::fprintf(stderr, "[VFS] sceKernelMkdir('%s', 0%o) -> %d\n", path.c_str(), mode, res);
+            ctx.rax = (res < 0) ? sce_err(res) : SCE_OK;
+        });
     register_symbol(0x0A0E2CAD9E9329B5ULL, "sceKernelRead", "libkernel",
         [sce_err](CpuContext& ctx, MemoryManager& mem) {
             const GuestSize n = ctx.rdx;
@@ -3049,6 +3145,38 @@ void NidRegistry::register_default_libraries() {
         [ctype_tables](CpuContext& ctx, MemoryManager& mem) { ctype_tables(mem); ctx.rax = s_tolower; });
     register_symbol(0xADC40252BD046915ULL, "_Getptoupper", "libc",
         [ctype_tables](CpuContext& ctx, MemoryManager& mem) { ctype_tables(mem); ctx.rax = s_toupper; });
+
+    // _Iswctype(wint_t c, wctype_t desc)
+    // NID: 0x0B25ECDA5FF590D0ULL ("CyXs2l_1kNA")
+    register_symbol(0x0B25ECDA5FF590D0ULL, "_Iswctype", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            const wint_t c = static_cast<wint_t>(ctx.rdi);
+            const u32 desc = static_cast<u32>(ctx.rsi);
+            bool ok = false;
+            if (desc == 6) ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+            else if (desc == 10) ok = (c >= 'A' && c <= 'Z');
+            else if (desc == 2) ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+            else if (desc == 4) ok = (c >= '0' && c <= '9');
+            else if (c < 128) ok = std::iswalnum(c) != 0;
+            ctx.rax = ok ? 1 : 0;
+        });
+
+    // _Towctrans(wint_t c, wctrans_t desc)
+    // NID: 0x0DB12703E327548CULL ("DbEnA+MnVIw")
+    register_symbol(0x0DB12703E327548CULL, "_Towctrans", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            const wint_t c = static_cast<wint_t>(ctx.rdi);
+            const u32 desc = static_cast<u32>(ctx.rsi);
+            wint_t res = c;
+            if (desc == 2) {
+                if (c >= 'A' && c <= 'Z') res = c + ('a' - 'A');
+                else res = std::towlower(c);
+            } else if (desc == 1) {
+                if (c >= 'a' && c <= 'z') res = c - ('a' - 'A');
+                else res = std::towupper(c);
+            }
+            ctx.rax = static_cast<u64>(res);
+        });
 
     // putchar(int c)
     register_symbol(0x9B9C0DF92C19391EULL, "putchar", "libc",
@@ -3398,6 +3526,13 @@ void NidRegistry::register_default_libraries() {
     };
     register_symbol(0xC37A8C8C7F0ED898ULL, "atan2f", "libc", atan2f_handler);
 
+    // atanf(float x)
+    // NID: 0xC1E0EE83C403FE51ULL ("weDug8QD-lE")
+    auto atanf_handler = [](CpuContext& ctx, MemoryManager&) {
+        ctx.ymm[0].f[0] = std::atan(ctx.ymm[0].f[0]);
+    };
+    register_symbol(0xC1E0EE83C403FE51ULL, "atanf", "libc", atanf_handler);
+
     // memcmp(const void* s1, const void* s2, size_t n)
     // NID: 0x0DF8AF3C0AE1B9C8ULL / 0xC8B9E10AC0F38A0DULL ("DfivPArhucg")
     auto memcmp_handler = [](CpuContext& ctx, MemoryManager& mem) {
@@ -3516,6 +3651,10 @@ void NidRegistry::register_default_libraries() {
                 }
             }
             FILE* fp = std::fopen(host_path.c_str(), mode);
+            if (fp) {
+                std::lock_guard<std::mutex> lock(g_guest_stdio_mtx);
+                g_guest_open_files.insert(reinterpret_cast<uintptr_t>(fp));
+            }
             std::fprintf(stderr, "[LIBC fopen] fopen('%s' -> '%s', '%s') -> %p\n", path, host_path.c_str(), mode, static_cast<void*>(fp));
             ctx.rax = reinterpret_cast<u64>(fp);
         });
@@ -3524,7 +3663,7 @@ void NidRegistry::register_default_libraries() {
     // NID: 0xAD0155057A7F0B18ULL
     register_symbol(0xAD0155057A7F0B18ULL, "fseek", "libc",
         [](CpuContext& ctx, MemoryManager&) {
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            FILE* fp = resolve_guest_stream(ctx.rdi);
             const long offset = static_cast<long>(ctx.rsi);
             const int whence = static_cast<int>(ctx.rdx);
             if (!fp) {
@@ -3538,7 +3677,7 @@ void NidRegistry::register_default_libraries() {
     // NID: 0x41ACF2F0B9974EFCULL
     register_symbol(0x41ACF2F0B9974EFCULL, "ftell", "libc",
         [](CpuContext& ctx, MemoryManager&) {
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            FILE* fp = resolve_guest_stream(ctx.rdi);
             if (!fp) {
                 ctx.rax = static_cast<u64>(-1);
                 return;
@@ -3548,6 +3687,33 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = static_cast<u64>(pos);
         });
 
+    // fgetpos(FILE* stream, fpos_t* pos)
+    // NID: 0x48796DEC484EB6A0ULL ("SHlt7EhOtqA")
+    register_symbol(0x48796DEC484EB6A0ULL, "fgetpos", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            FILE* fp = resolve_guest_stream(ctx.rdi);
+            const GuestAddr pos_ptr = ctx.rsi;
+            if (!fp || pos_ptr == 0) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            const long pos = std::ftell(fp);
+            if (pos < 0) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            mem.write_value<u64>(pos_ptr, static_cast<u64>(pos));
+            std::fprintf(stderr, "[LIBC fgetpos] fgetpos(%p) -> %ld\n", static_cast<void*>(fp), pos);
+            ctx.rax = 0;
+        });
+
+    // setvbuf(FILE* stream, char* buf, int mode, size_t size)
+    // NID: 0x40C1722E8A8DC488ULL ("QMFyLoqNxIg")
+    register_symbol(0x40C1722E8A8DC488ULL, "setvbuf", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 0;
+        });
+
     // fread(void* ptr, size_t size, size_t nmemb, FILE* stream)
     // NID: 0x95B07E52566A546DULL
     register_symbol(0x95B07E52566A546DULL, "fread", "libc",
@@ -3555,7 +3721,7 @@ void NidRegistry::register_default_libraries() {
             const GuestAddr dst_addr = ctx.rdi;
             const usize size = ctx.rsi;
             const usize nmemb = ctx.rdx;
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rcx);
+            FILE* fp = resolve_guest_stream(ctx.rcx);
             const usize total_bytes = size * nmemb;
             if (!fp || dst_addr == 0 || total_bytes == 0 || !mem.is_valid_address(dst_addr, total_bytes)) {
                 ctx.rax = 0;
@@ -3572,10 +3738,14 @@ void NidRegistry::register_default_libraries() {
     // NID: 0xBA874B632522A76DULL
     register_symbol(0xBA874B632522A76DULL, "fclose", "libc",
         [](CpuContext& ctx, MemoryManager&) {
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
-            if (!fp) {
-                ctx.rax = static_cast<u64>(-1);
+            FILE* fp = resolve_guest_stream(ctx.rdi);
+            if (!fp || fp == stdin || fp == stdout || fp == stderr) {
+                ctx.rax = 0;
                 return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_guest_stdio_mtx);
+                g_guest_open_files.erase(reinterpret_cast<uintptr_t>(fp));
             }
             std::fprintf(stderr, "[LIBC fclose] fclose(%p)\n", static_cast<void*>(fp));
             ctx.rax = static_cast<u64>(std::fclose(fp));
@@ -4954,6 +5124,45 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
+    // sceAudioOutOutputs(SceAudioOutOutputParam *param, uint32_t num)
+    // NID: 0xC373DD6924D2C061ULL ("w3PdaSTSwGE")
+    register_symbol(0xC373DD6924D2C061ULL, "sceAudioOutOutputs", "libSceAudioOut",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr param_array = ctx.rdi;
+            const u32 num = static_cast<u32>(ctx.rsi);
+            auto& am = get_audio_manager();
+
+            u32 max_grain = 0;
+            u32 sample_rate = 48000;
+
+            for (u32 i = 0; i < num; ++i) {
+                const GuestAddr entry = param_array + (static_cast<GuestSize>(i) * 16);
+                if (!mem.is_valid_address(entry, 16)) break;
+                i32 handle = 0;
+                GuestAddr ptr = 0;
+                mem.read_value(entry + 0, handle);
+                mem.read_value(entry + 8, ptr);
+
+                const u32 grain = am.get_port_grain(handle);
+                sample_rate = am.get_port_sample_rate(handle);
+                if (grain > max_grain) max_grain = grain;
+
+                const usize sample_count = static_cast<usize>(grain) * 2;
+                const usize byte_size = sample_count * sizeof(i16);
+
+                if (ptr != 0 && mem.is_valid_address(ptr, byte_size)) {
+                    if (const auto* pcm = mem.to_host_ptr<i16>(ptr)) {
+                        am.output_samples(handle, std::span<const i16>(pcm, sample_count));
+                    }
+                }
+            }
+
+            if (max_grain == 0) max_grain = 256;
+            thread_local AudioDeadlinePacer s_audio_outs_pacer;
+            s_audio_outs_pacer.pace(max_grain, sample_rate);
+            ctx.rax = SCE_OK;
+        });
+
     // sceAudioOutSetVolume(int32_t handle, int32_t flag, int32_t* vol)
     register_symbol(0x8F596D3C1F4FA286ULL, "sceAudioOutSetVolume", "libaudioout",
         [](CpuContext& ctx, MemoryManager& mem) {
@@ -4990,6 +5199,37 @@ void NidRegistry::register_default_libraries() {
                 }
             }
             ctx.rax = static_cast<u64>(-1);
+        });
+
+    // =========================================================================
+    // libSceAudioIn: Audio Input / Microphone
+    // =========================================================================
+
+    // sceAudioInOpen(int userId, int type, int index, uint32_t param)
+    // NID: 0xE4D13C4A373B542FULL ("5NE8Sjc7VC8")
+    register_symbol(0xE4D13C4A373B542FULL, "sceAudioInOpen", "libSceAudioIn",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 1; // valid audio in handle
+        });
+
+    // sceAudioInInput(int handle, void* dest)
+    // NID: 0x2E8CC4394F3E6A73ULL ("LozEOU8+anM")
+    register_symbol(0x2E8CC4394F3E6A73ULL, "sceAudioInInput", "libSceAudioIn",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dest = ctx.rsi;
+            // Dual channel 16-bit PCM @ 48kHz: 256 samples = 1024 bytes
+            if (dest > 0x1000 && mem.is_valid_address(dest, 1024)) {
+                mem.zero_memory(dest, 1024);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            ctx.rax = 256; // 256 samples read
+        });
+
+    // sceAudioInClose(int handle)
+    // NID: 0x261E966C786723AFULL ("Jh6WbHhnI68")
+    register_symbol(0x261E966C786723AFULL, "sceAudioInClose", "libSceAudioIn",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
         });
 
     // =========================================================================
@@ -5041,6 +5281,34 @@ void NidRegistry::register_default_libraries() {
                 }
             }
             ctx.rax = static_cast<u64>(-14);
+        });
+
+    // sceSaveDataInitialize3(const void* param)
+    // NID: 0x4F2C2B14A0A82C66ULL ("TywrFKCoLGY")
+    register_symbol(0x4F2C2B14A0A82C66ULL, "sceSaveDataInitialize3", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataSetParam(const void* param)
+    // NID: 0xF39CEE97FFDE197BULL ("85zul--eGXs")
+    register_symbol(0xF39CEE97FFDE197BULL, "sceSaveDataSetParam", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataDelete(const void* param)
+    // NID: 0x4B51A478F235EF34ULL ("S1GkePI17zQ")
+    register_symbol(0x4B51A478F235EF34ULL, "sceSaveDataDelete", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataCheck(const void* param)
+    // NID: 0xEB9547D1069ACFABULL ("65VH0Qaaz6s")
+    register_symbol(0xEB9547D1069ACFABULL, "sceSaveDataCheck", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
         });
 
     // sceSaveDataUmount(const SceSaveDataMountResult* result)
@@ -5956,6 +6224,22 @@ void NidRegistry::register_default_libraries() {
     // NID: 0x0818AEE26084D430ULL ("CBiu4mCE1DA")
     register_symbol(0x0818AEE26084D430ULL, "sceVideoOutSetFlipRate", "libSceVideoOut",
         [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+
+    // sceVideoOutGetVblankStatus(int handle, SceVideoOutVblankStatus *status)
+    // NID: 0xD456412B2F0778D5ULL ("1FZBKy8HeNU")
+    register_symbol(0xD456412B2F0778D5ULL, "sceVideoOutGetVblankStatus", "libSceVideoOut",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr status_ptr = ctx.rsi;
+            if (status_ptr != 0 && mem.is_valid_address(status_ptr, 16)) {
+                using clock = std::chrono::steady_clock;
+                static const auto s_epoch = clock::now();
+                const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - s_epoch).count();
+                const u64 vblank_count = static_cast<u64>(elapsed_us / 16666ULL);
+                mem.write_value<u64>(status_ptr, vblank_count);
+                mem.write_value<u64>(status_ptr + 8, static_cast<u64>(elapsed_us));
+            }
             ctx.rax = SCE_OK;
         });
 
@@ -8247,6 +8531,54 @@ void NidRegistry::register_default_libraries() {
             ctx.ymm[0].d[0] = std::strtod(text.c_str(), &end);
             store_end_pointer(mem, ctx.rsi, ctx.rdi, text, end);
         });
+    // atof(const char* s): converts string to double in XMM0
+    register_symbol(0x49123A4BD07EFDAEULL, "atof", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string text;
+            if (read_guest_cstring(mem, ctx.rdi, text)) {
+                ctx.ymm[0].d[0] = std::strtod(text.c_str(), nullptr);
+            } else {
+                ctx.ymm[0].d[0] = 0.0;
+            }
+        });
+    // __error(): returns pointer to errno in guest memory
+    register_symbol(0xF41703CA43E6A352ULL, "__error", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            constexpr GuestAddr GUEST_ERRNO_ADDR = 0x3FF2000ULL;
+            mem.write_value<int>(GUEST_ERRNO_ADDR, 0);
+            ctx.rax = GUEST_ERRNO_ADDR;
+        });
+
+    // sceNpTrophy
+    register_symbol(0x5DB9236E86D99426ULL, "sceNpTrophyCreateContext", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rdi, sizeof(int))) {
+                mem.write_value<int>(ctx.rdi, 1);
+            }
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0xABB53AB440107FB7ULL, "sceNpTrophyCreateHandle", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rdi, sizeof(int))) {
+                mem.write_value<int>(ctx.rdi, 1);
+            }
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x4C9080C6DA3D4845ULL, "sceNpTrophyRegisterContext", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x18D705E2889D6346ULL, "sceNpTrophyDestroyHandle", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x2C7B9298EDD22DDFULL, "sceNpTrophyGetTrophyUnlockState", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rcx, sizeof(u32))) {
+                mem.write_value<u32>(ctx.rcx, 0);
+            }
+            ctx.rax = SCE_OK;
+        });
     // _Stoll(const char* s, char** endptr, int base): strtoll with the end pointer.
     register_symbol(0xEE934A72C70AADFFULL, "_Stoll", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
@@ -8257,10 +8589,96 @@ void NidRegistry::register_default_libraries() {
             store_end_pointer(mem, ctx.rsi, ctx.rdi, text, end);
             ctx.rax = static_cast<u64>(v);
         });
+
+    // ldiv(long numer, long denom): returns ldiv_t in RAX (quot) and RDX (rem) (AMD64 ABI)
+    // NID: 0x81F3F48A6E59DE0DULL ("gfP0im5Z3g0")
+    register_symbol(0x81F3F48A6E59DE0DULL, "ldiv", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            const i64 numer = static_cast<i64>(ctx.rdi);
+            const i64 denom = static_cast<i64>(ctx.rsi);
+            if (denom == 0) {
+                ctx.rax = 0;
+                ctx.rdx = 0;
+                return;
+            }
+            const auto res = std::ldiv(numer, denom);
+            ctx.rax = static_cast<u64>(res.quot);
+            ctx.rdx = static_cast<u64>(res.rem);
+        });
+
+    // lldiv(long long numer, long long denom): returns lldiv_t in RAX (quot) and RDX (rem)
+    // NID: 0x89584966F00ED9A4ULL ("iViJ7vAO2aQ")
+    register_symbol(0x89584966F00ED9A4ULL, "lldiv", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            const i64 numer = static_cast<i64>(ctx.rdi);
+            const i64 denom = static_cast<i64>(ctx.rsi);
+            if (denom == 0) {
+                ctx.rax = 0;
+                ctx.rdx = 0;
+                return;
+            }
+            const auto res = std::lldiv(numer, denom);
+            ctx.rax = static_cast<u64>(res.quot);
+            ctx.rdx = static_cast<u64>(res.rem);
+        });
+
+    // div(int numer, int denom): returns div_t packed in RAX (quot in bits 0..31, rem in bits 32..63)
+    // NID: 0xDA06DC96D937B301ULL ("2gD286L3B24")
+    register_symbol(0xDA06DC96D937B301ULL, "div", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            const i32 numer = static_cast<i32>(ctx.rdi);
+            const i32 denom = static_cast<i32>(ctx.rsi);
+            if (denom == 0) {
+                ctx.rax = 0;
+                return;
+            }
+            const auto res = std::div(numer, denom);
+            ctx.rax = (static_cast<u64>(static_cast<u32>(res.rem)) << 32) | static_cast<u32>(res.quot);
+        });
     register_symbol(0xA4AC2C96C3149929ULL, "fmod", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::fmod(ctx.ymm[0].d[0], ctx.ymm[1].d[0]); });
     register_symbol(0xF3C56FFC0CC7563FULL, "fmodf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::fmod(ctx.ymm[0].f[0], ctx.ymm[1].f[0]); });
+    register_symbol(0xADC56FE62BCC858DULL, "lrintf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::lrint(ctx.ymm[0].f[0])); });
+    register_symbol(0x54E28E811ECBFF66ULL, "lrint", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::lrint(ctx.ymm[0].d[0])); });
+    register_symbol(0x28FB10034A62B3CAULL, "llrintf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::llrint(ctx.ymm[0].f[0])); });
+    register_symbol(0xFF8DF503F601024BULL, "llrint", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::llrint(ctx.ymm[0].d[0])); });
+    register_symbol(0x0BA81609624A33E5ULL, "lroundf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::lround(ctx.ymm[0].f[0])); });
+    register_symbol(0x2775EE192FDC0B44ULL, "lround", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::lround(ctx.ymm[0].d[0])); });
+    register_symbol(0x7908411674CEA78DULL, "llroundf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::llround(ctx.ymm[0].f[0])); });
+    register_symbol(0xC3F06F5C5E0EEB1AULL, "llround", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::llround(ctx.ymm[0].d[0])); });
+    register_symbol(0x0C31C6D5AEBEDEADULL, "roundf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::round(ctx.ymm[0].f[0]); });
+    register_symbol(0x9E56A88CBF610ED0ULL, "round", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::round(ctx.ymm[0].d[0]); });
+    register_symbol(0x98A8550E661C8960ULL, "floorf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::floor(ctx.ymm[0].f[0]); });
+    register_symbol(0x9A971380CCE1518FULL, "floor", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::floor(ctx.ymm[0].d[0]); });
+    register_symbol(0x18052E2CA1A1B02CULL, "ceilf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::ceil(ctx.ymm[0].f[0]); });
+    register_symbol(0x81A71F3A63BC84DBULL, "ceil", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::ceil(ctx.ymm[0].d[0]); });
+    register_symbol(0x568F2BBD6B59C378ULL, "truncf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::trunc(ctx.ymm[0].f[0]); });
+    register_symbol(0x6B880B1ACA4F1033ULL, "trunc", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::trunc(ctx.ymm[0].d[0]); });
+    register_symbol(0xAB95B3B9CC954A43ULL, "rintf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::rint(ctx.ymm[0].f[0]); });
+    register_symbol(0x2F11886182B02987ULL, "rint", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::rint(ctx.ymm[0].d[0]); });
+    register_symbol(0x73EE2BFD3FED1087ULL, "nearbyintf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::nearbyint(ctx.ymm[0].f[0]); });
+    register_symbol(0x7092D3C2D2865C99ULL, "nearbyint", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::nearbyint(ctx.ymm[0].d[0]); });
     // modf(double x, double* iptr): integer part to *iptr, fraction returned.
     register_symbol(0xD163070DBE43B7DEULL, "modf", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
@@ -8444,12 +8862,10 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // stdio on host FILE pointers: fopen hands the guest a host FILE*, so these
-    // pass it straight through. A NULL stream (an unresolved _Stdout/_Stderr data
-    // import) fails with EOF or 0 rather than writing somewhere else.
+    // stdio on host and guest FILE pointers:
     register_symbol(0x42B659749F17B17DULL, "fputs", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rsi);
+            FILE* fp = resolve_guest_stream(ctx.rsi);
             std::string text;
             if (!fp || !read_guest_cstring(mem, ctx.rdi, text)) {
                 ctx.rax = static_cast<u64>(-1);
@@ -8459,7 +8875,7 @@ void NidRegistry::register_default_libraries() {
         });
     register_symbol(0x6992BC94D7A2FD0CULL, "fputc", "libc",
         [](CpuContext& ctx, MemoryManager&) {
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rsi);
+            FILE* fp = resolve_guest_stream(ctx.rsi);
             ctx.rax = fp ? static_cast<u64>(static_cast<i64>(std::fputc(static_cast<int>(ctx.rdi), fp)))
                          : static_cast<u64>(-1);
         });
@@ -8469,7 +8885,7 @@ void NidRegistry::register_default_libraries() {
             const GuestAddr src = ctx.rdi;
             const GuestSize size = ctx.rsi;
             const GuestSize n = ctx.rdx;
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rcx);
+            FILE* fp = resolve_guest_stream(ctx.rcx);
             ctx.rax = 0;
             if (!fp || size == 0 || n == 0 || size > (GuestSize{1} << 32) || n > (GuestSize{1} << 32)) return;
             if (!mem.is_valid_address(src, size * n)) return;
@@ -8478,7 +8894,7 @@ void NidRegistry::register_default_libraries() {
     // fprintf(FILE* stream, const char* fmt, ...)
     register_symbol(0x7DF7F010B5CD5450ULL, "fprintf", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            FILE* fp = resolve_guest_stream(ctx.rdi);
             std::string fmt;
             if (!fp || !read_guest_cstring(mem, ctx.rsi, fmt)) {
                 ctx.rax = static_cast<u64>(-1);
@@ -8492,7 +8908,7 @@ void NidRegistry::register_default_libraries() {
     // vfprintf(FILE* stream, const char* fmt, va_list ap)
     register_symbol(0xA43043718EAE2D20ULL, "vfprintf", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            FILE* fp = resolve_guest_stream(ctx.rdi);
             std::string fmt;
             if (!fp || !read_guest_cstring(mem, ctx.rsi, fmt)) {
                 ctx.rax = static_cast<u64>(-1);
@@ -8508,7 +8924,7 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr dst = ctx.rdi;
             const int n = static_cast<int>(ctx.rsi);
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rdx);
+            FILE* fp = resolve_guest_stream(ctx.rdx);
             ctx.rax = 0;
             if (!fp || n <= 0 || !mem.is_valid_address(dst, static_cast<GuestSize>(n))) return;
             std::vector<char> line(static_cast<usize>(n));
@@ -8519,7 +8935,7 @@ void NidRegistry::register_default_libraries() {
     // ferror(FILE* stream): a NULL stream counts as failed.
     register_symbol(0x007C7284DF7A772EULL, "ferror", "libc",
         [](CpuContext& ctx, MemoryManager&) {
-            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            FILE* fp = resolve_guest_stream(ctx.rdi);
             ctx.rax = fp ? static_cast<u64>(std::ferror(fp) != 0) : 1;
         });
 
@@ -8583,6 +8999,7 @@ void NidRegistry::register_default_libraries() {
         {0xD9BDDE84CE9A1E02ULL, 0x6FAE042D5030EB68ULL}, // sceAudioOutGetPortInfo
         {0x948296238BC4F301ULL, 0xDF61D0010770336AULL}, // sceSaveDataMount
         {0x32791B317075AB6EULL, 0x04C47817F51E9371ULL}, // sceSaveDataUmount
+        {0x948296238BC4F301ULL, 0xD33E393C81FE48D2ULL}, // sceSaveDataMount (0z45PIH+SNI)
     };
     for (const auto& n : kRealNids) {
         if (m_symbols_by_nid.count(n.real)) continue;

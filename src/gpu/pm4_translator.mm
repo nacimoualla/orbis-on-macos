@@ -2231,6 +2231,16 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                         PM4_LOG("[PM4] IT_NOP (tag=0x%08x, len=%zu): [%s]\n",
                                      tag, packet.payload.size(), dwords_str.c_str());
 
+                        // Handle Gnm flip label write embedded in NOP packet (e.g. 0x68750778)
+                        if (packet.payload.size() >= 4 && ((tag & 0xFFFF0000) == 0x68750000)) {
+                            const GuestAddr label_addr = (static_cast<u64>(packet.payload[2]) << 32) | packet.payload[1];
+                            const u32 val = packet.payload[3];
+                            if (label_addr > 0x1000 && m_impl->memory && m_impl->memory->is_valid_address(label_addr, sizeof(u32))) {
+                                m_impl->memory->write_value(label_addr, val);
+                                PM4_LOG("[PM4] IT_NOP flip label write: *0x%llx = %u\n", (unsigned long long)label_addr, val);
+                            }
+                        }
+
                         // Scan for potential 64-bit GPU base addresses in payload
                         for (size_t d = 0; d + 1 < packet.payload.size(); ++d) {
                             const u64 addr = (static_cast<u64>(packet.payload[d + 1]) << 32) | packet.payload[d];

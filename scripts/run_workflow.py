@@ -7,6 +7,7 @@ Unified developer automation script for ps4-to-macos:
 - Running CTest test suites with phase filtering & failure log extraction
 - Discovering and launching PS4 games (Flappy Bird, etc.) via ps4-runner or ps4-gui
 - Inspecting recent crash logs, error analysis, and log collection
+- Extracting PS4 games from PKG files & archives (.zip/.7z/.rar)
 - Interactive terminal menu for quick everyday actions
 
 Usage:
@@ -14,6 +15,7 @@ Usage:
     python3 scripts/run_workflow.py build [options]  # Build targets
     python3 scripts/run_workflow.py test [options]   # Run CTest / Python tests
     python3 scripts/run_workflow.py run [options]    # Launch game (alias: game)
+    python3 scripts/run_workflow.py extract [target] # Extract PKG / archives
     python3 scripts/run_workflow.py logs [options]   # Logs / diagnostics
     python3 scripts/run_workflow.py clean           # Clean build artifacts
     python3 scripts/run_workflow.py all [options]    # Full pipeline: Build -> Test -> Run
@@ -28,6 +30,14 @@ import re
 import time
 import shutil
 from typing import List, Dict, Optional, Tuple
+
+try:
+    from extract_games import extract_game_target, inspect_pkg, is_already_extracted, extract_pkg
+except ImportError:
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from extract_games import extract_game_target, inspect_pkg, is_already_extracted, extract_pkg
 
 
 # ==============================================================================
@@ -492,20 +502,48 @@ class GameRunner:
             return False
 
         if game_path.lower().endswith(".pkg"):
-            # Check if there is an extracted game available
+            from pathlib import Path
+            abs_pkg = os.path.abspath(os.path.join(self.root_dir, game_path)) if not os.path.isabs(game_path) else game_path
             pkg_name = os.path.basename(game_path)
             extracted = None
+
+            # 1. Inspect PKG and match against existing extracted games
+            info = inspect_pkg(Path(abs_pkg))
+            cid = info.get("content_id", "")
+            tid = info.get("title_id", "")
+            title = info.get("title", "")
+
             for g in self.discover_games():
-                if "flappy" in pkg_name.lower() or "npxx51374" in pkg_name.lower() or "npxx51362" in pkg_name.lower():
-                    if "flappy" in g["path"].lower():
-                        extracted = g["path"]
-                        break
+                g_path_lower = g["path"].lower()
+                if cid and cid.lower() in g_path_lower:
+                    extracted = g["path"]
+                    break
+                if tid and tid.lower() in g_path_lower:
+                    extracted = g["path"]
+                    break
+                if title and title.lower() in g["title"].lower():
+                    extracted = g["path"]
+                    break
+                if "flappy" in pkg_name.lower() and "flappy" in g_path_lower:
+                    extracted = g["path"]
+                    break
+
+            # 2. If not yet extracted, auto-extract it
+            if not extracted:
+                ui.info(f"Package '{game_path}' not yet extracted. Auto-extracting...")
+                extracted_dir = extract_pkg(Path(abs_pkg), Path(self.root_dir) / "games")
+                if extracted_dir:
+                    eboot_candidate = extracted_dir / "eboot.elf"
+                    if not eboot_candidate.is_file():
+                        eboot_candidate = extracted_dir / "eboot.bin"
+                    if eboot_candidate.is_file():
+                        extracted = os.path.relpath(eboot_candidate, self.root_dir)
+
             if extracted:
                 ui.info(f"Package '{game_path}' resolved to unpacked binary: {extracted}")
                 game_path = extracted
             else:
-                ui.fail(f"'{game_path}' is an unpacked PKG archive container.")
-                ui.info("ps4-runner requires an extracted game folder with eboot.elf or eboot.bin.")
+                ui.fail(f"Could not extract or resolve package container: {game_path}")
                 return False
 
         # Build runner flags
@@ -664,6 +702,58 @@ class DiagnosticsManager:
 
 
 # ==============================================================================
+# Game Extractor Subsystem (PKG / Archives)
+# ==============================================================================
+
+class GameExtractorManager:
+    """Manages extraction of PKG files and archives (ZIP/7z/RAR) into runnable titles."""
+
+    def __init__(self, root_dir: str):
+        self.root_dir = root_dir
+        self.games_dir = os.path.join(root_dir, "games")
+
+    def extract(
+        self,
+        target: Optional[str] = None,
+        password: str = "SuperPSX",
+        force: bool = False,
+        output_dir: Optional[str] = None,
+    ) -> List[str]:
+        """Extract a PKG file, archive, or all games in target directory."""
+        from pathlib import Path
+        ui.header("Extracting PS4 Games & Archives")
+
+        target_path = Path(target) if target else Path(self.games_dir)
+        if not target_path.is_absolute():
+            target_path = Path(self.root_dir) / target_path
+
+        out_path = Path(output_dir) if output_dir else Path(self.games_dir)
+        if not out_path.is_absolute():
+            out_path = Path(self.root_dir) / out_path
+
+        ui.info(f"Target: {os.path.relpath(target_path, self.root_dir) if target_path.is_relative_to(self.root_dir) else target_path}")
+        ui.info(f"Output Directory: {os.path.relpath(out_path, self.root_dir) if out_path.is_relative_to(self.root_dir) else out_path}")
+        ui.info(f"Archive Password: {password}")
+
+        results = extract_game_target(
+            target=target_path,
+            games_dir=out_path,
+            password=password,
+            force=force,
+        )
+
+        ui.section("Extraction Results")
+        if results:
+            for r in results:
+                rel = os.path.relpath(r, self.root_dir) if r.is_relative_to(self.root_dir) else str(r)
+                ui.success(f"Game Ready: {r.name} ({rel})")
+        else:
+            ui.info("No new games were extracted.")
+
+        return [str(r) for r in results]
+
+
+# ==============================================================================
 # Interactive Terminal Menu
 # ==============================================================================
 
@@ -676,6 +766,7 @@ class InteractiveMenu:
         self.tester = TestManager(root_dir)
         self.runner = GameRunner(root_dir)
         self.diagnostics = DiagnosticsManager(root_dir)
+        self.extractor = GameExtractorManager(root_dir)
 
     def run(self):
         """Display the interactive loop."""
@@ -687,11 +778,12 @@ class InteractiveMenu:
             print(f"  {ui.BOLD}[4]{ui.RESET} Launch Game / App (Flappy Bird or custom eboot)")
             print(f"  {ui.BOLD}[5]{ui.RESET} Inspect / Collect Diagnostics & Logs")
             print(f"  {ui.BOLD}[6]{ui.RESET} Clean Build Artifacts")
+            print(f"  {ui.BOLD}[7]{ui.RESET} Extract Games (Unpack PKGs / Archives, password: SuperPSX)")
             print(f"  {ui.BOLD}[q]{ui.RESET} Exit")
             print(f"{ui.CYAN}{'─' * 64}{ui.RESET}")
 
             try:
-                choice = input(f"{ui.BOLD}Select an option [1-6, q]: {ui.RESET}").strip().lower()
+                choice = input(f"{ui.BOLD}Select an option [1-7, q]: {ui.RESET}").strip().lower()
             except (KeyboardInterrupt, EOFError):
                 print("\nExiting.")
                 break
@@ -711,8 +803,10 @@ class InteractiveMenu:
                 self._menu_diagnostics()
             elif choice == "6":
                 self.builder.clean()
+            elif choice == "7":
+                self._menu_extract()
             else:
-                ui.warn("Invalid choice, please select 1-6 or q.")
+                ui.warn("Invalid choice, please select 1-7 or q.")
 
             input(f"\n{ui.DIM}Press Enter to return to the menu...{ui.RESET}")
 
@@ -799,6 +893,22 @@ class InteractiveMenu:
             idx = int(sub) if (sub.isdigit() and 1 <= int(sub) <= len(logs)) else 1
             self.diagnostics.inspect_log(logs[idx - 1][0])
 
+    def _menu_extract(self):
+        ui.section("Extract Games & Archives")
+        print("  [1] Extract all new games in games/ folder (password: SuperPSX)")
+        print("  [2] Extract specific PKG or archive file")
+        print("  [3] Force re-extract all games")
+        sub = input("Select extract option [1-3, Enter=1]: ").strip()
+        if sub == "2":
+            target = input("Enter path to PKG or archive: ").strip()
+            if target:
+                pwd = input("Archive password [default: SuperPSX]: ").strip() or "SuperPSX"
+                self.extractor.extract(target=target, password=pwd)
+        elif sub == "3":
+            self.extractor.extract(force=True)
+        else:
+            self.extractor.extract()
+
 
 # ==============================================================================
 # Pipeline Execution (All)
@@ -876,6 +986,13 @@ def main():
     p_logs.add_argument("--inspect", "-i", type=str, default=None, help="Inspect specific log file for errors")
     p_logs.add_argument("--collect", "-c", action="store_true", help="Run PM4 log collector script")
 
+    # --- Extract subcommand ---
+    p_extract = subparsers.add_parser("extract", aliases=["unpack"], help="Extract PS4 PKG games and archives")
+    p_extract.add_argument("target", nargs="?", default=None, help="Path to PKG, archive (.zip/.7z/.rar), or directory (default: games/)")
+    p_extract.add_argument("--password", "-p", default="SuperPSX", help="Password for encrypted archives (default: SuperPSX)")
+    p_extract.add_argument("--force", "-f", action="store_true", help="Force re-extraction of already extracted games")
+    p_extract.add_argument("--output-dir", "-o", default=None, help="Custom output directory")
+
     # --- Clean subcommand ---
     subparsers.add_parser("clean", help="Clean build artifacts")
 
@@ -952,6 +1069,16 @@ def main():
             if recent:
                 print("\nTo inspect a log file for crash signatures:")
                 print(f"  python3 scripts/run_workflow.py logs --inspect {os.path.relpath(recent[0][0], root_dir)}")
+
+    elif args.command in ("extract", "unpack"):
+        extractor = GameExtractorManager(root_dir)
+        results = extractor.extract(
+            target=args.target,
+            password=args.password,
+            force=args.force,
+            output_dir=args.output_dir,
+        )
+        sys.exit(0)
 
     elif args.command == "clean":
         builder = BuildManager(root_dir)
