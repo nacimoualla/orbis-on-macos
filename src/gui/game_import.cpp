@@ -1,4 +1,5 @@
 #include "ps4/game_import.hpp"
+#include "ps4/sfo.hpp"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -110,6 +111,25 @@ void walk(const std::string& dir, int depth, std::vector<GameEntry>& out) {
         g.eboot = eboot;
         g.status = status;
         g.total_bytes = dir_size(dir, g.file_count);
+
+        // Check for sce_sys/param.sfo
+        const std::string sfo_path = dir + "/sce_sys/param.sfo";
+        std::unordered_map<std::string, SfoEntry> sfo_entries;
+        if (SfoParser::parse_file(sfo_path, sfo_entries)) {
+            g.name = SfoParser::get_string(sfo_entries, "TITLE", g.id);
+            g.title_id = SfoParser::get_string(sfo_entries, "TITLE_ID", "");
+            g.app_ver = SfoParser::get_string(sfo_entries, "APP_VER", "01.00");
+        } else {
+            g.name = g.id;
+            g.app_ver = "01.00";
+        }
+
+        // Check for sce_sys/icon0.png
+        const std::string icon_path = dir + "/sce_sys/icon0.png";
+        if (is_file(icon_path)) {
+            g.icon_path = icon_path;
+        }
+
         out.push_back(std::move(g));
         return;
     }

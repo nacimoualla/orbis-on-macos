@@ -335,18 +335,19 @@ int main(int argc, char* argv[]) {
                 const auto t_start = std::chrono::steady_clock::now();
                 while (window->is_open() && !guest_done.load()) {
                     window->poll_events();
-                    ps4::u32 buttons = window->input_buttons();
+                    ps4::PadState pad_state = window->input_pad_state();
                     if (s_auto_press > 0) {
                         const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-                        if (t > s_auto_press && std::fmod(t, s_auto_press) < 0.1) buttons |= 0x4000 | 0x100000;
+                        if (t > s_auto_press && std::fmod(t, s_auto_press) < 0.1) pad_state.buttons |= 0x4000 | 0x100000;
                     }
                     // PS4_AUTO_MOVE=1: hold d-pad right for 2 s, then left for 1 s, repeating.
                     static const bool s_auto_move = std::getenv("PS4_AUTO_MOVE") != nullptr;
                     if (s_auto_move) {
                         const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-                        buttons |= std::fmod(t, 3.0) < 2.0 ? 0x20 : 0x80;
+                        pad_state.buttons |= std::fmod(t, 3.0) < 2.0 ? 0x20 : 0x80;
                     }
-                    nid_registry.set_pad_buttons(buttons);
+                    nid_registry.set_pad_state(pad_state);
+                    nid_registry.set_mouse_state(window->input_mouse_state());
                     const ps4::u64 ready = frames_ready.load(std::memory_order_acquire);
                     if (ready != presented) {
                         presented = ready;

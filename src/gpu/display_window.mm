@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include "ps4/display_window.hpp"
+#include <algorithm>
 #include <iostream>
 
 namespace {
@@ -67,6 +68,11 @@ struct DisplayWindow::Impl {
     NSWindow* window{nil};
     CAMetalLayer* metal_layer{nil};
     PS4WindowDelegate* delegate{nil};
+    PadState active_pad_state{};
+    mutable MouseState active_mouse_state{};
+    bool key_down[512]{false};
+    bool mouse_left_down{false};
+    bool mouse_right_down{false};
     u32 buttons{0};
     // Buttons pressed since the last input_buttons() query: a click whose
     // down and up arrive in the same event batch would otherwise never be seen.
@@ -196,36 +202,144 @@ void DisplayWindow::poll_events() {
                                                   dequeue:YES];
             if (!event) break;
 
-            // Close on Escape key (keyCode 53)
-            if ([event type] == NSEventTypeKeyDown && [event keyCode] == 53) {
-                close();
-                break;
+            const NSEventType eventType = [event type];
+
+            // Close on Command+W (keyCode 13) or Command+Q (keyCode 12)
+            if (eventType == NSEventTypeKeyDown) {
+                const unsigned short code = [event keyCode];
+                const NSEventModifierFlags flags = [event modifierFlags];
+                if ((flags & NSEventModifierFlagCommand) && (code == 13 || code == 12)) {
+                    close();
+                    break;
+                }
             }
 
-            // Map Space bar (keyCode 49), Enter (keyCode 36), or Left Click / Touch to PS4 Cross
-            // (0x4000) plus a touch-pad press (0x100000): games that say "touch pad to start"
-            // read the touch pad, others read Cross.
-            constexpr u32 PS4_BUTTON_CROSS = 0x4000 | 0x100000;
-            if ([event type] == NSEventTypeKeyDown) {
+            if (eventType == NSEventTypeKeyDown) {
                 const unsigned short code = [event keyCode];
-                if (code == 49 || code == 36 || code == 126 /* Up */ || code == 124 /* Right */) {
-                    m_impl->buttons |= PS4_BUTTON_CROSS;
-                    m_impl->pressed_latch |= PS4_BUTTON_CROSS;
+                if (code < 512) {
+                    m_impl->key_down[code] = true;
                 }
-            } else if ([event type] == NSEventTypeKeyUp) {
+
+                u32 pressed = 0;
+                if (code == 49 || code == 36) pressed |= kPadCross;
+                if (code == 51 || code == 8)  pressed |= kPadCircle;
+                if (code == 3  || code == 7)  pressed |= kPadSquare;
+                if (code == 14 || code == 15) pressed |= kPadTriangle;
+                if (code == 12)               pressed |= kPadL1;
+                if (code == 48)               pressed |= kPadTouchPadClick;
+                if (code == 53)               pressed |= kPadStart;
+                if (code == 126)              pressed |= kPadUp;
+                if (code == 125)              pressed |= kPadDown;
+                if (code == 123)              pressed |= kPadLeft;
+                if (code == 124)              pressed |= kPadRight;
+                m_impl->pressed_latch |= pressed;
+            } else if (eventType == NSEventTypeKeyUp) {
                 const unsigned short code = [event keyCode];
-                if (code == 49 || code == 36 || code == 126 || code == 124) {
-                    m_impl->buttons &= ~PS4_BUTTON_CROSS;
+                if (code < 512) {
+                    m_impl->key_down[code] = false;
                 }
-            } else if ([event type] == NSEventTypeLeftMouseDown) {
-                m_impl->buttons |= PS4_BUTTON_CROSS;
-                m_impl->pressed_latch |= PS4_BUTTON_CROSS;
-            } else if ([event type] == NSEventTypeLeftMouseUp) {
-                m_impl->buttons &= ~PS4_BUTTON_CROSS;
+            } else if (eventType == NSEventTypeFlagsChanged) {
+                const unsigned short code = [event keyCode];
+                const NSEventModifierFlags flags = [event modifierFlags];
+                if (code == 56) { // Left Shift -> kPadL1
+                    const bool shift_down = (flags & NSEventModifierFlagShift) != 0;
+                    m_impl->key_down[56] = shift_down;
+                    if (shift_down) {
+                        m_impl->pressed_latch |= kPadL1;
+                    }
+                }
+            } else if (eventType == NSEventTypeMouseMoved ||
+                       eventType == NSEventTypeLeftMouseDragged ||
+                       eventType == NSEventTypeRightMouseDragged ||
+                       eventType == NSEventTypeOtherMouseDragged) {
+                m_impl->active_mouse_state.delta_x += static_cast<i32>([event deltaX]);
+                m_impl->active_mouse_state.delta_y += static_cast<i32>([event deltaY]);
+            } else if (eventType == NSEventTypeScrollWheel) {
+                m_impl->active_mouse_state.wheel += static_cast<i32>([event scrollingDeltaY]);
+            } else if (eventType == NSEventTypeLeftMouseDown) {
+                m_impl->mouse_left_down = true;
+                m_impl->active_pad_state.touch_down = true;
+                m_impl->active_mouse_state.buttons |= 1;
+                m_impl->pressed_latch |= (kPadCross | kPadTouchPadClick);
+            } else if (eventType == NSEventTypeLeftMouseUp) {
+                m_impl->mouse_left_down = false;
+                m_impl->active_pad_state.touch_down = false;
+                m_impl->active_mouse_state.buttons &= ~1;
+            } else if (eventType == NSEventTypeRightMouseDown) {
+                m_impl->mouse_right_down = true;
+                m_impl->active_mouse_state.buttons |= 2;
+                m_impl->pressed_latch |= kPadCircle;
+            } else if (eventType == NSEventTypeRightMouseUp) {
+                m_impl->mouse_right_down = false;
+                m_impl->active_mouse_state.buttons &= ~2;
+            } else if (eventType == NSEventTypeOtherMouseDown) {
+                m_impl->active_mouse_state.buttons |= 4;
+            } else if (eventType == NSEventTypeOtherMouseUp) {
+                m_impl->active_mouse_state.buttons &= ~4;
+            }
+
+            // Map mouse coordinates in the window to capacitive touchpad bounds [0..1920, 0..943]
+            if (eventType == NSEventTypeMouseMoved ||
+                eventType == NSEventTypeLeftMouseDragged ||
+                eventType == NSEventTypeRightMouseDragged ||
+                eventType == NSEventTypeOtherMouseDragged ||
+                eventType == NSEventTypeLeftMouseDown ||
+                eventType == NSEventTypeRightMouseDown ||
+                eventType == NSEventTypeOtherMouseDown) {
+                if (m_impl->window) {
+                    NSView* cv = [m_impl->window contentView];
+                    if (cv) {
+                        const NSRect bounds = cv.bounds;
+                        if (bounds.size.width > 0 && bounds.size.height > 0) {
+                            const NSPoint loc = [event locationInWindow];
+                            const CGFloat rx = std::clamp(loc.x / bounds.size.width, 0.0, 1.0);
+                            const CGFloat ry = std::clamp((bounds.size.height - loc.y) / bounds.size.height, 0.0, 1.0);
+                            m_impl->active_pad_state.touch_x = static_cast<u16>(rx * 1920.0);
+                            m_impl->active_pad_state.touch_y = static_cast<u16>(ry * 943.0);
+                        }
+                    }
+                }
             }
 
             [NSApp sendEvent:event];
         }
+
+        // Recompute sticks from WASD
+        u8 lx = 128;
+        if (m_impl->key_down[0] && !m_impl->key_down[2]) lx = 0;        // A (Left)
+        else if (m_impl->key_down[2] && !m_impl->key_down[0]) lx = 255; // D (Right)
+
+        u8 ly = 128;
+        if (m_impl->key_down[13] && !m_impl->key_down[1]) ly = 0;       // W (Up)
+        else if (m_impl->key_down[1] && !m_impl->key_down[13]) ly = 255;// S (Down)
+
+        m_impl->active_pad_state.lx = lx;
+        m_impl->active_pad_state.ly = ly;
+
+        // Recompute buttons mask
+        u32 btns = 0;
+        if (m_impl->key_down[126]) btns |= kPadUp;
+        if (m_impl->key_down[125]) btns |= kPadDown;
+        if (m_impl->key_down[123]) btns |= kPadLeft;
+        if (m_impl->key_down[124]) btns |= kPadRight;
+        if (m_impl->key_down[49] || m_impl->key_down[36]) btns |= kPadCross;
+        if (m_impl->key_down[51] || m_impl->key_down[8])  btns |= kPadCircle;
+        if (m_impl->key_down[3]  || m_impl->key_down[7])  btns |= kPadSquare;
+        if (m_impl->key_down[14] || m_impl->key_down[15]) btns |= kPadTriangle;
+        if (m_impl->key_down[12] || m_impl->key_down[56]) btns |= kPadL1;
+        if (m_impl->key_down[48]) btns |= kPadTouchPadClick;
+        if (m_impl->key_down[53]) btns |= kPadStart;
+
+        if (m_impl->mouse_left_down) {
+            btns |= (kPadCross | kPadTouchPadClick);
+        }
+        if (m_impl->mouse_right_down) {
+            btns |= kPadCircle;
+        }
+
+        m_impl->active_pad_state.buttons = btns;
+        m_impl->buttons = btns;
+
         [NSApp updateWindows];
     }
 }
@@ -235,6 +349,23 @@ u32 DisplayWindow::input_buttons() const noexcept {
     const u32 b = m_impl->buttons | m_impl->pressed_latch;
     m_impl->pressed_latch = 0;
     return b;
+}
+
+PadState DisplayWindow::input_pad_state() const noexcept {
+    if (!m_impl) return PadState{};
+    PadState st = m_impl->active_pad_state;
+    st.buttons |= m_impl->pressed_latch;
+    m_impl->pressed_latch = 0;
+    return st;
+}
+
+MouseState DisplayWindow::input_mouse_state() const noexcept {
+    if (!m_impl) return MouseState{};
+    MouseState ms = m_impl->active_mouse_state;
+    m_impl->active_mouse_state.delta_x = 0;
+    m_impl->active_mouse_state.delta_y = 0;
+    m_impl->active_mouse_state.wheel = 0;
+    return ms;
 }
 
 bool DisplayWindow::present_frame() {

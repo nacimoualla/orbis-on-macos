@@ -495,16 +495,16 @@ void NidRegistry::set_vfs(VirtualFileSystem* vfs) {
 
 static MetalBackend* g_metal_backend = nullptr;
 static std::unique_ptr<Pm4Translator> g_pm4_translator;
-static std::atomic<u32> g_pad_buttons{0};
+static std::mutex g_input_mutex;
+static PadState g_active_pad_state{};
+static std::atomic<u32> g_pad_pressed_latch{0};
+static MouseState g_active_mouse_state{};
 // Runs after every guest flip (see NidRegistry::set_flip_hook).
 static std::function<void()> g_flip_hook;
-// Buttons pressed since the guest last read the pad. The host samples input
-// once per frame and the game reads on its own schedule, so a short tap can
-// begin and end between two guest reads; it is reported down once regardless.
-static std::atomic<u32> g_pad_pressed_latch{0};
-static u32 read_pad_buttons() {
-    return g_pad_buttons.load(std::memory_order_relaxed) |
-           g_pad_pressed_latch.exchange(0, std::memory_order_relaxed);
+
+static PadState read_pad_state() {
+    std::lock_guard<std::mutex> lock(g_input_mutex);
+    return g_active_pad_state;
 }
 
 // ScePadData (0x78 bytes): buttons, left/right stick (u8 x,y), analog L2/R2,
@@ -512,23 +512,44 @@ static u32 read_pad_buttons() {
 // (+0x28), touch data (+0x34: count, then two {u16 x, u16 y, u8 id} at
 // +0x3C/+0x44), connected (+0x4C), timestamp (+0x50).
 constexpr GuestSize kScePadDataSize = 0x78;
-constexpr u32 kPadButtonTouchPad = 0x00100000;
-static void write_pad_data(MemoryManager& mem, GuestAddr p, u32 buttons) {
+static void write_pad_data(MemoryManager& mem, GuestAddr p, const PadState& st) {
     mem.zero_memory(p, kScePadDataSize);
-    mem.write_value(p + 0x00, buttons);
-    for (GuestAddr a = p + 0x04; a < p + 0x08; ++a) mem.write_value(a, static_cast<u8>(128)); // sticks centred
-    // D-pad left/right also push the left stick, for games that read only the axis.
-    if (buttons & 0x20) mem.write_value(p + 0x04, static_cast<u8>(255));      // RIGHT
-    else if (buttons & 0x80) mem.write_value(p + 0x04, static_cast<u8>(0));   // LEFT
+    const u32 latched_buttons = st.buttons | g_pad_pressed_latch.exchange(0, std::memory_order_relaxed);
+    mem.write_value(p + 0x00, latched_buttons);
+
+    // Left stick
+    u8 final_lx = st.lx;
+    u8 final_ly = st.ly;
+    if (final_lx == 128) {
+        if (latched_buttons & kPadRight) final_lx = 255;
+        else if (latched_buttons & kPadLeft) final_lx = 0;
+    }
+    if (final_ly == 128) {
+        if (latched_buttons & kPadUp) final_ly = 0;
+        else if (latched_buttons & kPadDown) final_ly = 255;
+    }
+    mem.write_value(p + 0x04, final_lx);
+    mem.write_value(p + 0x05, final_ly);
+
+    // Right stick
+    mem.write_value(p + 0x06, st.rx);
+    mem.write_value(p + 0x07, st.ry);
+
+    // Analog L2/R2
+    mem.write_value(p + 0x08, st.l2);
+    mem.write_value(p + 0x09, st.r2);
+
     mem.write_value(p + 0x18, 1.0f); // orientation w (identity)
     mem.write_value(p + 0x20, 1.0f); // acceleration: 1 g along y
-    if (buttons & kPadButtonTouchPad) {
-        // A finger at the centre of the 1920x943 pad while it is pressed.
-        mem.write_value(p + 0x34, static_cast<u8>(1));
-        mem.write_value(p + 0x3C, static_cast<u16>(960));
-        mem.write_value(p + 0x3E, static_cast<u16>(471));
+
+    // Touch data
+    if (st.touch_down || (latched_buttons & kPadTouchPadClick)) {
+        mem.write_value(p + 0x34, static_cast<u8>(1)); // 1 active touch point
+        mem.write_value(p + 0x3C, st.touch_x);
+        mem.write_value(p + 0x3E, st.touch_y);
     }
-    mem.write_value(p + 0x4C, static_cast<u8>(1)); // connected
+
+    mem.write_value(p + 0x4C, static_cast<u8>(st.connected ? 1 : 0));
     const u64 ts = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     mem.write_value(p + 0x50, ts);
@@ -684,9 +705,33 @@ void NidRegistry::set_flip_hook(std::function<void()> hook) {
     g_flip_hook = std::move(hook);
 }
 
+void NidRegistry::set_pad_state(const PadState& state) {
+    std::lock_guard<std::mutex> lock(g_input_mutex);
+    const u32 prev_buttons = g_active_pad_state.buttons;
+    g_active_pad_state = state;
+    g_pad_pressed_latch.fetch_or(state.buttons & ~prev_buttons, std::memory_order_relaxed);
+}
+
+PadState NidRegistry::get_pad_state() const noexcept {
+    std::lock_guard<std::mutex> lock(g_input_mutex);
+    return g_active_pad_state;
+}
+
 void NidRegistry::set_pad_buttons(u32 buttons) {
-    const u32 prev = g_pad_buttons.exchange(buttons, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_input_mutex);
+    const u32 prev = g_active_pad_state.buttons;
+    g_active_pad_state.buttons = buttons;
     g_pad_pressed_latch.fetch_or(buttons & ~prev, std::memory_order_relaxed);
+}
+
+void NidRegistry::set_mouse_state(const MouseState& state) {
+    std::lock_guard<std::mutex> lock(g_input_mutex);
+    g_active_mouse_state = state;
+}
+
+MouseState NidRegistry::get_mouse_state() const noexcept {
+    std::lock_guard<std::mutex> lock(g_input_mutex);
+    return g_active_mouse_state;
 }
 
 u64 NidRegistry::get_flip_count() const noexcept {
@@ -5957,7 +6002,7 @@ void NidRegistry::register_default_libraries() {
     auto pad_read_state_handler = [](CpuContext& ctx, MemoryManager& mem) {
         const GuestAddr data_ptr = ctx.rsi;
         if (data_ptr > 0x1000 && mem.is_valid_address(data_ptr, kScePadDataSize)) {
-            write_pad_data(mem, data_ptr, read_pad_buttons());
+            write_pad_data(mem, data_ptr, read_pad_state());
         }
         ctx.rax = SCE_OK;
     };
@@ -7617,7 +7662,7 @@ void NidRegistry::register_default_libraries() {
                 ctx.rax = num < 1 ? 0 : 0x80920001ULL; // SCE_PAD_ERROR_INVALID_ARG
                 return;
             }
-            write_pad_data(mem, ctx.rsi, read_pad_buttons());
+            write_pad_data(mem, ctx.rsi, read_pad_state());
             ctx.rax = 1;
         });
     // scePadGetControllerInformation(handle, ScePadControllerInformation*):
@@ -7650,19 +7695,54 @@ void NidRegistry::register_default_libraries() {
 
     // ---- Optional input devices: none attached ----
     // Returning 0 from the open calls handed Unity "handle 0" for a Move
-    // controller and a mouse, which it then polled every frame.
+    // controller, which it then polled every frame.
     static constexpr struct { Nid nid; const char* name; const char* module; u64 err; } kAbsentDevices[] = {
         {0x1F30BAD0C7E32715ULL, "sceMoveOpen", "libSceMove", 0x80EE0005ULL},          // SCE_MOVE_ERROR_NO_CONTROLLER_CONNECTED-style
         {0x1965D3CB1B3841B1ULL, "sceMoveGetDeviceInfo", "libSceMove", 0x80EE0003ULL},  // invalid handle
         {0x7F66DCA4AEA425F8ULL, "sceMoveReadStateRecent", "libSceMove", 0x80EE0003ULL},
-        {0x45AAB16487FA0EF1ULL, "sceMouseOpen", "libSceMouse", 0x80DF0003ULL},         // no device
-        {0xC7CAA75EA87FB623ULL, "sceMouseRead", "libSceMouse", 0x80DF0002ULL},         // invalid handle
         {0x79A1578DF26FDF1BULL, "sceImeKeyboardOpen", "libSceIme", 0x80BC0005ULL},     // no keyboard
     };
     for (const auto& d : kAbsentDevices) {
         const u64 err = d.err;
         register_symbol(d.nid, d.name, d.module, [err](CpuContext& ctx, MemoryManager&) { ctx.rax = err; });
     }
+
+    // ---- libSceMouse: active mouse input ----
+    // SceMouseData (0x40 bytes approx):
+    // timestamp (u64 at 0x00), buttons (u32 at 0x08), xAxis (i32 at 0x0C), yAxis (i32 at 0x10), wheel (i32 at 0x14), connected (u8 at 0x18)
+    constexpr GuestSize kSceMouseDataSize = 0x40;
+
+    // sceMouseOpen(int userId, int type, int index, const void* param)
+    register_symbol(0x45AAB16487FA0EF1ULL, "sceMouseOpen", "libSceMouse",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 1; // Handle 1
+        });
+
+    // sceMouseRead(int handle, SceMouseData* data, int num) -> samples read
+    register_symbol(0xC7CAA75EA87FB623ULL, "sceMouseRead", "libSceMouse",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const i32 num = static_cast<i32>(ctx.rdx);
+            const GuestAddr p = ctx.rsi;
+            if (num < 1 || p <= 0x1000 || !mem.is_valid_address(p, kSceMouseDataSize)) {
+                ctx.rax = num < 1 ? 0 : 0x80DF0001ULL; // SCE_MOUSE_ERROR_INVALID_ARG
+                return;
+            }
+            mem.zero_memory(p, kSceMouseDataSize);
+            MouseState ms;
+            {
+                std::lock_guard<std::mutex> lock(g_input_mutex);
+                ms = g_active_mouse_state;
+            }
+            const u64 ts = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            mem.write_value(p + 0x00, ts);
+            mem.write_value(p + 0x08, ms.buttons);
+            mem.write_value(p + 0x0C, ms.delta_x);
+            mem.write_value(p + 0x10, ms.delta_y);
+            mem.write_value(p + 0x14, ms.wheel);
+            mem.write_value(p + 0x18, static_cast<u8>(ms.connected ? 1 : 0));
+            ctx.rax = 1;
+        });
     // sceNpGetAccountIdA(userId, SceNpAccountId* out): a fixed offline id.
     register_symbol(0xADB9276948E9A96AULL, "sceNpGetAccountIdA", "libSceNpManager",
         [](CpuContext& ctx, MemoryManager& mem) {

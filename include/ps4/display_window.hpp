@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps4/common.hpp"
+#include "ps4/input.hpp"
 #include "ps4/metal_backend.hpp"
 #include <chrono>
 #include <memory>
@@ -46,6 +47,12 @@ public:
 
     /// Get current controller/keyboard buttons bitmask (Bit 14 = Cross/Space/Click)
     [[nodiscard]] u32 input_buttons() const noexcept;
+
+    /// Get comprehensive current pad state (sticks, buttons, triggers, touchpad)
+    [[nodiscard]] PadState input_pad_state() const noexcept;
+
+    /// Get current mouse state (delta movement, wheel, buttons)
+    [[nodiscard]] MouseState input_mouse_state() const noexcept;
 
     /// Window content width
     [[nodiscard]] u32 width() const noexcept;

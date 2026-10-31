@@ -63,6 +63,7 @@ add_library(ps4_core
     src/hle/nid_registry.cpp
     src/hle/thread.cpp
     src/gui/game_import.cpp
+    src/core/sfo.cpp
 )
 target_include_directories(ps4_core PUBLIC include)
 target_link_libraries(ps4_core PUBLIC
@@ -164,7 +165,7 @@ add_test(NAME Phase19_GcnShader COMMAND test_gcn_shader)
 add_executable(test_gpu_state tests/test_gpu_state.cpp)
 target_link_libraries(test_gpu_state PRIVATE ps4_core)
 add_test(NAME Phase20_GpuState COMMAND test_gpu_state)
-set_tests_properties(Flappy_GpuSmoke PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(Flappy_GpuSmoke PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} RUN_SERIAL TRUE)
 
 add_executable(test_bc_decode tests/test_bc_decode.cpp)
 target_link_libraries(test_bc_decode PRIVATE ps4_core)
@@ -187,7 +188,7 @@ target_link_libraries(ps4-gui PRIVATE ps4_core)
 set_source_files_properties(src/gui/game_library_gui.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 # Scanner test for the game-import GUI: finds the real dump layout on disk.
-add_executable(test_phase16 tests/test_phase16.cpp src/gui/game_import.cpp)
+add_executable(test_phase16 tests/test_phase16.cpp src/gui/game_import.cpp src/core/sfo.cpp)
 target_include_directories(test_phase16 PRIVATE include)
 add_test(NAME Phase16_GameImport COMMAND test_phase16)
 # The scanner test inspects the real games/ layout, so it must run from the
@@ -251,3 +252,12 @@ add_test(NAME JitMemOperands COMMAND test_jit_mem)
 add_executable(test_jit_diff tests/test_jit_diff.cpp)
 target_link_libraries(test_jit_diff PRIVATE ps4_core)
 add_test(NAME JitDifferentialFuzz COMMAND test_jit_diff)
+
+add_executable(test_sfo tests/test_sfo.cpp)
+target_link_libraries(test_sfo PRIVATE ps4_core)
+add_test(NAME SfoParser COMMAND test_sfo)
+set_tests_properties(SfoParser PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_input tests/test_input.cpp)
+target_link_libraries(test_input PRIVATE ps4_core)
+add_test(NAME InputState COMMAND test_input)
