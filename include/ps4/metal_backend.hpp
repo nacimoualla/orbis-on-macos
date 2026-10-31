@@ -85,6 +85,11 @@ public:
     void set_color_target(u32 slot, u64 key, u32 width = 0, u32 height = 0, u32 pixel_format = 0);
     /// Unbind every slot (slot 0 back to the screen).
     void reset_color_targets();
+    /// CB resolve: copy the colour surface `src_key` into `dst_key` (keys as
+    /// for set_color_target; a display buffer is the screen). Ends the open
+    /// pass. False when either side has no host texture or their formats
+    /// differ.
+    bool resolve_color(u64 src_key, u64 dst_key);
 
     /// Find color target texture by guest key
     [[nodiscard]] void* find_color_target(u64 key) const noexcept;

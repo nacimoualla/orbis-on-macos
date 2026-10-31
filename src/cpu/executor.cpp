@@ -1167,6 +1167,41 @@ StepResult CpuExecutor::step() {
         return StepResult::Halted;
     }
 
+    // 0xF5: CMC (Complement Carry Flag)
+    if (op0 == 0xF5) {
+        m_context.set_flag(CpuContext::FLAG_CF, !m_context.flag_cf());
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
+    // 0xF8: CLC (Clear Carry Flag)
+    if (op0 == 0xF8) {
+        m_context.set_flag(CpuContext::FLAG_CF, false);
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
+    // 0xF9: STC (Set Carry Flag)
+    if (op0 == 0xF9) {
+        m_context.set_flag(CpuContext::FLAG_CF, true);
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
+    // 0xFC: CLD (Clear Direction Flag)
+    if (op0 == 0xFC) {
+        m_context.set_flag(CpuContext::FLAG_DF, false);
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
+    // 0xFD: STD (Set Direction Flag)
+    if (op0 == 0xFD) {
+        m_context.set_flag(CpuContext::FLAG_DF, true);
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
     // 0x0F 0x05: SYSCALL
     if (op0 == 0x0F && m_memory.is_valid_address(start_rip + cursor, 1) && raw_code[cursor] == 0x05) {
         SyscallContext sctx(m_memory);

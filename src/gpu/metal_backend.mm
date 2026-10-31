@@ -1,7 +1,9 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include "ps4/metal_backend.hpp"
+#include <algorithm>
 #include <array>
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <set>
@@ -448,6 +450,52 @@ void MetalBackend::reset_color_targets() {
     if (had_nonzero && m_impl->active_render_encoder) {
         end_render_encoder();
     }
+}
+
+bool MetalBackend::resolve_color(u64 src_key, u64 dst_key) {
+    if (!is_initialized() || !m_impl->active_command_buffer) return false;
+    auto surface = [this](u64 key) -> id<MTLTexture> {
+        if (key == 0 || m_impl->display_buffers.count(key)) return m_impl->framebuffer;
+        Impl::ColorBuffer* cb = m_impl->find_color(key);
+        return cb && cb->initialized ? cb->texture : nil;
+    };
+    id<MTLTexture> src = surface(src_key);
+    if (!src) return false;
+    id<MTLTexture> dst = surface(dst_key);
+    if (!dst && dst_key != 0) {   // an offscreen destination nothing has drawn to yet
+        Impl::ColorBuffer& cb = m_impl->color_buffer(dst_key, static_cast<u32>(src.width),
+                                                     static_cast<u32>(src.height), src.pixelFormat);
+        cb.initialized = true;
+        dst = cb.texture;
+    }
+    if (!dst || dst == src) return false;
+    if (dst.pixelFormat != src.pixelFormat) {
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            std::fprintf(stderr, "[Metal] resolve between formats %lu and %lu is not supported\n",
+                         (unsigned long)src.pixelFormat, (unsigned long)dst.pixelFormat);
+        }
+        return false;
+    }
+    end_render_encoder();
+    end_compute_encoder();
+    @autoreleasepool {
+        id<MTLBlitCommandEncoder> blit = [m_impl->active_command_buffer blitCommandEncoder];
+        if (!blit) return false;
+        const NSUInteger w = std::min(src.width, dst.width), h = std::min(src.height, dst.height);
+        [blit copyFromTexture:src
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(w, h, 1)
+                    toTexture:dst
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+    }
+    return true;
 }
 
 void* MetalBackend::find_color_target(u64 key) const noexcept {

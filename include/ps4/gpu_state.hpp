@@ -37,6 +37,7 @@ inline constexpr u32 kPaClVportXscale = 0x10F;   // XSCALE, XOFFSET, YSCALE, YOF
 inline constexpr u32 kSpiPsInputEna = 0x1B3;
 inline constexpr u32 kSpiPsInputAddr = 0x1B4;
 inline constexpr u32 kDbDepthControl = 0x200;
+inline constexpr u32 kCbColorControl = 0x202;
 inline constexpr u32 kDbShaderControl = 0x203;
 inline constexpr u32 kPaClClipCntl = 0x204;
 inline constexpr u32 kPaSuScModeCntl = 0x205;
@@ -135,7 +136,18 @@ struct GpuRenderState {
     RenderScissor scissor{};
     // Nothing would be rasterised (empty scissor or front+back culling).
     bool skip_draw{false};
+    // CB_COLOR_CONTROL.MODE: 0 disable, 1 normal, 2 eliminate fast clear,
+    // 3 resolve (CB0 -> CB1), 4 decompress, 5 FMASK decompress.
+    u8 cb_mode{1};
 };
+
+namespace cb_mode {
+inline constexpr u8 kNormal = 1;
+inline constexpr u8 kEliminateFastClear = 2;
+inline constexpr u8 kResolve = 3;
+inline constexpr u8 kDecompress = 4;
+inline constexpr u8 kFmaskDecompress = 5;
+} // namespace cb_mode
 
 /// Decode the draw state from the context-register shadow `ctx` (indexed by
 /// context offset; `count` registers valid). `fb_width`/`fb_height` bound the

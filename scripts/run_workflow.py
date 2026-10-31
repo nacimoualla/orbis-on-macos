@@ -395,33 +395,39 @@ class GameRunner:
         self.logs_dir = os.path.join(root_dir, "Logs")
 
     def discover_games(self) -> List[Dict[str, str]]:
-        """Search for eboot.bin, eboot.elf, or .pkg in games/ and root."""
+        """Search for runnable eboot.elf or eboot.bin titles under games/ and root."""
         candidates = []
         games_dir = os.path.join(self.root_dir, "games")
 
-        # 1. Search games/
+        # 1. Search games/ for title directories containing an eboot
         if os.path.isdir(games_dir):
+            seen_dirs = set()
             for root, _, files in os.walk(games_dir):
-                for f in files:
-                    if f.lower() in ("eboot.bin", "eboot.elf") or f.lower().endswith(".pkg"):
-                        full_path = os.path.join(root, f)
-                        rel_path = os.path.relpath(full_path, self.root_dir)
-                        # Infer game title from folder name
-                        parent_name = os.path.basename(os.path.dirname(full_path))
-                        if parent_name.startswith("ED") or parent_name.startswith("CUSA"):
-                            # Check grandparent
-                            grandparent = os.path.basename(os.path.dirname(os.path.dirname(full_path)))
-                            title = f"{grandparent} ({parent_name})"
-                        else:
-                            title = parent_name if parent_name != "games" else f
-                        candidates.append({
-                            "title": title,
-                            "path": rel_path,
-                            "filename": f,
-                        })
+                eboot_elf = os.path.join(root, "eboot.elf")
+                eboot_bin = os.path.join(root, "eboot.bin")
+                chosen_eboot = None
+                if os.path.isfile(eboot_elf):
+                    chosen_eboot = eboot_elf
+                elif os.path.isfile(eboot_bin):
+                    chosen_eboot = eboot_bin
+
+                if chosen_eboot and root not in seen_dirs:
+                    seen_dirs.add(root)
+                    rel_path = os.path.relpath(chosen_eboot, self.root_dir)
+                    parent_name = os.path.basename(root)
+                    grandparent = os.path.basename(os.path.dirname(root))
+                    if grandparent != "games":
+                        title = f"{grandparent} ({parent_name})"
+                    else:
+                        title = parent_name
+                    candidates.append({
+                        "title": title,
+                        "path": rel_path,
+                        "filename": os.path.basename(chosen_eboot),
+                    })
 
         # 2. Check root directory
-        for f in ["eboot.bin", "eboot.elf"]:
+        for f in ["eboot.elf", "eboot.bin"]:
             root_f = os.path.join(self.root_dir, f)
             if os.path.isfile(root_f):
                 candidates.append({
@@ -429,6 +435,7 @@ class GameRunner:
                     "path": f,
                     "filename": f,
                 })
+                break
 
         return candidates
 
@@ -483,6 +490,23 @@ class GameRunner:
         if not os.path.exists(os.path.join(self.root_dir, game_path)):
             ui.fail(f"Game file does not exist: {game_path}")
             return False
+
+        if game_path.lower().endswith(".pkg"):
+            # Check if there is an extracted game available
+            pkg_name = os.path.basename(game_path)
+            extracted = None
+            for g in self.discover_games():
+                if "flappy" in pkg_name.lower() or "npxx51374" in pkg_name.lower() or "npxx51362" in pkg_name.lower():
+                    if "flappy" in g["path"].lower():
+                        extracted = g["path"]
+                        break
+            if extracted:
+                ui.info(f"Package '{game_path}' resolved to unpacked binary: {extracted}")
+                game_path = extracted
+            else:
+                ui.fail(f"'{game_path}' is an unpacked PKG archive container.")
+                ui.info("ps4-runner requires an extracted game folder with eboot.elf or eboot.bin.")
+                return False
 
         # Build runner flags
         cmd_parts = []

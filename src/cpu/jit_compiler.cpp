@@ -523,6 +523,13 @@ enum class Kind : u8 {
   Cmov,      // 0F 40-4F (reg = condition code)
   Setcc,     // 0F 90-9F (reg = condition code)
   Vec,       // SSE / AVX (vop selects the operation)
+  SignExt,   // 98 CBW/CWDE/CDQE (reg = 0), 99 CWD/CDQ/CQO (reg = 1)
+  Not,       // F6/F7 /2
+  Neg,       // F6/F7 /3
+  Imul,      // 0F AF r, r/m ; 69/6B r, r/m, imm (imm_form)
+  ShiftCl,   // D2/D3 /0 /1 /4 /5 /7: count in CL (alu_op = ModRM.reg); also
+             // ROL/ROR by imm8 / 1 (imm_form, count in imm)
+  BitTest,   // 0F A3/AB/B3/BB r, 0F BA /4-/7 imm8 (alu_op: 0 BT 1 BTS 2 BTR 3 BTC)
   CallRel,   // E8 rel32
   Ret,       // C3 / C2 imm16 (imm = extra bytes popped)
   CallInd,   // FF /2
@@ -610,6 +617,7 @@ struct JitInsn {
   bool dbl{false};  // double / 64-bit lanes (pd, sd; integer qword forms)
   bool w64{false};  // REX.W / VEX.W: 64-bit general register operand
   u8 vvvv{0};       // VEX.vvvv
+  bool imm_form{false}; // Imul / BitTest: the second operand is d.imm
 
   [[nodiscard]] bool has_mem() const noexcept {
     switch (kind) {
@@ -626,6 +634,11 @@ struct JitInsn {
     case Kind::Setcc:
     case Kind::CallInd:
     case Kind::JmpInd:
+    case Kind::Not:
+    case Kind::Neg:
+    case Kind::Imul:
+    case Kind::ShiftCl:
+    case Kind::BitTest:
       return !m.is_reg;
     default:
       return false;
@@ -1121,6 +1134,57 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return finish();
   }
 
+  // CBW/CWDE/CDQE, CWD/CDQ/CQO
+  if (op0 == 0x98 || op0 == 0x99) {
+    d.kind = Kind::SignExt;
+    d.width = op_bits;
+    d.reg = op0 & 1;
+    return finish();
+  }
+
+  // NOT / NEG r/m (F6/F7 /2 /3). LOCK forms were rejected above.
+  if ((op0 == 0xF6 || op0 == 0xF7) && pos < avail && ((code[pos] >> 3) & 7) >= 2 &&
+      ((code[pos] >> 3) & 7) <= 3) {
+    if (!modrm())
+      return false;
+    d.width = (op0 == 0xF6) ? 8 : op_bits;
+    if ((d.m.reg & 7) == 2) {
+      d.kind = Kind::Not;
+    } else {
+      d.kind = Kind::Neg;
+      d.flags_written = FLAGS_ARITH;
+    }
+    return finish();
+  }
+
+  // IMUL r, r/m, imm8 / imm16/32 (sign-extended). Only CF and OF are written.
+  if (op0 == 0x69 || op0 == 0x6B) {
+    if (!modrm())
+      return false;
+    d.width = op_bits;
+    if (!imm(op0 == 0x6B ? 1 : imm_for(op_bits)))
+      return false;
+    d.kind = Kind::Imul;
+    d.imm_form = true;
+    d.flags_written = CpuContext::FLAG_CF | CpuContext::FLAG_OF;
+    return finish();
+  }
+
+  // Shifts and rotates by CL. The count is only known at run time and a
+  // count of 0 changes no flag, so the liveness pass may not treat these as
+  // flag writers (flags_written = 0); the code writes the flags itself.
+  if (op0 == 0xD2 || op0 == 0xD3) {
+    if (!modrm())
+      return false;
+    const u8 sub = d.m.reg & 7;
+    if (sub == 2 || sub == 3 || sub == 6) // RCL/RCR, and the SAL alias
+      return false;
+    d.kind = Kind::ShiftCl;
+    d.width = (op0 == 0xD3) ? op_bits : 8;
+    d.alu_op = sub;
+    return finish();
+  }
+
   // TEST r/m, imm (F6 /0, F7 /0)
   if (op0 == 0xF6 || op0 == 0xF7) {
     if (!modrm() || (d.m.reg & 7) != 0)
@@ -1139,15 +1203,15 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return finish();
   }
 
-  // SHL/SAL/SHR/SAR r/m, imm8 / 1. The count is known at compile time, so
-  // the interpreter's semantics (incl. count 0 = no-op and counts >= the
-  // operand size for 8/16-bit) are reproduced exactly. Rotates and shifts by
-  // CL are not translated.
+  // SHL/SAL/SHR/SAR/ROL/ROR r/m, imm8 / 1. The count is known at compile
+  // time, so the interpreter's semantics (incl. count 0 = no-op and counts >=
+  // the operand size for 8/16-bit) are reproduced exactly. RCL/RCR are not
+  // translated.
   if (op0 == 0xC0 || op0 == 0xC1 || op0 == 0xD0 || op0 == 0xD1) {
     if (!modrm())
       return false;
     const u8 sub = d.m.reg & 7;
-    if (sub < 4)
+    if (sub == 2 || sub == 3) // RCL / RCR
       return false;
     d.width = (op0 & 1) ? op_bits : 8;
     if (op0 <= 0xC1) {
@@ -1157,6 +1221,12 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
       d.imm = 1;
     }
     d.imm &= (d.width == 64) ? 0x3F : 0x1F;
+    if (sub < 2) { // ROL / ROR imm: the CL path with a constant count
+      d.kind = Kind::ShiftCl;
+      d.alu_op = sub;
+      d.imm_form = true;
+      return finish();
+    }
     d.kind = Kind::ShiftImm;
     d.alu_op = (sub == 6) ? 4 : sub; // SAL == SHL
     d.flags_written = d.imm ? FLAGS_ARITH : 0;
@@ -1286,6 +1356,38 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
       d.sign_extend = op1 >= 0xBE;
       return finish();
     }
+
+    // IMUL r, r/m
+    if (op1 == 0xAF) {
+      if (!modrm())
+        return false;
+      d.kind = Kind::Imul;
+      d.width = op_bits;
+      d.flags_written = CpuContext::FLAG_CF | CpuContext::FLAG_OF;
+      return finish();
+    }
+
+    // BT/BTS/BTR/BTC r/m, r and r/m, imm8. The memory form with a register
+    // bit offset addresses a bit string beyond the operand; it stays in the
+    // interpreter.
+    if (op1 == 0xA3 || op1 == 0xAB || op1 == 0xB3 || op1 == 0xBB || op1 == 0xBA) {
+      if (!modrm())
+        return false;
+      if (op1 == 0xBA) {
+        if ((d.m.reg & 7) < 4 || !imm(1))
+          return false;
+        d.alu_op = (d.m.reg & 7) - 4;
+        d.imm_form = true;
+      } else {
+        if (!d.m.is_reg)
+          return false;
+        d.alu_op = op1 == 0xA3 ? 0 : op1 == 0xAB ? 1 : op1 == 0xB3 ? 2 : 3;
+      }
+      d.kind = Kind::BitTest;
+      d.width = op_bits;
+      d.flags_written = CpuContext::FLAG_CF;
+      return finish();
+    }
   }
 
   return false;
@@ -1405,6 +1507,40 @@ public:
       break;
     case Kind::Vec:
       emit_vec(d);
+      break;
+    case Kind::SignExt:
+      if (d.reg == 0) { // CBW / CWDE / CDQE
+        load_gpr(0, 0, w / 2);
+        m_e.sxt(true, 0, 0, w / 2);
+        store_gpr(0, w, 0);
+      } else {          // CWD / CDQ / CQO: rDX = sign of rAX
+        load_gpr(0, 0, w);
+        if (w < 64)
+          m_e.sxt(true, 0, 0, w);
+        m_e.asr_imm(true, 0, 0, 63);
+        store_gpr(2, w, 0);
+      }
+      break;
+    case Kind::Not:
+      load_rm(0, w);
+      m_e.mov_imm64(1, truncate(~0ULL, w));
+      m_e.eor_reg(0, 0, 1);
+      store_rm(0, w);
+      break;
+    case Kind::Neg: // 0 - x: CF = (x != 0), as SUB computes it
+      load_rm(1, w);
+      m_e.movz(true, 0, 0);
+      emit_alu(ALU_SUB, w, d.flags_written, flags_needed);
+      store_rm(0, w);
+      break;
+    case Kind::Imul:
+      emit_imul(d, flags_needed);
+      break;
+    case Kind::ShiftCl:
+      emit_shift_cl(d);
+      break;
+    case Kind::BitTest:
+      emit_bit_test(d);
       break;
     case Kind::CallRel:
     case Kind::CallInd:
@@ -2188,6 +2324,172 @@ private:
       }
     }
     store_rm(0, w);
+  }
+
+  /// IMUL r, r/m[, imm]: truncated product to ModRM.reg; CF = OF = the
+  /// signed result did not fit. Other flags are left alone (undefined).
+  void emit_imul(const JitInsn &d, u64 flags_needed) {
+    const u8 w = d.width;
+    load_rm(0, w);
+    if (d.imm_form)
+      m_e.mov_imm64(1, d.imm);
+    else
+      load_gpr(1, d.m.reg, w);
+    if (w == 64) {
+      m_e.emit(a64::mul(2, 0, 1));
+      m_e.emit(a64::smulh(3, 0, 1));
+      m_e.asr_imm(true, 4, 2, 63);
+      m_e.cmp_reg(true, 3, 4); // high half != sign of the low half
+    } else {
+      m_e.sxt(true, 0, 0, w);
+      m_e.sxt(true, 1, 1, w);
+      m_e.emit(a64::mul(2, 0, 1)); // exact: |product| < 2^62
+      m_e.sxt(true, 4, 2, w);
+      m_e.cmp_reg(true, 4, 2);     // product != its own w-bit sign extension
+    }
+    if (flags_needed) {
+      m_e.cset(true, 3, 1); // NE
+      m_e.ldr_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      m_e.mov_imm64(5, CpuContext::FLAG_CF | CpuContext::FLAG_OF);
+      m_e.bic_shifted(true, 4, 4, 5);
+      m_e.orr_shifted(true, 4, 4, 3);                            // CF
+      m_e.orr_shifted(true, 4, 4, 3, Arm64Emitter::SHIFT_LSL, 11); // OF
+      m_e.str_reg(4, R_CTX, offsetof(CpuContext, rflags));
+    }
+    store_gpr(d.m.reg, w, 2);
+  }
+
+  /// SHL/SHR/SAR/ROL/ROR r/m, CL with the interpreter's semantics: the count
+  /// is CL masked to 5 bits (6 for 64-bit operands); a zero count changes
+  /// nothing (a 32-bit register destination is still zero-extended).
+  /// Shifts: ZF/SF/PF from the result, CF = last bit out, OF = (count 1)
+  /// ? defined value : 0. Rotates: CF, and OF only for count 1.
+  void emit_shift_cl(const JitInsn &d) {
+    const u8 w = d.width;
+    const bool x64 = w == 64;
+    load_rm(0, w); // zero-extended
+    if (d.imm_form) {
+      m_e.mov_imm64(1, d.imm); // already masked
+    } else {
+      load_gpr(1, 1, 8);
+      m_e.ubfx(true, 1, 1, 0, x64 ? 6 : 5);
+    }
+    if (w == 32 && d.m.is_reg)
+      store_rm(0, 32);
+    m_e.cmp_reg(true, 1, 31);
+    const usize skip = m_e.pos();
+    m_e.b_cond(0, 0); // EQ: count 0, patched below
+    const u8 op = d.alu_op;
+    if (op == 0 || op == 1) {
+      // Rotate. 8/16-bit values are replicated to 32 bits so that a 32-bit
+      // rotate by any amount rotates them modulo their width.
+      m_e.mov_reg(7, 0);
+      if (w == 8)
+        m_e.orr_shifted(false, 7, 7, 7, Arm64Emitter::SHIFT_LSL, 8);
+      if (w <= 16)
+        m_e.orr_shifted(false, 7, 7, 7, Arm64Emitter::SHIFT_LSL, 16);
+      if (op == 0)
+        m_e.sub_reg(2, 31, 1); // ROL c == ROR -c
+      m_e.emit(a64::rorv(x64, 7, 7, op == 0 ? 2 : 1));
+      if (w < 32)
+        m_e.ubfx(false, 7, 7, 0, w);
+      // CF: ROL -> bit 0, ROR -> MSB. OF (count 1): MSB ^ CF / MSB ^ MSB-1.
+      m_e.ubfx(true, 6, 7, op == 0 ? 0 : static_cast<u8>(w - 1), 1);
+      m_e.ubfx(true, 10, 7, static_cast<u8>(w - 1), 1);
+      if (op == 0) {
+        m_e.eor_reg(10, 10, 6);
+      } else {
+        m_e.ubfx(true, 11, 7, static_cast<u8>(w - 2), 1);
+        m_e.eor_reg(10, 10, 11);
+      }
+      m_e.ldr_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      m_e.bfi(true, 4, 6, 0, 1);
+      m_e.mov_imm64(5, 1);
+      m_e.cmp_reg(true, 1, 5);
+      m_e.ubfx(true, 11, 4, 11, 1);
+      m_e.emit(a64::csel(true, 10, 10, 11, 0)); // count 1 ? new OF : old OF
+      m_e.bfi(true, 4, 10, 11, 1);
+      m_e.str_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      m_e.mov_reg(0, 7);
+    } else {
+      if (op == 4) { // SHL
+        if (x64) {
+          m_e.mov_imm64(2, 64);
+          m_e.sub_reg(2, 2, 1);
+          m_e.lsrv(true, 6, 0, 2); // CF = bit (64 - c)
+          m_e.ubfx(true, 6, 6, 0, 1);
+          m_e.emit(a64::lslv(true, 0, 0, 1));
+        } else {
+          m_e.emit(a64::lslv(true, 0, 0, 1)); // value < 2^32, c <= 31: no overflow
+          m_e.ubfx(true, 6, 0, w, 1);          // CF = bit w of the shifted value
+          m_e.ubfx(true, 0, 0, 0, w);
+        }
+        // OF (count 1) = MSB(result) ^ CF
+        m_e.ubfx(true, 10, 0, static_cast<u8>(w - 1), 1);
+        m_e.eor_reg(10, 10, 6);
+      } else if (op == 5) { // SHR
+        m_e.ubfx(true, 10, 0, static_cast<u8>(w - 1), 1); // OF (count 1) = MSB(source)
+        m_e.sub_imm(2, 1, 1);
+        m_e.lsrv(true, 6, 0, 2); // CF = bit (c - 1)
+        m_e.ubfx(true, 6, 6, 0, 1);
+        m_e.lsrv(true, 0, 0, 1);
+      } else { // 7: SAR, on the sign-extended value
+        if (w < 64)
+          m_e.sxt(true, 0, 0, w);
+        m_e.sub_imm(2, 1, 1);
+        m_e.emit(a64::asrv(true, 6, 0, 2)); // CF = bit (c - 1), the sign beyond
+        m_e.ubfx(true, 6, 6, 0, 1);
+        m_e.emit(a64::asrv(true, 0, 0, 1));
+        if (w < 64)
+          m_e.ubfx(true, 0, 0, 0, w);
+        m_e.movz(true, 10, 0);
+      }
+      // ZF/SF/PF from the result, CF from x6, OF = count 1 ? x10 : 0.
+      if (w < 32) {
+        m_e.lsl_imm(false, 7, 0, static_cast<u8>(32 - w));
+        m_e.ands_shifted(false, 31, 7, 7);
+      } else {
+        m_e.ands_shifted(x64, 31, 0, 0);
+      }
+      emit_flags(false, FLAGS_ARITH, 0, 6);
+      m_e.mov_imm64(5, 1);
+      m_e.cmp_reg(true, 1, 5);
+      m_e.emit(a64::csel(true, 10, 10, 31, 0)); // EQ ? x10 : 0
+      m_e.ldr_reg(11, R_CTX, offsetof(CpuContext, rflags));
+      m_e.bfi(true, 11, 10, 11, 1);
+      m_e.str_reg(11, R_CTX, offsetof(CpuContext, rflags));
+    }
+    store_rm(0, w);
+    m_e.patch_b_cond(skip, m_e.pos());
+  }
+
+  /// BT/BTS/BTR/BTC: CF = the selected bit (offset modulo the operand size);
+  /// BTS/BTR/BTC then set/clear/flip it. Other flags are left alone.
+  void emit_bit_test(const JitInsn &d) {
+    const u8 w = d.width;
+    load_rm(0, w);
+    if (d.imm_form)
+      m_e.mov_imm64(1, d.imm & (w - 1));
+    else {
+      load_gpr(1, d.m.reg, w);
+      m_e.ubfx(true, 1, 1, 0, w == 64 ? 6 : w == 32 ? 5 : 4);
+    }
+    m_e.lsrv(true, 6, 0, 1);
+    m_e.ubfx(true, 6, 6, 0, 1);
+    m_e.ldr_reg(4, R_CTX, offsetof(CpuContext, rflags));
+    m_e.bfi(true, 4, 6, 0, 1);
+    m_e.str_reg(4, R_CTX, offsetof(CpuContext, rflags));
+    if (d.alu_op != 0) {
+      m_e.mov_imm64(2, 1);
+      m_e.emit(a64::lslv(true, 2, 2, 1));
+      if (d.alu_op == 1)
+        m_e.orr_reg(0, 0, 2);
+      else if (d.alu_op == 2)
+        m_e.bic_shifted(true, 0, 0, 2);
+      else
+        m_e.eor_reg(0, 0, 2);
+      store_rm(0, w);
+    }
   }
 
   /// Convert NZCV (plus the parity of the low byte of `res`) to x86 flags and

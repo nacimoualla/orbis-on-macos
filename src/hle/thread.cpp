@@ -442,6 +442,16 @@ bool ThreadManager::rename_thread(ScePthreadId id, std::string_view name) {
     return false;
 }
 
+void ThreadManager::bind_current_host_thread(ScePthreadId id) {
+    t_current_thread_id = id;
+    t_guest_tid = static_cast<int>(id);
+    std::lock_guard<std::mutex> lock(m_threads_mutex);
+    auto it = m_threads.find(id);
+    if (it != m_threads.end()) {
+        t_current_guest_thread = it->second.get();
+    }
+}
+
 ScePthreadId ThreadManager::current_thread_id() const {
     return t_current_thread_id;
 }

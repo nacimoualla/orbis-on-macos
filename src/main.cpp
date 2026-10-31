@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
@@ -144,7 +145,8 @@ int main(int argc, char* argv[]) {
     // never be ambiguous about whether Mono actually executed.
     {
         const char* prx = std::getenv("PS4_LOAD_PRX");
-        std::fprintf(stderr, "[prx] mode=%s\n", (prx && prx[0] && std::strcmp(prx, "0") != 0) ? "real" : "hle");
+        const bool force_hle = (prx && std::strcmp(prx, "0") == 0);
+        std::fprintf(stderr, "[prx] mode=%s\n", force_hle ? "hle" : "auto");
     }
     // Hand the linker to HLE handlers: sceKernelLoadStartModule needs it to map
     // PRX modules for real, and the trampoline dispatcher it owns is what makes
@@ -176,6 +178,9 @@ int main(int argc, char* argv[]) {
                 std::cout << "[Metal] GPU command buffer executed clear pass.\n";
             }
             nid_registry.set_metal_backend(&metal);
+            if (auto* gpu = nid_registry.gpu_translator()) {
+                gpu->begin_frame();
+            }
         }
 
         if (enable_window) {
@@ -277,7 +282,7 @@ int main(int argc, char* argv[]) {
             // frames. Each guest flip now ends the GPU frame and marks a new
             // frame to present (set_flip_hook).
             ps4::Pm4Translator* gpu = nid_registry.gpu_translator();
-            if (gpu && !gpu->begin_frame()) {
+            if (gpu && !gpu->frame_in_progress() && !gpu->begin_frame()) {
                 std::cerr << "[GPU] Failed to begin translator frame; stopping guest execution.\n";
                 run_res.status = ps4::StepResult::MemoryFault;
             } else {
@@ -294,7 +299,7 @@ int main(int argc, char* argv[]) {
                 std::atomic<ps4::usize> guest_instructions{0};
                 ps4::RunResult guest_res{};
                 std::thread guest([&] {
-                    ps4::t_guest_tid = 1; // main is guest TID 1
+                    nid_registry.thread_manager(memory).bind_current_host_thread(1);
                     // It used to run on the AppKit thread; keep that thread's
                     // priority so it is not scheduled onto efficiency cores.
                     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -321,9 +326,27 @@ int main(int argc, char* argv[]) {
                 double worst_gap_ms = 0;
                 auto t_prev_present = t_window;
                 static const bool s_flip_stats = std::getenv("PS4_FLIP_STATS") != nullptr;
+                // PS4_AUTO_PRESS=N: pulse Cross (plus touch pad) for 100 ms every
+                // N seconds, to walk menus in unattended test runs.
+                static const double s_auto_press = [] {
+                    const char* v = std::getenv("PS4_AUTO_PRESS");
+                    return v ? std::atof(v) : 0.0;
+                }();
+                const auto t_start = std::chrono::steady_clock::now();
                 while (window->is_open() && !guest_done.load()) {
                     window->poll_events();
-                    nid_registry.set_pad_buttons(window->input_buttons());
+                    ps4::u32 buttons = window->input_buttons();
+                    if (s_auto_press > 0) {
+                        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                        if (t > s_auto_press && std::fmod(t, s_auto_press) < 0.1) buttons |= 0x4000 | 0x100000;
+                    }
+                    // PS4_AUTO_MOVE=1: hold d-pad right for 2 s, then left for 1 s, repeating.
+                    static const bool s_auto_move = std::getenv("PS4_AUTO_MOVE") != nullptr;
+                    if (s_auto_move) {
+                        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                        buttons |= std::fmod(t, 3.0) < 2.0 ? 0x20 : 0x80;
+                    }
+                    nid_registry.set_pad_buttons(buttons);
                     const ps4::u64 ready = frames_ready.load(std::memory_order_acquire);
                     if (ready != presented) {
                         presented = ready;
@@ -369,7 +392,23 @@ int main(int argc, char* argv[]) {
             auto t_start = std::chrono::steady_clock::now();
             auto t_last = t_start;
             ps4::usize instrs_last = 0;
+            static const double s_auto_press = [] {
+                const char* v = std::getenv("PS4_AUTO_PRESS");
+                return v ? std::atof(v) : 0.0;
+            }();
+            static const bool s_auto_move = std::getenv("PS4_AUTO_MOVE") != nullptr;
             while ((max_total == 0 || total_instructions < max_total) && !syscalls.has_exited()) {
+                if (s_auto_press > 0.0 || s_auto_move) {
+                    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                    ps4::u32 buttons = 0;
+                    if (s_auto_press > 0.0 && t > s_auto_press && std::fmod(t, s_auto_press) < 0.1) {
+                        buttons |= 0x4000 | 0x100000;
+                    }
+                    if (s_auto_move) {
+                        buttons |= std::fmod(t, 3.0) < 2.0 ? 0x20 : 0x80;
+                    }
+                    nid_registry.set_pad_buttons(buttons);
+                }
                 run_res = cpu.run(batch);
                 total_instructions += run_res.instructions_executed;
                 if (run_res.status != ps4::StepResult::Ok) break;
@@ -429,6 +468,7 @@ int main(int argc, char* argv[]) {
     }
     memory.dump_mappings();
     ps4::dump_rip_histogram();
+    ps4::write_jit_stats(); // before the thread teardown, which can hard-exit
     ps4::dump_hle_histogram();
     ps4::dump_export_tables();
     ps4::dump_prx_calls();
@@ -446,6 +486,17 @@ int main(int argc, char* argv[]) {
     }
 
     cpu.context().dump();
+
+    std::fprintf(stderr, "=== Main Thread Callstack ===\n");
+    ps4::GuestAddr fp = cpu.context().rbp;
+    for (int d = 0; d < 24 && fp != 0; ++d) {
+        ps4::u64 saved = 0, ret = 0;
+        if (!memory.read_bytes(fp, &saved, 8) || !memory.read_bytes(fp + 8, &ret, 8)) break;
+        std::fprintf(stderr, "  #%02d fp=0x%016llx ret=0x%016llx\n",
+                     d, (unsigned long long)fp, (unsigned long long)ret);
+        if (saved <= fp) break;
+        fp = saved;
+    }
 
     // End-of-run per-thread snapshot: state, wake deadline, last RIP, instrs.
     // Answers "what is each thread blocked in" without a live debugger.

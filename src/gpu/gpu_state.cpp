@@ -70,6 +70,10 @@ GpuRenderState decode_render_state(const u32* ctx, usize count, u32 fb_width, u3
         ct.enabled = base != 0 && ct.format != 0 && ct.write_mask != 0;
     }
 
+    // Unprogrammed (0) is treated as normal rendering, not CB_DISABLE.
+    const u8 cb = static_cast<u8>((reg(ctx_reg::kCbColorControl) >> 4) & 7);
+    st.cb_mode = cb ? cb : cb_mode::kNormal;
+
     // Depth target.
     DepthTarget& dt = st.depth;
     dt.z_format = reg(ctx_reg::kDbZInfo) & 3;

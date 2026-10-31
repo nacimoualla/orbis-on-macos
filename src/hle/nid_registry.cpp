@@ -32,6 +32,11 @@ static bool pm4_verbose() {
 #include <vector>
 #include <sys/time.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 
 namespace ps4 {
 
@@ -275,6 +280,21 @@ static std::mutex s_eflag_table_mtx;
 static std::unordered_map<u32, std::shared_ptr<GuestEventFlag>> s_eflags;
 static u32 s_next_eflag_id = 1;
 
+struct PMutex {
+    std::mutex m;
+    std::condition_variable cv;
+    std::thread::id owner{};
+    int count{0};
+};
+struct PCond {
+    std::mutex m;
+    std::condition_variable cv;
+    u64 seq{0};
+};
+static std::mutex s_ptab_mtx;
+static std::unordered_map<GuestAddr, std::shared_ptr<PMutex>> s_pmutexes;
+static std::unordered_map<GuestAddr, std::shared_ptr<PCond>> s_pconds;
+
 // Mono dummy-cookie arena: distinct zeroed 256-byte guest slots for Mono
 // object lookups. The guest dereferences fields inside these pointers, so they
 // must be real mapped memory — carved once from the libc heap bump pointer
@@ -497,6 +517,9 @@ static void write_pad_data(MemoryManager& mem, GuestAddr p, u32 buttons) {
     mem.zero_memory(p, kScePadDataSize);
     mem.write_value(p + 0x00, buttons);
     for (GuestAddr a = p + 0x04; a < p + 0x08; ++a) mem.write_value(a, static_cast<u8>(128)); // sticks centred
+    // D-pad left/right also push the left stick, for games that read only the axis.
+    if (buttons & 0x20) mem.write_value(p + 0x04, static_cast<u8>(255));      // RIGHT
+    else if (buttons & 0x80) mem.write_value(p + 0x04, static_cast<u8>(0));   // LEFT
     mem.write_value(p + 0x18, 1.0f); // orientation w (identity)
     mem.write_value(p + 0x20, 1.0f); // acceleration: 1 g along y
     if (buttons & kPadButtonTouchPad) {
@@ -552,6 +575,41 @@ static std::atomic<bool> s_sem_shutdown{false};
 void request_semaphore_shutdown() {
     s_sem_shutdown.store(true, std::memory_order_relaxed);
     s_sem_cv.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(s_sema_table_mtx);
+        for (auto& [id, sema] : s_semas) {
+            if (sema) {
+                std::lock_guard<std::mutex> slock(sema->mtx);
+                sema->deleted = true;
+                sema->cv.notify_all();
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_eflag_table_mtx);
+        for (auto& [id, eflag] : s_eflags) {
+            if (eflag) {
+                std::lock_guard<std::mutex> elock(eflag->mtx);
+                eflag->deleted = true;
+                eflag->cv.notify_all();
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_ptab_mtx);
+        for (auto& [addr, pm] : s_pmutexes) {
+            if (pm) {
+                std::lock_guard<std::mutex> mlock(pm->m);
+                pm->cv.notify_all();
+            }
+        }
+        for (auto& [addr, pc] : s_pconds) {
+            if (pc) {
+                std::lock_guard<std::mutex> clock(pc->m);
+                pc->cv.notify_all();
+            }
+        }
+    }
 }
 
 void NidRegistry::shutdown() {
@@ -1166,11 +1224,8 @@ static void ensure_unity_screen_resolution(MemoryManager& mem) {
         mem.write_value(DISPLAY_CFG_ADDR + 0x08, static_cast<u32>(0));
         mem.write_value(DISPLAY_CFG_ADDR + 0x0C, static_cast<u32>(0));
     }
-    // Link eboot.elf RELRO GOT pointers (QBbo2kzANmQ, iEfUiWkJ3PI, 8HhxNMSnlT4, hMr0EtMYJbQ)
-    if (mem.is_valid_address(0x14fd5e8, 8)) mem.write_value(0x14fd5e8, DISPLAY_CFG_ADDR + 0x00);
-    if (mem.is_valid_address(0x14fd5f0, 8)) mem.write_value(0x14fd5f0, DISPLAY_CFG_ADDR + 0x04);
-    if (mem.is_valid_address(0x14fd580, 8)) mem.write_value(0x14fd580, DISPLAY_CFG_ADDR + 0x08);
-    if (mem.is_valid_address(0x14fd5f8, 8)) mem.write_value(0x14fd5f8, DISPLAY_CFG_ADDR + 0x0C);
+    // Note: RELRO GOT pointers for QBbo2kzANmQ, iEfUiWkJ3PI, 8HhxNMSnlT4, hMr0EtMYJbQ
+    // are resolved directly to DISPLAY_CFG_ADDR by DynamicLinker at load time.
 
     // If Unity's ScreenManagerPS4 singleton is already instantiated at 0x1563a00,
     // ensure its cached dimensions are initialized to 1920x1080.
@@ -1191,6 +1246,160 @@ static void ensure_unity_screen_resolution(MemoryManager& mem) {
         PM4_LOG("[ScreenManager] Fixed sm=0x%llx from %ux%u to 1920x1080\n",
                      (unsigned long long)sm_ptr, old_w, old_h);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for the offline-console and libc stubs registered at the end of
+// register_default_libraries().
+// ---------------------------------------------------------------------------
+
+// Reads a NUL-terminated guest string into `out`. Returns false when the first
+// byte is unmapped; a string that runs off mapped memory keeps what was read.
+static bool read_guest_cstring(const MemoryManager& mem, GuestAddr p, std::string& out) {
+    out.clear();
+    if (p == 0 || !mem.is_valid_address(p, 1)) return false;
+    for (GuestSize i = 0; i < (GuestSize{1} << 20); ++i) {
+        char c = 0;
+        if (!mem.read_value(p + i, c) || c == 0) break;
+        out.push_back(c);
+    }
+    return true;
+}
+
+// strtol-style end pointer: *endptr = guest address of the first unparsed byte.
+static void store_end_pointer(MemoryManager& mem, GuestAddr endptr, GuestAddr s,
+                              const std::string& text, const char* end) {
+    if (endptr == 0 || !mem.is_valid_address(endptr, sizeof(GuestAddr))) return;
+    const GuestAddr at = end ? s + static_cast<GuestAddr>(end - text.c_str()) : s;
+    mem.write_value<GuestAddr>(endptr, at);
+}
+
+// A guest-visible NUL-terminated copy of `text`, allocated once per distinct
+// string. Used for char* results the guest may keep (strerror, setlocale, the
+// zone name in struct tm). Returns 0 when the guest heap is exhausted.
+static GuestAddr guest_static_string(MemoryManager& mem, const std::string& text) {
+    static std::mutex mtx;
+    static std::map<std::string, GuestAddr> cache;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (const auto it = cache.find(text); it != cache.end()) return it->second;
+    const GuestAddr at = bump_alloc(text.size() + 1, 16);
+    if (at == 0 || !mem.write_bytes(at, text.c_str(), text.size() + 1)) return 0;
+    cache.emplace(text, at);
+    return at;
+}
+
+// strcasecmp core over already-read strings (ASCII case folding).
+static int guest_strcasecmp(const std::string& a, const std::string& b) {
+    for (usize i = 0;; ++i) {
+        int ca = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        int cb = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+        if (ca >= 'A' && ca <= 'Z') ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z') cb += 'a' - 'A';
+        if (ca != cb) return ca - cb;
+        if (ca == 0) return 0;
+    }
+}
+
+// strtok / strtok_r core. `save` is the scan position kept between calls.
+static GuestAddr guest_strtok(MemoryManager& mem, GuestAddr s, GuestAddr delim, GuestAddr& save) {
+    std::string d;
+    if (s == 0) s = save;
+    if (s == 0 || !read_guest_cstring(mem, delim, d)) {
+        save = 0;
+        return 0;
+    }
+    auto is_delim = [&d](char c) { return d.find(c) != std::string::npos; };
+    char c = 0;
+    GuestAddr p = s;
+    for (;;) {  // skip leading delimiters
+        if (!mem.read_value(p, c) || c == 0) {
+            save = 0;
+            return 0;
+        }
+        if (!is_delim(c)) break;
+        ++p;
+    }
+    const GuestAddr token = p;
+    for (;;) {  // find the end of the token
+        if (!mem.read_value(p, c) || c == 0) {
+            save = 0;
+            return token;
+        }
+        if (is_delim(c)) {
+            mem.write_value<u8>(p, 0);
+            save = p + 1;
+            return token;
+        }
+        ++p;
+    }
+}
+
+// Guest struct tm (LP64): nine 32-bit fields, four bytes of padding, long
+// tm_gmtoff at +40 and char* tm_zone at +48; 56 bytes in all.
+static bool load_guest_tm(const MemoryManager& mem, GuestAddr p, std::tm& t) {
+    if (p == 0 || !mem.is_valid_address(p, 56)) return false;
+    i32 f[9] = {};
+    for (GuestSize i = 0; i < 9; ++i) mem.read_value(p + 4 * i, f[i]);
+    t = {};
+    t.tm_sec = f[0];  t.tm_min = f[1];  t.tm_hour = f[2];
+    t.tm_mday = f[3]; t.tm_mon = f[4];  t.tm_year = f[5];
+    t.tm_wday = f[6]; t.tm_yday = f[7]; t.tm_isdst = f[8];
+    return true;
+}
+
+static void store_guest_tm(MemoryManager& mem, GuestAddr p, const std::tm& t, bool with_zone) {
+    const i32 f[9] = {t.tm_sec, t.tm_min, t.tm_hour, t.tm_mday, t.tm_mon,
+                      t.tm_year, t.tm_wday, t.tm_yday, t.tm_isdst};
+    for (GuestSize i = 0; i < 9; ++i) mem.write_value<i32>(p + 4 * i, f[i]);
+    if (!with_zone) return;
+    mem.write_value<i64>(p + 40, static_cast<i64>(t.tm_gmtoff));
+    mem.write_value<GuestAddr>(p + 48, t.tm_zone ? guest_static_string(mem, t.tm_zone) : 0);
+}
+
+// localtime (local = true) and gmtime. Both hand back one static struct tm,
+// as libc does, so a second call overwrites the first result.
+static GuestAddr guest_time_split(MemoryManager& mem, GuestAddr timer, bool local) {
+    static GuestAddr result = 0;
+    i64 secs = 0;
+    if (!mem.read_value(timer, secs)) return 0;
+    const std::time_t tt = static_cast<std::time_t>(secs);
+    std::tm host{};
+    if ((local ? localtime_r(&tt, &host) : gmtime_r(&tt, &host)) == nullptr) return 0;
+    if (result == 0) result = bump_alloc(64, 16);
+    if (result == 0) return 0;
+    store_guest_tm(mem, result, host, true);
+    return result;
+}
+
+// Current time as an SCE RTC tick: microseconds since 0001-01-01 00:00:00 UTC.
+static u64 guest_rtc_now() {
+    constexpr u64 kUnixEpochTicks = 62135596800ULL * 1000000ULL;  // 0001-01-01 -> 1970-01-01
+    timeval tv{};
+    gettimeofday(&tv, nullptr);
+    return kUnixEpochTicks + static_cast<u64>(tv.tv_sec) * 1000000ULL + static_cast<u64>(tv.tv_usec);
+}
+
+// inet_pton over guest memory. Orbis address families follow FreeBSD:
+// AF_INET = 2, AF_INET6 = 28. Returns inet_pton's result (1 ok, 0 malformed),
+// or -1 for a family this layer does not map.
+static u64 guest_inet_pton(MemoryManager& mem, u64 af, GuestAddr src, GuestAddr dst) {
+    std::string text;
+    read_guest_cstring(mem, src, text);
+    int host_af = 0;
+    GuestSize len = 0;
+    if (af == 2) {
+        host_af = AF_INET;
+        len = 4;
+    } else if (af == 28) {
+        host_af = AF_INET6;
+        len = 16;
+    } else {
+        return static_cast<u64>(-1);
+    }
+    unsigned char out[16] = {};
+    const int rc = inet_pton(host_af, text.c_str(), out);
+    if (rc == 1 && mem.is_valid_address(dst, len)) mem.write_bytes(dst, out, len);
+    return static_cast<u64>(static_cast<i64>(rc));
 }
 
 void NidRegistry::register_default_libraries() {
@@ -1271,6 +1480,51 @@ void NidRegistry::register_default_libraries() {
 
     // sceKernelLoadStartModule
     // NID: 0xC33BEA4F852A297FULL
+    // Call guest code at `entry` (SysV: rdi, rsi) to completion on the calling
+    // thread's executor, nested inside the current HLE call, as exception
+    // delivery does. It returns through a HLT sentinel; the caller's context
+    // is restored afterwards. False when no executor is active or the code
+    // stopped before returning.
+    static auto call_guest = [](MemoryManager& mem, GuestAddr entry, u64 a0, u64 a1, u64& ret) -> bool {
+        CpuExecutor* ex = current_executor();
+        if (ex == nullptr || entry == 0) return false;
+        static const GuestAddr s_sentinel = [&mem] {
+            const GuestAddr p = bump_alloc(16, 16);
+            const u8 hlt = 0xF4;
+            if (p != 0) mem.write_bytes(p, &hlt, 1);
+            return p;
+        }();
+        if (s_sentinel == 0) return false;
+        const CpuContext saved = ex->context();
+        CpuContext& c = ex->context();
+        const GuestAddr sp = ((saved.rsp - 512) & ~GuestAddr{0xF}) - 8;  // below the red zone
+        mem.write_value(sp, s_sentinel);
+        c.rsp = sp;
+        c.rip = entry;
+        c.rdi = a0;
+        c.rsi = a1;
+        // A PRX start stub tail-calls a non-null third argument instead of
+        // the module's own module_start.
+        c.rdx = 0;
+        c.rcx = 0;
+        bool returned = false;
+        for (int i = 0; i < 100000; ++i) {
+            const RunResult rr = ex->run(200000);
+            if (c.rip == s_sentinel || c.rip == s_sentinel + 1) {
+                returned = true;
+                break;
+            }
+            if (rr.status != StepResult::Ok && rr.status != StepResult::Syscall) {
+                std::fprintf(stderr, "[HLE] guest call 0x%llx stopped at RIP=0x%llx (%s)\n",
+                             (unsigned long long)entry, (unsigned long long)c.rip,
+                             step_result_to_string(rr.status).data());
+                break;
+            }
+        }
+        ret = c.rax;
+        ex->context() = saved;
+        return returned;
+    };
     register_symbol(0xC33BEA4F852A297FULL, "sceKernelLoadStartModule", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr path_addr = ctx.rdi;
@@ -1317,6 +1571,27 @@ void NidRegistry::register_default_libraries() {
             const u32 handle = linker->load_module(host_path, base, /*run_init=*/false);
             std::fprintf(stderr, "[HLE] sceKernelLoadStartModule('%s' -> '%s') -> handle 0x%x\n",
                          path, host_path.c_str(), handle);
+            // The "Start": module_start(args, argp), whose result goes to
+            // *pRes (r9). Unity's SavedGames plugin marks itself started there;
+            // without the call every export returned early and the game's
+            // startup autoload never finished. A module that does not export
+            // module_start starts at its ELF entry: the SDK stub there runs the
+            // initializer array, then the module's own start routine (e_entry
+            // is commonly 0, i.e. the module base).
+            const u64 args = ctx.rsi, argp = ctx.rdx, res_ptr = ctx.r9;
+            constexpr Nid kModuleStart = 0x05A38A72783C83CFULL;
+            GuestAddr start = handle ? linker->find_module_export(handle, kModuleStart) : 0;
+            if (start == 0 && handle != 0)
+                if (const LoadedModule* m = linker->module(handle)) start = m->base + m->entry;
+            if (start != 0) {
+                u64 rv = 0;
+                const bool ok = call_guest(mem, start, args, argp, rv);
+                std::fprintf(stderr, "[HLE] module_start 0x%llx of handle 0x%x -> %s %lld\n",
+                             (unsigned long long)start, handle, ok ? "returned" : "did not return",
+                             (long long)static_cast<i32>(rv));
+                if (ok && res_ptr > 0x1000 && mem.is_valid_address(res_ptr, 4))
+                    mem.write_value(res_ptr, static_cast<i32>(rv));
+            }
             ensure_unity_screen_resolution(mem);
             ctx.rax = handle;
         });
@@ -1432,8 +1707,17 @@ void NidRegistry::register_default_libraries() {
         // Mono was stubbed. With the real runtime it erased the queued level0
         // load -- the preload thread then found its queue empty and the first
         // scene never loaded -- and it corrupted whatever else r15 pointed at.)
+        // The sleep answers guest signals like the other waits: Mono's GC
+        // stops the world with signal 30 and blocks until every thread has
+        // acknowledged. A sleeping thread only reached its handler at the end
+        // of its next instruction quantum, which for a usleep polling loop
+        // took tens of seconds (the game froze on each collection).
         if (usec > 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(usec));
+            std::mutex m;
+            std::condition_variable cv;
+            std::unique_lock<std::mutex> lock(m);
+            SignalWakeScope wake(cv);
+            cv.wait_for(lock, std::chrono::microseconds(usec), [] { return guest_signal_pending(); });
         } else {
             std::this_thread::yield();
         }
@@ -1442,6 +1726,7 @@ void NidRegistry::register_default_libraries() {
             cur_th->sleep_until_us.store(0);
             cur_th->state.store(ThreadState::Running);
         }
+        if (guest_signal_pending()) deliver_guest_exceptions(mem);
         ctx.rax = SCE_OK;
     };
     register_symbol(0x3230BAEFBC36C18BULL, "sceKernelUsleep", "libkernel", usleep_handler);
@@ -2275,6 +2560,31 @@ void NidRegistry::register_default_libraries() {
             }
             mem.write_bytes(out, &st, sizeof(st));
             ctx.rax = 0;
+        });
+    // sceKernelStat(path, stat*): stat with SCE error codes (ENOENT when the
+    // path does not open). SavedGames checks its slot files with it.
+    register_symbol(0x795F70003DAB8880ULL, "sceKernelStat", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr path = ctx.rdi, out = ctx.rsi;
+            if (path == 0 || !mem.is_valid_address(path, 1) || !mem.is_valid_address(out, sizeof(OrbisStat))) {
+                ctx.rax = 0x80020016ULL; // SCE_KERNEL_ERROR_EINVAL
+                return;
+            }
+            auto& vfs = get_vfs();
+            const i32 fd = vfs.open(mem.to_host_ptr<char>(path), 0 /* O_RDONLY */, 0);
+            if (fd < 0) {
+                ctx.rax = 0x80020002ULL; // SCE_KERNEL_ERROR_ENOENT
+                return;
+            }
+            OrbisStat st{};
+            const i32 r = vfs.fstat(fd, st);
+            vfs.close(fd);
+            if (r != 0) {
+                ctx.rax = 0x80020005ULL; // SCE_KERNEL_ERROR_EIO
+                return;
+            }
+            mem.write_bytes(out, &st, sizeof(st));
+            ctx.rax = SCE_OK;
         });
 
     // strcpy(char* dst, const char* src) -> dst
@@ -3436,7 +3746,7 @@ void NidRegistry::register_default_libraries() {
             const GuestAddr str = ctx.rdi;
             u64 len = 0;
             u8 ch = 0;
-            while (mem.read_value(str + len, ch) && ch != 0 && len < 4096) {
+            while (mem.read_value(str + len, ch) && ch != 0 && len < (u64{1} << 20)) {
                 len++;
             }
             ctx.rax = len;
@@ -3455,7 +3765,7 @@ void NidRegistry::register_default_libraries() {
             }
             u64 hlen = 0;
             u8 ch = 0;
-            while (mem.read_value(hay + hlen, ch) && ch != 0 && hlen < 4096) {
+            while (mem.read_value(hay + hlen, ch) && ch != 0 && hlen < (u64{1} << 20)) {
                 if (ch == n0) {
                     bool match = true;
                     u64 nlen = 1;
@@ -4173,8 +4483,8 @@ void NidRegistry::register_default_libraries() {
             s_sem_cv.notify_all();
             static const bool s_log_sem = (std::getenv("PS4_LOG_SEM") != nullptr);
             if (s_log_sem) {
-                std::fprintf(stderr, "[Sem] post(0x%llx) -> count=%u waiters=%u\n",
-                             (unsigned long long)sem_ptr, sem[0], sem[1]);
+                std::fprintf(stderr, "[Sem] TID=%d post(0x%llx) -> count=%u waiters=%u\n",
+                             (int)t_guest_tid, (unsigned long long)sem_ptr, sem[0], sem[1]);
             }
             ctx.rax = SCE_OK;
         });
@@ -4234,8 +4544,11 @@ void NidRegistry::register_default_libraries() {
             if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
             bool ok = false;
             bool valid = true;
+            const auto t0 = std::chrono::steady_clock::now();
+            int iters = 0;
             {
                 std::unique_lock<std::mutex> lock(s_sem_cv_mtx);
+                bool waiter_marked = false;
                 while (true) {
                     std::array<u32, 4> sem{};
                     if (!sem_read(mem, sem_ptr, sem)) {
@@ -4244,25 +4557,45 @@ void NidRegistry::register_default_libraries() {
                     }
                     if (sem[0] > 0) {
                         sem[0] -= 1;
+                        if (waiter_marked && sem[1] > 0) {
+                            sem[1] -= 1;
+                            waiter_marked = false;
+                        }
                         sem_write(mem, sem_ptr, sem);
                         ok = true;
                         break;
                     }
                     if (g_syscalls && g_syscalls->has_exited()) break;
                     if (s_sem_shutdown.load(std::memory_order_relaxed)) break;
+                    if (!waiter_marked) {
+                        sem[1] += 1;
+                        sem_write(mem, sem_ptr, sem);
+                        waiter_marked = true;
+                    }
+                    ++iters;
                     {
                         SignalWakeScope wake(s_sem_cv);
                         if (!guest_signal_pending()) s_sem_cv.wait_for(lock, std::chrono::milliseconds(20));
                     }
-                    lock.unlock();
-                    deliver_guest_exceptions(mem);
-                    lock.lock();
+                    if (guest_signal_pending()) {
+                        lock.unlock();
+                        deliver_guest_exceptions(mem);
+                        lock.lock();
+                    }
+                }
+                if (waiter_marked) {
+                    std::array<u32, 4> sem{};
+                    if (sem_read(mem, sem_ptr, sem) && sem[1] > 0) {
+                        sem[1] -= 1;
+                        sem_write(mem, sem_ptr, sem);
+                    }
                 }
             }
             if (cur_th) cur_th->state.store(ThreadState::Running);
+            const double waited_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (!valid) {
-                std::fprintf(stderr, "[Sem] wait(0x%llx) -> EINVAL\n",
-                             (unsigned long long)sem_ptr);
+                std::fprintf(stderr, "[Sem] TID=%d wait(0x%llx) -> EINVAL (waited=%.2fms, iters=%d)\n",
+                             (int)t_guest_tid, (unsigned long long)sem_ptr, waited_ms, iters);
                 ctx.rax = static_cast<u64>(-22);
                 return;
             }
@@ -4276,7 +4609,8 @@ void NidRegistry::register_default_libraries() {
             }
             static const bool s_log_sem = (std::getenv("PS4_LOG_SEM") != nullptr);
             if (s_log_sem) {
-                std::fprintf(stderr, "[Sem] wait(0x%llx) -> OK\n", (unsigned long long)sem_ptr);
+                std::fprintf(stderr, "[Sem] TID=%d wait(0x%llx) -> OK (waited=%.2fms, iters=%d)\n",
+                             (int)t_guest_tid, (unsigned long long)sem_ptr, waited_ms, iters);
             }
             ctx.rax = SCE_OK;
         });
@@ -4479,7 +4813,7 @@ void NidRegistry::register_default_libraries() {
             }
             u64 idx = 0;
             i32 diff = 0;
-            while (idx < 4096) {
+            while (idx < (u64{1} << 20)) {
                 u8 c1 = 0, c2 = 0;
                 if (!mem.read_value(s1 + idx, c1) || !mem.read_value(s2 + idx, c2)) {
                     diff = (s1 < s2) ? -1 : 1;
@@ -4628,9 +4962,33 @@ void NidRegistry::register_default_libraries() {
                 result_ptr != 0 && mem.is_valid_address(result_ptr, sizeof(SceSaveDataMountResult))) {
                 SceSaveDataMount mount_req{};
                 mem.read_bytes(mount_ptr, &mount_req, sizeof(mount_req));
+                std::string dir_name(mount_req.dir_name.data, strnlen(mount_req.dir_name.data, sizeof(mount_req.dir_name.data)));
+                u32 mode = mount_req.mount_mode;
+                // The SDK struct holds pointers: userId, pad, titleId*, dirName*
+                // (+0x10), fingerprint*, blocks, mountMode (+0x28). Games pass
+                // that layout; the inline one above is what test_phase12 builds.
+                u64 name_ptr = 0;
+                std::string sdk_name;
+                if (mem.read_value(mount_ptr + 0x10, name_ptr) && name_ptr > 0x1000 &&
+                    read_guest_cstring(mem, name_ptr, sdk_name) && !sdk_name.empty() && sdk_name.size() < 32 &&
+                    std::all_of(sdk_name.begin(), sdk_name.end(), [](char c) { return c > 0x20 && c < 0x7f; })) {
+                    dir_name = sdk_name;
+                    mem.read_value(mount_ptr + 0x28, mode);
+                }
+                // Mounting a save that does not exist without CREATE fails with
+                // NOT_FOUND. Unity's SavedGames treats that as "no data"; a
+                // successful mount of an empty folder read as a corrupt save,
+                // which it deleted and tried to load again, forever.
+                const std::filesystem::path host_dir =
+                    vfs.sandbox_root() / "savedata" / std::to_string(mount_req.user_id) / dir_name;
+                std::error_code ec;
+                if (!(mode & SCE_SAVE_DATA_MOUNT_MODE_CREATE) && !std::filesystem::is_directory(host_dir, ec)) {
+                    ctx.rax = 0x809F0008ULL; // SCE_SAVE_DATA_ERROR_NOT_FOUND
+                    return;
+                }
 
                 SceSaveDataMountResult mount_res{};
-                const i32 ret = vfs.mount_savedata(mount_req.user_id, mount_req.dir_name.data, mount_req.mount_mode, mount_res);
+                const i32 ret = vfs.mount_savedata(mount_req.user_id, dir_name, mode, mount_res);
                 if (ret == SCE_OK) {
                     mem.write_bytes(result_ptr, &mount_res, sizeof(mount_res));
                     ctx.rax = SCE_OK;
@@ -5309,7 +5667,11 @@ void NidRegistry::register_default_libraries() {
             if (s_prev_us != 0) {
                 const u64 gap = now_us - s_prev_us;
                 s_max_gap_us = std::max(s_max_gap_us, gap);
-                if (gap > 20000) ++s_hitches;
+                if (gap > 20000) {
+                    ++s_hitches;
+                    std::fprintf(stderr, "[fps] hitch %.1f ms before flip #%llu\n", gap / 1000.0,
+                                 (unsigned long long)count);
+                }
             }
             s_prev_us = now_us;
             if (s_window_start_us == 0) s_window_start_us = now_us;
@@ -5369,7 +5731,12 @@ void NidRegistry::register_default_libraries() {
                 g_thread_manager->equeue_signal(sub.eq_id, ev);
             }
         }
-        if (g_flip_hook) g_flip_hook();
+        if (g_flip_hook) {
+            g_flip_hook();
+        } else if (g_pm4_translator && g_pm4_translator->frame_in_progress()) {
+            g_pm4_translator->submit_frame(false);
+            g_pm4_translator->begin_frame();
+        }
     };
 
     // sceVideoOutRegisterBuffers(int handle, int startIndex, void* const* addresses, int bufferCount, ...)
@@ -5714,14 +6081,16 @@ void NidRegistry::register_default_libraries() {
     // libSceImeDialog. There is no on-screen keyboard, so the dialog never waits
     // for a user: Init finishes it at once, GetStatus reports FINISHED and
     // GetResult reports a cancel. A plugin that polls GetStatus therefore leaves
-    // its loop instead of spinning forever. Status values (NONE=0, FINISHED=2) and
-    // the USER_CANCELED end status follow the Orbis SDK as remembered; they are not
+    // its loop instead of spinning forever. Status values use the common-dialog
+    // enum (NONE=0, INITIALIZED=1, RUNNING=2, FINISHED=3), the same enum the
+    // sceXxxDialog families below use, so Init stores FINISHED and never RUNNING.
+    // The USER_CANCELED end status follows the Orbis SDK as remembered; it is not
     // checked against a header in this repo.
     static std::atomic<u32> s_ime_dialog_status{0};
     // sceImeDialogInit(const SceImeDialogParam* param, ...) -- NID 0x354781ACDEE1CDFD
     register_symbol(0x354781ACDEE1CDFDULL, "sceImeDialogInit", "libSceImeDialog",
         [](CpuContext& ctx, MemoryManager&) {
-            s_ime_dialog_status.store(2);   // FINISHED
+            s_ime_dialog_status.store(3);   // SCE_COMMON_DIALOG_STATUS_FINISHED
             ctx.rax = SCE_OK;
         });
     // sceImeDialogTerm() -- NID 0x8324F2567F9B5CCC
@@ -5887,14 +6256,14 @@ void NidRegistry::register_default_libraries() {
             const GuestAddr src = ctx.rsi;
             if (dst > 0x1000 && src > 0x1000) {
                 usize dst_len = 0;
-                while (dst_len < 4096) {
+                while (dst_len < (usize{1} << 20)) {
                     u8 b = 0;
                     if (!mem.is_valid_address(dst + dst_len, 1) || !mem.read_value(dst + dst_len, b)) break;
                     if (b == 0) break;
                     ++dst_len;
                 }
                 usize src_len = 0;
-                while (src_len < 4096) {
+                while (src_len < (usize{1} << 20)) {
                     u8 b = 0;
                     if (!mem.is_valid_address(src + src_len, 1) || !mem.read_value(src + src_len, b)) break;
                     if (b == 0) break;
@@ -7028,20 +7397,6 @@ void NidRegistry::register_default_libraries() {
     // Return values are POSIX error numbers (FreeBSD: EPERM 1, EBUSY 16,
     // EINVAL 22, ETIMEDOUT 60).
     // =========================================================================
-    struct PMutex {
-        std::mutex m;
-        std::condition_variable cv;
-        std::thread::id owner{};
-        int count{0};
-    };
-    struct PCond {
-        std::mutex m;
-        std::condition_variable cv;
-        u64 seq{0};
-    };
-    static std::mutex s_ptab_mtx;
-    static std::unordered_map<GuestAddr, std::shared_ptr<PMutex>> s_pmutexes;
-    static std::unordered_map<GuestAddr, std::shared_ptr<PCond>> s_pconds;
     auto pmutex = [](GuestAddr a) {
         std::lock_guard<std::mutex> l(s_ptab_mtx);
         auto& p = s_pmutexes[a];
@@ -7064,9 +7419,11 @@ void NidRegistry::register_default_libraries() {
                 SignalWakeScope wake(pm.cv);
                 if (!guest_signal_pending()) pm.cv.wait_for(l, std::chrono::milliseconds(20));
             }
-            l.unlock();
-            deliver_guest_exceptions(mem);
-            l.lock();
+            if (guest_signal_pending()) {
+                l.unlock();
+                deliver_guest_exceptions(mem);
+                l.lock();
+            }
         }
         pm.owner = self;
         pm.count += count;
@@ -7078,7 +7435,7 @@ void NidRegistry::register_default_libraries() {
         const int n = pm.count;
         pm.count = 0;
         pm.owner = {};
-        pm.cv.notify_one();
+        pm.cv.notify_all();
         return n;
     };
     auto ok = [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; };
@@ -7114,7 +7471,7 @@ void NidRegistry::register_default_libraries() {
             if (pm->count == 0 || pm->owner != std::this_thread::get_id()) { ctx.rax = 1; return; }
             if (--pm->count == 0) {
                 pm->owner = {};
-                pm->cv.notify_one();
+                pm->cv.notify_all();
             }
             ctx.rax = 0;
         });
@@ -7174,9 +7531,11 @@ void NidRegistry::register_default_libraries() {
                 if (!guest_signal_pending()) pc->cv.wait_for(cl, std::chrono::milliseconds(20));
             }
             if (pc->seq != gen) break;
-            cl.unlock();
-            deliver_guest_exceptions(mem);
-            cl.lock();
+            if (guest_signal_pending()) {
+                cl.unlock();
+                deliver_guest_exceptions(mem);
+                cl.lock();
+            }
         }
         cl.unlock();
         pm_acquire(*pm, mem, held);
@@ -7309,6 +7668,822 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager& mem) {
             if (ctx.rsi > 0x1000 && mem.is_valid_address(ctx.rsi, 8)) mem.write_value(ctx.rsi, static_cast<u64>(0x1000000000000001ULL));
             ctx.rax = SCE_OK;
+        });
+
+    // =====================================================================
+    // Offline console: PSN, network, HTTP, RTC, common dialogs, and the libc /
+    // C++ ABI gaps left unresolved by UnityNpToolkit.prx and the other plugins.
+    //
+    // The console is modelled as signed out with no network connection, so the
+    // game takes its offline path:
+    //   - Init / Term / Register / Unregister / Set / Delete / Abort / Check
+    //     calls touch only local state and return SCE_OK.
+    //   - Create calls return a positive handle id, so a caller that tests for
+    //     "< 0" or "== 0" takes its success branch.
+    //   - Anything that would reach a server (requests, lookups, scores, room
+    //     and web API traffic) returns the error a signed-out console returns.
+    //     Those calls never return success with an output buffer left unset.
+    //   - Common dialogs never draw a UI; see the tracker below.
+    // =====================================================================
+    struct HleStub { Nid nid; const char* name; };
+    static constexpr u64 kNpErrSignedOut = 0x80550006ULL;         // SCE_NP_ERROR_SIGNED_OUT
+    static constexpr u64 kHttpErrNetwork = 0x80431063ULL;         // SCE_HTTP_ERROR_NETWORK
+    static constexpr u64 kNetCtlErrNotConnected = 0x80412108ULL;  // SCE_NET_CTL_ERROR_NOT_CONNECTED
+    // Shared counter for the Create* handle ids (positive, never reused here).
+    static std::atomic<u64> s_offline_handle_seq{1};
+    // Each entry's handler sets rax to `rax`.
+    auto add_stubs = [this](const char* module, std::initializer_list<HleStub> stubs, u64 rax) {
+        for (const HleStub& s : stubs)
+            register_symbol(s.nid, s.name, module, [rax](CpuContext& ctx, MemoryManager&) { ctx.rax = rax; });
+    };
+    // Each entry's handler returns a fresh positive handle id.
+    auto add_handles = [this](const char* module, std::initializer_list<HleStub> stubs) {
+        for (const HleStub& s : stubs)
+            register_symbol(s.nid, s.name, module,
+                [](CpuContext& ctx, MemoryManager&) { ctx.rax = s_offline_handle_seq.fetch_add(1); });
+    };
+
+    // --- PSN / network: offline console ---
+    add_stubs("libSceNp", {
+        {0x11CEB7CB9F65F6DCULL, "sceNpSetNpTitleId"},
+        {0x036090DE4812A294ULL, "sceNpSetContentRestriction"},
+        {0x55F45298F9A3F10FULL, "sceNpRegisterStateCallback"},
+        {0x9A38D35E1F8D1D66ULL, "sceNpUnregisterStateCallback"},
+        {0xDD997C05E3D387D6ULL, "sceNpCheckCallback"},
+        {0x4BB4139FBD8FAC3CULL, "sceNpDeleteRequest"},
+    }, SCE_OK);
+    add_handles("libSceNp", {
+        {0x1A92D00CD28809A7ULL, "sceNpCreateRequest"},
+    });
+    add_stubs("libSceNp", {
+        {0xDABB059A519695E4ULL, "sceNpCheckNpAvailability"},
+        {0xA7FA3BE029E83736ULL, "sceNpGetNpId"},
+        {0x5C39DC5D02095129ULL, "sceNpGetOnlineId"},
+    }, kNpErrSignedOut);
+    // sceNpCmpNpId(const SceNpId* a, const SceNpId* b): 0 when the online ids
+    // match. Only the 16-byte handle is compared; the struct layout is assumed.
+    register_symbol(0x8BC5265D34AAECDEULL, "sceNpCmpNpId", "libSceNp",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (!mem.is_valid_address(ctx.rdi, 16) || !mem.is_valid_address(ctx.rsi, 16)) {
+                ctx.rax = 1;
+                return;
+            }
+            ctx.rax = std::strncmp(mem.to_host_ptr<char>(ctx.rdi), mem.to_host_ptr<char>(ctx.rsi), 16) == 0 ? 0 : 1;
+        });
+
+    // libSceNpMatching2: rooms and signaling need a live session.
+    add_stubs("libSceNpMatching2", {
+        {0xD74B777B9F893E75ULL, "sceNpMatching2Initialize"},
+        {0x32AA77949FAC8F2EULL, "sceNpMatching2Terminate"},
+        {0x99E12321D6E3000DULL, "sceNpMatching2SetUserInfo"},
+        {0xFDFE8CE1C68D7BC9ULL, "sceNpMatching2ContextStop"},
+        {0x373FD913BBABDF62ULL, "sceNpMatching2DestroyContext"},
+        {0x7D041F3FCEC8EE1BULL, "sceNpMatching2RegisterContextCallback"},
+        {0xA7ED849F199A00C3ULL, "sceNpMatching2RegisterRoomEventCallback"},
+        {0xB81112CF3E02430BULL, "sceNpMatching2RegisterRoomMessageCallback"},
+        {0xD1431E5911A764A0ULL, "sceNpMatching2RegisterSignalingCallback"},
+        {0xFBC7BBC172E68DDBULL, "sceNpMatching2SetDefaultRequestOptParam"},
+    }, SCE_OK);
+    add_handles("libSceNpMatching2", {
+        {0x61F9A95BBD7DACCAULL, "sceNpMatching2CreateContext"},
+    });
+    add_stubs("libSceNpMatching2", {
+        {0xEEF8CD43A675A29DULL, "sceNpMatching2ContextStart"},
+        {0x2E108F72D2080B14ULL, "sceNpMatching2GetServerId"},
+        {0x043EA47F1E38D83AULL, "sceNpMatching2LeaveRoom"},
+        {0x01455F53A6F28377ULL, "sceNpMatching2KickoutRoomMember"},
+        {0x230DA1D09AEB6F95ULL, "sceNpMatching2SendRoomMessage"},
+        {0xA290E997BE298B61ULL, "sceNpMatching2SendRoomChatMessage"},
+        {0xAC934F26A0C2A622ULL, "sceNpMatching2GetWorldInfoList"},
+        {0xCC25999975CDEB4DULL, "sceNpMatching2CreateJoinRoom"},
+        {0x56A657ECF3A0D8C9ULL, "sceNpMatching2SearchRoom"},
+        {0xA9E17FAB9283B407ULL, "sceNpMatching2GetUserInfoList"},
+        {0x09220C0EC563B3F8ULL, "sceNpMatching2JoinRoom"},
+        {0xDBABD6ACF01625F3ULL, "sceNpMatching2GetRoomDataExternalList"},
+        {0x26B6B189F9A87ADEULL, "sceNpMatching2GetRoomDataInternal"},
+        {0xE6586F3AA85E1410ULL, "sceNpMatching2GetRoomMemberDataInternal"},
+        {0xABB18AF7CFE76121ULL, "sceNpMatching2SetRoomDataExternal"},
+        {0x4BD0FC252608AE31ULL, "sceNpMatching2SetRoomDataInternal"},
+        {0x1E8A93AE44BD7394ULL, "sceNpMatching2SetRoomMemberDataInternal"},
+        {0xB7056EA5E69862B9ULL, "sceNpMatching2SignalingGetConnectionInfo"},
+    }, kNpErrSignedOut);
+
+    // libSceNpWebApi: requests fail; the handles and filters are local.
+    add_stubs("libSceNpWebApi", {
+        {0x1B70272CD7510631ULL, "sceNpWebApiInitialize"},
+        {0x6ACCF74ED22A185FULL, "sceNpWebApiTerminate"},
+        {0xE4C9FB4D8C29977DULL, "sceNpWebApiDeleteHandle"},
+        {0xCC4F91E91731DD6DULL, "sceNpWebApiDeletePushEventFilter"},
+        {0x3DF43E7FAC2CEFAEULL, "sceNpWebApiDeleteServicePushEventFilter"},
+        {0x9E842095EBBE28B1ULL, "sceNpWebApiDeleteRequest"},
+        {0x5D48DDB124D36775ULL, "sceNpWebApiDeleteContext"},
+        {0x2738584CFD9F1B5FULL, "sceNpWebApiAbortRequest"},
+        {0x3DF4930C280D3207ULL, "sceNpWebApiRegisterPushEventCallback"},
+        {0x909409134B8A9B9CULL, "sceNpWebApiRegisterServicePushEventCallback"},
+        {0xD9E76B92BD1CFF08ULL, "sceNpWebApiUnregisterServicePushEventCallback"},
+        {0xA8AE28DBAE7A5B8CULL, "sceNpWebApiUnregisterPushEventCallback"},
+    }, SCE_OK);
+    add_handles("libSceNpWebApi", {
+        {0xEFD33F26ABEF1A8DULL, "sceNpWebApiCreateHandle"},
+        {0xCB94DAE490B34076ULL, "sceNpWebApiCreatePushEventFilter"},
+        {0xB08171EF7E3EC72BULL, "sceNpWebApiCreateServicePushEventFilter"},
+        {0xADD82CE59D4CC85CULL, "sceNpWebApiCreateRequest"},
+        {0xC7563BCA261293B7ULL, "sceNpWebApiCreateContext"},
+    });
+    add_stubs("libSceNpWebApi", {
+        {0x9156CBE212F72BBCULL, "sceNpWebApiSendRequest"},
+        {0x936D74A0A80FF346ULL, "sceNpWebApiGetHttpStatusCode"},
+        {0x090B4F45217A0ECFULL, "sceNpWebApiReadData"},
+        {0xEF8DD9CC4073955FULL, "sceNpWebApiGetHttpResponseHeaderValueLength"},
+        {0x5702792F41E2820DULL, "sceNpWebApiGetHttpResponseHeaderValue"},
+    }, kNpErrSignedOut);
+
+    // libSceNpScore / libSceNpTus / libSceNpTss: server-backed data.
+    add_stubs("libSceNpScore", {
+        {0x1B4A44F91342C1F9ULL, "sceNpScoreDeleteNpTitleCtx"},
+        {0x74AF3F4A061FEABEULL, "sceNpScoreDeleteRequest"},
+        {0xD62EE498A6D7EA19ULL, "sceNpScoreAbortRequest"},
+    }, SCE_OK);
+    add_handles("libSceNpScore", {
+        {0x2A7340D53120B412ULL, "sceNpScoreCreateNpTitleCtx"},
+        {0x816F2ACA362B51B9ULL, "sceNpScoreCreateRequest"},
+    });
+    add_stubs("libSceNpScore", {
+        {0xCD3D1706D82D3922ULL, "sceNpScoreRecordScore"},
+        {0x00D26CB0FCF7998DULL, "sceNpScoreRecordScoreAsync"},
+        {0xF66644828884ABA6ULL, "sceNpScoreGetRankingByNpId"},
+        {0x45DDBB76A505655FULL, "sceNpScoreGetRankingByNpIdAsync"},
+        {0x2811F10E3CA4FE30ULL, "sceNpScoreGetRankingByRange"},
+        {0xAD2866A971F0A101ULL, "sceNpScoreGetRankingByRangeAsync"},
+        {0xF24B88CD4C3ABAD4ULL, "sceNpScoreGetFriendsRanking"},
+        {0xED2B8C52537B43A2ULL, "sceNpScoreGetFriendsRankingAsync"},
+        {0x2E854C56B8A354E9ULL, "sceNpScoreGetBoardInfo"},
+        {0x9B50DF351B2D9124ULL, "sceNpScorePollAsync"},
+    }, kNpErrSignedOut);
+    add_stubs("libSceNpTus", {
+        {0x09C207E347584BCFULL, "sceNpTusDeleteRequest"},
+        {0x1F7BAAEF1D2C64E2ULL, "sceNpTusDeleteNpTitleCtx"},
+    }, SCE_OK);
+    add_handles("libSceNpTus", {
+        {0x04890C9947CD2963ULL, "sceNpTusCreateNpTitleCtx"},
+        {0xDDB876681BEF9AF3ULL, "sceNpTusCreateRequest"},
+    });
+    add_stubs("libSceNpTus", {
+        {0xD42CF4853245CA1EULL, "sceNpTusSetMultiSlotVariableVUser"},
+        {0x73A698A1AE3B6202ULL, "sceNpTusSetMultiSlotVariable"},
+        {0xB85C556091247267ULL, "sceNpTusGetMultiSlotVariableVUser"},
+        {0x17E79095F7246BDFULL, "sceNpTusGetMultiSlotVariable"},
+        {0xF918734AEB97C31AULL, "sceNpTusSetDataVUser"},
+        {0xE0DAEE7E43429221ULL, "sceNpTusSetData"},
+        {0x1901C292C4BB68BBULL, "sceNpTusGetDataVUser"},
+        {0x5CECECCCEE0E3565ULL, "sceNpTusGetData"},
+    }, kNpErrSignedOut);
+    add_stubs("libSceNpTss", {
+        {0xFD2511F94A0B4BA7ULL, "sceNpTssGetData"},
+    }, kNpErrSignedOut);
+
+    // libSceNpLookup / libSceNpAuth / libSceNpWordFilter / libSceNpSnsFacebook
+    add_stubs("libSceNpLookup", {
+        {0x9ADA832BDCE4A081ULL, "sceNpLookupDeleteTitleCtx"},
+        {0xC0B6B1721BC41279ULL, "sceNpLookupDeleteRequest"},
+    }, SCE_OK);
+    add_handles("libSceNpLookup", {
+        {0xF39DF743E2D4EC44ULL, "sceNpLookupCreateTitleCtx"},
+        {0x890AFD5313C7505BULL, "sceNpLookupCreateRequest"},
+    });
+    add_stubs("libSceNpLookup", {
+        {0x4FAB6733552D8B88ULL, "sceNpLookupNpId"},
+    }, kNpErrSignedOut);
+    add_stubs("libSceNpAuth", {
+        {0x1FCC06F4193F9CF7ULL, "sceNpAuthDeleteRequest"},
+    }, SCE_OK);
+    add_handles("libSceNpAuth", {
+        {0xE9BC05928B184508ULL, "sceNpAuthCreateRequest"},
+    });
+    add_stubs("libSceNpAuth", {
+        {0x2B11A43AB4094EA6ULL, "sceNpAuthGetAuthorizationCode"},
+    }, kNpErrSignedOut);
+    add_stubs("libSceNpWordFilter", {
+        {0xB743F9CF9CAE14F0ULL, "sceNpWordFilterDeleteTitleCtx"},
+        {0x3D8152D47EF46C3BULL, "sceNpWordFilterDeleteRequest"},
+        {0xAC038EA830310489ULL, "sceNpWordFilterAbortRequest"},
+    }, SCE_OK);
+    add_handles("libSceNpWordFilter", {
+        {0xAFD0602343DF2598ULL, "sceNpWordFilterCreateTitleCtx"},
+        {0x882AB9C56E4A416EULL, "sceNpWordFilterCreateRequest"},
+        {0x20407EBE056841BCULL, "sceNpWordFilterCreateAsyncRequest"},
+    });
+    add_stubs("libSceNpWordFilter", {
+        {0xD5D32776A2FF4201ULL, "sceNpWordFilterCensorComment"},
+        {0x263E2692914EDA01ULL, "sceNpWordFilterSanitizeComment"},
+        {0xBABE524A1C86D1D9ULL, "sceNpWordFilterPollAsync"},
+    }, kNpErrSignedOut);
+    add_stubs("libSceNpSnsFacebook", {
+        {0xA53BC0295D624241ULL, "sceNpSnsFacebookDeleteRequest"},
+    }, SCE_OK);
+    add_handles("libSceNpSnsFacebook", {
+        {0x3A84E37F197CFF02ULL, "sceNpSnsFacebookCreateRequest"},
+    });
+    add_stubs("libSceNpSnsFacebook", {
+        {0x56DC92F172C1A8D1ULL, "sceNpSnsFacebookGetAccessToken"},
+    }, kNpErrSignedOut);
+
+    // libSceNpInGameMessage / libSceNpBandwidthTest / libSceNpCommerce icons
+    add_stubs("libSceNpInGameMessage", {
+        {0x1858555294666C71ULL, "sceNpInGameMessageInitialize"},
+        {0x6CC1B77159949AE9ULL, "sceNpInGameMessageTerminate"},
+        {0xF9A9EE4B1D9ABC74ULL, "sceNpInGameMessageDeleteHandle"},
+    }, SCE_OK);
+    add_handles("libSceNpInGameMessage", {
+        {0xB385046B988125D7ULL, "sceNpInGameMessageCreateHandle"},
+    });
+    add_stubs("libSceNpInGameMessage", {
+        {0x561D5B8541BA992BULL, "sceNpInGameMessagePrepare"},
+        {0x38DED27F95C43262ULL, "sceNpInGameMessageSendData"},
+    }, kNpErrSignedOut);
+    add_stubs("libSceNpBandwidthTest", {
+        {0xA4BAF57C4412D73FULL, "sceNpBandwidthTestShutdown"},
+    }, SCE_OK);
+    add_stubs("libSceNpBandwidthTest", {
+        {0x8E4B70C37C895E77ULL, "sceNpBandwidthTestInitStart"},
+        {0x05821918A9BA6CEEULL, "sceNpBandwidthTestGetStatus"},
+    }, kNpErrSignedOut);
+    add_stubs("libSceNpCommerce", {
+        {0x0C79B0B1AE92F137ULL, "sceNpCommerceShowPsStoreIcon"},
+        {0x76CA8256C34CD198ULL, "sceNpCommerceHidePsStoreIcon"},
+    }, SCE_OK);
+
+    // --- Network: no interface, no servers ---
+    add_stubs("libSceNet", {
+        {0x3657AFECB83C9370ULL, "sceNetInit"},
+        {0x7131A473AFD30652ULL, "sceNetTerm"},
+        {0x2BB465AD3908FE6CULL, "sceNetPoolDestroy"},
+        {0x9099581F9B8C0162ULL, "sceNetResolverDestroy"},
+    }, SCE_OK);
+    add_handles("libSceNet", {
+        {0x76024169E2671A9AULL, "sceNetPoolCreate"},
+        {0x0B85200C71CFBDDCULL, "sceNetResolverCreate"},
+    });
+    add_stubs("libSceNet", {
+        {0x35DF7559A5A61B6CULL, "sceNetResolverStartNtoa"},
+        {0x0296F8603C4AB112ULL, "sceNetResolverStartAton"},
+    }, kNetCtlErrNotConnected);
+    register_symbol(0x896416AF0892B7C0ULL, "sceNetHtons", "libSceNet",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = __builtin_bswap16(static_cast<u16>(ctx.rdi)); });
+    register_symbol(0xF53DA90C5D91CAA8ULL, "sceNetHtonl", "libSceNet",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = __builtin_bswap32(static_cast<u32>(ctx.rdi)); });
+    register_symbol(0xF0A729E5DFEAD54AULL, "sceNetInetPton", "libSceNet",
+        [](CpuContext& ctx, MemoryManager& mem) { ctx.rax = guest_inet_pton(mem, ctx.rdi, ctx.rsi, ctx.rdx); });
+
+    // libSceNetCtl: disconnected, with no callbacks ever fired.
+    add_stubs("libSceNetCtl", {
+        {0x824CB4FA868D3389ULL, "sceNetCtlInit"},
+        {0x678C3008588110B4ULL, "sceNetCtlTerm"},
+        {0x509F99ED0FB8724DULL, "sceNetCtlRegisterCallback"},
+        {0x46A9B63A764C0B3DULL, "sceNetCtlUnregisterCallback"},
+        {0x890C378903E1BD44ULL, "sceNetCtlCheckCallback"},
+    }, SCE_OK);
+    add_stubs("libSceNetCtl", {
+        {0xA1BBB17538B0905FULL, "sceNetCtlGetInfo"},
+        {0x24EE32B93B8CA0A2ULL, "sceNetCtlGetNatInfo"},
+        {0xD1C06076E3D147E3ULL, "sceNetCtlGetResult"},
+    }, kNetCtlErrNotConnected);
+    // sceNetCtlGetState(int* state): SCE_NET_CTL_STATE_DISCONNECTED (0).
+    register_symbol(0xB813E5AF495BBA22ULL, "sceNetCtlGetState", "libSceNetCtl",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rdi, sizeof(u32))) mem.write_value<u32>(ctx.rdi, 0);
+            ctx.rax = SCE_OK;
+        });
+
+    // libSceHttp / libSsl: templates, connections and requests are local
+    // handles; anything that sends fails with a network error.
+    add_stubs("libSceHttp", {
+        {0x224FCAA4B4E57FB4ULL, "sceHttpTerm"},
+        {0xE08F2F129B84859FULL, "sceHttpDeleteTemplate"},
+        {0x3FA037CADA6C8987ULL, "sceHttpDeleteConnection"},
+        {0xA9EEE867EBF83D60ULL, "sceHttpDeleteRequest"},
+    }, SCE_OK);
+    add_handles("libSceHttp", {
+        {0x03D715314B44A786ULL, "sceHttpInit"},
+        {0xD206233D347FE9C6ULL, "sceHttpCreateTemplate"},
+        {0xAA0C43063A2B531BULL, "sceHttpCreateConnectionWithURL"},
+        {0x01EBB9C152A417DCULL, "sceHttpCreateRequestWithURL"},
+    });
+    add_stubs("libSceHttp", {
+        {0xD5ED8137023F5F31ULL, "sceHttpSendRequest"},
+        {0xD1AD9304D7C4DC15ULL, "sceHttpGetStatusCode"},
+    }, kHttpErrNetwork);
+    add_stubs("libSceSsl", {
+        {0xD0AD7243A2EFFD87ULL, "sceSslTerm"},
+    }, SCE_OK);
+    add_handles("libSceSsl", {
+        {0x85DA551140C55B7BULL, "sceSslInit"},
+    });
+
+    // libSceRtc: the local clock stands in for network time (no NTP offline).
+    register_symbol(0xD7C076352D72F545ULL, "sceRtcGetCurrentTick", "libSceRtc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rdi, sizeof(u64))) mem.write_value<u64>(ctx.rdi, guest_rtc_now());
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0xCCEF542F7A8820D4ULL, "sceRtcGetCurrentNetworkTick", "libSceRtc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rdi, sizeof(u64))) mem.write_value<u64>(ctx.rdi, guest_rtc_now());
+            ctx.rax = SCE_OK;
+        });
+
+    // --- Common dialogs: one status tracker per family ---
+    // SCE_COMMON_DIALOG_STATUS_*: NONE=0, INITIALIZED=1, RUNNING=2, FINISHED=3.
+    // No dialog is ever drawn and nobody answers one, so Open finishes at once
+    // (GetStatus then reads FINISHED), Terminate returns the family to NONE, and
+    // GetResult reports SCE_COMMON_DIALOG_RESULT_USER_CANCELED (1).
+    struct DialogTracker { std::atomic<u32> status{0}; };
+    static DialogTracker s_dlg_invitation, s_dlg_friend_list, s_dlg_profile,
+                         s_dlg_custom_data, s_dlg_commerce, s_dlg_facebook;
+    static constexpr u32 kDlgStatusNone = 0;
+    static constexpr u32 kDlgStatusFinished = 3;
+    static constexpr u32 kDlgResultUserCanceled = 1;
+    auto dlg_ok = [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; };
+    auto dlg_open = [](DialogTracker& t) {
+        return [&t](CpuContext& ctx, MemoryManager&) {
+            t.status.store(kDlgStatusFinished);
+            ctx.rax = SCE_OK;
+        };
+    };
+    auto dlg_terminate = [](DialogTracker& t) {
+        return [&t](CpuContext& ctx, MemoryManager&) {
+            t.status.store(kDlgStatusNone);
+            ctx.rax = SCE_OK;
+        };
+    };
+    auto dlg_status = [](DialogTracker& t) {
+        return [&t](CpuContext& ctx, MemoryManager&) { ctx.rax = t.status.load(); };
+    };
+    // GetResult(result*): the first word of the result struct is the end status.
+    auto dlg_result = []() {
+        return [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rdi, sizeof(u32))) mem.write_value<u32>(ctx.rdi, kDlgResultUserCanceled);
+            ctx.rax = SCE_OK;
+        };
+    };
+
+    // libSceInvitationDialog
+    register_symbol(0x5EF039292E7AC1CBULL, "sceInvitationDialogInitialize", "libSceInvitationDialog", dlg_ok);
+    register_symbol(0xD335341BEC2254B0ULL, "sceInvitationDialogOpen", "libSceInvitationDialog", dlg_open(s_dlg_invitation));
+    register_symbol(0x07A1D526D0D8C441ULL, "sceInvitationDialogTerminate", "libSceInvitationDialog", dlg_terminate(s_dlg_invitation));
+    register_symbol(0xF7E83D88EABEEE48ULL, "sceInvitationDialogUpdateStatus", "libSceInvitationDialog", dlg_status(s_dlg_invitation));
+    register_symbol(0xF17291EB06BAE224ULL, "sceInvitationDialogGetResult", "libSceInvitationDialog", dlg_result());
+    // libSceNpFriendListDialog (no Initialize import)
+    register_symbol(0xCD433F446E479B27ULL, "sceNpFriendListDialogOpen", "libSceNpFriendListDialog", dlg_open(s_dlg_friend_list));
+    register_symbol(0xF0154FE7A24866E0ULL, "sceNpFriendListDialogGetStatus", "libSceNpFriendListDialog", dlg_status(s_dlg_friend_list));
+    register_symbol(0x6782498570A722F6ULL, "sceNpFriendListDialogGetResult", "libSceNpFriendListDialog", dlg_result());
+    register_symbol(0x10213393E2BD2F69ULL, "sceNpFriendListDialogTerminate", "libSceNpFriendListDialog", dlg_terminate(s_dlg_friend_list));
+    // libSceNpProfileDialog (no Open import)
+    register_symbol(0x2E0F8D084EA94F04ULL, "sceNpProfileDialogInitialize", "libSceNpProfileDialog", dlg_ok);
+    register_symbol(0xDC1AA88853A34AC9ULL, "sceNpProfileDialogGetStatus", "libSceNpProfileDialog", dlg_status(s_dlg_profile));
+    register_symbol(0xF2B84B975FF45BFAULL, "sceNpProfileDialogGetResult", "libSceNpProfileDialog", dlg_result());
+    register_symbol(0xD12A7DBC9701D7FCULL, "sceNpProfileDialogTerminate", "libSceNpProfileDialog", dlg_terminate(s_dlg_profile));
+    // libSceGameCustomDataDialog
+    register_symbol(0xC6D6DBFF67FBD370ULL, "sceGameCustomDataDialogInitialize", "libSceGameCustomDataDialog", dlg_ok);
+    register_symbol(0xE53BEDB7246E53CEULL, "sceGameCustomDataDialogOpen", "libSceGameCustomDataDialog", dlg_open(s_dlg_custom_data));
+    register_symbol(0x1F012D1C50A95395ULL, "sceGameCustomDataDialogTerminate", "libSceGameCustomDataDialog", dlg_terminate(s_dlg_custom_data));
+    register_symbol(0x3E474BB1103838DDULL, "sceGameCustomDataDialogUpdateStatus", "libSceGameCustomDataDialog", dlg_status(s_dlg_custom_data));
+    register_symbol(0xB09A6D670BECD62BULL, "sceGameCustomDataDialogGetResult", "libSceGameCustomDataDialog", dlg_result());
+    // libSceNpCommerceDialog
+    register_symbol(0xD1A4766969906A5EULL, "sceNpCommerceDialogInitialize", "libSceNpCommerceDialog", dlg_ok);
+    register_symbol(0x0DF4820D10371236ULL, "sceNpCommerceDialogOpen", "libSceNpCommerceDialog", dlg_open(s_dlg_commerce));
+    register_symbol(0x9BF23DD806F9D16FULL, "sceNpCommerceDialogTerminate", "libSceNpCommerceDialog", dlg_terminate(s_dlg_commerce));
+    register_symbol(0x2D1E5CC0530C0951ULL, "sceNpCommerceDialogUpdateStatus", "libSceNpCommerceDialog", dlg_status(s_dlg_commerce));
+    register_symbol(0xAF8D9B59C41BB596ULL, "sceNpCommerceDialogGetResult", "libSceNpCommerceDialog", dlg_result());
+    // libSceNpSnsFacebookDialog
+    register_symbol(0xB5D400AD42DB3509ULL, "sceNpSnsFacebookDialogInitialize", "libSceNpSnsFacebookDialog", dlg_ok);
+    register_symbol(0x1E2DE89EA1D237A3ULL, "sceNpSnsFacebookDialogOpen", "libSceNpSnsFacebookDialog", dlg_open(s_dlg_facebook));
+    register_symbol(0x71DA8E172BA9452EULL, "sceNpSnsFacebookDialogTerminate", "libSceNpSnsFacebookDialog", dlg_terminate(s_dlg_facebook));
+    register_symbol(0x7E357B0BC1F463C9ULL, "sceNpSnsFacebookDialogUpdateStatus", "libSceNpSnsFacebookDialog", dlg_status(s_dlg_facebook));
+    register_symbol(0x0227DD708D5A29ABULL, "sceNpSnsFacebookDialogGetResult", "libSceNpSnsFacebookDialog", dlg_result());
+    // libSceSaveDataDialog: Unity's SavedGames plugin shows one while it
+    // loads ("no saved data" on a first boot) and waits for FINISHED before
+    // reporting the load to the game; the fallback status 0 kept it waiting
+    // forever, so the startup autoload never completed. Every dialog ends
+    // at once with the OK button.
+    static DialogTracker s_dlg_save_data;
+    register_symbol(0xB3D7B7F98A519F3CULL, "sceSaveDataDialogInitialize", "libSceSaveDataDialog", dlg_ok);
+    register_symbol(0xE2D3E1B0FE85A432ULL, "sceSaveDataDialogOpen", "libSceSaveDataDialog", dlg_open(s_dlg_save_data));
+    register_symbol(0x7C7E3A2DA83CF176ULL, "sceSaveDataDialogClose", "libSceSaveDataDialog", dlg_open(s_dlg_save_data));
+    register_symbol(0x62E1F6140EDACEA4ULL, "sceSaveDataDialogTerminate", "libSceSaveDataDialog", dlg_terminate(s_dlg_save_data));
+    register_symbol(0x28ADC1760D5158ADULL, "sceSaveDataDialogUpdateStatus", "libSceSaveDataDialog", dlg_status(s_dlg_save_data));
+    register_symbol(0x1112B392C6AE0090ULL, "sceSaveDataDialogGetStatus", "libSceSaveDataDialog", dlg_status(s_dlg_save_data));
+    register_symbol(0x7A7EE03559E1F3BFULL, "sceSaveDataDialogIsReadyToDisplay", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 1; });
+    register_symbol(0x85ACB509F4E62F20ULL, "sceSaveDataDialogProgressBarSetValue", "libSceSaveDataDialog", dlg_ok);
+    // sceSaveDataDirNameSearch(cond, result*): no saved data yet. Writes
+    // hitNum (+0) and setNum (+0x14); the fallback left them uninitialised.
+    // (Real host-folder save data is in feat/hle-savedata-trophy.)
+    register_symbol(0x7722219D7ABFD123ULL, "sceSaveDataDirNameSearch", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rsi, 0x18)) {
+                mem.write_value<u32>(ctx.rsi + 0x00, 0);
+                mem.write_value<u32>(ctx.rsi + 0x14, 0);
+            }
+            ctx.rax = SCE_OK;
+        });
+    // GetResult(SceSaveDataDialogResult*): mode (left as is), result 0, buttonId OK (1).
+    register_symbol(0xC84889FEAAABE828ULL, "sceSaveDataDialogGetResult", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rdi, 12)) {
+                mem.write_value<i32>(ctx.rdi + 4, 0);
+                mem.write_value<i32>(ctx.rdi + 8, 1);
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // --- libc / libc++ gaps (real implementations) ---
+    register_symbol(0x015EA2A4235AE11CULL, "strcasecmp", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string a, b;
+            read_guest_cstring(mem, ctx.rdi, a);
+            read_guest_cstring(mem, ctx.rsi, b);
+            ctx.rax = static_cast<u64>(static_cast<i64>(guest_strcasecmp(a, b)));
+        });
+    register_symbol(0xE6336E6F0E2F9400ULL, "strnlen", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            GuestSize n = 0;
+            char c = 0;
+            while (n < ctx.rsi && mem.read_value(ctx.rdi + n, c) && c != 0) ++n;
+            ctx.rax = n;
+        });
+    register_symbol(0xF2EF253F3504ABE5ULL, "memchr", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr s = ctx.rdi;
+            const GuestSize n = ctx.rdx;
+            ctx.rax = 0;
+            if (n == 0 || !mem.is_valid_address(s, n)) return;
+            const u8* base = mem.to_host_ptr<u8>(s);
+            if (const void* hit = std::memchr(base, static_cast<int>(ctx.rsi & 0xFF), n))
+                ctx.rax = s + static_cast<GuestAddr>(static_cast<const u8*>(hit) - base);
+        });
+    register_symbol(0xA15919F16F3F43C0ULL, "strtok", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            // Dinkumware keeps strtok's scan position per thread; Unity's
+            // shader loader and main thread tokenize concurrently. Guest
+            // threads are not 1:1 with host threads, so key by guest tid.
+            static std::mutex s_strtok_mtx;
+            static std::unordered_map<ScePthreadId, GuestAddr> s_strtok_save;
+            const ScePthreadId tid = current_hle_thread_id();
+            GuestAddr save = 0;
+            {
+                std::lock_guard<std::mutex> lk(s_strtok_mtx);
+                save = s_strtok_save[tid];
+            }
+            ctx.rax = guest_strtok(mem, ctx.rdi, ctx.rsi, save);
+            std::lock_guard<std::mutex> lk(s_strtok_mtx);
+            s_strtok_save[tid] = save;
+        });
+    register_symbol(0x7A7A8F18B7E654D5ULL, "strtok_r", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            GuestAddr save = 0;
+            if (!mem.read_value(ctx.rdx, save)) {
+                ctx.rax = 0;
+                return;
+            }
+            ctx.rax = guest_strtok(mem, ctx.rdi, ctx.rsi, save);
+            mem.write_value<GuestAddr>(ctx.rdx, save);
+        });
+    register_symbol(0x9979718662CD30F8ULL, "strtol", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string text;
+            read_guest_cstring(mem, ctx.rdi, text);
+            char* end = nullptr;
+            const long v = std::strtol(text.c_str(), &end, static_cast<int>(ctx.rdx));
+            store_end_pointer(mem, ctx.rsi, ctx.rdi, text, end);
+            ctx.rax = static_cast<u64>(static_cast<i64>(v));
+        });
+    // _Stod(const char* s, char** endptr, ...): strtod with the end pointer.
+    register_symbol(0x738D5410756D8840ULL, "_Stod", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string text;
+            read_guest_cstring(mem, ctx.rdi, text);
+            char* end = nullptr;
+            ctx.ymm[0].d[0] = std::strtod(text.c_str(), &end);
+            store_end_pointer(mem, ctx.rsi, ctx.rdi, text, end);
+        });
+    // _Stoll(const char* s, char** endptr, int base): strtoll with the end pointer.
+    register_symbol(0xEE934A72C70AADFFULL, "_Stoll", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string text;
+            read_guest_cstring(mem, ctx.rdi, text);
+            char* end = nullptr;
+            const long long v = std::strtoll(text.c_str(), &end, static_cast<int>(ctx.rdx));
+            store_end_pointer(mem, ctx.rsi, ctx.rdi, text, end);
+            ctx.rax = static_cast<u64>(v);
+        });
+    register_symbol(0xA4AC2C96C3149929ULL, "fmod", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::fmod(ctx.ymm[0].d[0], ctx.ymm[1].d[0]); });
+    register_symbol(0xF3C56FFC0CC7563FULL, "fmodf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::fmod(ctx.ymm[0].f[0], ctx.ymm[1].f[0]); });
+    // modf(double x, double* iptr): integer part to *iptr, fraction returned.
+    register_symbol(0xD163070DBE43B7DEULL, "modf", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            double ip = 0.0;
+            const double frac = std::modf(ctx.ymm[0].d[0], &ip);
+            if (mem.is_valid_address(ctx.rdi, sizeof(double))) mem.write_value<double>(ctx.rdi, ip);
+            ctx.ymm[0].d[0] = frac;
+        });
+    register_symbol(0xF4B0A3A56C90E597ULL, "pow", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::pow(ctx.ymm[0].d[0], ctx.ymm[1].d[0]); });
+    register_symbol(0x35569D7E7CD08474ULL, "exp", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::exp(ctx.ymm[0].d[0]); });
+    register_symbol(0x4FBBB236A3FBBD00ULL, "tan", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::tan(ctx.ymm[0].d[0]); });
+    register_symbol(0x644E9134BF9E2DB9ULL, "tanf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::tan(ctx.ymm[0].f[0]); });
+    register_symbol(0x24CE0406F593F6B7ULL, "tanh", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::tanh(ctx.ymm[0].d[0]); });
+    register_symbol(0x24172062E5BC94F5ULL, "acos", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::acos(ctx.ymm[0].d[0]); });
+    register_symbol(0xECBCB9DB368BE384ULL, "asin", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::asin(ctx.ymm[0].d[0]); });
+    register_symbol(0x39799AB8B750F246ULL, "atan", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::atan(ctx.ymm[0].d[0]); });
+    register_symbol(0x1D46D998E9D3FC38ULL, "atan2", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::atan2(ctx.ymm[0].d[0], ctx.ymm[1].d[0]); });
+    // vsprintf(char* dest, const char* fmt, va_list ap): returns the length.
+    register_symbol(0x8DBCFD23DBE4AA49ULL, "vsprintf", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string fmt;
+            if (!read_guest_cstring(mem, ctx.rsi, fmt)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            VaListArgs args(mem, ctx.rdx);
+            const std::string out = format_guest(mem, fmt.c_str(), args);
+            if (mem.is_valid_address(ctx.rdi, out.size() + 1)) mem.write_bytes(ctx.rdi, out.c_str(), out.size() + 1);
+            ctx.rax = static_cast<u64>(out.size());
+        });
+    // vsnprintf_s(char* buf, size_t bufsz, size_t count, const char* fmt, va_list ap).
+    // Writes at most min(count, bufsz - 1) characters; returns that length, or -1
+    // when the output had to be cut short.
+    register_symbol(0xAD64AE4D663624DDULL, "vsnprintf_s", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dest = ctx.rdi;
+            const GuestSize size = ctx.rsi;
+            const GuestSize count = ctx.rdx;
+            std::string fmt;
+            if (size == 0 || !read_guest_cstring(mem, ctx.rcx, fmt)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            VaListArgs args(mem, ctx.r8);
+            const std::string out = format_guest(mem, fmt.c_str(), args);
+            const usize n = std::min<usize>({static_cast<usize>(count), static_cast<usize>(size - 1), out.size()});
+            if (mem.is_valid_address(dest, n + 1)) {
+                mem.write_bytes(dest, out.c_str(), n);
+                mem.write_value<u8>(dest + n, 0);
+            }
+            ctx.rax = out.size() > n ? static_cast<u64>(-1) : static_cast<u64>(n);
+        });
+    // div(int numer, int denom): div_t comes back packed in rax (quot low, rem high).
+    register_symbol(0xDA06DC96D937B301ULL, "div", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const i32 num = static_cast<i32>(ctx.rdi);
+            const i32 den = static_cast<i32>(ctx.rsi);
+            if (den == 0 || (num == INT32_MIN && den == -1))
+                guest_abort("div(): division by zero or overflow (SIGFPE on the PS4)", ctx, mem);
+            const u64 q = static_cast<u32>(num / den);
+            const u64 r = static_cast<u32>(num % den);
+            ctx.rax = q | (r << 32);
+        });
+    register_symbol(0x72908E5D632085ADULL, "rand", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::rand()); });
+    register_symbol(0xD30BB7DE1BA735D1ULL, "sleep", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            std::this_thread::sleep_for(std::chrono::seconds(static_cast<u32>(ctx.rdi)));
+            ctx.rax = 0;
+        });
+    // perror(const char* s): the message goes to stderr; guest errno is not modelled.
+    register_symbol(0x10CBADC1A437E09AULL, "perror", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string text;
+            read_guest_cstring(mem, ctx.rdi, text);
+            std::fprintf(stderr, "[guest perror] %s\n", text.c_str());
+            ctx.rax = 0;
+        });
+    // setlocale(int category, const char* locale): only the C locale exists.
+    register_symbol(0x3EDB01D50F70B050ULL, "setlocale", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (ctx.rsi == 0) {
+                ctx.rax = guest_static_string(mem, "C");
+                return;
+            }
+            std::string loc;
+            read_guest_cstring(mem, ctx.rsi, loc);
+            const bool c_locale = loc.empty() || loc == "C" || loc == "POSIX";
+            ctx.rax = c_locale ? guest_static_string(mem, "C") : 0;
+        });
+    register_symbol(0x4486BA1A75A9FA25ULL, "strerror", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = guest_static_string(mem, std::strerror(static_cast<int>(ctx.rdi)));
+        });
+    // _Syserror_map(int): the same message text, under its C++ name.
+    register_symbol(0x3C35F4D73894CFEEULL, "_ZSt13_Syserror_mapi", "libstdc++",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = guest_static_string(mem, std::strerror(static_cast<int>(ctx.rdi)));
+        });
+    // _Fltrounds(): FLT_ROUNDS = 1, round to nearest.
+    register_symbol(0x268F4E37F017F5E5ULL, "_Fltrounds", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 1; });
+    // wcsncpy over 32-bit wchar_t: copies up to n code units, then pads with zeros.
+    register_symbol(0xD27576D498D8087FULL, "wcsncpy", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dest = ctx.rdi;
+            const GuestAddr src = ctx.rsi;
+            const GuestSize n = ctx.rdx;
+            ctx.rax = dest;
+            if (n == 0 || n > (GuestSize{1} << 28) || !mem.is_valid_address(dest, n * 4)) return;
+            bool copying = true;
+            for (GuestSize i = 0; i < n; ++i) {
+                u32 wc = 0;
+                if (copying && (!mem.read_value(src + 4 * i, wc) || wc == 0)) copying = false;
+                if (!copying) wc = 0;
+                mem.write_value<u32>(dest + 4 * i, wc);
+            }
+        });
+    // mktime(struct tm*): normalises the fields in place and returns the time_t.
+    register_symbol(0x9FB01EA70474B37EULL, "mktime", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::tm t{};
+            if (!load_guest_tm(mem, ctx.rdi, t)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            const std::time_t r = std::mktime(&t);
+            store_guest_tm(mem, ctx.rdi, t, false);
+            ctx.rax = static_cast<u64>(static_cast<i64>(r));
+        });
+    register_symbol(0x79F84AFD84946184ULL, "localtime", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) { ctx.rax = guest_time_split(mem, ctx.rdi, true); });
+    register_symbol(0xD6679C3FB4602360ULL, "gmtime", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) { ctx.rax = guest_time_split(mem, ctx.rdi, false); });
+    // difftime(time_t t1, time_t t0) -> double t1 - t0.
+    register_symbol(0xFD5567EF8672844BULL, "difftime", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.ymm[0].d[0] = static_cast<double>(static_cast<i64>(ctx.rdi) - static_cast<i64>(ctx.rsi));
+        });
+    // strftime(char* s, size_t max, const char* fmt, const struct tm* tm)
+    register_symbol(0x02FDF38D68BAE0ACULL, "strftime", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dest = ctx.rdi;
+            const GuestSize max = ctx.rsi;
+            std::string fmt;
+            std::tm t{};
+            ctx.rax = 0;
+            if (max == 0 || max > (GuestSize{1} << 20) || !read_guest_cstring(mem, ctx.rdx, fmt)
+                || !load_guest_tm(mem, ctx.rcx, t))
+                return;
+            std::vector<char> buf(static_cast<usize>(max));
+            const usize n = std::strftime(buf.data(), buf.size(), fmt.c_str(), &t);
+            if (n == 0 || !mem.is_valid_address(dest, n + 1)) return;
+            mem.write_bytes(dest, buf.data(), n);
+            mem.write_value<u8>(dest + n, 0);
+            ctx.rax = n;
+        });
+    register_symbol(0xE27E75B34CC47F47ULL, "inet_pton", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) { ctx.rax = guest_inet_pton(mem, ctx.rdi, ctx.rsi, ctx.rdx); });
+    // _Assert(expr, file, line): Dinkumware assertion. It always terminates.
+    register_symbol(0xFD082A393E6ED959ULL, "_Assert", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string expr, file;
+            read_guest_cstring(mem, ctx.rdi, expr);
+            read_guest_cstring(mem, ctx.rsi, file);
+            guest_abort("_Assert failed: " + expr + " (" + file + ")", ctx, mem);
+        });
+    // scePthreadGetaffinity(thread, SceKernelCpumask* mask): every core is allowed.
+    register_symbol(0xADCAD5149B105916ULL, "scePthreadGetaffinity", "libkernel",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rsi, sizeof(u64))) mem.write_value<u64>(ctx.rsi, 0xFFULL);
+            ctx.rax = SCE_OK;
+        });
+
+    // stdio on host FILE pointers: fopen hands the guest a host FILE*, so these
+    // pass it straight through. A NULL stream (an unresolved _Stdout/_Stderr data
+    // import) fails with EOF or 0 rather than writing somewhere else.
+    register_symbol(0x42B659749F17B17DULL, "fputs", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rsi);
+            std::string text;
+            if (!fp || !read_guest_cstring(mem, ctx.rdi, text)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            ctx.rax = static_cast<u64>(static_cast<i64>(std::fputs(text.c_str(), fp)));
+        });
+    register_symbol(0x6992BC94D7A2FD0CULL, "fputc", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rsi);
+            ctx.rax = fp ? static_cast<u64>(static_cast<i64>(std::fputc(static_cast<int>(ctx.rdi), fp)))
+                         : static_cast<u64>(-1);
+        });
+    // fwrite(const void* ptr, size_t size, size_t nmemb, FILE* stream)
+    register_symbol(0x329C61321F1016BAULL, "fwrite", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr src = ctx.rdi;
+            const GuestSize size = ctx.rsi;
+            const GuestSize n = ctx.rdx;
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rcx);
+            ctx.rax = 0;
+            if (!fp || size == 0 || n == 0 || size > (GuestSize{1} << 32) || n > (GuestSize{1} << 32)) return;
+            if (!mem.is_valid_address(src, size * n)) return;
+            ctx.rax = std::fwrite(mem.to_host_ptr<void>(src), size, n, fp);
+        });
+    // fprintf(FILE* stream, const char* fmt, ...)
+    register_symbol(0x7DF7F010B5CD5450ULL, "fprintf", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            std::string fmt;
+            if (!fp || !read_guest_cstring(mem, ctx.rsi, fmt)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            CallArgs args(ctx, mem, 2);
+            const std::string out = format_guest(mem, fmt.c_str(), args);
+            ctx.rax = std::fwrite(out.data(), 1, out.size(), fp) == out.size()
+                          ? static_cast<u64>(out.size()) : static_cast<u64>(-1);
+        });
+    // vfprintf(FILE* stream, const char* fmt, va_list ap)
+    register_symbol(0xA43043718EAE2D20ULL, "vfprintf", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            std::string fmt;
+            if (!fp || !read_guest_cstring(mem, ctx.rsi, fmt)) {
+                ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            VaListArgs args(mem, ctx.rdx);
+            const std::string out = format_guest(mem, fmt.c_str(), args);
+            ctx.rax = std::fwrite(out.data(), 1, out.size(), fp) == out.size()
+                          ? static_cast<u64>(out.size()) : static_cast<u64>(-1);
+        });
+    // fgets(char* buf, int n, FILE* stream)
+    register_symbol(0x29D3FF9D42E9B86CULL, "fgets", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dst = ctx.rdi;
+            const int n = static_cast<int>(ctx.rsi);
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rdx);
+            ctx.rax = 0;
+            if (!fp || n <= 0 || !mem.is_valid_address(dst, static_cast<GuestSize>(n))) return;
+            std::vector<char> line(static_cast<usize>(n));
+            if (std::fgets(line.data(), n, fp) == nullptr) return;
+            mem.write_bytes(dst, line.data(), std::strlen(line.data()) + 1);
+            ctx.rax = dst;
+        });
+    // ferror(FILE* stream): a NULL stream counts as failed.
+    register_symbol(0x007C7284DF7A772EULL, "ferror", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            FILE* fp = reinterpret_cast<FILE*>(ctx.rdi);
+            ctx.rax = fp ? static_cast<u64>(std::ferror(fp) != 0) : 1;
+        });
+
+    // --- C++ exception ABI: no unwinder is emulated. Any throw terminates. ---
+    // A silent return would let the guest keep running on a half-built exception
+    // object, so each entry names itself and the caller RIP is printed by
+    // guest_abort. Consistent with abort() above.
+    register_symbol(0xCEBD3DE04437F56CULL, "__cxa_pure_virtual", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            guest_abort("__cxa_pure_virtual: pure virtual method called", ctx, mem);
+        });
+    register_symbol(0x71F017BABBDF979AULL, "__cxa_allocate_exception", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            guest_abort("__cxa_allocate_exception: C++ exception raised, unwinder not emulated", ctx, mem);
+        });
+    register_symbol(0xBE4BAE2DF8674992ULL, "__cxa_throw", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            guest_abort("__cxa_throw: C++ exception thrown, unwinder not emulated", ctx, mem);
+        });
+    register_symbol(0x64BF455789895F1AULL, "__cxa_rethrow", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            guest_abort("__cxa_rethrow: C++ exception rethrown, unwinder not emulated", ctx, mem);
+        });
+    register_symbol(0xBAC29BBAFCB68508ULL, "__cxa_call_unexpected", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            guest_abort("__cxa_call_unexpected: exception specification violated", ctx, mem);
+        });
+    register_symbol(0x7F5CF02778C02369ULL, "_Unwind_Resume", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            guest_abort("_Unwind_Resume: resuming an unwind, unwinder not emulated", ctx, mem);
+        });
+    register_symbol(0xA98867A1EBDDF5B2ULL, "_ZSt9terminatev", "libstdc++",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            guest_abort("std::terminate() called", ctx, mem);
+        });
+    register_symbol(0x793D94B264DEC1B5ULL, "_ZSt11_Xbad_allocv", "libstdc++",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            guest_abort("std::bad_alloc thrown (std::_Xbad_alloc)", ctx, mem);
+        });
+    register_symbol(0xA33300AF6F01C126ULL, "_ZSt14_Xout_of_rangePKc", "libstdc++",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string msg;
+            read_guest_cstring(mem, ctx.rdi, msg);
+            guest_abort("std::out_of_range thrown: " + msg, ctx, mem);
         });
 
     // Some handlers above were registered under NIDs that are not the real

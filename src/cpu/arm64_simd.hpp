@@ -1,6 +1,6 @@
 #pragma once
 
-// ARM64 FP/NEON instruction encodings used by the JIT's SSE/AVX translator.
+// ARM64 FP/NEON (and a few integer) instruction encodings used by the JIT.
 // Each function returns one instruction word; register arguments are
 // V-register numbers (vd/vn/vm), X/W-register numbers (xd/xn/...), byte
 // offsets for loads/stores and element indices for lane moves. Encodings are
@@ -100,5 +100,12 @@ constexpr u32 dup_elem(bool dbl, u32 d, u32 n, u32 j) {           // all lanes =
 constexpr u32 csel(bool x, u32 d, u32 n, u32 m, u32 cond) {
     return (x ? 0x9A800000u : 0x1A800000u) | (m << 16) | (cond << 12) | (n << 5) | d;
 }
+// Variable shifts/rotates (amount taken modulo the register size).
+constexpr u32 gsz(bool x) { return x ? 0x80000000u : 0u; }
+constexpr u32 lslv(bool x, u32 d, u32 n, u32 m) { return rd_rn_rm(0x1AC02000 | gsz(x), d, n, m); }
+constexpr u32 asrv(bool x, u32 d, u32 n, u32 m) { return rd_rn_rm(0x1AC02800 | gsz(x), d, n, m); }
+constexpr u32 rorv(bool x, u32 d, u32 n, u32 m) { return rd_rn_rm(0x1AC02C00 | gsz(x), d, n, m); }
+constexpr u32 mul(u32 d, u32 n, u32 m) { return rd_rn_rm(0x9B007C00, d, n, m); }     // 64-bit
+constexpr u32 smulh(u32 d, u32 n, u32 m) { return rd_rn_rm(0x9B407C00, d, n, m); }
 
 } // namespace ps4::a64

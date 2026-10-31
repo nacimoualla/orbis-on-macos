@@ -241,6 +241,7 @@ struct Pm4Translator::Impl {
                              i32 base_vertex = 0, u32 instance_count = 1);
     bool render_auto_mesh(u32 vtx_count, PrimitiveType prim_type,
                           i32 base_vertex = 0, u32 instance_count = 1);
+    bool cb_special_draw();
     id<MTLBuffer> cached_buffer(id<MTLDevice> device, GuestAddr address, usize size,
                                 const void* bytes, u32 format = 0);
     void evict_resource_cache(usize requested);
@@ -257,6 +258,17 @@ struct Pm4Translator::Impl {
     void mark_pipeline_dirty() noexcept { dirty_bits |= DirtyPipeline; }
     void mark_resource_dirty() noexcept {
         dirty_bits |= DirtyVertexLayout | DirtyTexture | DirtyUniform | DirtyRenderTarget;
+    }
+
+    bool ensure_frame() {
+        if (!metal || !metal->is_initialized()) return true;
+        if (metal->frame_in_progress()) return true;
+        if (!metal->begin_frame()) return false;
+        frame_draw_encoded = false;
+        frame_submission_start = metal->submitted_frame_count();
+        frame_stats = GpuFrameStats{};
+        frame_stats.frame_index = frame_submission_start + 1;
+        return true;
     }
 };
 
@@ -1186,6 +1198,7 @@ bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_ad
 
 bool Pm4Translator::Impl::try_gcn_dispatch(u32 dim_x, u32 dim_y, u32 dim_z) {
     if (!gcn_enabled || !memory || !metal || cs_shader_addr <= 0x1000) return false;
+    if (!ensure_frame()) return false;
     @autoreleasepool {
         if (!gcn_cache) gcn_cache = std::make_unique<GcnPipelineCache>(metal->raw_device(), memory);
         gcn_cache->set_memory(memory);
@@ -1232,10 +1245,11 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         indexed_draw_count++;
         return true;
     }
-    if (!metal->frame_in_progress()) {
+    if (!ensure_frame()) {
         PM4_LOG("[PM4] draw outside frame\n");
         return false;
     }
+    if (cb_special_draw()) return true;
 
     if (try_gcn_draw(true, idx_count, idx_addr, idx_type, prim_type, base_vertex, instance_count)) {
         draw_count++;
@@ -1443,6 +1457,27 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
     }
 }
 
+// A draw issued with CB_COLOR_CONTROL in a non-rendering mode is a CB
+// operation, not geometry. Resolve copies CB0 into CB1 (how Unity moves its
+// offscreen scene to the VideoOut buffer); fast-clear elimination and
+// (FMASK) decompression have no host equivalent: our targets are never
+// compressed. Returns true when the draw was consumed.
+bool Pm4Translator::Impl::cb_special_draw() {
+    const u32 ctl = reg_file[kPm4ContextRegBase + ctx_reg::kCbColorControl];
+    const u8 mode = static_cast<u8>((ctl >> 4) & 7);
+    if (mode == cb_mode::kEliminateFastClear || mode == cb_mode::kDecompress || mode == cb_mode::kFmaskDecompress)
+        return true;
+    if (mode != cb_mode::kResolve) return false;
+    const u32* cb0 = reg_file.data() + kPm4ContextRegBase + ctx_reg::kCbColor0BaseGfx7;
+    const u64 src = static_cast<u64>(cb0[0]) << 8;
+    const u64 dst = static_cast<u64>(cb0[ctx_reg::kCbColorStrideGfx7]) << 8;
+    const bool ok = metal->resolve_color(src, dst);
+    PM4_LOG("[PM4] CB resolve 0x%llx -> 0x%llx%s\n", (unsigned long long)src, (unsigned long long)dst,
+            ok ? "" : " (no source surface)");
+    if (ok && metal->is_display_buffer(dst)) frame_draw_encoded = true;
+    return true;
+}
+
 bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_type,
                                            i32 base_vertex, u32 instance_count) {
     if (vtx_count == 0) return true;
@@ -1451,10 +1486,11 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         draw_count++;
         return true;
     }
-    if (!metal->frame_in_progress()) {
+    if (!ensure_frame()) {
         PM4_LOG("[PM4] draw outside frame\n");
         return false;
     }
+    if (cb_special_draw()) return true;
 
     if (try_gcn_draw(false, vtx_count, 0, MTLIndexTypeUInt16, prim_type, base_vertex, instance_count)) {
         draw_count++;
@@ -1715,7 +1751,15 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
     m_impl->metal->end_render_encoder();
     // PS4_GPU_READBACK=1: wait for frames that drew and log the framebuffer
     // centre (diagnostic for comparing the GCN path with the fixed shader).
-    static const bool readback = std::getenv("PS4_GPU_READBACK") != nullptr;
+    // PS4_GPU_READBACK_EVERY=N: dump only every Nth frame (a 1080p PPM is
+    // 6 MB) and wait for the GPU only on those, so frame pacing is unaffected.
+    static const u64 dump_every = [] {
+        const char* v = std::getenv("PS4_GPU_READBACK_EVERY");
+        const u64 n = v ? std::strtoull(v, nullptr, 0) : 1;
+        return n ? n : 1;
+    }();
+    const bool sample = (m_impl->metal->submitted_frame_count() + 1) % dump_every == 0;
+    const bool readback = std::getenv("PS4_GPU_READBACK") != nullptr && sample;
     const bool drew = m_impl->frame_draw_encoded;
     const bool submitted = m_impl->metal->submit_frame(wait_for_completion || (readback && drew));
     if (readback && drew && submitted) {

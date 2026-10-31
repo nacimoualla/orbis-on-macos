@@ -153,6 +153,30 @@ bool DynamicLinker::initialize(GuestAddr trampoline_base) {
 
     // Reserve 64KB space for trampolines
     constexpr GuestSize TRAMPOLINE_POOL_SIZE = 0x10000;
+    if (!m_memory.reserve_mapping(m_trampoline_base, TRAMPOLINE_POOL_SIZE, "trampolines")) {
+        // If the requested base overlaps with an existing mapping (e.g. an ELF segment),
+        // find a free non-overlapping range above the highest mapping.
+        GuestAddr candidate = m_trampoline_base;
+        for (const auto& m : m_memory.mappings()) {
+            if (candidate < m.start + m.size && m.start < candidate + TRAMPOLINE_POOL_SIZE) {
+                candidate = (m.start + m.size + 0xFFFFULL) & ~0xFFFFULL;
+            }
+        }
+        bool reserved = false;
+        while (candidate + TRAMPOLINE_POOL_SIZE < 0x20000000ULL) {
+            if (m_memory.reserve_mapping(candidate, TRAMPOLINE_POOL_SIZE, "trampolines")) {
+                m_trampoline_base = candidate;
+                reserved = true;
+                break;
+            }
+            candidate += 0x10000ULL;
+        }
+        if (!reserved) {
+            m_last_error = "failed to reserve free space for trampoline pool";
+            return false;
+        }
+    }
+
     if (!m_memory.is_valid_address(m_trampoline_base, TRAMPOLINE_POOL_SIZE)) {
         m_last_error = "trampoline pool outside guest memory";
         return false;
@@ -707,6 +731,39 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
         return false;
     };
 
+    auto handle_special_data_import = [&](MemoryManager& mem, GuestAddr patch_location, std::string_view sym_str, Nid nid) -> bool {
+        if (sym_str.find("f7uOxY9mM1U") != std::string_view::npos ||
+            nid == 0x7fbb8ec58f663355ULL || nid == 0x5533668fc58ebb7fULL) {
+            constexpr GuestAddr STACK_CANARY_ADDR = 0x3FF0000ULL;
+            constexpr u64 CANARY_VALUE = 0x595E9FBD94FDA766ULL;
+            mem.write_value(STACK_CANARY_ADDR, CANARY_VALUE);
+            mem.write_value(patch_location, STACK_CANARY_ADDR);
+            return true;
+        }
+        constexpr GuestAddr DISPLAY_CFG_ADDR = 0x3FF1000ULL;
+        if (sym_str.find("QBbo2kzANmQ") != std::string_view::npos || nid == 0x4016e8da4cc03664ULL) {
+            mem.write_value(DISPLAY_CFG_ADDR + 0x00, static_cast<u32>(1920));
+            mem.write_value(patch_location, DISPLAY_CFG_ADDR + 0x00);
+            return true;
+        }
+        if (sym_str.find("iEfUiWkJ3PI") != std::string_view::npos || nid == 0x8847d4896909dcf2ULL) {
+            mem.write_value(DISPLAY_CFG_ADDR + 0x04, static_cast<u32>(1920));
+            mem.write_value(patch_location, DISPLAY_CFG_ADDR + 0x04);
+            return true;
+        }
+        if (sym_str.find("8HhxNMSnlT4") != std::string_view::npos || nid == 0xf0787134c4a7953eULL) {
+            mem.write_value(DISPLAY_CFG_ADDR + 0x08, static_cast<u32>(0));
+            mem.write_value(patch_location, DISPLAY_CFG_ADDR + 0x08);
+            return true;
+        }
+        if (sym_str.find("hMr0EtMYJbQ") != std::string_view::npos || nid == 0x84caf412d31825b4ULL) {
+            mem.write_value(DISPLAY_CFG_ADDR + 0x0C, static_cast<u32>(0));
+            mem.write_value(patch_location, DISPLAY_CFG_ADDR + 0x0C);
+            return true;
+        }
+        return false;
+    };
+
     auto process_rela_table = [&](GuestAddr table_addr, GuestSize table_size, const char* what) -> bool {
         if (table_addr == 0 || table_size == 0) return true;
         const usize count = static_cast<usize>(table_size / sizeof(Elf64_Rela));
@@ -764,14 +821,8 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                 }
                 if (!m_registry.find_by_nid(nid) && !m_module_exports.contains(nid))
                     m_unresolved_nids.push_back(nid);
-                if (std::string_view(sym_str).find("f7uOxY9mM1U") != std::string_view::npos ||
-                    nid == 0x7fbb8ec58f663355ULL || nid == 0x5533668fc58ebb7fULL) {
-                    constexpr GuestAddr STACK_CANARY_ADDR = 0x3FF0000ULL;
-                    constexpr u64 CANARY_VALUE = 0x595E9FBD94FDA766ULL;
-                    if (!m_memory.write_value(STACK_CANARY_ADDR, CANARY_VALUE))
-                        patch_failed(STACK_CANARY_ADDR);
-                    if (!m_memory.write_value(patch_location, STACK_CANARY_ADDR))
-                        patch_failed(patch_location);
+                if (handle_special_data_import(m_memory, patch_location, sym_str, nid)) {
+                    // Special GOT data symbol handled
                 } else {
                     const GuestAddr tramp = get_or_create_trampoline(nid);
                     if (!m_memory.write_value(patch_location, tramp + rela.r_addend))
@@ -798,14 +849,8 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                         if (!m_registry.find_by_nid(nid) && !m_module_exports.contains(nid)) {
                             m_unresolved_nids.push_back(nid);
                         }
-                        if (std::string_view(sym_str).find("f7uOxY9mM1U") != std::string_view::npos ||
-                            nid == 0x7fbb8ec58f663355ULL || nid == 0x5533668fc58ebb7fULL) {
-                            constexpr GuestAddr STACK_CANARY_ADDR = 0x3FF0000ULL;
-                            constexpr u64 CANARY_VALUE = 0x595E9FBD94FDA766ULL;
-                            if (!m_memory.write_value(STACK_CANARY_ADDR, CANARY_VALUE))
-                                patch_failed(STACK_CANARY_ADDR);
-                            if (!m_memory.write_value(patch_location, STACK_CANARY_ADDR))
-                                patch_failed(patch_location);
+                        if (handle_special_data_import(m_memory, patch_location, sym_str, nid)) {
+                            // Special GOT data symbol handled
                         } else {
                             if (!patch_jump_slot(patch_location, nid))
                                 patch_failed(patch_location);
@@ -1187,6 +1232,7 @@ u32 DynamicLinker::load_module(const std::string& path, GuestAddr base, bool run
     mod.handle = handle;
     mod.path = path;
     mod.base = base;
+    mod.entry = loader.entry_point();
     m_modules.emplace(handle, mod);
 
     const auto rollback_mapping = [&]() {

@@ -36,6 +36,7 @@ struct LoadedModule {
     GuestAddr base{0};
     GuestAddr init{0};          // DT_INIT, 0 when the module has no entry point
     GuestAddr fini{0};          // DT_FINI
+    GuestAddr entry{0};         // ELF e_entry, module-relative: a PRX's start stub (often 0, the base)
     GuestSize size{0};          // total mapped span
     usize export_count{0};
 };
