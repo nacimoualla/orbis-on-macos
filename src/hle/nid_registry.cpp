@@ -3629,7 +3629,10 @@ void NidRegistry::register_default_libraries() {
 
     // snprintf(char* str, size_t size, const char* format, ...)
     // NID: 0x78B743C3A974FDB5ULL ("eLdDw6l0-bU")
-    register_symbol(0x78B743C3A974FDB5ULL, "snprintf", "libc",
+    // snprintf_s (C11 Annex K) has the same three fixed arguments; Dragon Ball
+    // Xenoverse 2 formats floats with it ("%f"), and the unregistered stub left
+    // the buffer unwritten.
+    auto snprintf_handler =
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr buf = ctx.rdi;
             const GuestSize sz  = ctx.rsi;
@@ -3652,7 +3655,9 @@ void NidRegistry::register_default_libraries() {
                 }
             }
             ctx.rax = formatted.size();
-        });
+        };
+    register_symbol(0x78B743C3A974FDB5ULL, "snprintf", "libc", snprintf_handler);
+    register_symbol(0xDC1CAD3CE42054A7ULL, "snprintf_s", "libc", snprintf_handler);
 
     // fopen(const char* path, const char* mode)
     // NID: 0xC5E60EE2EEEEC89DULL ("xeYO4u7uyJ0")
@@ -4482,8 +4487,15 @@ void NidRegistry::register_default_libraries() {
             if (out_ptr != 0 && mem.is_valid_address(out_ptr, sizeof(u32))) {
                 mem.write_value(out_ptr, evf->bits);
             }
-            ctx.rax = eventflag_satisfied(*evf, want, and_mode) ? SCE_OK
-                                                                : 0x80020010ULL; // EBUSY
+            if (!eventflag_satisfied(*evf, want, and_mode)) {
+                ctx.rax = 0x80020010ULL; // EBUSY
+                return;
+            }
+            // Same CLEAR_ALL (0x10) / CLEAR_PAT (0x20) bits as the wait.
+            const u32 poll_mode = static_cast<u32>(ctx.rcx);
+            if (poll_mode & 0x10u) evf->bits = 0;
+            else if (poll_mode & 0x20u) evf->bits &= ~want;
+            ctx.rax = SCE_OK;
         });
 
     // sceKernelWaitEventFlag(SceKernelEventFlag evf, uint32_t bitPattern,
@@ -4518,8 +4530,14 @@ void NidRegistry::register_default_libraries() {
             const u32 wait_mode = static_cast<u32>(ctx.rdx);
             const GuestAddr out_ptr = ctx.rcx;
             const GuestAddr timo_ptr = ctx.r8;
+            // SCE_KERNEL_EVF_WAITMODE_: AND 0x01, OR 0x02, CLEAR_ALL 0x10,
+            // CLEAR_PAT 0x20. Clearing used to key off 0x02 (OR), so AND|CLEAR_ALL
+            // waits (0x11) never cleared: Dragon Ball Xenoverse 2's render thread
+            // sailed through its per-frame flags and rebuilt the command buffer
+            // many times per flip, and the main thread submitted it half-built.
             const bool and_mode = (wait_mode & 1u) != 0;
-            const bool clear_on_match = (wait_mode & 2u) != 0;
+            const bool clear_all = (wait_mode & 0x10u) != 0;
+            const bool clear_pat = (wait_mode & 0x20u) != 0;
 
             std::shared_ptr<GuestEventFlag> evf;
             {
@@ -4567,7 +4585,8 @@ void NidRegistry::register_default_libraries() {
                 evf->waiters--;
                 if (ok) {
                     matched = evf->bits & want;
-                    if (clear_on_match) evf->bits &= ~want;
+                    if (clear_all) evf->bits = 0;
+                    else if (clear_pat) evf->bits &= ~want;
                 }
             }
 
@@ -7155,6 +7174,28 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = slot;
         });
 
+    // PlayGo: the whole game is installed on the host, so every chunk is local.
+    // Unregistered, scePlayGoGetLocus returned 0 without writing outLoci, so
+    // Dragon Ball Xenoverse 2 read SCE_PLAYGO_LOCUS_NOT_DOWNLOADED and polled
+    // it forever on a black screen.
+    register_symbol(0xB6CE8695938A46B1ULL, "scePlayGoInitialize", "libScePlayGo",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+    // scePlayGoOpen(ScePlayGoHandle* outHandle, const void* param)
+    register_symbol(0x3351A66B5A1CAC61ULL, "scePlayGoOpen", "libScePlayGo",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (ctx.rdi != 0) mem.write_value(ctx.rdi, static_cast<i32>(1));
+            ctx.rax = SCE_OK;
+        });
+    // scePlayGoGetLocus(handle, const ScePlayGoChunkId* ids, u32 n, ScePlayGoLocus* out)
+    register_symbol(0xB962182C5924C2A9ULL, "scePlayGoGetLocus", "libScePlayGo",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            constexpr u8 kLocusLocalFast = 3;
+            const GuestAddr out = ctx.rcx;
+            const u32 n = static_cast<u32>(ctx.rdx);
+            for (u32 i = 0; out != 0 && i < n; ++i) mem.write_value(out + i, kLocusLocalFast);
+            ctx.rax = SCE_OK;
+        });
+
     // Unity memory allocator, FMOD, Mono and GNM setup stubs. Every NID here
     // is a one-shot call we answer with SCE_OK; the names come from ps4libdoc
     // (known_names.txt / libkernel.sprx.json) so the trace labels are true.
@@ -7209,7 +7250,6 @@ void NidRegistry::register_default_libraries() {
         {0x967DF7CE306B7E39ULL, "sceGnmGetTheTessellationFactorRingBufferBaseAddress", "libSceGnm"},
         {0xE6E7409BEE9BA158ULL, "sceGnmCreateWorkloadStream", "libSceGnm"},
         {0x8A1C6B6ECA122967ULL, "sceGnmBeginWorkload", "libSceGnm"},
-        {0xC9BD9C4616A00F52ULL, "sceGnmDrawInitDefaultHardwareState350", "libSceGnm"},
     };
     for (const SyncStub& stub : kSyncStubs) {
         register_symbol(stub.nid, stub.name, stub.module,
@@ -7283,6 +7323,38 @@ void NidRegistry::register_default_libraries() {
                     write_dcb_nop_padding(mem, dcb_addr, num_dwords);
                 }
                 ctx.rax = SCE_OK;
+            });
+    }
+
+    // sceGnmDrawInitDefaultHardwareState{,175,200,350}(u32* cmd, u64 numDwords)
+    // -> DWORDs written; the caller advances its command pointer by the return
+    // value. As a sync stub it returned 0 and wrote nothing, so Dragon Ball
+    // Xenoverse 2's command buffers lost their 0x100-DWORD init block, the
+    // packets after it no longer lined up with the sizes the game submitted,
+    // and every frame came out black. Reserve the same 0x100 DWORDs the real
+    // driver does as one NOP; the PM4 translator keeps its own default state.
+    struct HwInitStub {
+        Nid nid;
+        const char* name;
+    };
+    static constexpr HwInitStub kHwInitStubs[] = {
+        {0x21D7DFC1FDF287CBULL, "sceGnmDrawInitDefaultHardwareState"},
+        {0x4219F245EB5E2753ULL, "sceGnmDrawInitDefaultHardwareState175"},
+        {0xD07DAF0586D32C72ULL, "sceGnmDrawInitDefaultHardwareState200"},
+        {0xC9BD9C4616A00F52ULL, "sceGnmDrawInitDefaultHardwareState350"},
+    };
+    for (const HwInitStub& stub : kHwInitStubs) {
+        register_symbol(stub.nid, stub.name, "libSceGnm",
+            [write_dcb_nop_padding](CpuContext& ctx, MemoryManager& mem) {
+                constexpr u32 kHwInitDwords = 0x100;
+                const GuestAddr dcb_addr = ctx.rdi;
+                if (ctx.rsi < kHwInitDwords ||
+                    !mem.is_valid_address(dcb_addr, GuestSize{kHwInitDwords} * sizeof(u32))) {
+                    ctx.rax = 0;
+                    return;
+                }
+                write_dcb_nop_padding(mem, dcb_addr, kHwInitDwords);
+                ctx.rax = kHwInitDwords;
             });
     }
 
