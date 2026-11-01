@@ -58,6 +58,7 @@ private:
     SyscallTable& m_syscalls;
     CpuContext m_context{};
     JitCompiler* m_jit{nullptr};
+    JitCompiler* m_chain_barriers_set{nullptr}; // PS4_REG_HOOK barriers registered with this JIT
 };
 
 /// The executor whose run() is active on the calling host thread (innermost

@@ -3,15 +3,20 @@
 #include "ps4/executor.hpp"
 #include "ps4/metal_backend.hpp"
 #include "ps4/nid_registry.hpp"
+#include "ps4/np_trophy.hpp"
 #include "ps4/guest_libc_blob.hpp"
 #include "ps4/pm4_translator.hpp"
+#include "ps4/save_data.hpp"
 #include "ps4/syscall_table.hpp"
 #include "ps4/thread.hpp"
 #include "ps4/vfs.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -29,7 +34,9 @@ static bool pm4_verbose() {
 #define PM4_LOG(...) do { if (pm4_verbose()) std::fprintf(stderr, __VA_ARGS__); } while (0)
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -650,6 +657,17 @@ void NidRegistry::register_symbol(Nid nid, std::string_view name, std::string_vi
     m_nids_by_name[sym.name] = nid;
 }
 
+void NidRegistry::register_data_symbol(Nid nid, std::string_view name, DataFactory make) {
+    m_data_by_nid[nid] = DataSymbol{std::string(name), std::move(make), 0};
+}
+
+GuestAddr NidRegistry::resolve_data_symbol(Nid nid, MemoryManager& mem) {
+    auto it = m_data_by_nid.find(nid);
+    if (it == m_data_by_nid.end()) return 0;
+    if (it->second.addr == 0) it->second.addr = it->second.make(mem);
+    return it->second.addr;
+}
+
 const HleSymbol* NidRegistry::find_by_nid(Nid nid) const {
     auto it = m_symbols_by_nid.find(nid);
     if (it != m_symbols_by_nid.end()) {
@@ -1048,7 +1066,33 @@ static void deliver_gnm_eop_interrupt() {
 // The PM4 translator performs the label writes; the interrupts belong to the
 // HLE equeue path, raised after the stream has executed (the label is visible
 // before the waiter wakes, as on hardware).
-static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_bytes, bool log) {
+// The "prepare flip" marker Gnm leaves as the last packet of a flip's DCB: a
+// 64-dword NOP the driver rewrites into the work that runs once the flip has
+// happened. Tags: 0x68750777 plain, 0x68750778 + write label, 0x68750780 +
+// EOP interrupt, 0x68750781 + label and interrupt. Payload after the tag:
+// label lo, label hi, value (label forms); the game spins on that label to
+// know the display buffer is free again.
+struct PrepareFlip {
+    GuestAddr label{0};
+    u32 value{0};
+    bool interrupt{false};
+};
+
+static std::optional<PrepareFlip> decode_prepare_flip(const u32* p, u16 count) {
+    if (count < 1) return std::nullopt;
+    const u32 tag = p[0];
+    if (tag != 0x68750777 && tag != 0x68750778 && tag != 0x68750780 && tag != 0x68750781) return std::nullopt;
+    PrepareFlip f;
+    f.interrupt = tag == 0x68750780 || tag == 0x68750781;
+    if ((tag == 0x68750778 || tag == 0x68750781) && count >= 4) {
+        f.label = (static_cast<GuestAddr>(p[2]) << 32) | p[1];
+        f.value = p[3];
+    }
+    return f;
+}
+
+static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_bytes, bool log,
+                                    std::vector<PrepareFlip>* flips = nullptr) {
     if (!mem.is_valid_address(dcb, size_bytes)) return 0;
     const u32* dw = mem.to_host_ptr<u32>(dcb);
     const usize n = size_bytes / sizeof(u32);
@@ -1063,6 +1107,9 @@ static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_
         if (hdr.type == Pm4PacketType::Type3) {
             if (hdr.opcode == IT_EVENT_WRITE_EOP && hdr.count >= 3 && ((p[2] >> 24) & 0x3) != 0) ++interrupts;
             if (hdr.opcode == IT_RELEASE_MEM && hdr.count >= 2 && ((p[1] >> 24) & 0x7) != 0) ++interrupts;
+            if (flips && hdr.opcode == IT_NOP) {
+                if (auto f = decode_prepare_flip(p, hdr.count)) flips->push_back(*f);
+            }
             if (log) {
                 switch (hdr.opcode) {
                 case IT_WAIT_REG_MEM:
@@ -1089,7 +1136,7 @@ static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_
 // EOP interrupts they request. Shared by sceGnmSubmitCommandBuffers and
 // sceGnmSubmitAndFlipCommandBuffers.
 static void execute_submitted_dcbs(MemoryManager& mem, u32 count, GuestAddr dcb_addrs_ptr,
-                                   GuestAddr dcb_sizes_ptr) {
+                                   GuestAddr dcb_sizes_ptr, std::vector<PrepareFlip>* flips = nullptr) {
     if (dcb_addrs_ptr == 0 || dcb_sizes_ptr == 0 || count > 64) return;
     static std::atomic<u32> s_submits_logged{0};
     const bool log = s_submits_logged.fetch_add(1, std::memory_order_relaxed) < 4;
@@ -1108,7 +1155,7 @@ static void execute_submitted_dcbs(MemoryManager& mem, u32 count, GuestAddr dcb_
             !mem.is_valid_address(dcb_gpu_addr, dcb_size_bytes)) {
             continue;
         }
-        interrupts += count_dcb_eop_interrupts(mem, dcb_gpu_addr, dcb_size_bytes, log);
+        interrupts += count_dcb_eop_interrupts(mem, dcb_gpu_addr, dcb_size_bytes, log, flips);
         if (g_pm4_translator) {
             const usize pkts_in_dcb = g_pm4_translator->execute_command_buffer(dcb_gpu_addr, dcb_size_bytes);
             auto cc = g_pm4_translator->clear_color();
@@ -1119,6 +1166,14 @@ static void execute_submitted_dcbs(MemoryManager& mem, u32 count, GuestAddr dcb_
         }
     }
     for (u32 i = 0; i < interrupts; ++i) deliver_gnm_eop_interrupt();
+}
+
+// Run what the prepare-flip markers of a just-performed flip ask for.
+static void complete_prepare_flips(MemoryManager& mem, const std::vector<PrepareFlip>& flips) {
+    for (const PrepareFlip& f : flips) {
+        if (f.label != 0 && mem.is_valid_address(f.label, sizeof(u32))) mem.write_value(f.label, f.value);
+        if (f.interrupt) deliver_gnm_eop_interrupt();
+    }
 }
 
 // Sema-table snapshot for the stall watchdog (id, count/max per semaphore).
@@ -1192,6 +1247,10 @@ static void ensure_unity_screen_resolution(MemoryManager& mem) {
                      (unsigned long long)sm_ptr, old_w, old_h);
     }
 }
+
+static void register_save_data_and_trophy(NidRegistry& reg);
+static void register_libc_cxx_runtime(NidRegistry& reg);
+static void register_np_offline(NidRegistry& reg);
 
 void NidRegistry::register_default_libraries() {
     // =========================================================================
@@ -4428,124 +4487,22 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = static_cast<u64>(-1);
         });
 
-    // =========================================================================
-    // libsave_data: PlayStation 4 Save Data Services
-    // =========================================================================
+    // libSceSaveData and libSceNpTrophy (see register_save_data_and_trophy).
+    register_save_data_and_trophy(*this);
 
-    // sceSaveDataMount(const SceSaveDataMount* mount, SceSaveDataMountResult* result)
-    register_symbol(0x948296238BC4F301ULL, "sceSaveDataMount", "libsave_data",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr mount_ptr = ctx.rdi;
-            const GuestAddr result_ptr = ctx.rsi;
-            auto& vfs = get_vfs();
-
-            if (mount_ptr != 0 && mem.is_valid_address(mount_ptr, sizeof(SceSaveDataMount)) &&
-                result_ptr != 0 && mem.is_valid_address(result_ptr, sizeof(SceSaveDataMountResult))) {
-                SceSaveDataMount mount_req{};
-                mem.read_bytes(mount_ptr, &mount_req, sizeof(mount_req));
-
-                SceSaveDataMountResult mount_res{};
-                const i32 ret = vfs.mount_savedata(mount_req.user_id, mount_req.dir_name.data, mount_req.mount_mode, mount_res);
-                if (ret == SCE_OK) {
-                    mem.write_bytes(result_ptr, &mount_res, sizeof(mount_res));
-                    ctx.rax = SCE_OK;
-                    return;
-                }
-            }
-            ctx.rax = static_cast<u64>(-14);
-        });
-
-    // sceSaveDataUmount(const SceSaveDataMountResult* result)
-    register_symbol(0x32791B317075AB6EULL, "sceSaveDataUmount", "libsave_data",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr result_ptr = ctx.rdi;
-            auto& vfs = get_vfs();
-
-            if (result_ptr != 0 && mem.is_valid_address(result_ptr, sizeof(SceSaveDataMountResult))) {
-                SceSaveDataMountResult mount_res{};
-                mem.read_bytes(result_ptr, &mount_res, sizeof(mount_res));
-                const i32 ret = vfs.unmount_savedata(mount_res.mount_path);
-                ctx.rax = (ret == SCE_OK) ? SCE_OK : static_cast<u64>(-1);
-                return;
-            }
-            ctx.rax = static_cast<u64>(-14);
-        });
+    // libc / C++ runtime pieces Sonic Mania (RSDKv5) imports, and the NP
+    // services it polls, served as an offline console.
+    register_libc_cxx_runtime(*this);
+    register_np_offline(*this);
 
     // =========================================================================
-    // libsave_data: the memory-budget pair, and libSceVideoOut /
-    // libSceSocialScreen entries that were falling through to the generic
-    // unimplemented stub. Each of these is registered under the name
+    // libSceVideoOut / libSceSocialScreen entries that were falling through to
+    // the generic unimplemented stub. Each of these is registered under the name
     // ps4libdoc's 42k corpus gives it (known_names.txt), so the log now states
     // what the guest actually called rather than "Unimplemented stub called:
-    // NID=0x... returning 0". Four were firing on every run, at the call sites
-    // cited below.
+    // NID=0x... returning 0". Several were firing on every run, at the call
+    // sites cited below.
     // =========================================================================
-
-    // sceSaveDataSetupSaveDataMemory2(const void* param)
-    // NID: 0xA10C921147E05D10ULL -- imported by eboot.bin. Called from
-    // 0x10acf7e (guest `callq` whose return address is 0x10acf83) by the
-    // worker at TID 4, with rdi = 0x1cff9fea0 (a heap param struct).
-    //
-    // Guest code at the call site (eboot.elf, vaddr == file offset):
-    //   10acf7e: callq <import>
-    //   10acf83: movl  %eax, %ecx
-    //   10acf85: testl %ecx, %ecx
-    //   10acf87: je    0x10acfb2            ; success -> continue
-    //   10acf89: xorl  %eax, %eax
-    //   10acf8d: callq 0x10ad840            ; error reporter
-    // It is an int-returning status call with an *input* struct; the success
-    // path reads nothing the callee was meant to fill in (it only pages in its
-    // own pointers at 0x10acfb2+). Returning 0 is therefore correct here and is
-    // kept: the memory "setup" is a budget reservation we do not need to
-    // model, and the guest's success path is the healthy one.
-    // The first call dumps the param struct so the layout can be decoded
-    // later instead of guessed at now.
-    register_symbol(0xA10C921147E05D10ULL, "sceSaveDataSetupSaveDataMemory2", "libSceSaveData",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            static std::atomic<bool> s_logged{false};
-            const GuestAddr p = ctx.rdi;
-            const bool dump = !s_logged.exchange(true);
-            if (dump && p > 0x1000 && mem.is_valid_address(p, 64)) {
-                const u8* b = mem.to_host_ptr<u8>(p);
-                if (b) {
-                    std::fprintf(stderr, "[SaveData] SetupSaveDataMemory2 rdi=0x%llx struct: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                                 (unsigned long long)p, b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7], b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15],
-                                 b[16],b[17],b[18],b[19],b[20],b[21],b[22],b[23], b[24],b[25],b[26],b[27],b[28],b[29],b[30],b[31],
-                                 b[32],b[33],b[34],b[35],b[36],b[37],b[38],b[39], b[40],b[41],b[42],b[43],b[44],b[45],b[46],b[47],
-                                 b[48],b[49],b[50],b[51],b[52],b[53],b[54],b[55], b[56],b[57],b[58],b[59],b[60],b[61],b[62],b[63]);
-                }
-            }
-            const GuestAddr res_ptr = ctx.rsi;
-            if (res_ptr > 0x1000 && mem.is_valid_address(res_ptr, 24)) {
-                mem.zero_memory(res_ptr, 24);
-            }
-            ctx.rax = SCE_OK;
-        });
-
-    // sceSaveDataGetSaveDataMemory2(const void* param, ...)
-    // NID: 0x43038EEEF7A09D5FULL -- imported by eboot.bin.
-    register_symbol(0x43038EEEF7A09D5FULL, "sceSaveDataGetSaveDataMemory2", "libSceSaveData",
-        [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr param_ptr = ctx.rdi;
-            if (param_ptr > 0x1000 && mem.is_valid_address(param_ptr, 40)) {
-                GuestAddr data_ptr = 0;
-                mem.read_value(param_ptr + 8, data_ptr);
-                if (data_ptr > 0x1000 && mem.is_valid_address(data_ptr, 24)) {
-                    GuestAddr buf_addr = 0;
-                    u64 buf_size = 0;
-                    mem.read_value(data_ptr + 0, buf_addr);
-                    mem.read_value(data_ptr + 8, buf_size);
-                    if (buf_addr > 0x1000 && buf_size > 0 && buf_size <= 0x1000000 && mem.is_valid_address(buf_addr, buf_size)) {
-                        mem.zero_memory(buf_addr, buf_size);
-                    }
-                }
-            }
-            const GuestAddr res_ptr = ctx.rsi;
-            if (res_ptr > 0x1000 && mem.is_valid_address(res_ptr, 24)) {
-                mem.zero_memory(res_ptr, 24);
-            }
-            ctx.rax = SCE_OK;
-        });
 
     // sceVideoOutGetDeviceCapabilityInfo_(int handle, void* info, size_t size)
     // NID: 0x90654B73786D404FULL ("YIvXmjmhRBs") -- imported by eboot.bin.
@@ -5083,6 +5040,7 @@ void NidRegistry::register_default_libraries() {
     static std::vector<FlipSubscription> s_flip_subscriptions;
 
     auto perform_flip = [](MemoryManager& mem, u32 buffer_index, i64 flip_arg) {
+        const auto t_flip_enter = std::chrono::steady_clock::now();
         // VBlank pacing. A PS4 flips at the next 60 Hz vblank and the game
         // paces itself on that; completing every flip at once let frame times
         // drift between 16 and 22 ms (judder). With a presenter attached
@@ -5098,11 +5056,19 @@ void NidRegistry::register_default_libraries() {
             if (s_next_vblank.time_since_epoch().count() == 0 || now > s_next_vblank + kVblank) {
                 s_next_vblank = now; // first flip, or more than a frame late: resync
             } else if (now < s_next_vblank) {
-                // sleep_until oversleeps by 1-2 ms on macOS; sleep to just short
-                // of the tick and spin the remainder so frames stay evenly spaced.
-                const auto coarse = s_next_vblank - std::chrono::microseconds(1500);
+                // sleep_until oversleeps by 1-2 ms on macOS, and by 3-4 ms while
+                // the audio and GPU threads are busy; sleep to well short of
+                // the tick and spin the remainder so frames stay evenly spaced.
+                // The spin must not yield: Darwin's sched_yield drops the thread
+                // to the lowest priority for a quantum, so with other threads
+                // busy the tick was missed by 2-8 ms.
+                const auto coarse = s_next_vblank - std::chrono::microseconds(4000);
                 if (now < coarse) std::this_thread::sleep_until(coarse);
-                while (clock::now() < s_next_vblank) std::this_thread::yield();
+                while (clock::now() < s_next_vblank) {
+#if defined(__aarch64__)
+                    __builtin_arm_isb(15);
+#endif
+                }
             }
             s_next_vblank += kVblank;
         }
@@ -5184,7 +5150,27 @@ void NidRegistry::register_default_libraries() {
                 g_thread_manager->equeue_signal(sub.eq_id, ev);
             }
         }
+        const auto t_hook = std::chrono::steady_clock::now();
         if (g_flip_hook) g_flip_hook();
+        // PS4_HITCH_MS=n: for every frame longer than n ms, where the time
+        // went -- guest work since the last flip returned (CPU + command
+        // buffer execution), the vblank wait, and the presenter's flip hook.
+        static const double s_hitch_ms = std::getenv("PS4_HITCH_MS") ? std::atof(std::getenv("PS4_HITCH_MS")) : 0.0;
+        if (s_hitch_ms > 0.0) {
+            using ms = std::chrono::duration<double, std::milli>;
+            static std::chrono::steady_clock::time_point s_last_exit{};
+            const auto t_exit = std::chrono::steady_clock::now();
+            if (s_last_exit.time_since_epoch().count() != 0) {
+                const double guest = ms(t_flip_enter - s_last_exit).count();
+                const double wait = ms(t_hook - t_flip_enter).count();
+                const double hook = ms(t_exit - t_hook).count();
+                if (guest + wait + hook > s_hitch_ms) {
+                    std::fprintf(stderr, "[hitch] flip %llu: %.1f ms = guest %.1f + vblank wait %.1f + flip hook %.1f\n",
+                                 (unsigned long long)count, guest + wait + hook, guest, wait, hook);
+                }
+            }
+            s_last_exit = t_exit;
+        }
     };
 
     // sceVideoOutRegisterBuffers(int handle, int startIndex, void* const* addresses, int bufferCount, ...)
@@ -6625,11 +6611,13 @@ void NidRegistry::register_default_libraries() {
 
             // The command processor runs the DCBs to completion here (labels
             // written, EOP interrupts raised), then the flip is performed.
-            execute_submitted_dcbs(mem, count, dcb_addrs_ptr, dcb_sizes_ptr);
+            std::vector<PrepareFlip> flips;
+            execute_submitted_dcbs(mem, count, dcb_addrs_ptr, dcb_sizes_ptr, &flips);
             g_gnm_completed_label.fetch_add(1);
             sync_gnm_label_slot(mem);
 
             perform_flip(mem, buffer_index, flip_arg);
+            complete_prepare_flips(mem, flips);
             ctx.rax = SCE_OK;
         });
 
@@ -6644,13 +6632,6 @@ void NidRegistry::register_default_libraries() {
             g_gnm_completed_label.fetch_add(1);
             sync_gnm_label_slot(mem);
             ctx.rax = SCE_OK;
-        });
-
-    // sceSaveDataInitialize3 — stub returning success; real save-data calls later.
-    // NID: 0x4F2C2B14A0A82C66ULL
-    register_symbol(0x4F2C2B14A0A82C66ULL, "sceSaveDataInitialize3", "libSceSaveData",
-        [](CpuContext& ctx, MemoryManager&) {
-            ctx.rax = 0;
         });
 
     // sceVideoOutModeSetAny_ — initializes the mode struct at rdi.
@@ -6992,8 +6973,6 @@ void NidRegistry::register_default_libraries() {
         {0x69661413865EE60CULL, 0x40E42D6DE0EAB13EULL}, // sceAudioOutOutput
         {0x8F596D3C1F4FA286ULL, 0x6FEB8057CF489711ULL}, // sceAudioOutSetVolume
         {0xD9BDDE84CE9A1E02ULL, 0x6FAE042D5030EB68ULL}, // sceAudioOutGetPortInfo
-        {0x948296238BC4F301ULL, 0xDF61D0010770336AULL}, // sceSaveDataMount
-        {0x32791B317075AB6EULL, 0x04C47817F51E9371ULL}, // sceSaveDataUmount
     };
     for (const auto& n : kRealNids) {
         if (m_symbols_by_nid.count(n.real)) continue;
@@ -7003,6 +6982,1607 @@ void NidRegistry::register_default_libraries() {
             m_nids_by_name[copy.name] = n.wrong; // keep name lookups on the original
         }
     }
+}
+
+// =========================================================================
+// libSceSaveData: save directories backed by host folders
+// =========================================================================
+//
+// A mount binds "/savedataN" (N = slot 0..15, reused after unmount) in the
+// VFS to <sandbox>/savedata/<user id>/<title id>/<dir name>, so the guest's
+// sceKernelOpen/Write/Read on /savedata0/... hit real files and the save
+// survives the process. The title id comes from INSTALL_DIR_SAVEDATA (else
+// TITLE_ID) in /app0/sce_sys/param.sfo. Each save keeps its SceSaveDataParam
+// as raw bytes in sce_sys/param.bin and its icon in sce_sys/icon0.png; the
+// guest sees sce_sys/ inside the mount as it does on hardware. Save-data
+// memory (sceSaveData*SaveDataMemory*) is a flat file in the title folder:
+// sce_sdmemory[<slot>]/memory.dat. Directory names starting with "sce_" are
+// never reported by sceSaveDataDirNameSearch.
+//
+// Behaviour follows the SDK and shadPS4's save_data library: CREATE fails
+// with EXISTS when the save exists, CREATE2 creates only when missing and
+// reports MOUNT_STATUS_CREATED, a mount without either fails with NOT_FOUND
+// when the save is missing, and mounting the same save twice is BUSY.
+// Calls made before sceSaveDataInitialize* are accepted, not rejected.
+
+namespace {
+
+// First call of each function only: some are polled every frame
+// (sceSaveDataGetEventResult) and the log should stay readable.
+void hle_log_once(const char* lib, const char* fn, const std::string& detail = {}) {
+    static std::mutex s_mtx;
+    static std::unordered_set<std::string> s_seen;
+    {
+        std::lock_guard lock(s_mtx);
+        if (!s_seen.insert(fn).second) return;
+    }
+    std::fprintf(stderr, "[%s] %s%s%s\n", lib, fn, detail.empty() ? "" : " ", detail.c_str());
+}
+
+template <typename T>
+bool read_guest(const MemoryManager& mem, GuestAddr addr, T& out) {
+    return addr > 0x1000 && mem.is_valid_address(addr, sizeof(T)) && mem.read_bytes(addr, &out, sizeof(T));
+}
+
+template <typename T>
+bool write_guest(MemoryManager& mem, GuestAddr addr, const T& value) {
+    return addr > 0x1000 && mem.is_valid_address(addr, sizeof(T)) && mem.write_bytes(addr, &value, sizeof(T));
+}
+
+// A fixed-size guest char array that may lack its terminator.
+template <usize N>
+std::string fixed_string(const char (&data)[N]) {
+    return std::string(data, strnlen(data, N));
+}
+
+template <usize N>
+void copy_fixed_string(char (&dst)[N], std::string_view src) {
+    std::memset(dst, 0, N);
+    std::memcpy(dst, src.data(), std::min(src.size(), N - 1));
+}
+
+// Save directory and title names become host path components.
+bool valid_save_name(std::string_view s, usize max_len) {
+    if (s.empty() || s.size() > max_len || s[0] == '.') return false;
+    return std::all_of(s.begin(), s.end(), [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '.';
+    });
+}
+
+// One string value from a PSF (param.sfo) file, or "" when absent.
+std::string read_sfo_string(const std::filesystem::path& path, std::string_view key) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    const std::vector<char> sfo((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto u32_at = [&](usize off) -> u32 {
+        u32 v = 0;
+        if (off + 4 <= sfo.size()) std::memcpy(&v, sfo.data() + off, 4);
+        return v;
+    };
+    auto u16_at = [&](usize off) -> u16 {
+        u16 v = 0;
+        if (off + 2 <= sfo.size()) std::memcpy(&v, sfo.data() + off, 2);
+        return v;
+    };
+    if (sfo.size() < 0x14 || u32_at(0) != 0x46535000) return {}; // "\0PSF"
+    const u32 key_table = u32_at(0x08), data_table = u32_at(0x0C), count = u32_at(0x10);
+    for (u32 i = 0; i < count; ++i) {
+        const usize entry = 0x14 + usize(i) * 16;
+        if (entry + 16 > sfo.size()) break;
+        const usize key_off = usize(key_table) + u16_at(entry);
+        const u16 fmt = u16_at(entry + 2);
+        const u32 len = u32_at(entry + 4);
+        const usize data_off = usize(data_table) + u32_at(entry + 12);
+        if (key_off >= sfo.size() || data_off + len > sfo.size()) continue;
+        const char* k = sfo.data() + key_off;
+        if (std::string_view(k, strnlen(k, sfo.size() - key_off)) != key || fmt == 0x0404) continue;
+        const char* v = sfo.data() + data_off;
+        return std::string(v, strnlen(v, len));
+    }
+    return {};
+}
+
+constexpr usize kSaveDataSlots = 16;
+
+struct SaveDataSlot {
+    bool used{false};
+    std::string mount_point; // "/savedataN"
+    std::filesystem::path host_dir;
+    bool read_only{false};
+    u64 blocks{0};
+};
+
+struct SaveDataState {
+    std::mutex mtx;
+    std::array<SaveDataSlot, kSaveDataSlots> slots;
+    std::string title_id;
+    std::unordered_map<u32, std::filesystem::path> memory_files; // save-memory slot -> memory.dat
+};
+
+SaveDataState& save_data_state() {
+    static SaveDataState s;
+    return s;
+}
+
+// Caller holds save_data_state().mtx.
+const std::string& own_title_id() {
+    std::string& id = save_data_state().title_id;
+    if (id.empty()) {
+        if (auto sfo = get_vfs().resolve_path("/app0/sce_sys/param.sfo")) {
+            id = read_sfo_string(*sfo, "INSTALL_DIR_SAVEDATA");
+            if (id.empty()) id = read_sfo_string(*sfo, "TITLE_ID");
+        }
+        if (!valid_save_name(id, 9)) id = "CUSA00000";
+    }
+    return id;
+}
+
+std::filesystem::path title_save_dir(i32 user_id, const std::string& title_id) {
+    return get_vfs().sandbox_root() / "savedata" / std::to_string(user_id) / title_id;
+}
+
+// Title id from an optional guest SceSaveDataTitleId*; false if malformed.
+bool guest_title_id(const MemoryManager& mem, GuestAddr p, std::string& out) {
+    if (p == 0) {
+        out = own_title_id();
+        return true;
+    }
+    SceSaveDataTitleId t{};
+    if (!read_guest(mem, p, t)) return false;
+    out = fixed_string(t.data);
+    return valid_save_name(out, 9);
+}
+
+bool guest_dir_name(const MemoryManager& mem, GuestAddr p, std::string& out) {
+    SceSaveDataDirName d{};
+    if (!read_guest(mem, p, d)) return false;
+    out = fixed_string(d.data);
+    return valid_save_name(out, 31);
+}
+
+// Caller holds the lock. Null when the mount point is not mounted.
+SaveDataSlot* find_mounted(const MemoryManager& mem, GuestAddr mount_point_ptr) {
+    SceSaveDataMountPoint mp{};
+    if (!read_guest(mem, mount_point_ptr, mp)) return nullptr;
+    const std::string name = fixed_string(mp.data);
+    for (auto& s : save_data_state().slots) {
+        if (s.used && s.mount_point == name) return &s;
+    }
+    return nullptr;
+}
+
+u64 directory_bytes(const std::filesystem::path& dir) {
+    std::error_code ec;
+    u64 total = 0;
+    for (auto it = std::filesystem::recursive_directory_iterator(dir, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (it->is_regular_file(ec)) total += it->file_size(ec);
+    }
+    return total;
+}
+
+i64 last_write_unix(const std::filesystem::path& p) {
+    struct stat st{};
+    return ::stat(p.c_str(), &st) == 0 ? static_cast<i64>(st.st_mtime) : 0;
+}
+
+// The stored param of a save directory (zeros, apart from mtime, if never set).
+SceSaveDataParam load_param(const std::filesystem::path& dir) {
+    SceSaveDataParam param{};
+    const auto file = dir / "sce_sys" / "param.bin";
+    std::ifstream f(file, std::ios::binary);
+    if (f) f.read(reinterpret_cast<char*>(&param), sizeof(param));
+    param.mtime = last_write_unix(std::filesystem::exists(file) ? file : dir);
+    return param;
+}
+
+bool store_param(const std::filesystem::path& dir, const SceSaveDataParam& param) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir / "sce_sys", ec);
+    std::ofstream f(dir / "sce_sys" / "param.bin", std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(&param), sizeof(param));
+    return static_cast<bool>(f);
+}
+
+// Copies a guest SceSaveDataIcon's image to <dir>/sce_sys/icon0.png.
+bool store_icon(MemoryManager& mem, const std::filesystem::path& dir, const SceSaveDataIcon& icon) {
+    const u64 n = std::min(icon.buf_size, icon.data_size ? icon.data_size : icon.buf_size);
+    if (icon.buf <= 0x1000 || n > (64ull << 20) || !mem.is_valid_address(icon.buf, n)) return false;
+    std::vector<char> bytes(n);
+    mem.read_bytes(icon.buf, bytes.data(), n);
+    std::error_code ec;
+    std::filesystem::create_directories(dir / "sce_sys", ec);
+    std::ofstream f(dir / "sce_sys" / "icon0.png", std::ios::binary | std::ios::trunc);
+    f.write(bytes.data(), static_cast<std::streamsize>(n));
+    return static_cast<bool>(f);
+}
+
+u32 save_data_mount(MemoryManager& mem, i32 user_id, GuestAddr title_ptr, GuestAddr dir_ptr, u64 blocks,
+                    u32 mode, GuestAddr result_ptr) {
+    if (user_id < 0) return SCE_SAVE_DATA_ERROR_INVALID_LOGIN_USER;
+    if (result_ptr <= 0x1000 || !mem.is_valid_address(result_ptr, sizeof(SceSaveDataMountResult)))
+        return SCE_SAVE_DATA_ERROR_PARAMETER;
+    auto& st = save_data_state();
+    std::lock_guard lock(st.mtx);
+    std::string title, dir;
+    if (!guest_title_id(mem, title_ptr, title) || !guest_dir_name(mem, dir_ptr, dir))
+        return SCE_SAVE_DATA_ERROR_PARAMETER;
+    const auto host_dir = title_save_dir(user_id, title) / dir;
+
+    SaveDataSlot* slot = nullptr;
+    usize slot_index = 0;
+    for (usize i = 0; i < st.slots.size(); ++i) {
+        if (st.slots[i].used) {
+            if (st.slots[i].host_dir == host_dir) return SCE_SAVE_DATA_ERROR_BUSY;
+        } else if (!slot) {
+            slot = &st.slots[i];
+            slot_index = i;
+        }
+    }
+    if (!slot) return SCE_SAVE_DATA_ERROR_MOUNT_FULL;
+
+    std::error_code ec;
+    const bool exists = std::filesystem::is_directory(host_dir, ec);
+    const bool create = mode & SCE_SAVE_DATA_MOUNT_MODE_CREATE;
+    const bool create2 = mode & SCE_SAVE_DATA_MOUNT_MODE_CREATE2;
+    if (exists && create) return SCE_SAVE_DATA_ERROR_EXISTS;
+    if (!exists && !create && !create2) return SCE_SAVE_DATA_ERROR_NOT_FOUND;
+    if (!exists && !std::filesystem::create_directories(host_dir / "sce_sys", ec))
+        return SCE_SAVE_DATA_ERROR_INTERNAL;
+
+    *slot = SaveDataSlot{
+        .used = true,
+        .mount_point = "/savedata" + std::to_string(slot_index),
+        .host_dir = host_dir,
+        .read_only = (mode & SCE_SAVE_DATA_MOUNT_MODE_RDONLY) != 0,
+        .blocks = blocks ? std::min(blocks, SCE_SAVE_DATA_BLOCKS_MAX) : SCE_SAVE_DATA_BLOCKS_MAX,
+    };
+    get_vfs().mount(slot->mount_point, host_dir, slot->read_only);
+
+    SceSaveDataMountResult res{};
+    copy_fixed_string(res.mount_point.data, slot->mount_point);
+    res.mount_status = (!exists && create2) ? SCE_SAVE_DATA_MOUNT_STATUS_CREATED : SCE_SAVE_DATA_MOUNT_STATUS_NOTHING;
+    mem.write_bytes(result_ptr, &res, sizeof(res));
+    hle_log_once("SaveData", "mount", slot->mount_point + " -> " + host_dir.string());
+    return SCE_OK;
+}
+
+// ---- save-data memory -----------------------------------------------------
+
+std::filesystem::path save_memory_dir(i32 user_id, u32 slot_id) {
+    std::lock_guard lock(save_data_state().mtx);
+    const std::string name = slot_id == 0 ? "sce_sdmemory" : "sce_sdmemory" + std::to_string(slot_id);
+    return title_save_dir(user_id, own_title_id()) / name;
+}
+
+std::optional<std::filesystem::path> save_memory_file(u32 slot_id) {
+    auto& st = save_data_state();
+    std::lock_guard lock(st.mtx);
+    auto it = st.memory_files.find(slot_id);
+    if (it == st.memory_files.end()) return std::nullopt;
+    return it->second;
+}
+
+// Creates or opens the slot's memory.dat, at least memory_size bytes long.
+// Returns the size it had before (0 when just created), or nullopt on failure.
+std::optional<u64> setup_save_memory(i32 user_id, u32 slot_id, u64 memory_size) {
+    const auto dir = save_memory_dir(user_id, slot_id);
+    const auto file = dir / "memory.dat";
+    std::error_code ec;
+    std::filesystem::create_directories(dir / "sce_sys", ec);
+    const u64 existed = std::filesystem::exists(file, ec) ? std::filesystem::file_size(file, ec) : 0;
+    if (!std::filesystem::exists(file, ec)) std::ofstream(file, std::ios::binary);
+    if (existed < memory_size) std::filesystem::resize_file(file, memory_size, ec);
+    if (ec) return std::nullopt;
+    auto& st = save_data_state();
+    std::lock_guard lock(st.mtx);
+    st.memory_files[slot_id] = file;
+    return existed;
+}
+
+// Copies between memory.dat and guest memory; reads past the end give zeros.
+bool save_memory_io(MemoryManager& mem, const std::filesystem::path& file, const SceSaveDataMemoryData& d,
+                    bool write) {
+    if (d.buf_size == 0) return true;
+    if (d.buf <= 0x1000 || d.offset < 0 || d.buf_size > (1ull << 30) || !mem.is_valid_address(d.buf, d.buf_size))
+        return false;
+    std::vector<char> bytes(d.buf_size, 0);
+    if (write) {
+        mem.read_bytes(d.buf, bytes.data(), bytes.size());
+        std::fstream f(file, std::ios::binary | std::ios::in | std::ios::out);
+        f.seekp(d.offset);
+        f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        return static_cast<bool>(f);
+    }
+    std::ifstream f(file, std::ios::binary);
+    f.seekg(d.offset);
+    f.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    return mem.write_bytes(d.buf, bytes.data(), bytes.size());
+}
+
+u32 save_memory_get(MemoryManager& mem, u32 slot_id, GuestAddr data_ptr, GuestAddr param_ptr, GuestAddr icon_ptr) {
+    const auto file = save_memory_file(slot_id);
+    if (!file) return SCE_SAVE_DATA_ERROR_MEMORY_NOT_READY;
+    SceSaveDataMemoryData d{};
+    if (data_ptr && (!read_guest(mem, data_ptr, d) || !save_memory_io(mem, *file, d, false)))
+        return SCE_SAVE_DATA_ERROR_PARAMETER;
+    const auto dir = file->parent_path();
+    if (param_ptr && !write_guest(mem, param_ptr, load_param(dir))) return SCE_SAVE_DATA_ERROR_PARAMETER;
+    SceSaveDataIcon icon{};
+    if (icon_ptr && read_guest(mem, icon_ptr, icon)) {
+        std::ifstream f(dir / "sce_sys" / "icon0.png", std::ios::binary);
+        const std::vector<char> png((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const u64 n = std::min<u64>(icon.buf_size, png.size());
+        if (n && icon.buf > 0x1000 && mem.is_valid_address(icon.buf, n)) mem.write_bytes(icon.buf, png.data(), n);
+        icon.data_size = n;
+        write_guest(mem, icon_ptr, icon);
+    }
+    return SCE_OK;
+}
+
+u32 save_memory_set(MemoryManager& mem, u32 slot_id, GuestAddr data_ptr, u32 data_num, GuestAddr param_ptr,
+                    GuestAddr icon_ptr) {
+    const auto file = save_memory_file(slot_id);
+    if (!file) return SCE_SAVE_DATA_ERROR_MEMORY_NOT_READY;
+    for (u32 i = 0; data_ptr && i < std::max(data_num, 1u); ++i) {
+        SceSaveDataMemoryData d{};
+        if (!read_guest(mem, data_ptr + i * sizeof(d), d) || !save_memory_io(mem, *file, d, true))
+            return SCE_SAVE_DATA_ERROR_PARAMETER;
+    }
+    SceSaveDataParam param{};
+    if (param_ptr && read_guest(mem, param_ptr, param)) store_param(file->parent_path(), param);
+    SceSaveDataIcon icon{};
+    if (icon_ptr && read_guest(mem, icon_ptr, icon)) store_icon(mem, file->parent_path(), icon);
+    return SCE_OK;
+}
+
+// '%' matches any run of characters, '_' exactly one (case-insensitive).
+bool save_name_matches(std::string_view s, std::string_view pat) {
+    if (pat.empty()) return s.empty();
+    if (pat[0] == '%') {
+        for (usize i = 0; i <= s.size(); ++i)
+            if (save_name_matches(s.substr(i), pat.substr(1))) return true;
+        return false;
+    }
+    if (s.empty()) return false;
+    const bool same = pat[0] == '_' || std::tolower(static_cast<unsigned char>(pat[0])) ==
+                                           std::tolower(static_cast<unsigned char>(s[0]));
+    return same && save_name_matches(s.substr(1), pat.substr(1));
+}
+
+// =========================================================================
+// libSceNpTrophy: in-memory contexts, handles and unlocks
+// =========================================================================
+//
+// There is no trophy pack to read, so every title has an empty trophy set:
+// contexts and handles behave like the real ones (ids from 1, 8 contexts and
+// 4 handles at most, one context per user and service label), unlocks are
+// remembered for the process, and the info queries report what was unlocked
+// so far with no names or grades. Nothing here blocks or shows UI.
+
+struct TrophyContext {
+    bool used{false};
+    i32 user_id{0};
+    u32 service_label{0};
+    bool registered{false};
+};
+
+struct TrophyState {
+    std::mutex mtx;
+    std::array<TrophyContext, 8> contexts;
+    std::array<bool, 4> handles{};
+    std::map<i32, std::array<u64, SCE_NP_TROPHY_NUM_MAX>> unlock_ticks; // user -> RTC tick, 0 = locked
+};
+
+TrophyState& trophy_state() {
+    static TrophyState s;
+    return s;
+}
+
+// Caller holds the lock. Checks context then handle, as the library does.
+u32 trophy_lookup(i32 context, i32 handle, TrophyContext** out) {
+    auto& st = trophy_state();
+    if (context < 1 || context > static_cast<i32>(st.contexts.size()) || !st.contexts[context - 1].used)
+        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+    if (handle < 1 || handle > static_cast<i32>(st.handles.size()) || !st.handles[handle - 1])
+        return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
+    *out = &st.contexts[context - 1];
+    return SCE_OK;
+}
+
+// SceRtcTick now: microseconds since 0001-01-01.
+u64 rtc_tick_now() {
+    constexpr u64 kUnixEpochTicks = 62135596800ull * 1000000ull;
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    return kUnixEpochTicks + static_cast<u64>(us);
+}
+
+struct TrophyCounts {
+    u32 num_trophies{0}; // highest unlocked id + 1: the set has no other members we know of
+    u32 unlocked{0};
+};
+
+TrophyCounts trophy_counts(const TrophyContext& c) {
+    TrophyCounts counts;
+    auto it = trophy_state().unlock_ticks.find(c.user_id);
+    if (it == trophy_state().unlock_ticks.end()) return counts;
+    for (i32 id = 0; id < SCE_NP_TROPHY_NUM_MAX; ++id) {
+        if (it->second[id]) {
+            counts.num_trophies = static_cast<u32>(id) + 1;
+            ++counts.unlocked;
+        }
+    }
+    return counts;
+}
+
+} // namespace
+
+static void register_save_data_and_trophy(NidRegistry& reg) {
+    // ---- libSceSaveData: lifecycle ---------------------------------------
+    // sceSaveDataInitialize/2/3(const SceSaveDataInitParams*) and Terminate().
+    // Spelled out one per line so scripts/verify_nids.py audits each NID.
+    auto succeed = [](const char* name) {
+        return [name](CpuContext& ctx, MemoryManager&) {
+            hle_log_once("SaveData", name);
+            ctx.rax = SCE_OK;
+        };
+    };
+    reg.register_symbol(0x664661B2408F5C5CULL, "sceSaveDataInitialize", "libSceSaveData", succeed("sceSaveDataInitialize"));
+    reg.register_symbol(0x9753660DE0E93465ULL, "sceSaveDataInitialize2", "libSceSaveData", succeed("sceSaveDataInitialize2"));
+    reg.register_symbol(0x4F2C2B14A0A82C66ULL, "sceSaveDataInitialize3", "libSceSaveData", succeed("sceSaveDataInitialize3"));
+    reg.register_symbol(0xC8A0F2F12E722C0DULL, "sceSaveDataTerminate", "libSceSaveData", succeed("sceSaveDataTerminate"));
+
+    // ---- libSceSaveData: mount / unmount ---------------------------------
+    // sceSaveDataMount(const SceSaveDataMount*, SceSaveDataMountResult*)
+    reg.register_symbol(0xDF61D0010770336AULL, "sceSaveDataMount", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataMount");
+            SceSaveDataMount m{};
+            if (!read_guest(mem, ctx.rdi, m)) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER;
+                return;
+            }
+            ctx.rax = save_data_mount(mem, m.user_id, m.title_id, m.dir_name, m.blocks, m.mount_mode, ctx.rsi);
+        });
+
+    // sceSaveDataMount2(const SceSaveDataMount2*, SceSaveDataMountResult*)
+    reg.register_symbol(0xD33E393C81FE48D2ULL, "sceSaveDataMount2", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataMount2");
+            SceSaveDataMount2 m{};
+            if (!read_guest(mem, ctx.rdi, m)) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER;
+                return;
+            }
+            ctx.rax = save_data_mount(mem, m.user_id, 0, m.dir_name, m.blocks, m.mount_mode, ctx.rsi);
+        });
+
+    // sceSaveDataUmount(const SceSaveDataMountPoint*)
+    reg.register_symbol(0x04C47817F51E9371ULL, "sceSaveDataUmount", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataUmount");
+            std::lock_guard lock(save_data_state().mtx);
+            SaveDataSlot* slot = find_mounted(mem, ctx.rdi);
+            if (!slot) {
+                ctx.rax = ctx.rdi ? SCE_SAVE_DATA_ERROR_NOT_FOUND : SCE_SAVE_DATA_ERROR_PARAMETER;
+                return;
+            }
+            get_vfs().unmount(slot->mount_point);
+            *slot = SaveDataSlot{};
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataGetMountInfo(const SceSaveDataMountPoint*, SceSaveDataMountInfo*)
+    reg.register_symbol(0xEB9547D1069ACFABULL, "sceSaveDataGetMountInfo", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataGetMountInfo");
+            std::lock_guard lock(save_data_state().mtx);
+            SaveDataSlot* slot = find_mounted(mem, ctx.rdi);
+            if (!slot) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_NOT_MOUNTED;
+                return;
+            }
+            const u64 used = (directory_bytes(slot->host_dir) + SCE_SAVE_DATA_BLOCK_SIZE - 1) / SCE_SAVE_DATA_BLOCK_SIZE;
+            SceSaveDataMountInfo info{};
+            info.blocks = slot->blocks;
+            info.free_blocks = slot->blocks > used ? slot->blocks - used : 0;
+            ctx.rax = write_guest(mem, ctx.rsi, info) ? SCE_OK : SCE_SAVE_DATA_ERROR_PARAMETER;
+        });
+
+    // ---- libSceSaveData: params and icon ---------------------------------
+    // sceSaveDataGetParam(const SceSaveDataMountPoint*, SceSaveDataParamType,
+    //                     void* buf, size_t bufSize, size_t* gotSize)
+    reg.register_symbol(0x5E0BD2B88767325CULL, "sceSaveDataGetParam", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataGetParam");
+            const u32 type = static_cast<u32>(ctx.rsi);
+            const GuestAddr buf = ctx.rdx, got_ptr = ctx.r8;
+            const u64 buf_size = ctx.rcx;
+            std::lock_guard lock(save_data_state().mtx);
+            SaveDataSlot* slot = find_mounted(mem, ctx.rdi);
+            if (!slot) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_NOT_MOUNTED;
+                return;
+            }
+            const SceSaveDataParam p = load_param(slot->host_dir);
+            std::string text;
+            const void* src = nullptr;
+            u64 n = 0;
+            switch (type) {
+            case SCE_SAVE_DATA_PARAM_TYPE_ALL: src = &p; n = sizeof(p); break;
+            case SCE_SAVE_DATA_PARAM_TYPE_TITLE: text = fixed_string(p.title); break;
+            case SCE_SAVE_DATA_PARAM_TYPE_SUB_TITLE: text = fixed_string(p.sub_title); break;
+            case SCE_SAVE_DATA_PARAM_TYPE_DETAIL: text = fixed_string(p.detail); break;
+            case SCE_SAVE_DATA_PARAM_TYPE_USER_PARAM: src = &p.user_param; n = sizeof(p.user_param); break;
+            case SCE_SAVE_DATA_PARAM_TYPE_MTIME: src = &p.mtime; n = sizeof(p.mtime); break;
+            default: ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER; return;
+            }
+            if (!src) { // strings: truncated to the buffer, always terminated
+                if (buf_size == 0) {
+                    ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER;
+                    return;
+                }
+                text.resize(std::min<u64>(text.size(), buf_size - 1));
+                src = text.c_str();
+                n = text.size() + 1;
+            }
+            if (buf_size < n || buf <= 0x1000 || !mem.is_valid_address(buf, n)) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER;
+                return;
+            }
+            mem.write_bytes(buf, src, n);
+            if (got_ptr) write_guest(mem, got_ptr, n);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataSetParam(const SceSaveDataMountPoint*, SceSaveDataParamType,
+    //                     const void* buf, size_t bufSize)
+    reg.register_symbol(0xF39CEE97FFDE197BULL, "sceSaveDataSetParam", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataSetParam");
+            const u32 type = static_cast<u32>(ctx.rsi);
+            const GuestAddr buf = ctx.rdx;
+            std::lock_guard lock(save_data_state().mtx);
+            SaveDataSlot* slot = find_mounted(mem, ctx.rdi);
+            if (!slot) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_NOT_MOUNTED;
+                return;
+            }
+            if (slot->read_only) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_BAD_MOUNTED;
+                return;
+            }
+            SceSaveDataParam p = load_param(slot->host_dir);
+            auto read_text = [&](auto& field) {
+                char tmp[sizeof(field)] = {};
+                const u64 n = std::min<u64>(sizeof(tmp) - 1, ctx.rcx ? ctx.rcx : sizeof(tmp) - 1);
+                if (buf <= 0x1000 || !mem.is_valid_address(buf, n)) return false;
+                mem.read_bytes(buf, tmp, n);
+                copy_fixed_string(field, std::string_view(tmp, strnlen(tmp, n)));
+                return true;
+            };
+            bool ok = false;
+            switch (type) {
+            case SCE_SAVE_DATA_PARAM_TYPE_ALL: ok = read_guest(mem, buf, p); break;
+            case SCE_SAVE_DATA_PARAM_TYPE_TITLE: ok = read_text(p.title); break;
+            case SCE_SAVE_DATA_PARAM_TYPE_SUB_TITLE: ok = read_text(p.sub_title); break;
+            case SCE_SAVE_DATA_PARAM_TYPE_DETAIL: ok = read_text(p.detail); break;
+            case SCE_SAVE_DATA_PARAM_TYPE_USER_PARAM: ok = read_guest(mem, buf, p.user_param); break;
+            default: break; // MTIME is not settable
+            }
+            if (!ok) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER;
+                return;
+            }
+            ctx.rax = store_param(slot->host_dir, p) ? SCE_OK : SCE_SAVE_DATA_ERROR_INTERNAL;
+        });
+
+    // sceSaveDataSaveIcon(const SceSaveDataMountPoint*, const SceSaveDataIcon*)
+    reg.register_symbol(0x73CF18CB9E0CC74CULL, "sceSaveDataSaveIcon", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataSaveIcon");
+            std::lock_guard lock(save_data_state().mtx);
+            SaveDataSlot* slot = find_mounted(mem, ctx.rdi);
+            SceSaveDataIcon icon{};
+            if (!slot) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_NOT_MOUNTED;
+            } else if (slot->read_only) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_BAD_MOUNTED;
+            } else if (!read_guest(mem, ctx.rsi, icon) || !store_icon(mem, slot->host_dir, icon)) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER;
+            } else {
+                ctx.rax = SCE_OK;
+            }
+        });
+
+    // ---- libSceSaveData: delete / search / events ------------------------
+    // sceSaveDataDelete(const SceSaveDataDelete*)
+    reg.register_symbol(0x4B51A478F235EF34ULL, "sceSaveDataDelete", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataDelete");
+            SceSaveDataDelete d{};
+            std::lock_guard lock(save_data_state().mtx);
+            std::string title, dir;
+            if (!read_guest(mem, ctx.rdi, d) || !guest_title_id(mem, d.title_id, title) ||
+                !guest_dir_name(mem, d.dir_name, dir)) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER;
+                return;
+            }
+            const auto host_dir = title_save_dir(d.user_id, title) / dir;
+            for (const auto& s : save_data_state().slots) {
+                if (s.used && s.host_dir == host_dir) {
+                    ctx.rax = SCE_SAVE_DATA_ERROR_BUSY;
+                    return;
+                }
+            }
+            std::error_code ec;
+            std::filesystem::remove_all(host_dir, ec);
+            ctx.rax = ec ? SCE_SAVE_DATA_ERROR_INTERNAL : SCE_OK;
+        });
+
+    // sceSaveDataDirNameSearch(const SceSaveDataDirNameSearchCond*,
+    //                          SceSaveDataDirNameSearchResult*)
+    reg.register_symbol(0x7722219D7ABFD123ULL, "sceSaveDataDirNameSearch", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataDirNameSearch");
+            SceSaveDataDirNameSearchCond cond{};
+            SceSaveDataDirNameSearchResult res{};
+            std::lock_guard lock(save_data_state().mtx);
+            std::string title, pattern;
+            if (!read_guest(mem, ctx.rdi, cond) || !read_guest(mem, ctx.rsi, res) ||
+                !guest_title_id(mem, cond.title_id, title) || cond.key > SCE_SAVE_DATA_SORT_KEY_FREE_BLOCKS ||
+                cond.key == 4 || cond.order > SCE_SAVE_DATA_SORT_ORDER_DESCENT) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER;
+                return;
+            }
+            SceSaveDataDirName pat{};
+            if (cond.dir_name && read_guest(mem, cond.dir_name, pat)) pattern = fixed_string(pat.data);
+
+            struct Entry {
+                std::string name;
+                SceSaveDataParam param;
+                u64 blocks, free_blocks;
+            };
+            std::vector<Entry> found;
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(title_save_dir(cond.user_id, title), ec)) {
+                const std::string name = e.path().filename().string();
+                if (!e.is_directory(ec) || name.starts_with("sce_") || !valid_save_name(name, 31)) continue;
+                if (!pattern.empty() && !save_name_matches(name, pattern)) continue;
+                const u64 used = (directory_bytes(e.path()) + SCE_SAVE_DATA_BLOCK_SIZE - 1) / SCE_SAVE_DATA_BLOCK_SIZE;
+                found.push_back({name, load_param(e.path()), SCE_SAVE_DATA_BLOCKS_MAX, SCE_SAVE_DATA_BLOCKS_MAX - used});
+            }
+            auto key = [&](const Entry& e) -> i64 {
+                switch (cond.key) {
+                case SCE_SAVE_DATA_SORT_KEY_USER_PARAM: return e.param.user_param;
+                case SCE_SAVE_DATA_SORT_KEY_BLOCKS: return static_cast<i64>(e.blocks);
+                case SCE_SAVE_DATA_SORT_KEY_MTIME: return e.param.mtime;
+                case SCE_SAVE_DATA_SORT_KEY_FREE_BLOCKS: return static_cast<i64>(e.free_blocks);
+                default: return 0;
+                }
+            };
+            std::sort(found.begin(), found.end(), [](const Entry& a, const Entry& b) { return a.name < b.name; });
+            if (cond.key != SCE_SAVE_DATA_SORT_KEY_DIRNAME)
+                std::stable_sort(found.begin(), found.end(), [&](const Entry& a, const Entry& b) { return key(a) < key(b); });
+            if (cond.order == SCE_SAVE_DATA_SORT_ORDER_DESCENT) std::reverse(found.begin(), found.end());
+
+            const u32 n = static_cast<u32>(std::min<usize>(found.size(), res.dir_names_num));
+            for (u32 i = 0; i < n; ++i) {
+                SceSaveDataDirName dn{};
+                copy_fixed_string(dn.data, found[i].name);
+                if (!write_guest(mem, res.dir_names + i * sizeof(dn), dn)) {
+                    ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER;
+                    return;
+                }
+                if (res.params) write_guest(mem, res.params + i * sizeof(SceSaveDataParam), found[i].param);
+                if (res.infos) {
+                    SceSaveDataSearchInfo info{};
+                    info.blocks = found[i].blocks;
+                    info.free_blocks = found[i].free_blocks;
+                    write_guest(mem, res.infos + i * sizeof(info), info);
+                }
+            }
+            res.hit_num = static_cast<u32>(found.size());
+            res.set_num = n;
+            write_guest(mem, ctx.rsi, res);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataGetEventResult(const SceSaveDataEventParam*, SceSaveDataEvent*)
+    // Events come from backups and save-memory syncs, which are not modelled:
+    // the queue is always empty.
+    reg.register_symbol(0x8FCC4AB62163D126ULL, "sceSaveDataGetEventResult", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager&) {
+            hle_log_once("SaveData", "sceSaveDataGetEventResult");
+            ctx.rax = ctx.rsi ? SCE_SAVE_DATA_ERROR_NOT_FOUND : SCE_SAVE_DATA_ERROR_PARAMETER;
+        });
+
+    // ---- libSceSaveData: save-data memory --------------------------------
+    // sceSaveDataSetupSaveDataMemory(userId, size_t memorySize, SceSaveDataParam*)
+    reg.register_symbol(0xBFB00000CA342F3EULL, "sceSaveDataSetupSaveDataMemory", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataSetupSaveDataMemory");
+            const auto existed = setup_save_memory(static_cast<i32>(ctx.rdi), 0, ctx.rsi);
+            if (!existed) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_INTERNAL;
+                return;
+            }
+            SceSaveDataParam param{};
+            if (ctx.rdx && read_guest(mem, ctx.rdx, param)) store_param(save_memory_dir(static_cast<i32>(ctx.rdi), 0), param);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataSetupSaveDataMemory2(const SceSaveDataMemorySetup2*,
+    //                                 SceSaveDataMemorySetupResult*)
+    // Called by the Flappy eboot at 0x10acf7e on a worker thread.
+    reg.register_symbol(0xA10C921147E05D10ULL, "sceSaveDataSetupSaveDataMemory2", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataSetupSaveDataMemory2");
+            SceSaveDataMemorySetup2 setup{};
+            if (!read_guest(mem, ctx.rdi, setup)) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_PARAMETER;
+                return;
+            }
+            const auto existed = setup_save_memory(setup.user_id, setup.slot_id, setup.memory_size);
+            if (!existed) {
+                ctx.rax = SCE_SAVE_DATA_ERROR_INTERNAL;
+                return;
+            }
+            if (*existed == 0) { // just created: apply the initial param and icon
+                const auto dir = save_memory_dir(setup.user_id, setup.slot_id);
+                SceSaveDataParam param{};
+                if (setup.init_param && read_guest(mem, setup.init_param, param)) store_param(dir, param);
+                SceSaveDataIcon icon{};
+                if (setup.init_icon && read_guest(mem, setup.init_icon, icon)) store_icon(mem, dir, icon);
+            }
+            SceSaveDataMemorySetupResult result{};
+            result.existed_memory_size = *existed;
+            if (ctx.rsi) write_guest(mem, ctx.rsi, result);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataGetSaveDataMemory(userId, void* buf, size_t bufSize, int64_t offset)
+    reg.register_symbol(0xEC1B79A410BF01CAULL, "sceSaveDataGetSaveDataMemory", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataGetSaveDataMemory");
+            const auto file = save_memory_file(0);
+            SceSaveDataMemoryData d{};
+            d.buf = ctx.rsi;
+            d.buf_size = ctx.rdx;
+            d.offset = static_cast<i64>(ctx.rcx);
+            ctx.rax = !file ? SCE_SAVE_DATA_ERROR_MEMORY_NOT_READY
+                    : save_memory_io(mem, *file, d, false) ? SCE_OK : SCE_SAVE_DATA_ERROR_PARAMETER;
+        });
+
+    // sceSaveDataGetSaveDataMemory2(SceSaveDataMemoryGet2*)
+    reg.register_symbol(0x43038EEEF7A09D5FULL, "sceSaveDataGetSaveDataMemory2", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataGetSaveDataMemory2");
+            SceSaveDataMemoryGet2 get{};
+            ctx.rax = read_guest(mem, ctx.rdi, get) ? save_memory_get(mem, get.slot_id, get.data, get.param, get.icon)
+                                                    : SCE_SAVE_DATA_ERROR_PARAMETER;
+        });
+
+    // sceSaveDataSetSaveDataMemory(userId, const void* buf, size_t bufSize, int64_t offset)
+    reg.register_symbol(0x8776144735C64954ULL, "sceSaveDataSetSaveDataMemory", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataSetSaveDataMemory");
+            const auto file = save_memory_file(0);
+            SceSaveDataMemoryData d{};
+            d.buf = ctx.rsi;
+            d.buf_size = ctx.rdx;
+            d.offset = static_cast<i64>(ctx.rcx);
+            ctx.rax = !file ? SCE_SAVE_DATA_ERROR_MEMORY_NOT_READY
+                    : save_memory_io(mem, *file, d, true) ? SCE_OK : SCE_SAVE_DATA_ERROR_PARAMETER;
+        });
+
+    // sceSaveDataSetSaveDataMemory2(const SceSaveDataMemorySet2*)
+    reg.register_symbol(0x71DBB2F6FE18993EULL, "sceSaveDataSetSaveDataMemory2", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("SaveData", "sceSaveDataSetSaveDataMemory2");
+            SceSaveDataMemorySet2 set{};
+            ctx.rax = read_guest(mem, ctx.rdi, set)
+                    ? save_memory_set(mem, set.slot_id, set.data, set.data_num, set.param, set.icon)
+                    : SCE_SAVE_DATA_ERROR_PARAMETER;
+        });
+
+    // ---- libSceNpTrophy ----------------------------------------------------
+    // sceNpTrophyCreateContext(SceNpTrophyContext* out, userId, serviceLabel, u64 options)
+    reg.register_symbol(0x5DB9236E86D99426ULL, "sceNpTrophyCreateContext", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("NpTrophy", "sceNpTrophyCreateContext");
+            const i32 user_id = static_cast<i32>(ctx.rsi);
+            const u32 label = static_cast<u32>(ctx.rdx);
+            auto& st = trophy_state();
+            std::lock_guard lock(st.mtx);
+            if (ctx.rcx != 0 || ctx.rdi <= 0x1000 || !mem.is_valid_address(ctx.rdi, 4)) {
+                ctx.rax = SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+                return;
+            }
+            TrophyContext* free_slot = nullptr;
+            i32 id = 0;
+            for (usize i = 0; i < st.contexts.size(); ++i) {
+                auto& c = st.contexts[i];
+                if (c.used && c.user_id == user_id && c.service_label == label) {
+                    ctx.rax = SCE_NP_TROPHY_ERROR_CONTEXT_ALREADY_EXISTS;
+                    return;
+                }
+                if (!c.used && !free_slot) {
+                    free_slot = &c;
+                    id = static_cast<i32>(i) + 1;
+                }
+            }
+            if (!free_slot) {
+                ctx.rax = SCE_NP_TROPHY_ERROR_CONTEXT_EXCEEDS_MAX;
+                return;
+            }
+            *free_slot = TrophyContext{.used = true, .user_id = user_id, .service_label = label};
+            mem.write_value(ctx.rdi, id);
+            ctx.rax = SCE_OK;
+        });
+
+    // sceNpTrophyCreateHandle(SceNpTrophyHandle* out)
+    reg.register_symbol(0xABB53AB440107FB7ULL, "sceNpTrophyCreateHandle", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("NpTrophy", "sceNpTrophyCreateHandle");
+            auto& st = trophy_state();
+            std::lock_guard lock(st.mtx);
+            if (ctx.rdi <= 0x1000 || !mem.is_valid_address(ctx.rdi, 4)) {
+                ctx.rax = SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+                return;
+            }
+            for (usize i = 0; i < st.handles.size(); ++i) {
+                if (!st.handles[i]) {
+                    st.handles[i] = true;
+                    mem.write_value(ctx.rdi, static_cast<i32>(i) + 1);
+                    ctx.rax = SCE_OK;
+                    return;
+                }
+            }
+            ctx.rax = SCE_NP_TROPHY_ERROR_HANDLE_EXCEEDS_MAX;
+        });
+
+    // sceNpTrophyRegisterContext(context, handle, u64 options)
+    reg.register_symbol(0x4C9080C6DA3D4845ULL, "sceNpTrophyRegisterContext", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager&) {
+            hle_log_once("NpTrophy", "sceNpTrophyRegisterContext");
+            std::lock_guard lock(trophy_state().mtx);
+            TrophyContext* c = nullptr;
+            const u32 err = trophy_lookup(static_cast<i32>(ctx.rdi), static_cast<i32>(ctx.rsi), &c);
+            if (err == SCE_OK) c->registered = true;
+            ctx.rax = err;
+        });
+
+    // sceNpTrophyDestroyContext(context)
+    reg.register_symbol(0x1355ABC1DD3B2EBFULL, "sceNpTrophyDestroyContext", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager&) {
+            hle_log_once("NpTrophy", "sceNpTrophyDestroyContext");
+            auto& st = trophy_state();
+            std::lock_guard lock(st.mtx);
+            const i32 id = static_cast<i32>(ctx.rdi);
+            if (id < 1 || id > static_cast<i32>(st.contexts.size()) || !st.contexts[id - 1].used) {
+                ctx.rax = SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+                return;
+            }
+            st.contexts[id - 1] = TrophyContext{};
+            ctx.rax = SCE_OK;
+        });
+
+    // sceNpTrophyDestroyHandle(handle)
+    reg.register_symbol(0x18D705E2889D6346ULL, "sceNpTrophyDestroyHandle", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager&) {
+            hle_log_once("NpTrophy", "sceNpTrophyDestroyHandle");
+            auto& st = trophy_state();
+            std::lock_guard lock(st.mtx);
+            const i32 id = static_cast<i32>(ctx.rdi);
+            if (id < 1 || id > static_cast<i32>(st.handles.size()) || !st.handles[id - 1]) {
+                ctx.rax = SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
+                return;
+            }
+            st.handles[id - 1] = false;
+            ctx.rax = SCE_OK;
+        });
+
+    // sceNpTrophyUnlockTrophy(context, handle, SceNpTrophyId, SceNpTrophyId* platinumId)
+    reg.register_symbol(0xDBCC6645415AA3AFULL, "sceNpTrophyUnlockTrophy", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const i32 trophy = static_cast<i32>(ctx.rdx);
+            hle_log_once("NpTrophy", "sceNpTrophyUnlockTrophy", "id=" + std::to_string(trophy));
+            auto& st = trophy_state();
+            std::lock_guard lock(st.mtx);
+            TrophyContext* c = nullptr;
+            u32 err = trophy_lookup(static_cast<i32>(ctx.rdi), static_cast<i32>(ctx.rsi), &c);
+            if (err == SCE_OK && (trophy < 0 || trophy >= SCE_NP_TROPHY_NUM_MAX)) err = SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID;
+            if (err == SCE_OK && (ctx.rcx <= 0x1000 || !mem.is_valid_address(ctx.rcx, 4))) err = SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+            if (err == SCE_OK && !c->registered) err = SCE_NP_TROPHY_ERROR_NOT_REGISTERED;
+            if (err == SCE_OK) {
+                auto& tick = st.unlock_ticks[c->user_id][trophy];
+                if (tick) {
+                    err = SCE_NP_TROPHY_ERROR_TROPHY_ALREADY_UNLOCKED;
+                } else {
+                    tick = rtc_tick_now();
+                    mem.write_value(ctx.rcx, SCE_NP_TROPHY_INVALID_TROPHY_ID); // no platinum earned
+                }
+            }
+            ctx.rax = err;
+        });
+
+    // sceNpTrophyGetTrophyUnlockState(context, handle, SceNpTrophyFlagArray*, u32* count)
+    reg.register_symbol(0x2C7B9298EDD22DDFULL, "sceNpTrophyGetTrophyUnlockState", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("NpTrophy", "sceNpTrophyGetTrophyUnlockState");
+            auto& st = trophy_state();
+            std::lock_guard lock(st.mtx);
+            TrophyContext* c = nullptr;
+            u32 err = (ctx.rdx && ctx.rcx) ? SCE_OK : SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+            if (err == SCE_OK) err = trophy_lookup(static_cast<i32>(ctx.rdi), static_cast<i32>(ctx.rsi), &c);
+            if (err == SCE_OK && !c->registered) err = SCE_NP_TROPHY_ERROR_NOT_REGISTERED;
+            if (err != SCE_OK) {
+                ctx.rax = err;
+                return;
+            }
+            SceNpTrophyFlagArray flags{};
+            if (auto it = st.unlock_ticks.find(c->user_id); it != st.unlock_ticks.end()) {
+                for (i32 id = 0; id < SCE_NP_TROPHY_NUM_MAX; ++id)
+                    if (it->second[id]) flags.flag_bits[id >> 5] |= 1u << (id & 31);
+            }
+            const u32 count = trophy_counts(*c).num_trophies;
+            ctx.rax = write_guest(mem, ctx.rdx, flags) && write_guest(mem, ctx.rcx, count)
+                    ? SCE_OK : SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+        });
+
+    // sceNpTrophyGetGameInfo(context, handle, SceNpTrophyGameDetails*, SceNpTrophyGameData*)
+    reg.register_symbol(0x6183F77F65B4F688ULL, "sceNpTrophyGetGameInfo", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("NpTrophy", "sceNpTrophyGetGameInfo");
+            std::lock_guard lock(trophy_state().mtx);
+            TrophyContext* c = nullptr;
+            u32 err = trophy_lookup(static_cast<i32>(ctx.rdi), static_cast<i32>(ctx.rsi), &c);
+            if (err == SCE_OK && !c->registered) err = SCE_NP_TROPHY_ERROR_NOT_REGISTERED;
+            if (err != SCE_OK) {
+                ctx.rax = err;
+                return;
+            }
+            const TrophyCounts counts = trophy_counts(*c);
+            SceNpTrophyGameDetails details{};
+            if (ctx.rdx && read_guest(mem, ctx.rdx, details.size)) { // size is the caller's
+                const u64 size = details.size;
+                details = SceNpTrophyGameDetails{};
+                details.size = size;
+                details.num_trophies = counts.num_trophies;
+                write_guest(mem, ctx.rdx, details);
+            }
+            SceNpTrophyGameData data{};
+            if (ctx.rcx && read_guest(mem, ctx.rcx, data.size)) {
+                const u64 size = data.size;
+                data = SceNpTrophyGameData{};
+                data.size = size;
+                data.unlocked_trophies = counts.unlocked;
+                data.progress_percentage = counts.num_trophies ? counts.unlocked * 100 / counts.num_trophies : 0;
+                write_guest(mem, ctx.rcx, data);
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // sceNpTrophyGetGroupInfo(context, handle, SceNpTrophyGroupId,
+    //                         SceNpTrophyGroupDetails*, SceNpTrophyGroupData*)
+    reg.register_symbol(0xC1353019FB292A27ULL, "sceNpTrophyGetGroupInfo", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("NpTrophy", "sceNpTrophyGetGroupInfo");
+            const i32 group = static_cast<i32>(ctx.rdx);
+            std::lock_guard lock(trophy_state().mtx);
+            TrophyContext* c = nullptr;
+            u32 err = trophy_lookup(static_cast<i32>(ctx.rdi), static_cast<i32>(ctx.rsi), &c);
+            if (err == SCE_OK && !c->registered) err = SCE_NP_TROPHY_ERROR_NOT_REGISTERED;
+            if (err == SCE_OK && group < SCE_NP_TROPHY_BASE_GAME_GROUP_ID) err = SCE_NP_TROPHY_ERROR_INVALID_GROUP_ID;
+            if (err != SCE_OK) {
+                ctx.rax = err;
+                return;
+            }
+            // Every unlocked trophy belongs to the base game; other groups are empty.
+            const TrophyCounts counts = group == SCE_NP_TROPHY_BASE_GAME_GROUP_ID ? trophy_counts(*c) : TrophyCounts{};
+            SceNpTrophyGroupDetails details{};
+            if (ctx.rcx && read_guest(mem, ctx.rcx, details.size)) {
+                const u64 size = details.size;
+                details = SceNpTrophyGroupDetails{};
+                details.size = size;
+                details.group_id = group;
+                details.num_trophies = counts.num_trophies;
+                write_guest(mem, ctx.rcx, details);
+            }
+            SceNpTrophyGroupData data{};
+            if (ctx.r8 && read_guest(mem, ctx.r8, data.size)) {
+                const u64 size = data.size;
+                data = SceNpTrophyGroupData{};
+                data.size = size;
+                data.group_id = group;
+                data.unlocked_trophies = counts.unlocked;
+                data.progress_percentage = counts.num_trophies ? counts.unlocked * 100 / counts.num_trophies : 0;
+                write_guest(mem, ctx.r8, data);
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // sceNpTrophyGetTrophyInfo(context, handle, SceNpTrophyId,
+    //                          SceNpTrophyDetails*, SceNpTrophyData*)
+    reg.register_symbol(0xAAA515183810066DULL, "sceNpTrophyGetTrophyInfo", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            hle_log_once("NpTrophy", "sceNpTrophyGetTrophyInfo");
+            const i32 trophy = static_cast<i32>(ctx.rdx);
+            auto& st = trophy_state();
+            std::lock_guard lock(st.mtx);
+            TrophyContext* c = nullptr;
+            u32 err = trophy_lookup(static_cast<i32>(ctx.rdi), static_cast<i32>(ctx.rsi), &c);
+            if (err == SCE_OK && (trophy < 0 || trophy >= SCE_NP_TROPHY_NUM_MAX)) err = SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID;
+            if (err == SCE_OK && !c->registered) err = SCE_NP_TROPHY_ERROR_NOT_REGISTERED;
+            if (err != SCE_OK) {
+                ctx.rax = err;
+                return;
+            }
+            u64 tick = 0;
+            if (auto it = st.unlock_ticks.find(c->user_id); it != st.unlock_ticks.end()) tick = it->second[trophy];
+            SceNpTrophyDetails details{};
+            if (ctx.rcx && read_guest(mem, ctx.rcx, details.size)) {
+                const u64 size = details.size;
+                details = SceNpTrophyDetails{};
+                details.size = size;
+                details.trophy_id = trophy;
+                details.group_id = SCE_NP_TROPHY_BASE_GAME_GROUP_ID;
+                write_guest(mem, ctx.rcx, details);
+            }
+            SceNpTrophyData data{};
+            if (ctx.r8 && read_guest(mem, ctx.r8, data.size)) {
+                const u64 size = data.size;
+                data = SceNpTrophyData{};
+                data.size = size;
+                data.trophy_id = trophy;
+                data.unlocked = tick != 0;
+                data.timestamp = tick;
+                write_guest(mem, ctx.r8, data);
+            }
+            ctx.rax = SCE_OK;
+        });
+
+    // sceNpTrophyShowTrophyList(context, handle): no system UI to show.
+    reg.register_symbol(0x77D8E974FCF97FFFULL, "sceNpTrophyShowTrophyList", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager&) {
+            hle_log_once("NpTrophy", "sceNpTrophyShowTrophyList");
+            std::lock_guard lock(trophy_state().mtx);
+            TrophyContext* c = nullptr;
+            ctx.rax = trophy_lookup(static_cast<i32>(ctx.rdi), static_cast<i32>(ctx.rsi), &c);
+        });
+
+    // ---- libkernel: the write side of file I/O ---------------------------
+    // sceKernelOpen/Read/Lseek/Close were already routed to the VFS; without
+    // these a guest writing its save under /savedataN got 0 bytes written.
+    auto sce_err = [](i64 neg_errno) -> u64 {
+        return 0x80020000ULL | static_cast<u64>(-neg_errno & 0xFFFF);
+    };
+    // sceKernelWrite(int fd, const void* buf, size_t n); fds 1/2 go to the host's.
+    reg.register_symbol(0xE304B37BDD8184B2ULL, "sceKernelWrite", "libkernel",
+        [sce_err](CpuContext& ctx, MemoryManager& mem) {
+            const i32 fd = static_cast<i32>(ctx.rdi);
+            const GuestSize n = ctx.rdx;
+            if (n != 0 && !mem.is_valid_address(ctx.rsi, n)) {
+                ctx.rax = sce_err(-EFAULT);
+                return;
+            }
+            if (fd == 1 || fd == 2) {
+                std::fwrite(mem.to_host_ptr(ctx.rsi, n), 1, n, fd == 1 ? stdout : stderr);
+                ctx.rax = n;
+                return;
+            }
+            const i64 r = n == 0 ? 0 : get_vfs().write(fd, mem.to_host_ptr(ctx.rsi, n), n);
+            ctx.rax = r < 0 ? sce_err(r) : static_cast<u64>(r);
+        });
+    // sceKernelMkdir(const char* path, mode_t mode)
+    reg.register_symbol(0xD7F2C52E6445C713ULL, "sceKernelMkdir", "libkernel",
+        [sce_err](CpuContext& ctx, MemoryManager& mem) {
+            const i32 r = get_vfs().mkdir(guest_cstring(mem, ctx.rdi, 1024), static_cast<i32>(ctx.rsi));
+            ctx.rax = r < 0 ? sce_err(r) : 0;
+        });
+    // sceKernelUnlink(const char* path)
+    reg.register_symbol(0x0145D5C5678953F0ULL, "sceKernelUnlink", "libkernel",
+        [sce_err](CpuContext& ctx, MemoryManager& mem) {
+            const i32 r = get_vfs().unlink(guest_cstring(mem, ctx.rdi, 1024));
+            ctx.rax = r < 0 ? sce_err(r) : 0;
+        });
+}
+
+
+// =============================================================================
+// libc / C++ runtime: the pieces of the game-bundled libc.prx (Dinkumware) that
+// Sonic Mania (RSDKv5) imports beyond what the Unity titles needed.
+//
+// Guest code reaches several of these objects without calling us -- a locale's
+// _Incref is a virtual call, an id is read straight from memory -- so the
+// objects live in guest memory, and the few member functions guest code calls
+// virtually are tiny x86 stubs written there too.
+// =============================================================================
+
+namespace {
+
+// Copy `code` into fresh guest heap memory and return its address.
+GuestAddr emit_guest_code(MemoryManager& mem, std::initializer_list<u8> code) {
+    const GuestAddr p = bump_alloc(code.size(), 16);
+    if (p != 0) mem.write_bytes(p, std::data(code), code.size());
+    return p;
+}
+
+// Zeroed guest object of `size` bytes.
+GuestAddr alloc_guest_zeroed(MemoryManager& mem, GuestSize size) {
+    const GuestAddr p = bump_alloc(size, 16);
+    if (p != 0) mem.zero_memory(p, size);
+    return p;
+}
+
+// ---- locale -----------------------------------------------------------------
+// locale::_Locimp is a facet (vptr, u32 refcount) followed by
+//   0x10 facet** _Facetvec, 0x18 size_t _Facetcount, 0x20 int _Catmask,
+//   0x24 bool _Xparent, 0x28 const char* _Name   (0x30 bytes, from the
+// game's own `new _Locimp` and its inlined use_facet). Facet vtables are
+// [dtor, deleting dtor, _Incref, _Decref]; _Decref returns the facet to delete
+// or null. Our locale objects are never freed, so their _Decref returns null.
+constexpr GuestSize kLocimpSize = 0x30;
+GuestAddr g_locimp_vtable = 0;
+GuestAddr g_global_locimp = 0;
+GuestAddr g_locale_name = 0;
+std::mutex g_locale_mtx;
+
+void ensure_global_locale(MemoryManager& mem) {
+    std::lock_guard lock(g_locale_mtx);
+    if (g_global_locimp != 0) return;
+    const GuestAddr ret = emit_guest_code(mem, {0xC3});                    // ret
+    const GuestAddr ret0 = emit_guest_code(mem, {0x31, 0xC0, 0xC3});      // xor eax,eax; ret
+    g_locimp_vtable = alloc_guest_zeroed(mem, 4 * 8);
+    mem.write_value(g_locimp_vtable + 0x00, ret);
+    mem.write_value(g_locimp_vtable + 0x08, ret);
+    mem.write_value(g_locimp_vtable + 0x10, ret);
+    mem.write_value(g_locimp_vtable + 0x18, ret0);
+    g_locale_name = alloc_guest_zeroed(mem, 16);
+    mem.write_bytes(g_locale_name, "C", 2);
+    g_global_locimp = alloc_guest_zeroed(mem, kLocimpSize);
+    mem.write_value(g_global_locimp + 0x00, g_locimp_vtable);
+    mem.write_value(g_global_locimp + 0x08, static_cast<u32>(1));
+    mem.write_value(g_global_locimp + 0x20, static_cast<i32>(0x3F)); // all categories
+    mem.write_value(g_global_locimp + 0x28, g_locale_name);
+}
+
+// ---- std::thread launch pad ---------------------------------------------------
+// _Pad::_Launch(_Thrd_t*) starts a thread running the derived object's _Go()
+// (vtable slot 0) and waits until _Go has copied what it needs and called
+// _Release() -- the pad lives on the launching thread's stack.
+struct PadState {
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool released{false};
+};
+std::mutex g_pads_mtx;
+std::unordered_map<GuestAddr, std::shared_ptr<PadState>> g_pads;
+GuestAddr g_pad_entry = 0;
+
+std::shared_ptr<PadState> pad_state(GuestAddr pad, bool create) {
+    std::lock_guard lock(g_pads_mtx);
+    auto it = g_pads.find(pad);
+    if (it != g_pads.end()) return it->second;
+    if (!create) return nullptr;
+    auto st = std::make_shared<PadState>();
+    g_pads.emplace(pad, st);
+    return st;
+}
+
+// _Locksyslock(kind) / _Unlocksyslock(kind): Dinkumware's _Lockit table.
+std::array<std::recursive_mutex, 8> g_syslocks;
+
+// The game-bundled libc's rand(): FreeBSD's Park-Miller generator, RAND_MAX
+// 0x7fffffff.
+std::atomic<u32> g_rand_state{1};
+
+// _Stderr / _Stdout as seen by the guest: a FILE-sized blob whose address the
+// stdio handlers below map back to the host stream.
+GuestAddr g_guest_stderr = 0;
+
+FILE* host_stream(GuestAddr fp) {
+    if (fp != 0 && fp == g_guest_stderr) return stderr;
+    return reinterpret_cast<FILE*>(fp);
+}
+
+} // namespace
+
+static void register_libc_cxx_runtime(NidRegistry& reg) {
+    // ---- data objects -------------------------------------------------------
+    reg.register_data_symbol(0x1FC029ACA799B4D8ULL, "_Stderr", [](MemoryManager& mem) {
+        g_guest_stderr = alloc_guest_zeroed(mem, 0x100);
+        return g_guest_stderr;
+    });
+    reg.register_data_symbol(0x3F7DF43F774517AFULL, "Need_sceLibc", [](MemoryManager& mem) {
+        return alloc_guest_zeroed(mem, 8);
+    });
+    // static int locale::id::_Id_cnt, and codecvt<char16_t, char, mbstate_t>::id
+    // (a size_t the game assigns from ++_Id_cnt on first use).
+    reg.register_data_symbol(0x1F87DCA503A9734FULL, "_ZNSt6locale2id7_Id_cntE", [](MemoryManager& mem) {
+        return alloc_guest_zeroed(mem, 8);
+    });
+    reg.register_data_symbol(0xC4CE6B7B9F26C63FULL, "_ZNSt7codecvtIDsc9_MbstatetE2idE", [](MemoryManager& mem) {
+        return alloc_guest_zeroed(mem, 8);
+    });
+    // runtime_error / range_error vtables, for objects the game constructs on
+    // a conversion error path: dtor, deleting dtor, what().
+    auto make_error_vtable = [](const char* what) {
+        return [what](MemoryManager& mem) -> GuestAddr {
+            const GuestAddr text = alloc_guest_zeroed(mem, std::strlen(what) + 1);
+            mem.write_bytes(text, what, std::strlen(what) + 1);
+            const GuestAddr ret = emit_guest_code(mem, {0xC3});
+            // movabs rax, text; ret
+            u8 code[11] = {0x48, 0xB8};
+            std::memcpy(code + 2, &text, 8);
+            code[10] = 0xC3;
+            const GuestAddr what_fn = bump_alloc(sizeof(code), 16);
+            mem.write_bytes(what_fn, code, sizeof(code));
+            // [offset-to-top, typeinfo] then the address point.
+            const GuestAddr vt = alloc_guest_zeroed(mem, 5 * 8);
+            mem.write_value(vt + 0x10, ret);
+            mem.write_value(vt + 0x18, ret);
+            mem.write_value(vt + 0x20, what_fn);
+            return vt;
+        };
+    };
+    reg.register_data_symbol(0xFCBFBFF05D3E8017ULL, "_ZTVSt13runtime_error", make_error_vtable("runtime_error"));
+    reg.register_data_symbol(0x45BCD637C5F6D616ULL, "_ZTVSt11range_error", make_error_vtable("range_error"));
+
+    // ---- operator new / delete ----------------------------------------------
+    auto op_new = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr p = bump_alloc(ctx.rdi ? ctx.rdi : 1, 16);
+        if (p == 0) guest_abort("operator new: out of memory (std::bad_alloc)", ctx, mem);
+        ctx.rax = p;
+    };
+    auto op_delete = [](CpuContext& ctx, MemoryManager&) { heap_free(ctx.rdi); };
+    reg.register_symbol(0x7C99E9B955416CA9ULL, "_Znwm", "libc", op_new);
+    reg.register_symbol(0x85D9B461F31AED34ULL, "_Znam", "libc", op_new);
+    reg.register_symbol(0xCFE3FEC429D62C19ULL, "_ZdlPv", "libc", op_delete);
+    reg.register_symbol(0x30B5A5F7448558D1ULL, "_ZdaPv", "libc", op_delete);
+
+    // ---- C++ error throwers: the guest only reaches these when the real
+    // library would throw, and we have no unwinder, so stop with the reason.
+    static constexpr struct { Nid nid; const char* name; } kThrowers[] = {
+        {0x793D94B264DEC1B5ULL, "_ZSt11_Xbad_allocv"},
+        {0x6D1BA3221796941DULL, "_ZSt14_Throw_C_errori"},
+        {0xA33300AF6F01C126ULL, "_ZSt14_Xout_of_rangePKc"},
+        {0x5B48FABC2C61F4F7ULL, "_ZSt16_Throw_Cpp_errori"},
+        {0x3042E2FDC2AA5AADULL, "_ZSt19_Xbad_function_callv"},
+        {0x0EE5B966A66FFFBDULL, "_ZNKSt9exception6_RaiseEv"},
+    };
+    for (const auto& t : kThrowers) {
+        const std::string reason = std::string(t.name) + ": guest threw a C++ exception";
+        reg.register_symbol(t.nid, t.name, "libc", [reason](CpuContext& ctx, MemoryManager& mem) {
+            guest_abort(reason, ctx, mem);
+        });
+    }
+    reg.register_symbol(0x36735A59AD7A3AF1ULL, "_ZNSt11range_errorD1Ev", "libc",
+        [](CpuContext&, MemoryManager&) {});
+
+    // ---- process start-up -----------------------------------------------------
+    reg.register_symbol(0x6F3404C72D7CF592ULL, "_init_env", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+    // atexit(fn): handlers never run (the process is torn down from the host).
+    reg.register_symbol(0xF06D8B07E037AF38ULL, "atexit", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+    // catchReturnFromMain(int status): the CRT calls this when main returns.
+    reg.register_symbol(0x5CA45E82C1691299ULL, "catchReturnFromMain", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            std::fprintf(stderr, "[libc] main returned %d\n", static_cast<int>(ctx.rdi));
+            std::fflush(nullptr);
+            std::_Exit(static_cast<int>(ctx.rdi));
+        });
+
+    // ---- math ---------------------------------------------------------------
+    // Dinkumware kernels: _Sin(x, qoff) / _FSin is sin for qoff 0 and cos for
+    // qoff 1; _Log(x, baseflag) is ln for 0, log10 for >0 and log2 for <0.
+    reg.register_symbol(0x66D8ECA64250FAFCULL, "_FSin", "libc", [](CpuContext& ctx, MemoryManager&) {
+        const float x = ctx.ymm[0].f[0];
+        ctx.ymm[0].f[0] = (ctx.rdi & 1) ? std::cos(x) : std::sin(x);
+    });
+    reg.register_symbol(0x7025E353BD99D0ECULL, "_Sin", "libc", [](CpuContext& ctx, MemoryManager&) {
+        const double x = ctx.ymm[0].df[0];
+        ctx.ymm[0].df[0] = (ctx.rdi & 1) ? std::cos(x) : std::sin(x);
+    });
+    reg.register_symbol(0xCD70A2EFC6D8AC42ULL, "_Log", "libc", [](CpuContext& ctx, MemoryManager&) {
+        const double x = ctx.ymm[0].df[0];
+        const i32 base = static_cast<i32>(ctx.rdi);
+        ctx.ymm[0].df[0] = base == 0 ? std::log(x) : base > 0 ? std::log10(x) : std::log2(x);
+    });
+    reg.register_symbol(0x408FF1D122FC8E1CULL, "acosf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::acos(ctx.ymm[0].f[0]); });
+    reg.register_symbol(0x1995A317F6081459ULL, "asinf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::asin(ctx.ymm[0].f[0]); });
+    reg.register_symbol(0x644E9134BF9E2DB9ULL, "tanf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::tan(ctx.ymm[0].f[0]); });
+    reg.register_symbol(0x35569D7E7CD08474ULL, "exp", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::exp(ctx.ymm[0].df[0]); });
+    reg.register_symbol(0x76769E1976E33FA1ULL, "exp2", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::exp2(ctx.ymm[0].df[0]); });
+    reg.register_symbol(0xF4B0A3A56C90E597ULL, "pow", "libc", [](CpuContext& ctx, MemoryManager&) {
+        ctx.ymm[0].df[0] = std::pow(ctx.ymm[0].df[0], ctx.ymm[1].df[0]);
+    });
+    reg.register_symbol(0x26BC0520CCCA36BDULL, "ldexp", "libc", [](CpuContext& ctx, MemoryManager&) {
+        ctx.ymm[0].df[0] = std::ldexp(ctx.ymm[0].df[0], static_cast<int>(ctx.rdi));
+    });
+    reg.register_symbol(0x72908E5D632085ADULL, "rand", "libc", [](CpuContext& ctx, MemoryManager&) {
+        u32 cur = g_rand_state.load(), next;
+        do {
+            // x = 16807 * x mod (2^31 - 1), Schrage's method as in FreeBSD.
+            i64 x = cur % 0x7FFFFFFE + 1;
+            const i64 hi = x / 127773, lo = x % 127773;
+            x = 16807 * lo - 2836 * hi;
+            if (x < 0) x += 0x7FFFFFFF;
+            next = static_cast<u32>(x - 1);
+        } while (!g_rand_state.compare_exchange_weak(cur, next));
+        ctx.rax = next;
+    });
+
+    // ---- atomics: _Atomic_fetch_{add,sub}_4(u32* p, u32 v, memory_order) ----
+    reg.register_symbol(0x88F06AB3E614505CULL, "_Atomic_fetch_add_4", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            auto* p = mem.to_host_ptr<u32>(ctx.rdi);
+            ctx.rax = p ? __atomic_fetch_add(p, static_cast<u32>(ctx.rsi), __ATOMIC_SEQ_CST) : 0;
+        });
+    reg.register_symbol(0xD879E62A22E657ABULL, "_Atomic_fetch_sub_4", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            auto* p = mem.to_host_ptr<u32>(ctx.rdi);
+            ctx.rax = p ? __atomic_fetch_sub(p, static_cast<u32>(ctx.rsi), __ATOMIC_SEQ_CST) : 0;
+        });
+    reg.register_symbol(0x9002EF76012FE4C1ULL, "_Locksyslock", "libc", [](CpuContext& ctx, MemoryManager&) {
+        g_syslocks[ctx.rdi % g_syslocks.size()].lock();
+    });
+    reg.register_symbol(0xF677FC8E851349A4ULL, "_Unlocksyslock", "libc", [](CpuContext& ctx, MemoryManager&) {
+        g_syslocks[ctx.rdi % g_syslocks.size()].unlock();
+    });
+
+    // ---- strings / stdio ------------------------------------------------------
+    reg.register_symbol(0xF2EF253F3504ABE5ULL, "memchr", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr s = ctx.rdi;
+        const GuestSize n = ctx.rdx;
+        const u8* p = (n != 0 && mem.is_valid_address(s, n)) ? mem.to_host_ptr<u8>(s) : nullptr;
+        const void* hit = p ? std::memchr(p, static_cast<int>(ctx.rsi & 0xFF), n) : nullptr;
+        ctx.rax = hit ? s + static_cast<GuestAddr>(static_cast<const u8*>(hit) - p) : 0;
+    });
+    // strlcpy(dst, src, size) -> strlen(src)
+    reg.register_symbol(0x49F40865CAAFBE6BULL, "strlcpy", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const std::string src = guest_cstring(mem, ctx.rsi, 1 << 20);
+        const GuestSize size = ctx.rdx;
+        if (size != 0) {
+            const usize n = std::min<usize>(src.size(), size - 1);
+            mem.write_bytes(ctx.rdi, src.data(), n);
+            mem.write_value(ctx.rdi + n, static_cast<u8>(0));
+        }
+        ctx.rax = src.size();
+    });
+    // strncat(dst, src, n) -> dst
+    reg.register_symbol(0x907838E6A3C2E9FDULL, "strncat", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const std::string dst = guest_cstring(mem, ctx.rdi, 1 << 20);
+        std::string src = guest_cstring(mem, ctx.rsi, ctx.rdx);
+        mem.write_bytes(ctx.rdi + dst.size(), src.c_str(), src.size() + 1);
+        ctx.rax = ctx.rdi;
+    });
+    // vsprintf(buf, fmt, va_list) -> length
+    reg.register_symbol(0x8DBCFD23DBE4AA49ULL, "vsprintf", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const std::string fmt = guest_cstring(mem, ctx.rsi, 4096);
+        VaListArgs args(mem, ctx.rdx);
+        const std::string out = format_guest(mem, fmt.c_str(), args);
+        mem.write_bytes(ctx.rdi, out.c_str(), out.size() + 1);
+        ctx.rax = out.size();
+    });
+    // fprintf(FILE*, fmt, ...) -> length
+    reg.register_symbol(0x7DF7F010B5CD5450ULL, "fprintf", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const std::string fmt = guest_cstring(mem, ctx.rsi, 4096);
+        CallArgs args(ctx, mem, 2);
+        const std::string out = format_guest(mem, fmt.c_str(), args);
+        FILE* f = host_stream(ctx.rdi);
+        ctx.rax = f ? std::fwrite(out.data(), 1, out.size(), f) : static_cast<u64>(-1);
+    });
+    // fwrite(ptr, size, nmemb, FILE*) -> items written
+    reg.register_symbol(0x329C61321F1016BAULL, "fwrite", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestSize total = ctx.rsi * ctx.rdx;
+        FILE* f = host_stream(ctx.rcx);
+        if (!f || total == 0 || !mem.is_valid_address(ctx.rdi, total)) {
+            ctx.rax = 0;
+            return;
+        }
+        ctx.rax = std::fwrite(mem.to_host_ptr<void>(ctx.rdi), ctx.rsi, ctx.rdx, f);
+    });
+
+    // ---- std::locale (one codecvt<char16_t> converter in the game) -----------
+    auto locale_global = [](CpuContext& ctx, MemoryManager& mem) {
+        ensure_global_locale(mem);
+        ctx.rax = g_global_locimp;
+    };
+    reg.register_symbol(0xF6B30C2F4F3A4841ULL, "_ZNSt6locale5_InitEv", "libc", locale_global);
+    reg.register_symbol(0x844436622E0F2570ULL, "_ZNSt6locale16_GetgloballocaleEv", "libc", locale_global);
+    // _Locimp::_Locimp(const _Locimp& right)
+    reg.register_symbol(0x5958B0C6D10AC479ULL, "_ZNSt6locale7_LocimpC1ERKS0_", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            ensure_global_locale(mem);
+            const GuestAddr self = ctx.rdi, right = ctx.rsi;
+            u64 count = 0, vec = 0, name = 0;
+            i32 catmask = 0;
+            mem.read_value(right + 0x18, count);
+            mem.read_value(right + 0x10, vec);
+            mem.read_value(right + 0x20, catmask);
+            mem.read_value(right + 0x28, name);
+            mem.zero_memory(self, kLocimpSize);
+            mem.write_value(self + 0x00, g_locimp_vtable);
+            mem.write_value(self + 0x08, static_cast<u32>(1));
+            GuestAddr copy = 0;
+            if (count != 0 && vec != 0) {
+                copy = alloc_guest_zeroed(mem, count * 8);
+                for (u64 i = 0; i < count; ++i) {
+                    u64 f = 0;
+                    mem.read_value(vec + i * 8, f);
+                    mem.write_value(copy + i * 8, f);
+                    // facet::_Incref is an atomic add on the u32 at +8.
+                    if (auto* refs = f ? mem.to_host_ptr<u32>(f + 8) : nullptr)
+                        __atomic_fetch_add(refs, 1u, __ATOMIC_SEQ_CST);
+                }
+            }
+            mem.write_value(self + 0x10, copy);
+            mem.write_value(self + 0x18, copy ? count : 0);
+            mem.write_value(self + 0x20, catmask);
+            mem.write_value(self + 0x28, name ? name : g_locale_name);
+        });
+    // _Locimp::_Addfac(facet* pf, size_t id)
+    reg.register_symbol(0xBAE81ADD18A908A4ULL, "_ZNSt6locale7_Locimp7_AddfacEPNS_5facetEm", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr self = ctx.rdi, facet = ctx.rsi;
+            const u64 id = ctx.rdx;
+            u64 count = 0, vec = 0;
+            mem.read_value(self + 0x18, count);
+            mem.read_value(self + 0x10, vec);
+            if (id >= count) {
+                const u64 grown = std::max<u64>(id + 1, 40);
+                const GuestAddr nv = alloc_guest_zeroed(mem, grown * 8);
+                for (u64 i = 0; i < count; ++i) {
+                    u64 f = 0;
+                    mem.read_value(vec + i * 8, f);
+                    mem.write_value(nv + i * 8, f);
+                }
+                vec = nv;
+                count = grown;
+                mem.write_value(self + 0x10, vec);
+                mem.write_value(self + 0x18, count);
+            }
+            if (auto* refs = facet ? mem.to_host_ptr<u32>(facet + 8) : nullptr)
+                __atomic_fetch_add(refs, 1u, __ATOMIC_SEQ_CST);
+            mem.write_value(vec + id * 8, facet);
+        });
+    // _Locinfo holds the C library's category data; the game only builds one
+    // to construct a facet and never reads it back.
+    reg.register_symbol(0x86A8BCC8C382986DULL, "_ZNSt8_LocinfoC1EPKc", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = ctx.rdi; });
+    reg.register_symbol(0xA7A2EB1E321031D9ULL, "_ZNSt8_LocinfoD1Ev", "libc", [](CpuContext&, MemoryManager&) {});
+
+    // ---- std::thread ----------------------------------------------------------
+    reg.register_symbol(0x746628F6613C2B60ULL, "_ZNSt4_PadC2Ev", "libc", [](CpuContext& ctx, MemoryManager&) {
+        auto st = pad_state(ctx.rdi, true);
+        std::lock_guard lock(st->mtx);
+        st->released = false;
+    });
+    reg.register_symbol(0x8232D16607DBDE2DULL, "_ZNSt4_PadD2Ev", "libc", [](CpuContext& ctx, MemoryManager&) {
+        std::lock_guard lock(g_pads_mtx);
+        g_pads.erase(ctx.rdi);
+    });
+    // _Pad::_Launch(_Thrd_t* thr)
+    reg.register_symbol(0xC59AA266F99CA7D9ULL, "_ZNSt4_Pad7_LaunchEPP7pthread", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr pad = ctx.rdi, thr = ctx.rsi;
+            if (g_pad_entry == 0) {
+                // mov rax, [rdi]; jmp qword ptr [rax]  -- this->_Go()
+                g_pad_entry = emit_guest_code(mem, {0x48, 0x8B, 0x07, 0xFF, 0x20});
+            }
+            auto st = pad_state(pad, true);
+            ScePthreadAttr attr{};
+            const ScePthreadId tid = get_thread_manager(mem).create_thread(g_pad_entry, pad, &attr, "std::thread");
+            if (thr != 0) mem.write_value(thr, static_cast<u64>(tid));
+            std::unique_lock lock(st->mtx);
+            st->cv.wait(lock, [&] { return st->released; });
+        });
+    reg.register_symbol(0x6BFCFBC31B983B61ULL, "_ZNSt4_Pad8_ReleaseEv", "libc", [](CpuContext& ctx, MemoryManager&) {
+        if (auto st = pad_state(ctx.rdi, false)) {
+            std::lock_guard lock(st->mtx);
+            st->released = true;
+            st->cv.notify_all();
+        }
+    });
+    reg.register_symbol(0x2FB7FBCD8C01BD90ULL, "_Thrd_detach", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+
+    // ---- libkernel / libSceRtc / libSceVideoOut odds and ends -------------------
+    reg.register_symbol(0x71091EF54B8140E9ULL, "sceKernelMunmap", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+    reg.register_symbol(0x301B88B6F6DAEB3FULL, "sceKernelReleaseDirectMemory", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+    // sceRtcGetCurrentTick(SceRtcTick* tick): microseconds since 0001-01-01 UTC.
+    reg.register_symbol(0xD7C076352D72F545ULL, "sceRtcGetCurrentTick", "libSceRtc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            constexpr u64 kUnixEpochTicks = 62135596800ULL * 1000000ULL;
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            if (ctx.rdi == 0) {
+                ctx.rax = 0x80B50002ULL; // SCE_RTC_ERROR_INVALID_POINTER
+                return;
+            }
+            mem.write_value(ctx.rdi, kUnixEpochTicks + static_cast<u64>(us));
+            ctx.rax = SCE_OK;
+        });
+    reg.register_symbol(0xBAAB951F8FC3BBBFULL, "sceVideoOutClose", "libSceVideoOut",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+    reg.register_symbol(0xEF7590E098F49C92ULL, "sceScreenShotSetOverlayImageWithOrigin", "libSceScreenShot",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+}
+
+// =============================================================================
+// NP services as an offline console: the user is signed out of PSN, so
+// availability checks, leaderboards (libSceNpScore) and the save-data dialog
+// finish at once with "signed out" / "OK" and the game carries on locally.
+// =============================================================================
+static void register_np_offline(NidRegistry& reg) {
+    constexpr u64 kSignedOut = 0x80550006ULL; // SCE_NP_ERROR_SIGNED_OUT
+    static std::atomic<i32> s_next_request{1};
+    auto new_request = [](CpuContext& ctx, MemoryManager&) { ctx.rax = s_next_request.fetch_add(1); };
+    auto ok = [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; };
+    auto signed_out = [kSignedOut](CpuContext& ctx, MemoryManager&) { ctx.rax = kSignedOut; };
+    // Poll(reqId, int* result): finished (0), with the request failing signed out.
+    auto poll_signed_out = [kSignedOut](CpuContext& ctx, MemoryManager& mem) {
+        if (ctx.rsi != 0) mem.write_value(ctx.rsi, static_cast<i32>(kSignedOut));
+        ctx.rax = 0;
+    };
+
+    reg.register_symbol(0x7A2A8C0ADF54B212ULL, "sceNpCreateAsyncRequest", "libSceNpManager", new_request);
+    reg.register_symbol(0x4BB4139FBD8FAC3CULL, "sceNpDeleteRequest", "libSceNpManager", ok);
+    reg.register_symbol(0xF19D897391AF1832ULL, "sceNpCheckNpAvailabilityA", "libSceNpManager", signed_out);
+    reg.register_symbol(0xBAA70F24B58BD3C3ULL, "sceNpPollAsync", "libSceNpManager", poll_signed_out);
+    reg.register_symbol(0x56061CCCF181E6CBULL, "sceNpGetUserIdByAccountId", "libSceNpManager", signed_out);
+    reg.register_symbol(0x036090DE4812A294ULL, "sceNpSetContentRestriction", "libSceNpManager", ok);
+    reg.register_symbol(0x11CEB7CB9F65F6DCULL, "sceNpSetNpTitleId", "libSceNpManager", ok);
+
+    reg.register_symbol(0x1969D640D5D91F93ULL, "sceNpScoreCreateNpTitleCtxA", "libSceNpScore", new_request);
+    reg.register_symbol(0x816F2ACA362B51B9ULL, "sceNpScoreCreateRequest", "libSceNpScore", new_request);
+    reg.register_symbol(0x74AF3F4A061FEABEULL, "sceNpScoreDeleteRequest", "libSceNpScore", ok);
+    reg.register_symbol(0x751B3334DC865A4CULL, "sceNpScoreGetRankingByAccountIdAsync", "libSceNpScore", ok);
+    reg.register_symbol(0xCB98DAED6234E6BBULL, "sceNpScoreGetRankingByRangeAAsync", "libSceNpScore", ok);
+    reg.register_symbol(0x00D26CB0FCF7998DULL, "sceNpScoreRecordScoreAsync", "libSceNpScore", ok);
+    reg.register_symbol(0x9B50DF351B2D9124ULL, "sceNpScorePollAsync", "libSceNpScore", poll_signed_out);
+
+    // Save-data dialog: an opened dialog finishes at once with OK pressed.
+    // SceCommonDialogStatus: NONE 0, INITIALIZED 1, RUNNING 2, FINISHED 3.
+    static std::atomic<i32> s_dialog_status{0};
+    reg.register_symbol(0xB3D7B7F98A519F3CULL, "sceSaveDataDialogInitialize", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager&) {
+            s_dialog_status.store(1);
+            ctx.rax = SCE_OK;
+        });
+    reg.register_symbol(0x62E1F6140EDACEA4ULL, "sceSaveDataDialogTerminate", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager&) {
+            s_dialog_status.store(0);
+            ctx.rax = SCE_OK;
+        });
+    reg.register_symbol(0xE2D3E1B0FE85A432ULL, "sceSaveDataDialogOpen", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager&) {
+            hle_log_once("SaveDataDialog", "sceSaveDataDialogOpen");
+            s_dialog_status.store(3);
+            ctx.rax = SCE_OK;
+        });
+    reg.register_symbol(0x28ADC1760D5158ADULL, "sceSaveDataDialogUpdateStatus", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(s_dialog_status.load()); });
+    // sceSaveDataDialogGetResult(SceSaveDataDialogResult*): result 0, button OK.
+    reg.register_symbol(0xC84889FEAAABE828ULL, "sceSaveDataDialogGetResult", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (ctx.rdi != 0) {
+                mem.write_value(ctx.rdi + 4, static_cast<i32>(0));
+                mem.write_value(ctx.rdi + 8, static_cast<i32>(1)); // SCE_SAVE_DATA_DIALOG_BUTTON_ID_OK
+            }
+            ctx.rax = SCE_OK;
+        });
 }
 
 } // namespace ps4

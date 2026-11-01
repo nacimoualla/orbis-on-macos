@@ -199,6 +199,64 @@ struct GcnPipelineCache::Impl {
         return s;
     }
 
+    // Content hash for the texture cache: four independent 64-bit lanes so
+    // a multi-megabyte texture (a movie frame) hashes at memory speed rather
+    // than one serial multiply per word.
+    static u64 hash_texture(const u8* p, usize n) {
+        u64 h[4] = {0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0xd6e8feb86659fd93ull};
+        usize i = 0;
+        for (; i + 32 <= n; i += 32) {
+            for (usize k = 0; k < 4; ++k) {
+                u64 w;
+                std::memcpy(&w, p + i + 8 * k, 8);
+                h[k] = (h[k] ^ w) * 0x100000001b3ull;
+                h[k] ^= h[k] >> 29;
+            }
+        }
+        u64 r = h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7) ^ n;
+        for (; i < n; ++i) r = (r ^ p[i]) * 0x100000001b3ull;
+        return r;
+    }
+
+    id<MTLTexture> direct_texture(const gcn::TextureDesc& td, const u8* src) {
+        const bool linear = td.tiling_index == 8 || td.tiling_index == 31;
+        if (!linear || td.nfmt != 0 || (td.dfmt != 10 && td.dfmt != 16) || td.type != 9) return nil;
+        auto swz = [](u32 sel, MTLTextureSwizzle* out) {
+            switch (sel) {
+            case 0: *out = MTLTextureSwizzleZero; return true;
+            case 1: *out = MTLTextureSwizzleOne; return true;
+            case 4: *out = MTLTextureSwizzleRed; return true;
+            case 5: *out = MTLTextureSwizzleGreen; return true;
+            case 6: *out = MTLTextureSwizzleBlue; return true;
+            case 7: *out = MTLTextureSwizzleAlpha; return true;
+            default: return false;
+            }
+        };
+        // GCN 5_6_5 keeps channel 0 in bits 4:0, which Metal's B5G6R5Unorm
+        // reads as blue (red is bits 15:11), so channels 0 and 2 trade
+        // places; 8_8_8_8 keeps channel k in byte k (RGBA8Unorm).
+        const bool rgb565 = td.dfmt == 16;
+        MTLTextureSwizzle c[4];
+        for (u32 k = 0; k < 4; ++k) {
+            u32 sel = td.dst_sel[k];
+            if (rgb565 && (sel == 4 || sel == 6)) sel = sel == 4 ? 6 : 4;
+            if (!swz(sel, &c[k])) return nil;
+        }
+        MTLTextureDescriptor* d = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:rgb565 ? MTLPixelFormatB5G6R5Unorm : MTLPixelFormatRGBA8Unorm
+                                         width:td.width
+                                        height:td.height
+                                     mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        d.swizzle = MTLTextureSwizzleChannelsMake(c[0], c[1], c[2], c[3]);
+        id<MTLTexture> tex = [device newTextureWithDescriptor:d];
+        if (!tex) return nil;
+        const u32 bpp = rgb565 ? 2 : 4;
+        [tex replaceRegion:MTLRegionMake2D(0, 0, td.width, td.height) mipmapLevel:0 withBytes:src
+               bytesPerRow:std::max(td.pitch, td.width) * bpp];
+        return tex;
+    }
+
     id<MTLTexture> texture_for(const gcn::ImageDescriptors& img) {
         const gcn::TextureDesc td = gcn::decode_tsharp(img.tsharp);
         if (td.type != 9 && td.type != 8) {
@@ -211,12 +269,21 @@ struct GcnPipelineCache::Impl {
             return white_texture();
         }
         const u8* src = memory->to_host_ptr<u8>(td.base);
-        const u64 h = gcn::hash_words(reinterpret_cast<const u32*>(src), size / 4);
+        const u64 h = hash_texture(src, size);
         std::vector<u32> key(img.tsharp, img.tsharp + 8);
         auto it = textures.find(key);
         if (it != textures.end() && it->second.content_hash == h) {
             it->second.last_used = ++clock;
             return it->second.tex;
+        }
+        // Linear 8_8_8_8 / 5_6_5 unorm (software-rendered screens, movie
+        // frames): Metal reads the guest bytes as they are, with the T#'s
+        // channel selects as the texture swizzle -- no CPU conversion.
+        if (id<MTLTexture> direct = direct_texture(td, src)) {
+            if (textures.size() > 256) textures.clear();
+            textures[key] = TexEntry{direct, h, ++clock};
+            ++stats.textures_uploaded;
+            return direct;
         }
         std::vector<u8> rgba;
         std::string err;

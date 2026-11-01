@@ -46,6 +46,12 @@ public:
     /// Initialize trampoline area in guest memory and hook HLE dispatcher
     bool initialize(GuestAddr trampoline_base = HLE_TRAMPOLINE_BASE);
 
+    /// Where the trampoline pool can go without overlapping `loader`'s loaded
+    /// segments: HLE_TRAMPOLINE_BASE when that is free, else the first 64 KB
+    /// boundary past the executable. An executable linked at 0 (Sonic Mania)
+    /// has code at HLE_TRAMPOLINE_BASE, which initialize() would zero.
+    [[nodiscard]] static GuestAddr trampoline_base_for(const ElfLoader& loader);
+
     /// Get or generate an x86_64 trampoline stub address for a 64-bit NID
     GuestAddr get_or_create_trampoline(Nid nid);
 
