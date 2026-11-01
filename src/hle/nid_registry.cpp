@@ -3533,6 +3533,18 @@ void NidRegistry::register_default_libraries() {
     };
     register_symbol(0xC1E0EE83C403FE51ULL, "atanf", "libc", atanf_handler);
 
+    // asinf(float x) / acosf(float x). Unregistered, they returned 0 in rax and
+    // left xmm0 untouched, so Dragon Ball Xenoverse 2 got a garbage float on
+    // ~800 calls in a single boot.
+    register_symbol(0x1995A317F6081459ULL, "asinf", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.ymm[0].f[0] = std::asin(ctx.ymm[0].f[0]);
+        });
+    register_symbol(0x408FF1D122FC8E1CULL, "acosf", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.ymm[0].f[0] = std::acos(ctx.ymm[0].f[0]);
+        });
+
     // memcmp(const void* s1, const void* s2, size_t n)
     // NID: 0x0DF8AF3C0AE1B9C8ULL / 0xC8B9E10AC0F38A0DULL ("DfivPArhucg")
     auto memcmp_handler = [](CpuContext& ctx, MemoryManager& mem) {
@@ -4932,6 +4944,46 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager&) {
             const GuestSize alignment = ctx.rsi > 0 ? ctx.rsi : 16;
             ctx.rax = mspace_alloc(ctx.rdx, alignment);
+        });
+
+    // The rest of the mspace API. Every block comes from the shared CPU heap
+    // (bump_alloc/heap_free) and `msp` is never dereferenced, so any non-zero
+    // handle works. Create used to be a SyncStub answering 0: Unity then passed
+    // a NULL mspace to sceLibcMspaceMalloc, which was unregistered and returned
+    // 0, and the first allocation threw std::bad_alloc (Dragon Ball Xenoverse 2
+    // aborted right after boot).
+
+    // sceLibcMspaceCreate(...) -> mspace handle: a unique 16-byte control block.
+    register_symbol(0xFE19F5B5C547AB94ULL, "sceLibcMspaceCreate", "libSceLibcInternal",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = bump_alloc(16, 16);
+        });
+
+    // sceLibcMspaceMalloc(mspace msp, size_t size)
+    register_symbol(0x3898E6FD03881E52ULL, "sceLibcMspaceMalloc", "libSceLibcInternal",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = bump_alloc(ctx.rsi, 16);
+        });
+
+    // sceLibcMspaceCalloc(mspace msp, size_t n, size_t size): zeroed, since
+    // freed blocks are reused.
+    register_symbol(0x2D8A371A1225077FULL, "sceLibcMspaceCalloc", "libSceLibcInternal",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestSize n = ctx.rsi, size = ctx.rdx;
+            if (size != 0 && n > ~GuestSize{0} / size) {
+                ctx.rax = 0;
+                return;
+            }
+            const GuestAddr p = bump_alloc(n * size, 16);
+            if (p != 0 && n * size != 0) mem.zero_memory(p, n * size);
+            ctx.rax = p;
+        });
+
+    // sceLibcMspaceFree(mspace msp, void* ptr)
+    register_symbol(0x5656BF67E797971AULL, "sceLibcMspaceFree", "libSceLibcInternal",
+        [](CpuContext& ctx, MemoryManager&) {
+            heap_free(ctx.rsi);
+            ctx.rax = 0;
         });
 
     // memcpy(void* dest, const void* src, size_t n)
@@ -7109,7 +7161,6 @@ void NidRegistry::register_default_libraries() {
         {0x54EC7C3469875D3BULL, "sceKernelGetCpumode", "libkernel_cpumode"},
         {0xFEEC04868FFB80EBULL, "sceKernelSyncStub", "libkernel"}, // thread attr helper
         {0x22EC6752E5E4E818ULL, "sceKernelGetModuleList", "libkernel"},
-        {0xFE19F5B5C547AB94ULL, "sceLibcMspaceCreate", "libSceLibcInternal"},
         {0x960213B81B11A36AULL, "sceFiosIOFilterAdd", "libSceFios2"}, // debug.log stream setup
         {0x47D940F363AB68DBULL, "sceAppContentInitialize", "libSceAppContent"},
         {0x55EED6C524805364ULL, "sceKernelSyncStub", "libkernel"}, // Unity string/domain setup 1
