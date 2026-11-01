@@ -2575,6 +2575,21 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = 0;
         });
 
+    // _ZSt18_Xinvalid_argumentPKc: libc++ throw helper, never returns. There is
+    // no unwinder, so returning would fall into the ud2 after the call; abort
+    // with the message instead, like _Xout_of_range below.
+    static auto throw_helper_abort = [](const char* kind, CpuContext& ctx, MemoryManager& mem) {
+        std::string what;
+        for (GuestSize i = 0; i < 256; ++i) {
+            char c = 0;
+            if (!mem.read_value(ctx.rdi + i, c) || c == 0) break;
+            what.push_back(c);
+        }
+        guest_abort(std::string(kind) + " thrown: " + what, ctx, mem);
+    };
+    register_symbol(0x354FD3E10A304CD0ULL, "_ZSt18_Xinvalid_argumentPKc", "libstdc++",
+        [](CpuContext& ctx, MemoryManager& mem) { throw_helper_abort("std::invalid_argument", ctx, mem); });
+
     // =========================================================================
     // POSIX entry points imported by mono-ps4.prx (PS4_LOAD_PRX)
     // =========================================================================

@@ -6170,6 +6170,25 @@ StepResult CpuExecutor::step() {
         return StepResult::Ok;
     }
 
+    // 0x9C: PUSHFQ, 0x9D: POPFQ. The interpreter lacked both, so a guest that
+    // saved its flags (Dragon Ball Xenoverse 2 does `pushfq; pop rcx`) stopped
+    // with "Illegal or unimplemented instruction". Only the user-modifiable
+    // flags (CF PF AF ZF SF TF IF DF OF) are restored by POPFQ.
+    if (op0 == 0x9C || op0 == 0x9D) {
+        if (op0 == 0x9C) {
+            m_context.rsp -= 8;
+            if (!m_memory.write_value(m_context.rsp, m_context.rflags | 0x02)) return StepResult::MemoryFault;
+        } else {
+            u64 val = 0;
+            if (!m_memory.read_value(m_context.rsp, val)) return StepResult::MemoryFault;
+            constexpr u64 kPopfMask = 0xDD5ULL;
+            m_context.rflags = (m_context.rflags & ~kPopfMask) | (val & kPopfMask) | 0x02;
+            m_context.rsp += 8;
+        }
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
     if (op0 == 0x98) {
         if (rex_w) {
             m_context.rax = static_cast<u64>(static_cast<i64>(static_cast<i32>(m_context.rax)));

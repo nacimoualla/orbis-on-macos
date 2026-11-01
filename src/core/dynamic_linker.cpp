@@ -143,42 +143,47 @@ bool DynamicLinker::is_whitelisted(Nid nid) const noexcept {
     return m_whitelist.contains(nid);
 }
 
+// The trampoline pool is zeroed and then filled with HLE stubs, so it must not
+// sit on a mapped guest segment. The eboot is mapped at base 0 and its text runs
+// past 0x100000 (Dragon Ball Xenoverse 2: 0..0x2523dc8), so the default pool
+// zeroed and overwrote the game's own code there. Its next wild jump landed in
+// stub bytes and corrupted the stack canary. Slide the pool up past any mapping
+// that overlaps it.
+static GuestAddr free_trampoline_base(const MemoryManager& memory, GuestAddr wanted, GuestSize size) {
+    GuestAddr base = wanted;
+    bool moved = true;
+    while (moved) {
+        moved = false;
+        for (const GuestMapping& m : memory.mappings()) {
+            if (base < m.start + m.size && m.start < base + size) {
+                base = (m.start + m.size + 0xFFFFULL) & ~0xFFFFULL;
+                moved = true;
+            }
+        }
+    }
+    if (base != wanted) {
+        std::fprintf(stderr, "[linker] trampoline pool moved 0x%llx -> 0x%llx (overlaps a guest mapping)\n",
+                     (unsigned long long)wanted, (unsigned long long)base);
+    }
+    return base;
+}
+
 bool DynamicLinker::initialize(GuestAddr trampoline_base) {
     m_last_error.clear();
     m_unresolved_nids.clear();
-    m_trampoline_base = trampoline_base;
     m_next_trampoline_id = 0;
     m_nid_to_trampoline.clear();
     m_id_to_nid.clear();
 
     // Reserve 64KB space for trampolines
     constexpr GuestSize TRAMPOLINE_POOL_SIZE = 0x10000;
-    if (!m_memory.reserve_mapping(m_trampoline_base, TRAMPOLINE_POOL_SIZE, "trampolines")) {
-        // If the requested base overlaps with an existing mapping (e.g. an ELF segment),
-        // find a free non-overlapping range above the highest mapping.
-        GuestAddr candidate = m_trampoline_base;
-        for (const auto& m : m_memory.mappings()) {
-            if (candidate < m.start + m.size && m.start < candidate + TRAMPOLINE_POOL_SIZE) {
-                candidate = (m.start + m.size + 0xFFFFULL) & ~0xFFFFULL;
-            }
-        }
-        bool reserved = false;
-        while (candidate + TRAMPOLINE_POOL_SIZE < 0x20000000ULL) {
-            if (m_memory.reserve_mapping(candidate, TRAMPOLINE_POOL_SIZE, "trampolines")) {
-                m_trampoline_base = candidate;
-                reserved = true;
-                break;
-            }
-            candidate += 0x10000ULL;
-        }
-        if (!reserved) {
-            m_last_error = "failed to reserve free space for trampoline pool";
-            return false;
-        }
-    }
-
+    m_trampoline_base = free_trampoline_base(m_memory, trampoline_base, TRAMPOLINE_POOL_SIZE);
     if (!m_memory.is_valid_address(m_trampoline_base, TRAMPOLINE_POOL_SIZE)) {
         m_last_error = "trampoline pool outside guest memory";
+        return false;
+    }
+    if (!m_memory.reserve_mapping(m_trampoline_base, TRAMPOLINE_POOL_SIZE, "hle-trampolines")) {
+        m_last_error = "trampoline pool overlaps a guest mapping";
         return false;
     }
 
