@@ -5059,9 +5059,16 @@ void NidRegistry::register_default_libraries() {
                 // sleep_until oversleeps by 1-2 ms on macOS, and by 3-4 ms while
                 // the audio and GPU threads are busy; sleep to well short of
                 // the tick and spin the remainder so frames stay evenly spaced.
+                // The spin must not yield: Darwin's sched_yield drops the thread
+                // to the lowest priority for a quantum, so with other threads
+                // busy the tick was missed by 2-8 ms.
                 const auto coarse = s_next_vblank - std::chrono::microseconds(4000);
                 if (now < coarse) std::this_thread::sleep_until(coarse);
-                while (clock::now() < s_next_vblank) std::this_thread::yield();
+                while (clock::now() < s_next_vblank) {
+#if defined(__aarch64__)
+                    __builtin_arm_isb(15);
+#endif
+                }
             }
             s_next_vblank += kVblank;
         }
