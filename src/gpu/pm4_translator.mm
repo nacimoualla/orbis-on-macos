@@ -1729,6 +1729,11 @@ bool Pm4Translator::begin_frame() {
     if (!m_impl) return false;
     std::lock_guard<std::recursive_mutex> frame_lock(m_impl->frame_mutex);
     if (!m_impl->metal) return true;
+    // A guest render thread opens a frame itself (ensure_frame on a draw, or
+    // the flip hook's submit + begin) whenever none is active, so between a
+    // host loop's submit_frame and this call one may already be open. Adopt
+    // it: refusing failed test_flappy_gpu with "GPU frame begin failed".
+    if (m_impl->metal->frame_in_progress()) return true;
     if (!m_impl->metal->begin_frame()) return false;
     m_impl->frame_draw_encoded = false;
     const usize upload_bytes = m_impl->frame_stats.upload_bytes;
@@ -1747,7 +1752,9 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
     if (!m_impl) return false;
     std::lock_guard<std::recursive_mutex> frame_lock(m_impl->frame_mutex);
     if (!m_impl->metal) return true;
-    if (!m_impl->metal->frame_in_progress()) return false;
+    // Nothing open: the guest's flip already submitted this frame (see
+    // begin_frame), so there is nothing left to do.
+    if (!m_impl->metal->frame_in_progress()) return true;
     m_impl->metal->end_render_encoder();
     // PS4_GPU_READBACK=1: wait for frames that drew and log the framebuffer
     // centre (diagnostic for comparing the GCN path with the fixed shader).

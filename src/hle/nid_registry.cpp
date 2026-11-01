@@ -56,9 +56,14 @@ std::atomic<GuestAddr> g_direct_phys_current{0x40000000ULL};  // 1 GB mark
 // headers (realloc and free look sizes up here instead), and freed blocks are
 // reused best-fit: with free() a no-op a long session walked the bump pointer
 // into the 1 GB ceiling and every later malloc returned NULL.
-static std::mutex s_heap_sizes_mtx;                       // guards everything below
-static std::unordered_map<GuestAddr, GuestSize> s_heap_sizes;   // live block -> size
-static std::multimap<GuestSize, GuestAddr> s_heap_free;         // size -> free block
+//
+// All three are leaked on purpose: guest threads keep allocating while the host
+// tears down at exit, and a destroyed mutex throws "mutex lock failed: Invalid
+// argument" out of bump_alloc (Flappy's Unity workers do this through the
+// sceLibcMspace* handlers).
+static std::mutex& s_heap_sizes_mtx = *new std::mutex;                                   // guards everything below
+static auto& s_heap_sizes = *new std::unordered_map<GuestAddr, GuestSize>;              // live block -> size
+static auto& s_heap_free = *new std::multimap<GuestSize, GuestAddr>;                    // size -> free block
 
 // Hard ceiling for the CPU heap. The memory map reserves 0x20000000-0x40000000
 // for the guest libc heap and 0x40000000-0x1C0000000 for direct (Garlic/ONION)
@@ -2962,9 +2967,12 @@ void NidRegistry::register_default_libraries() {
             const char* p = mem.to_host_ptr<char>(path);
             const i32 fd = get_vfs().open(p, static_cast<i32>(ctx.rsi), static_cast<i32>(ctx.rdx));
             static std::atomic<u32> s_logged{0};
-            if (s_logged.fetch_add(1) < 64)
-                std::fprintf(stderr, "[VFS] sceKernelOpen('%s', 0x%x) -> %d\n", p,
-                             static_cast<u32>(ctx.rsi), fd);
+            if (s_logged.fetch_add(1) < 64) {
+                GuestAddr caller = 0;
+                mem.read_value(ctx.rsp, caller);
+                std::fprintf(stderr, "[VFS] sceKernelOpen('%s', 0x%x) -> %d (caller 0x%llx)\n", p,
+                             static_cast<u32>(ctx.rsi), fd, (unsigned long long)caller);
+            }
             ctx.rax = fd < 0 ? sce_err(fd) : static_cast<u64>(fd);
         });
     register_symbol(0x50AD939760D6527BULL, "sceKernelClose", "libkernel",
@@ -3103,7 +3111,8 @@ void NidRegistry::register_default_libraries() {
 
     // _Stoul(const char* s, char** endptr, int base): Dinkumware's strtoul,
     // which libc's strtoul wraps. Parsed on the host from a bounded copy.
-    register_symbol(0xCE57C41FC166C940ULL, "_Stoul", "libc",
+    // _Stoull is the same 64-bit parse (unsigned long is 64-bit on PS4).
+    auto stoul_handler =
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr s = ctx.rdi, endptr = ctx.rsi;
             std::string text;
@@ -3117,7 +3126,9 @@ void NidRegistry::register_default_libraries() {
             if (endptr != 0) mem.write_value(endptr, static_cast<u64>(s + (end - text.c_str())));
             // 64-bit unsigned long on PS4; clamp like strtoul on overflow.
             ctx.rax = static_cast<u64>(v);
-        });
+        };
+    register_symbol(0xCE57C41FC166C940ULL, "_Stoul", "libc", stoul_handler);
+    register_symbol(0xABEF44D17DDA5A95ULL, "_Stoull", "libc", stoul_handler);
 
     // Dinkumware ctype tables. _Getpctype/_Getptolower/_Getptoupper return
     // pointers into 16-bit tables indexed by (unsigned char) c, with the EOF
@@ -3516,7 +3527,7 @@ void NidRegistry::register_default_libraries() {
 
     // _Sin(double x, unsigned int idx)
     auto sin_dinkum_handler = [](CpuContext& ctx, MemoryManager&) {
-        const double x = ctx.ymm[0].d[0];
+        const double x = ctx.ymm[0].df[0];
         const u32 idx = static_cast<u32>(ctx.rdi);
         double res = 0.0;
         switch (idx & 3) {
@@ -3525,7 +3536,7 @@ void NidRegistry::register_default_libraries() {
             case 2: res = -std::sin(x); break;
             case 3: res = -std::cos(x); break;
         }
-        ctx.ymm[0].d[0] = res;
+        ctx.ymm[0].df[0] = res;
     };
     register_symbol(0x7025E353BD99D0ECULL, "_Sin", "libc", sin_dinkum_handler);
 
@@ -3558,6 +3569,40 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0x408FF1D122FC8E1CULL, "acosf", "libc",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.ymm[0].f[0] = std::acos(ctx.ymm[0].f[0]);
+        });
+
+    // More libm that Dragon Ball Xenoverse 2 calls every frame once it is past
+    // boot; unregistered, each returned 0 in rax and left xmm0 as it was.
+    register_symbol(0xF33B2ED385CDB19EULL, "expf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::exp(ctx.ymm[0].f[0]); });
+    register_symbol(0xC2E010B7F8FEA78AULL, "exp2f", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::exp2(ctx.ymm[0].f[0]); });
+    register_symbol(0xB9545C336C8574FEULL, "fminf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::fmin(ctx.ymm[0].f[0], ctx.ymm[1].f[0]); });
+    register_symbol(0x2F2C760F350BECB7ULL, "fmaxf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::fmax(ctx.ymm[0].f[0], ctx.ymm[1].f[0]); });
+    // ldexpf(float x, int e) / ldexp(double x, int e): the exponent is in edi.
+    register_symbol(0x927D32898784C600ULL, "ldexpf", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.ymm[0].f[0] = std::ldexp(ctx.ymm[0].f[0], static_cast<int>(ctx.rdi));
+        });
+    register_symbol(0x26BC0520CCCA36BDULL, "ldexp", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.ymm[0].df[0] = std::ldexp(ctx.ymm[0].df[0], static_cast<int>(ctx.rdi));
+        });
+    // Dinkumware _FLog(float x, int base) / _Log(double x, int base): the
+    // backends of log (0), log10 (1) and log2 (-1).
+    register_symbol(0x8E38D14BB97530F3ULL, "_FLog", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            const float x = ctx.ymm[0].f[0];
+            const int base = static_cast<int>(ctx.rdi);
+            ctx.ymm[0].f[0] = base == 0 ? std::log(x) : base == 1 ? std::log10(x) : std::log2(x);
+        });
+    register_symbol(0xCD70A2EFC6D8AC42ULL, "_Log", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            const double x = ctx.ymm[0].df[0];
+            const int base = static_cast<int>(ctx.rdi);
+            ctx.ymm[0].df[0] = base == 0 ? std::log(x) : base == 1 ? std::log10(x) : std::log2(x);
         });
 
     // memcmp(const void* s1, const void* s2, size_t n)
@@ -3658,6 +3703,109 @@ void NidRegistry::register_default_libraries() {
         };
     register_symbol(0x78B743C3A974FDB5ULL, "snprintf", "libc", snprintf_handler);
     register_symbol(0xDC1CAD3CE42054A7ULL, "snprintf_s", "libc", snprintf_handler);
+    register_symbol(0xC44B332551A9C9BBULL, "sprintf_s", "libc", snprintf_handler);
+
+    // swprintf / swprintf_s / vswprintf over 16-bit wchar_t: narrow the format
+    // to UTF-8, format with the shared printf engine, widen the result. %ls
+    // arguments are read as narrow strings (format_guest has no wide %s).
+    auto wide_printf = [](MemoryManager& mem, GuestAddr buf, GuestSize n, GuestAddr fmt_addr,
+                          auto& args) -> u64 {
+        std::string fmt;
+        for (GuestSize i = 0; i < 4096; ++i) {
+            u16 wc = 0;
+            if (!mem.read_value(fmt_addr + 2 * i, wc) || wc == 0) break;
+            fmt.push_back(wc < 0x80 ? static_cast<char>(wc) : '?');
+        }
+        const std::string out = format_guest(mem, fmt.c_str(), args);
+        std::vector<u16> wide;
+        for (usize i = 0; i < out.size();) {
+            const u8 b = static_cast<u8>(out[i]);
+            u32 cp = b;
+            usize len = 1;
+            if (b >= 0xE0 && i + 2 < out.size()) {
+                cp = ((b & 0x0Fu) << 12) | ((out[i + 1] & 0x3Fu) << 6) | (out[i + 2] & 0x3Fu);
+                len = 3;
+            } else if (b >= 0xC0 && i + 1 < out.size()) {
+                cp = ((b & 0x1Fu) << 6) | (out[i + 1] & 0x3Fu);
+                len = 2;
+            }
+            wide.push_back(static_cast<u16>(cp));
+            i += len;
+        }
+        if (buf == 0 || n == 0) return static_cast<u64>(-1);
+        const GuestSize count = std::min<GuestSize>(wide.size(), n - 1);
+        if (count) mem.write_bytes(buf, wide.data(), count * 2);
+        mem.write_value<u16>(buf + 2 * count, 0);
+        return wide.size() < n ? wide.size() : static_cast<u64>(-1);
+    };
+    auto swprintf_handler = [wide_printf](CpuContext& ctx, MemoryManager& mem) {
+        CallArgs args(ctx, mem, 3);
+        ctx.rax = wide_printf(mem, ctx.rdi, ctx.rsi, ctx.rdx, args);
+    };
+    register_symbol(0x9C9CF5E89135B713ULL, "swprintf", "libc", swprintf_handler);
+    register_symbol(0x226E79549FC17A47ULL, "swprintf_s", "libc", swprintf_handler);
+    register_symbol(0xBB45CEB2E3A63B37ULL, "vswprintf", "libc",
+        [wide_printf](CpuContext& ctx, MemoryManager& mem) {
+            VaListArgs args(mem, ctx.rcx);
+            ctx.rax = wide_printf(mem, ctx.rdi, ctx.rsi, ctx.rdx, args);
+        });
+
+    // strcpy_s / strcat_s (C11 Annex K): errno_t, 0 on success. Unregistered,
+    // they returned 0 without copying, so Dragon Ball Xenoverse 2's CRI file
+    // loader took "/app0/data.cpk" into an empty buffer and opened ''.
+    auto read_guest_str = [](MemoryManager& mem, GuestAddr at, GuestSize limit, std::string& out) {
+        out.clear();
+        for (GuestSize i = 0; i < limit; ++i) {
+            char c = 0;
+            if (!mem.read_value(at + i, c)) return false;
+            if (c == 0) return true;
+            out.push_back(c);
+        }
+        return false; // no terminator within limit
+    };
+    constexpr u64 kEINVAL = 22, kERANGE = 34;
+    // strcpy_s(char* dest, rsize_t destsz, const char* src)
+    register_symbol(0xE576B600234409DAULL, "strcpy_s", "libc",
+        [read_guest_str](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dest = ctx.rdi, src = ctx.rdx;
+            const GuestSize destsz = ctx.rsi;
+            if (dest == 0 || destsz == 0 || destsz > 0x7FFFFFFF) {
+                ctx.rax = kEINVAL;
+                return;
+            }
+            std::string text;
+            const bool terminated = src != 0 && read_guest_str(mem, src, destsz, text);
+            if (!terminated) {
+                mem.write_value<u8>(dest, 0);
+                ctx.rax = src == 0 ? kEINVAL : kERANGE;
+                return;
+            }
+            mem.write_bytes(dest, text.c_str(), text.size() + 1);
+            ctx.rax = 0;
+        });
+    // strcat_s(char* dest, rsize_t destsz, const char* src)
+    register_symbol(0x2BE81C9C51492957ULL, "strcat_s", "libc",
+        [read_guest_str](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dest = ctx.rdi, src = ctx.rdx;
+            const GuestSize destsz = ctx.rsi;
+            if (dest == 0 || destsz == 0 || destsz > 0x7FFFFFFF) {
+                ctx.rax = kEINVAL;
+                return;
+            }
+            std::string head, tail;
+            if (!read_guest_str(mem, dest, destsz, head) || src == 0) {
+                mem.write_value<u8>(dest, 0);
+                ctx.rax = kEINVAL;
+                return;
+            }
+            if (!read_guest_str(mem, src, destsz - head.size(), tail)) {
+                mem.write_value<u8>(dest, 0);
+                ctx.rax = kERANGE;
+                return;
+            }
+            mem.write_bytes(dest + head.size(), tail.c_str(), tail.size() + 1);
+            ctx.rax = 0;
+        });
 
     // fopen(const char* path, const char* mode)
     // NID: 0xC5E60EE2EEEEC89DULL ("xeYO4u7uyJ0")
@@ -7358,6 +7506,21 @@ void NidRegistry::register_default_libraries() {
             });
     }
 
+    // sceGnmDrawInitToDefaultContextState(u32* cmd, u32 numDwords) -> DWORDs
+    // written: the same contract with a 0x20-DWORD block.
+    register_symbol(0xF251F9E2C7E37E65ULL, "sceGnmDrawInitToDefaultContextState", "libSceGnm",
+        [write_dcb_nop_padding](CpuContext& ctx, MemoryManager& mem) {
+            constexpr u32 kCtxInitDwords = 0x20;
+            const GuestAddr dcb_addr = ctx.rdi;
+            if (ctx.rsi < kCtxInitDwords ||
+                !mem.is_valid_address(dcb_addr, GuestSize{kCtxInitDwords} * sizeof(u32))) {
+                ctx.rax = 0;
+                return;
+            }
+            write_dcb_nop_padding(mem, dcb_addr, kCtxInitDwords);
+            ctx.rax = kCtxInitDwords;
+        });
+
     // sceGnmDrawIndexAuto -- writes IT_DRAW_INDEX_AUTO (0x2D, 3 DWORDs) + NOP padding
     register_symbol(0x186B27EE3313C70EULL, "sceGnmDrawIndexAuto", "libSceGnm",
         [write_dcb_nop_padding](CpuContext& ctx, MemoryManager& mem) {
@@ -8666,7 +8829,7 @@ void NidRegistry::register_default_libraries() {
             std::string text;
             read_guest_cstring(mem, ctx.rdi, text);
             char* end = nullptr;
-            ctx.ymm[0].d[0] = std::strtod(text.c_str(), &end);
+            ctx.ymm[0].df[0] = std::strtod(text.c_str(), &end);
             store_end_pointer(mem, ctx.rsi, ctx.rdi, text, end);
         });
     // atof(const char* s): converts string to double in XMM0
@@ -8674,9 +8837,9 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager& mem) {
             std::string text;
             if (read_guest_cstring(mem, ctx.rdi, text)) {
-                ctx.ymm[0].d[0] = std::strtod(text.c_str(), nullptr);
+                ctx.ymm[0].df[0] = std::strtod(text.c_str(), nullptr);
             } else {
-                ctx.ymm[0].d[0] = 0.0;
+                ctx.ymm[0].df[0] = 0.0;
             }
         });
     // __error(): returns pointer to errno in guest memory
@@ -8774,75 +8937,75 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = (static_cast<u64>(static_cast<u32>(res.rem)) << 32) | static_cast<u32>(res.quot);
         });
     register_symbol(0xA4AC2C96C3149929ULL, "fmod", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::fmod(ctx.ymm[0].d[0], ctx.ymm[1].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::fmod(ctx.ymm[0].df[0], ctx.ymm[1].df[0]); });
     register_symbol(0xF3C56FFC0CC7563FULL, "fmodf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::fmod(ctx.ymm[0].f[0], ctx.ymm[1].f[0]); });
     register_symbol(0xADC56FE62BCC858DULL, "lrintf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::lrint(ctx.ymm[0].f[0])); });
     register_symbol(0x54E28E811ECBFF66ULL, "lrint", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::lrint(ctx.ymm[0].d[0])); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::lrint(ctx.ymm[0].df[0])); });
     register_symbol(0x28FB10034A62B3CAULL, "llrintf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::llrint(ctx.ymm[0].f[0])); });
     register_symbol(0xFF8DF503F601024BULL, "llrint", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::llrint(ctx.ymm[0].d[0])); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::llrint(ctx.ymm[0].df[0])); });
     register_symbol(0x0BA81609624A33E5ULL, "lroundf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::lround(ctx.ymm[0].f[0])); });
     register_symbol(0x2775EE192FDC0B44ULL, "lround", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::lround(ctx.ymm[0].d[0])); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::lround(ctx.ymm[0].df[0])); });
     register_symbol(0x7908411674CEA78DULL, "llroundf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::llround(ctx.ymm[0].f[0])); });
     register_symbol(0xC3F06F5C5E0EEB1AULL, "llround", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::llround(ctx.ymm[0].d[0])); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(std::llround(ctx.ymm[0].df[0])); });
     register_symbol(0x0C31C6D5AEBEDEADULL, "roundf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::round(ctx.ymm[0].f[0]); });
     register_symbol(0x9E56A88CBF610ED0ULL, "round", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::round(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::round(ctx.ymm[0].df[0]); });
     register_symbol(0x98A8550E661C8960ULL, "floorf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::floor(ctx.ymm[0].f[0]); });
     register_symbol(0x9A971380CCE1518FULL, "floor", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::floor(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::floor(ctx.ymm[0].df[0]); });
     register_symbol(0x18052E2CA1A1B02CULL, "ceilf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::ceil(ctx.ymm[0].f[0]); });
     register_symbol(0x81A71F3A63BC84DBULL, "ceil", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::ceil(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::ceil(ctx.ymm[0].df[0]); });
     register_symbol(0x568F2BBD6B59C378ULL, "truncf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::trunc(ctx.ymm[0].f[0]); });
     register_symbol(0x6B880B1ACA4F1033ULL, "trunc", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::trunc(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::trunc(ctx.ymm[0].df[0]); });
     register_symbol(0xAB95B3B9CC954A43ULL, "rintf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::rint(ctx.ymm[0].f[0]); });
     register_symbol(0x2F11886182B02987ULL, "rint", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::rint(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::rint(ctx.ymm[0].df[0]); });
     register_symbol(0x73EE2BFD3FED1087ULL, "nearbyintf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::nearbyint(ctx.ymm[0].f[0]); });
     register_symbol(0x7092D3C2D2865C99ULL, "nearbyint", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::nearbyint(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::nearbyint(ctx.ymm[0].df[0]); });
     // modf(double x, double* iptr): integer part to *iptr, fraction returned.
     register_symbol(0xD163070DBE43B7DEULL, "modf", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
             double ip = 0.0;
-            const double frac = std::modf(ctx.ymm[0].d[0], &ip);
+            const double frac = std::modf(ctx.ymm[0].df[0], &ip);
             if (mem.is_valid_address(ctx.rdi, sizeof(double))) mem.write_value<double>(ctx.rdi, ip);
-            ctx.ymm[0].d[0] = frac;
+            ctx.ymm[0].df[0] = frac;
         });
     register_symbol(0xF4B0A3A56C90E597ULL, "pow", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::pow(ctx.ymm[0].d[0], ctx.ymm[1].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::pow(ctx.ymm[0].df[0], ctx.ymm[1].df[0]); });
     register_symbol(0x35569D7E7CD08474ULL, "exp", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::exp(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::exp(ctx.ymm[0].df[0]); });
     register_symbol(0x4FBBB236A3FBBD00ULL, "tan", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::tan(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::tan(ctx.ymm[0].df[0]); });
     register_symbol(0x644E9134BF9E2DB9ULL, "tanf", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::tan(ctx.ymm[0].f[0]); });
     register_symbol(0x24CE0406F593F6B7ULL, "tanh", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::tanh(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::tanh(ctx.ymm[0].df[0]); });
     register_symbol(0x24172062E5BC94F5ULL, "acos", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::acos(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::acos(ctx.ymm[0].df[0]); });
     register_symbol(0xECBCB9DB368BE384ULL, "asin", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::asin(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::asin(ctx.ymm[0].df[0]); });
     register_symbol(0x39799AB8B750F246ULL, "atan", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::atan(ctx.ymm[0].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::atan(ctx.ymm[0].df[0]); });
     register_symbol(0x1D46D998E9D3FC38ULL, "atan2", "libc",
-        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].d[0] = std::atan2(ctx.ymm[0].d[0], ctx.ymm[1].d[0]); });
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::atan2(ctx.ymm[0].df[0], ctx.ymm[1].df[0]); });
     // vsprintf(char* dest, const char* fmt, va_list ap): returns the length.
     register_symbol(0x8DBCFD23DBE4AA49ULL, "vsprintf", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
@@ -8928,21 +9091,205 @@ void NidRegistry::register_default_libraries() {
     // _Fltrounds(): FLT_ROUNDS = 1, round to nearest.
     register_symbol(0x268F4E37F017F5E5ULL, "_Fltrounds", "libc",
         [](CpuContext& ctx, MemoryManager&) { ctx.rax = 1; });
-    // wcsncpy over 32-bit wchar_t: copies up to n code units, then pads with zeros.
+    // Wide strings. The PS4 toolchain's wchar_t is 16-bit (clang's PS4 target
+    // uses unsigned short; Dragon Ball Xenoverse 2 tests `word ptr [s]` before
+    // wcslen and stores L"%d" as UTF-16). wcsncpy used to assume 32-bit units
+    // and the rest were unregistered: wcslen and mbstowcs returned 0, a wide
+    // name came back empty, and the game threw "invalid string position".
+    static constexpr GuestSize kWideMax = GuestSize{1} << 24;
+    auto wide_len = [](MemoryManager& mem, GuestAddr s, GuestSize limit) -> GuestSize {
+        GuestSize n = 0;
+        u16 wc = 0;
+        while (n < limit && mem.read_value(s + 2 * n, wc) && wc != 0) ++n;
+        return n;
+    };
+    // wcslen(const wchar_t* s)
+    register_symbol(0x5A491ECB02C97205ULL, "wcslen", "libc",
+        [wide_len](CpuContext& ctx, MemoryManager& mem) { ctx.rax = wide_len(mem, ctx.rdi, kWideMax); });
+    // wcscpy(wchar_t* dest, const wchar_t* src) -> dest
+    register_symbol(0x14CE4D3E72EA05CFULL, "wcscpy", "libc",
+        [wide_len](CpuContext& ctx, MemoryManager& mem) {
+            const GuestSize n = wide_len(mem, ctx.rsi, kWideMax);
+            std::vector<u16> buf(n + 1, 0);
+            if (n) mem.read_bytes(ctx.rsi, buf.data(), n * 2);
+            mem.write_bytes(ctx.rdi, buf.data(), (n + 1) * 2);
+            ctx.rax = ctx.rdi;
+        });
+    // wcsncpy(wchar_t* dest, const wchar_t* src, size_t n): copies up to n units, then pads with zeros.
     register_symbol(0xD27576D498D8087FULL, "wcsncpy", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr dest = ctx.rdi;
             const GuestAddr src = ctx.rsi;
             const GuestSize n = ctx.rdx;
             ctx.rax = dest;
-            if (n == 0 || n > (GuestSize{1} << 28) || !mem.is_valid_address(dest, n * 4)) return;
+            if (n == 0 || n > kWideMax || !mem.is_valid_address(dest, n * 2)) return;
             bool copying = true;
             for (GuestSize i = 0; i < n; ++i) {
-                u32 wc = 0;
-                if (copying && (!mem.read_value(src + 4 * i, wc) || wc == 0)) copying = false;
+                u16 wc = 0;
+                if (copying && (!mem.read_value(src + 2 * i, wc) || wc == 0)) copying = false;
                 if (!copying) wc = 0;
-                mem.write_value<u32>(dest + 4 * i, wc);
+                mem.write_value<u16>(dest + 2 * i, wc);
             }
+        });
+    // wcscmp / wcsncmp: compare as unsigned 16-bit units.
+    auto wide_cmp = [](MemoryManager& mem, GuestAddr a, GuestAddr b, GuestSize n) -> i64 {
+        for (GuestSize i = 0; i < n; ++i) {
+            u16 x = 0, y = 0;
+            mem.read_value(a + 2 * i, x);
+            mem.read_value(b + 2 * i, y);
+            if (x != y) return x < y ? -1 : 1;
+            if (x == 0) return 0;
+        }
+        return 0;
+    };
+    register_symbol(0xA4DB49744DF1E3D1ULL, "wcscmp", "libc",
+        [wide_cmp](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = static_cast<u64>(wide_cmp(mem, ctx.rdi, ctx.rsi, kWideMax));
+        });
+    register_symbol(0x13CC02A1411B7F39ULL, "wcsncmp", "libc",
+        [wide_cmp](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = static_cast<u64>(wide_cmp(mem, ctx.rdi, ctx.rsi, std::min<GuestSize>(ctx.rdx, kWideMax)));
+        });
+    // wcsstr(const wchar_t* haystack, const wchar_t* needle) -> match or NULL
+    register_symbol(0x583A686E322601BEULL, "wcsstr", "libc",
+        [wide_len](CpuContext& ctx, MemoryManager& mem) {
+            const GuestSize hn = wide_len(mem, ctx.rdi, kWideMax), nn = wide_len(mem, ctx.rsi, kWideMax);
+            if (nn == 0) {
+                ctx.rax = ctx.rdi;
+                return;
+            }
+            std::vector<u16> h(hn), nd(nn);
+            if (hn) mem.read_bytes(ctx.rdi, h.data(), hn * 2);
+            mem.read_bytes(ctx.rsi, nd.data(), nn * 2);
+            const auto it = std::search(h.begin(), h.end(), nd.begin(), nd.end());
+            ctx.rax = it == h.end() ? 0 : ctx.rdi + 2 * static_cast<GuestAddr>(it - h.begin());
+        });
+    // wmem*: n counts 16-bit units.
+    register_symbol(0x7E75048C108D4555ULL, "wmemchr", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const u16 c = static_cast<u16>(ctx.rsi);
+            ctx.rax = 0;
+            for (GuestSize i = 0; i < std::min<GuestSize>(ctx.rdx, kWideMax); ++i) {
+                u16 wc = 0;
+                if (!mem.read_value(ctx.rdi + 2 * i, wc)) break;
+                if (wc == c) {
+                    ctx.rax = ctx.rdi + 2 * i;
+                    break;
+                }
+            }
+        });
+    register_symbol(0x409E7155F2A49E2DULL, "wmemcmp", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = 0;
+            for (GuestSize i = 0; i < std::min<GuestSize>(ctx.rdx, kWideMax); ++i) {
+                u16 x = 0, y = 0;
+                mem.read_value(ctx.rdi + 2 * i, x);
+                mem.read_value(ctx.rsi + 2 * i, y);
+                if (x != y) {
+                    ctx.rax = static_cast<u64>(x < y ? -1 : 1);
+                    break;
+                }
+            }
+        });
+    auto wmem_move = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestSize bytes = std::min<GuestSize>(ctx.rdx, kWideMax) * 2;
+        if (bytes && mem.is_valid_address(ctx.rsi, bytes) && mem.is_valid_address(ctx.rdi, bytes)) {
+            std::vector<u8> buf(bytes);
+            mem.read_bytes(ctx.rsi, buf.data(), bytes);
+            mem.write_bytes(ctx.rdi, buf.data(), bytes);
+        }
+        ctx.rax = ctx.rdi;
+    };
+    register_symbol(0x7CBDCED36CA96451ULL, "wmemcpy", "libc", wmem_move);
+    register_symbol(0x3688FD3EC26BB1AFULL, "wmemmove", "libc", wmem_move);
+    register_symbol(0x025F0C64987FE213ULL, "wmemset", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestSize n = std::min<GuestSize>(ctx.rdx, kWideMax);
+            if (n && mem.is_valid_address(ctx.rdi, n * 2)) {
+                std::vector<u16> buf(n, static_cast<u16>(ctx.rsi));
+                mem.write_bytes(ctx.rdi, buf.data(), n * 2);
+            }
+            ctx.rax = ctx.rdi;
+        });
+    // mbstowcs(wchar_t* dst, const char* src, size_t n): UTF-8 -> UTF-16, n
+    // units at most; with dst NULL it returns the length it would write. Bytes
+    // that are not valid UTF-8 pass through as Latin-1.
+    register_symbol(0x554CE35E49CF3C1BULL, "mbstowcs", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::string src;
+            for (GuestSize i = 0; i < kWideMax; ++i) {
+                char c = 0;
+                if (!mem.read_value(ctx.rsi + i, c) || c == 0) break;
+                src.push_back(c);
+            }
+            std::vector<u16> out;
+            for (usize i = 0; i < src.size();) {
+                const u8 b = static_cast<u8>(src[i]);
+                u32 cp = b;
+                usize len = 1;
+                if (b >= 0xF0 && i + 3 < src.size()) {
+                    cp = ((b & 0x07u) << 18) | ((src[i + 1] & 0x3Fu) << 12) | ((src[i + 2] & 0x3Fu) << 6) | (src[i + 3] & 0x3Fu);
+                    len = 4;
+                } else if (b >= 0xE0 && i + 2 < src.size()) {
+                    cp = ((b & 0x0Fu) << 12) | ((src[i + 1] & 0x3Fu) << 6) | (src[i + 2] & 0x3Fu);
+                    len = 3;
+                } else if (b >= 0xC0 && i + 1 < src.size()) {
+                    cp = ((b & 0x1Fu) << 6) | (src[i + 1] & 0x3Fu);
+                    len = 2;
+                }
+                if (cp >= 0x10000) {
+                    cp -= 0x10000;
+                    out.push_back(static_cast<u16>(0xD800 + (cp >> 10)));
+                    out.push_back(static_cast<u16>(0xDC00 + (cp & 0x3FF)));
+                } else {
+                    out.push_back(static_cast<u16>(cp));
+                }
+                i += len;
+            }
+            if (ctx.rdi == 0) {
+                ctx.rax = out.size();
+                return;
+            }
+            const GuestSize n = ctx.rdx;
+            const GuestSize count = std::min<GuestSize>(out.size(), n);
+            if (count) mem.write_bytes(ctx.rdi, out.data(), count * 2);
+            if (count < n) mem.write_value<u16>(ctx.rdi + 2 * count, 0);
+            ctx.rax = count;
+        });
+    // wcstombs(char* dst, const wchar_t* src, size_t n): UTF-16 -> UTF-8, n bytes at most.
+    register_symbol(0xBFB4BB2E13F63897ULL, "wcstombs", "libc",
+        [wide_len](CpuContext& ctx, MemoryManager& mem) {
+            const GuestSize wn = wide_len(mem, ctx.rsi, kWideMax);
+            std::vector<u16> w(wn);
+            if (wn) mem.read_bytes(ctx.rsi, w.data(), wn * 2);
+            std::string out;
+            for (usize i = 0; i < w.size(); ++i) {
+                u32 cp = w[i];
+                if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < w.size() && w[i + 1] >= 0xDC00 && w[i + 1] < 0xE000)
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (w[++i] - 0xDC00);
+                if (cp < 0x80) out.push_back(static_cast<char>(cp));
+                else if (cp < 0x800) {
+                    out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                } else if (cp < 0x10000) {
+                    out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                } else {
+                    out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+                    out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+                    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                }
+            }
+            if (ctx.rdi == 0) {
+                ctx.rax = out.size();
+                return;
+            }
+            const GuestSize count = std::min<GuestSize>(out.size(), ctx.rdx);
+            if (count) mem.write_bytes(ctx.rdi, out.data(), count);
+            if (count < ctx.rdx) mem.write_value<u8>(ctx.rdi + count, 0);
+            ctx.rax = count;
         });
     // mktime(struct tm*): normalises the fields in place and returns the time_t.
     register_symbol(0x9FB01EA70474B37EULL, "mktime", "libc",
@@ -8963,7 +9310,7 @@ void NidRegistry::register_default_libraries() {
     // difftime(time_t t1, time_t t0) -> double t1 - t0.
     register_symbol(0xFD5567EF8672844BULL, "difftime", "libc",
         [](CpuContext& ctx, MemoryManager&) {
-            ctx.ymm[0].d[0] = static_cast<double>(static_cast<i64>(ctx.rdi) - static_cast<i64>(ctx.rsi));
+            ctx.ymm[0].df[0] = static_cast<double>(static_cast<i64>(ctx.rdi) - static_cast<i64>(ctx.rsi));
         });
     // strftime(char* s, size_t max, const char* fmt, const struct tm* tm)
     register_symbol(0x02FDF38D68BAE0ACULL, "strftime", "libc",

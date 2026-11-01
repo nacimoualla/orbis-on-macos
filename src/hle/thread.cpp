@@ -158,6 +158,19 @@ ThreadManager::~ThreadManager() {
             th->host_thread.join();
         }
     }
+
+    // 5. Leak the GuestThread objects instead of freeing them. A host thread
+    // that was never joinable here (detached, or one serving a host task) can
+    // still be inside an HLE wait, and its SignalWakeScope locks
+    // GuestThread::wait_cv_mtx on the way out: freeing it aborted runs with
+    // "mutex lock failed: Invalid argument" after the guest had finished.
+    // The process is exiting, so the leak is free.
+    {
+        std::lock_guard<std::mutex> lock(m_threads_mutex);
+        for (auto& [id, thread] : m_threads) {
+            static_cast<void>(thread.release());
+        }
+    }
 }
 
 ScePthreadId ThreadManager::create_thread(GuestAddr entry_point, GuestAddr arg,
