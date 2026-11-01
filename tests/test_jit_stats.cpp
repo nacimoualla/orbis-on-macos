@@ -59,21 +59,21 @@ void test_normalize() {
 }
 
 // Program used by tests 2 and 3. Loops 100 times over a body the JIT only
-// partly handles (SBB, 83 /3, is not translated), then exits with the loop
-// count. `add rax, 1` leaves CF=0, so `sbb rdx, -1` adds 1 and sets CF
-// (borrow), so `sbb ecx, 0` subtracts 1.
+// partly handles (8-bit SBB, 80 /3, is not translated), then exits with the
+// loop count. `add rax, 1` leaves CF=0, so `sbb dl, -1` adds 1 and sets CF
+// (borrow), so `sbb cl, 0` subtracts 1.
 const GuestAddr PROG_ADDR = 0x50000;
 const u8 PROG[] = {
     0xB9, 0x64, 0x00, 0x00, 0x00, // 00: mov ecx, 100
     0x31, 0xD2,                   // 05: xor edx, edx
     0x48, 0x89, 0xD8,             // 07: mov rax, rbx   <- loop
     0x48, 0x83, 0xC0, 0x01,       // 0A: add rax, 1
-    0x48, 0x83, 0xDA, 0xFF,       // 0E: sbb rdx, -1    (unsupported)
-    0x83, 0xD9, 0x00,             // 12: sbb ecx, 0     (unsupported)
-    0x75, 0xF0,                   // 15: jnz loop       (JIT, ends its block)
-    0x89, 0xD7,                   // 17: mov edi, edx
-    0xB8, 0x01, 0x00, 0x00, 0x00, // 19: mov eax, 1 (SYS_exit)
-    0x0F, 0x05,                   // 1E: syscall        (terminator)
+    0x80, 0xDA, 0xFF,             // 0E: sbb dl, -1     (unsupported)
+    0x80, 0xD9, 0x00,             // 11: sbb cl, 0      (unsupported)
+    0x75, 0xF1,                   // 14: jnz loop       (JIT, ends its block)
+    0x89, 0xD7,                   // 16: mov edi, edx
+    0xB8, 0x01, 0x00, 0x00, 0x00, // 18: mov eax, 1 (SYS_exit)
+    0x0F, 0x05,                   // 1D: syscall        (terminator)
 };
 
 RunResult run_program(bool with_jit) {
@@ -116,18 +116,18 @@ void test_mixed_run() {
 
     // Every retired instruction is attributed to exactly one engine.
     assert(t.jit_retired + t.interp_retired == res.instructions_executed);
-    // Block @00: 4 insns, block @07: 2 insns x 99, block @15 (jnz alone)
-    // x 100, block @17: 2 insns.
+    // Block @00: 4 insns, block @07: 2 insns x 99, block @14 (jnz alone)
+    // x 100, block @16: 2 insns.
     assert(t.jit_retired == 4 + 99 * 2 + 100 + 2);
     // sbb, sbb per iteration + the final syscall.
     assert(t.interp_retired == 2 * 100 + 1);
     assert(t.jit_block_executions == 1 + 99 + 100 + 1);
     assert(t.blocks_compiled == 4);
-    // Failed compiles are cached, so each failing address (sbb @0E, sbb @12,
-    // syscall @1E) is compiled only once.
+    // Failed compiles are cached, so each failing address (sbb @0E, sbb @11,
+    // syscall @1D) is compiled only once.
     assert(t.compile_failures == 3);
 
-    assert(interp_count("83 /3 reg") == 200);
+    assert(interp_count("80 /3 reg") == 200);
     assert(interp_count("75") == 0);
     assert(interp_count("0F 05") == 1);
     assert(interp_count("89 reg") == 0);
@@ -136,7 +136,7 @@ void test_mixed_run() {
     dump_jit_stats(json);
     const std::string s = json.str();
     assert(s.find("\"jit_retired\": 304") != std::string::npos);
-    assert(s.find("\"key\": \"83 /3 reg\"") != std::string::npos);
+    assert(s.find("\"key\": \"80 /3 reg\"") != std::string::npos);
     assert(s.find("\"reason\": \"unsupported\", \"blocks\": 2, \"failed_compiles\": 2") !=
            std::string::npos);
     assert(s.find("\"reason\": \"terminator\", \"blocks\": 1, \"failed_compiles\": 1") !=

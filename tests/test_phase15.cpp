@@ -84,12 +84,12 @@ void test_basic_block_boundaries_and_traps() {
         assert(ctx.rip == code_addr + 5); // RIP points to hlt
     }
 
-    // 4. RET boundary: code ending in 0xC3 (RET)
+    // 4. Trap boundary: code ending in HLT (RET is compiled now)
     {
         const GuestAddr code_addr = 0x13000;
         const u8 code[] = {
             0xBF, 0x66, 0x66, 0x00, 0x00, // mov edi, 0x6666 (5 bytes)
-            0xC3                          // ret             (1 byte)
+            0xF4                          // hlt             (1 byte)
         };
         assert(memory.write_bytes(code_addr, code, sizeof(code)));
 
@@ -98,7 +98,7 @@ void test_basic_block_boundaries_and_traps() {
 
         assert(jit.execute_block(ctx, memory));
         assert(ctx.rdi == 0x6666);
-        assert(ctx.rip == code_addr + 5); // RIP points to ret
+        assert(ctx.rip == code_addr + 5); // RIP points to hlt
     }
 
     std::cout << "  -> Basic-block boundaries and trap exits verified!\n";

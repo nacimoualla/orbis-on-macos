@@ -397,6 +397,9 @@ bool Emitter::valu_op1(u32 op, u32 d, u32 a) {
     case 11: write_v(d, float_result("gcn_hlo(" + ua + ")")); return true;
     case 12: write_v(d, "uint(int(floor(" + fa() + " + 0.5f)))"); return true;
     case 13: write_v(d, "uint(int(floor(" + fa() + ")))"); return true;
+    // v_cvt_off_f32_i4: the low nibble as a signed 4-bit value, in 1/16ths
+    // (a sample offset: 0x8 -> -0.5, 0x7 -> 0.4375).
+    case 14: write_v(d, float_result("float(gcn_sext(" + ua + " & 0xfu, 4u)) * 0.0625f")); return true;
     case 17: case 18: case 19: case 20:
         write_v(d, float_result("float((" + ua + " >> " + std::to_string((op - 17) * 8) + "u) & 0xffu)"));
         return true;
@@ -1440,6 +1443,44 @@ bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size, std:
     const u32 pitch = std::max(td.pitch, td.width);
     const u32 tiles_per_row = (pitch + 7) / 8;
     out.assign(static_cast<usize>(td.width) * td.height * 4, 0);
+
+    // Fast paths for the common linear unorm formats (a game's software-
+    // rendered screen or a decoded movie frame is converted every frame):
+    // integer channel selects instead of the per-texel float decode.
+    // dst_sel: 0 -> 0, 1 -> 1.0 (255), 4..7 -> source channel 0..3.
+    if (linear && td.nfmt == 0 && (td.dfmt == 10 || td.dfmt == 16)) {
+        u8 sel[4];
+        bool ok = true;
+        for (u32 k = 0; k < 4; ++k) {
+            sel[k] = static_cast<u8>(td.dst_sel[k]);
+            ok = ok && (sel[k] == 0 || sel[k] == 1 || (sel[k] >= 4 && sel[k] <= 7));
+        }
+        if (ok) {
+            for (u32 y = 0; y < td.height; ++y) {
+                u8* o = out.data() + static_cast<usize>(y) * td.width * 4;
+                if (td.dfmt == 10) {
+                    const u8* row = src + static_cast<usize>(y) * pitch * 4;
+                    for (u32 x = 0; x < td.width; ++x) {
+                        const u8* t = row + x * 4;
+                        for (u32 k = 0; k < 4; ++k)
+                            o[x * 4 + k] = sel[k] >= 4 ? t[sel[k] - 4] : (sel[k] == 1 ? 255 : 0);
+                    }
+                } else { // 5_6_5: channel 0 = bits 4:0, 1 = 10:5, 2 = 15:11 (A = 1)
+                    const u16* row = reinterpret_cast<const u16*>(src) + static_cast<usize>(y) * pitch;
+                    for (u32 x = 0; x < td.width; ++x) {
+                        u16 v;
+                        std::memcpy(&v, row + x, 2);
+                        const u32 r5 = v & 0x1F, g6 = (v >> 5) & 0x3F, b5 = v >> 11;
+                        const u8 c[4] = {static_cast<u8>((r5 * 527 + 23) >> 6), static_cast<u8>((g6 * 259 + 33) >> 6),
+                                         static_cast<u8>((b5 * 527 + 23) >> 6), 255};
+                        for (u32 k = 0; k < 4; ++k)
+                            o[x * 4 + k] = sel[k] >= 4 ? c[sel[k] - 4] : (sel[k] == 1 ? 255 : 0);
+                    }
+                }
+            }
+            return true;
+        }
+    }
     float c[4];
     for (u32 y = 0; y < td.height; ++y) {
         for (u32 x = 0; x < td.width; ++x) {

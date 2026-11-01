@@ -15,6 +15,8 @@
 > **Status:** Phases 1–15 implemented and verified (see [ROADMAP.md](ROADMAP.md)). CPU interpreter + ARM64 JIT, PRX/NID dynamic linker, Orbis syscall HLE, VFS, Metal graphics pipeline, CoreAudio, and threading are all in place.
 >
 > **Milestone:** a retail Unity title (Flappy Bird, `NPXX51362`) boots on the **real Mono runtime** (`mono-ps4.prx`, full-AOT, Boehm GC), loads its first scene, renders through the GCN → MSL path and is **playable at ~60 FPS** in the window — title screen, touch-pad input, gameplay, game over and restart. See [Running a real Unity title](#-running-a-real-unity-title).
+>
+> **Milestone:** a native (non-Unity) retail game, **Sonic Mania Plus** (`CUSA07010`, RSDKv5), runs from boot through the SEGA logo, title screen, menus, save select and in-level gameplay at a **steady 60 FPS** (≈4–5 ms of guest work per 16.7 ms frame in levels). See [Running Sonic Mania](#-running-sonic-mania).
 
 ## 🗺️ Progress & Roadmap
 
@@ -111,13 +113,14 @@ This builds the `ps4_core` library, the `ps4-runner` CLI, the `test_phase*` bina
 ./build/ps4-runner [options] <path-to-eboot.bin-or-elf>
 ```
 
-Options: `--window/-w`, `--headless`, `--budget N` (headless instruction budget,
+Options: `--window/-w`, `--headless`, `--offscreen`, `--budget N` (headless instruction budget,
 default 100 M), `--no-jit`, `--trace/-t`, `--strict-hle`.
 
 | Option | Meaning |
 |---|---|
 | `--window`, `-w` | Open an interactive macOS Metal window (60 FPS presentation loop). |
 | `--headless` | Run console-only (default). |
+| `--offscreen` | No window, but every frame is rendered, submitted and paced to 60 Hz exactly as in `--window` (for automated play-throughs; see `PS4_INPUT`). |
 | `--no-jit` | Disable ARM64 JIT dynamic recompiler (interpreter only). |
 | `--trace`, `-t` | Trace guest instruction execution step-by-step. |
 | `--help`, `-h` | Show usage. |
@@ -148,7 +151,7 @@ PS4_LOAD_PRX=1 ./build/ps4-runner --window games/<Title>/eboot.elf
 
 The window runs the game's main thread on its own host thread and presents every frame the game flips, paced to a 60 Hz vblank, so Flappy holds a steady 60 FPS.
 
-**Controls:** left click, `Space`, `Enter`, `↑` or `→` press **Cross** and the **touch pad** together (games that say "touch pad to start" read the touch pad). `Esc` closes the window.
+**Controls:** any connected game controller (DualShock 4, DualSense, Xbox, MFi) maps by button position. On the keyboard: arrow keys = D-pad, `Space` = **Cross + touch pad** (games that say "touch pad to start" read the touch pad), `Z` = Cross, `X` = Circle, `C` = Square, `V` = Triangle, `Return` = Options, `A`/`S` = L1/R1, `Q`/`E` = L2/R2, `Tab` = touch pad; a left click is Cross + touch pad. `Esc` closes the window.
 
 What this path exercises: full-AOT Mono with Boehm GC stop-the-world (guest exception delivery via `sceKernelRaiseException`), Unity's preload/scene-load threads, FMOD audio paced by `sceAudioOutOutput`, the user-service login that opens the pad, Gnm command-buffer building (`sceGnmSet/Update*Shader*`, draws, EOP interrupts) and AVX-heavy engine math in the JIT.
 
@@ -176,7 +179,35 @@ PS4_LOAD_PRX=1 PS4_FRAMES=300 PS4_AUTO_TAP=130,2,1 PS4_GPU_READBACK=/tmp/frames 
 | `PS4_LOG_PM4=1` | Trace every PM4 packet, draw, shader dump, Gnm call and flip (very verbose). |
 | `PS4_FLIP_STATS=1` | Once a second: game FPS, worst frame time, frames over 20 ms, and window presents. |
 | `PS4_NO_VSYNC=1` | Windowed runner: complete flips immediately instead of pacing them to 60 Hz vblank. |
+| `PS4_FRAMES=N` | `--offscreen`: stop after N flips. |
+| `PS4_INPUT=f:b,f:b,…` | `--offscreen`: from flip `f`, hold pad buttons `b` (e.g. `0x4000` Cross, `0x20` Right) until the next entry. |
+| `PS4_READBACK_EVERY=N` | With `PS4_GPU_READBACK`, only every Nth frame (each readback waits for the GPU). |
+| `PS4_HITCH_MS=n` | Every frame longer than n ms, split into guest work, vblank wait and presenter time. |
+| `PS4_JIT_TRACE=1` / `=addr` | Record every JIT block in the control-transfer ring dumped on a guest abort / print each run of the block at `addr`. (Disables block chaining.) |
+| `PS4_REG_HOOK=rip:reg=v[,reg=v][;rip:…]` | Whenever execution reaches `rip`, set guest registers first (rax rcx rdx rbx rsi rdi r8 r9) — e.g. redirect a call's arguments to jump straight to a scene. |
 | `PS4_JIT_STATS=1` | JIT vs. interpreter coverage telemetry (see below). |
+
+## 🦔 Running Sonic Mania
+
+Sonic Mania Plus (`CUSA07010`) is a native RSDKv5 game: no Mono, no PRX modules beyond the game's own `libc.prx` (served by HLE). Point the runner at the decrypted executable:
+
+```bash
+./build/ps4-runner --window games/sonic_mania_plus/CUSA07010/eboot.elf
+```
+
+Saves go to `vfs_root/savedata/<user>/CUSA07010/SAVEDATA00/SaveData.bin`. The game is offline: PSN availability, leaderboards and the save-data dialog report "signed out" / OK.
+
+Any scene can be reached directly from the save-select screen with `PS4_REG_HOOK` (from a save slot marked cleared, `saveState = 2` at offset `0x58` of `SaveData.bin`): `0x67a3e` is the game's `SetScene("Mania Mode", …)` call and `0x67a92` adds the zone's scene offset in `rbx`. For example the third UFO special stage: `PS4_REG_HOOK="0x67a3e:rdi=0x29f5cf;0x67a92:rbx=2"` (`0x29f5cf` = "Special Stage", `0x29e5d1` = "Blue Spheres", `0x29e5a8` = "Mania Mode").
+
+What this title exercised: a fixed-base executable linked at address 0 (the HLE trampoline pool now moves past it), Dinkumware `libc.prx` internals (`operator new`, `_FSin`, `std::locale`, `std::thread`'s `_Pad`), data imports (vtables, `_Stderr`), Gnm "prepare flip" labels, RGB565 textures through the GCN path, BMI1 (`bextr`, `andn`), scalar and packed-integer AVX in the JIT, and a software video decoder (the opening movie) whose SSSE3/AVX integer ops (`vpshuflw`, `vpmaddubsw`, `vpmulhrsw`, packs, `vcmpsd`, …) are all checked against real x86 by `scripts/x86_diff`.
+
+Automated play, e.g. into the first level with Cross presses and then running right:
+
+```bash
+PS4_FRAMES=4000 PS4_FLIP_STATS=1 PS4_HITCH_MS=20 \
+PS4_INPUT=1250:0x4000,1258:0,1600:0x4000,1608:0,1950:0x4000,1958:0,2300:0x4000,2308:0,2800:0x20 \
+  ./build/ps4-runner --offscreen games/sonic_mania_plus/CUSA07010/eboot.elf
+```
 
 ## 🧪 Testing
 

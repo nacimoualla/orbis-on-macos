@@ -371,6 +371,101 @@ void Arm64Emitter::str_x_idx(u8 rt, u8 rn, u8 rm) {
   emit(ldst_idx(0xf8000000, rt, rn, rm));
 }
 
+// --- Variable shifts, select, multiply, rotate -----------------------------------
+
+namespace {
+inline u32 rrr(u32 base, bool sf, u8 rd, u8 rn, u8 rm) {
+  return base | (sf ? 0x80000000u : 0u) | (static_cast<u32>(rm) << 16) |
+         (static_cast<u32>(rn) << 5) | rd;
+}
+} // namespace
+
+void Arm64Emitter::lslv(bool sf, u8 rd, u8 rn, u8 rm) { emit(rrr(0x1ac02000u, sf, rd, rn, rm)); }
+void Arm64Emitter::asrv(bool sf, u8 rd, u8 rn, u8 rm) { emit(rrr(0x1ac02800u, sf, rd, rn, rm)); }
+
+void Arm64Emitter::csel(bool sf, u8 rd, u8 rn, u8 rm, u8 cond) {
+  emit(rrr(0x1a800000u, sf, rd, rn, rm) | (static_cast<u32>(cond & 0xf) << 12));
+}
+
+void Arm64Emitter::cmp_imm(bool sf, u8 rn, u16 imm12) {
+  // SUBS zr, rn, #imm12
+  emit((sf ? 0xf1000000u : 0x71000000u) | (static_cast<u32>(imm12 & 0xfff) << 10) |
+       (static_cast<u32>(rn) << 5) | 31u);
+}
+
+void Arm64Emitter::mul(bool sf, u8 rd, u8 rn, u8 rm) {
+  emit(rrr(0x1b000000u, sf, rd, rn, rm) | (31u << 10)); // MADD rd, rn, rm, zr
+}
+void Arm64Emitter::smull(u8 rd, u8 rn, u8 rm) {
+  emit(rrr(0x9b200000u, false, rd, rn, rm) | (31u << 10)); // SMADDL xd, wn, wm, xzr
+}
+void Arm64Emitter::smulh(u8 rd, u8 rn, u8 rm) {
+  emit(rrr(0x9b400000u, false, rd, rn, rm) | (31u << 10));
+}
+
+void Arm64Emitter::ror_imm(bool sf, u8 rd, u8 rn, u8 shift) {
+  emit((sf ? 0x93c00000u : 0x13800000u) | (static_cast<u32>(rn) << 16) |
+       (static_cast<u32>(shift & (sf ? 63 : 31)) << 10) | (static_cast<u32>(rn) << 5) | rd);
+}
+
+void Arm64Emitter::cbz(bool sf, u8 rt, i32 offset_words) {
+  emit((sf ? 0xb4000000u : 0x34000000u) | ((static_cast<u32>(offset_words) & 0x7ffff) << 5) | rt);
+}
+
+// --- SIMD&FP -------------------------------------------------------------------------
+
+namespace {
+// LDR/STR (SIMD&FP, unsigned offset) and (register, LSL #0), indexed by
+// size_log2 - 2 (S, D, Q).
+constexpr u32 kFpLdrImm[3] = {0xbd400000u, 0xfd400000u, 0x3dc00000u};
+constexpr u32 kFpStrImm[3] = {0xbd000000u, 0xfd000000u, 0x3d800000u};
+constexpr u32 kFpLdrIdx[3] = {0xbc606800u, 0xfc606800u, 0x3ce06800u};
+constexpr u32 kFpStrIdx[3] = {0xbc206800u, 0xfc206800u, 0x3ca06800u};
+} // namespace
+
+void Arm64Emitter::fp_ldr(u8 size_log2, u8 vt, u8 rn, u32 offset_bytes) {
+  emit(kFpLdrImm[size_log2 - 2] | (((offset_bytes >> size_log2) & 0xfff) << 10) |
+       (static_cast<u32>(rn) << 5) | vt);
+}
+void Arm64Emitter::fp_str(u8 size_log2, u8 vt, u8 rn, u32 offset_bytes) {
+  emit(kFpStrImm[size_log2 - 2] | (((offset_bytes >> size_log2) & 0xfff) << 10) |
+       (static_cast<u32>(rn) << 5) | vt);
+}
+void Arm64Emitter::fp_ldr_idx(u8 size_log2, u8 vt, u8 rn, u8 rm) {
+  emit(kFpLdrIdx[size_log2 - 2] | (static_cast<u32>(rm) << 16) | (static_cast<u32>(rn) << 5) | vt);
+}
+void Arm64Emitter::fp_str_idx(u8 size_log2, u8 vt, u8 rn, u8 rm) {
+  emit(kFpStrIdx[size_log2 - 2] | (static_cast<u32>(rm) << 16) | (static_cast<u32>(rn) << 5) | vt);
+}
+
+void Arm64Emitter::fp_arith(bool dbl, u8 op, u8 vd, u8 vn, u8 vm) {
+  emit(0x1e200800u | (dbl ? 0x400000u : 0u) | (static_cast<u32>(op & 3) << 12) |
+       (static_cast<u32>(vm) << 16) | (static_cast<u32>(vn) << 5) | vd);
+}
+void Arm64Emitter::fcmp(bool dbl, u8 vn, u8 vm) {
+  emit(0x1e202000u | (dbl ? 0x400000u : 0u) | (static_cast<u32>(vm) << 16) | (static_cast<u32>(vn) << 5));
+}
+void Arm64Emitter::fcsel(bool dbl, u8 vd, u8 vn, u8 vm, u8 cond) {
+  emit(0x1e200c00u | (dbl ? 0x400000u : 0u) | (static_cast<u32>(vm) << 16) |
+       (static_cast<u32>(cond & 0xf) << 12) | (static_cast<u32>(vn) << 5) | vd);
+}
+void Arm64Emitter::scvtf(bool dbl, bool src64, u8 vd, u8 rn) {
+  emit(0x1e220000u | (src64 ? 0x80000000u : 0u) | (dbl ? 0x400000u : 0u) |
+       (static_cast<u32>(rn) << 5) | vd);
+}
+void Arm64Emitter::ins_lane0(bool dbl, u8 vd, u8 vn) {
+  emit((dbl ? 0x6e080400u : 0x6e040400u) | (static_cast<u32>(vn) << 5) | vd);
+}
+void Arm64Emitter::eor_v16(u8 vd, u8 vn, u8 vm) {
+  emit(0x6e201c00u | (static_cast<u32>(vm) << 16) | (static_cast<u32>(vn) << 5) | vd);
+}
+void Arm64Emitter::fmov_to_gpr(bool dbl, u8 rd, u8 vn) {
+  emit((dbl ? 0x9e660000u : 0x1e260000u) | (static_cast<u32>(vn) << 5) | rd);
+}
+void Arm64Emitter::fmov_from_gpr(bool dbl, u8 vd, u8 rn) {
+  emit((dbl ? 0x9e670000u : 0x1e270000u) | (static_cast<u32>(rn) << 5) | vd);
+}
+
 void Arm64Emitter::patch_b_cond(usize at, usize target) {
   const i32 offset_words = static_cast<i32>(static_cast<isize>(target) -
                                             static_cast<isize>(at));
@@ -378,24 +473,35 @@ void Arm64Emitter::patch_b_cond(usize at, usize target) {
                ((static_cast<u32>(offset_words) & 0x7ffff) << 5);
 }
 
+namespace {
+// STP/LDP (64-bit): pre-index, signed offset, post-index. imm in bytes.
+inline u32 ldst_pair(u32 base, u8 rt, u8 rt2, u8 rn, i32 imm) {
+  return base | ((static_cast<u32>(imm / 8) & 0x7f) << 15) | (static_cast<u32>(rt2) << 10) |
+         (static_cast<u32>(rn) << 5) | rt;
+}
+} // namespace
+
 void Arm64Emitter::emit_prologue() {
-  // stp x19, x30, [sp, #-32]!
-  emit(0xa9be7bf3);
-  // stp x20, x21, [sp, #16]
-  emit(0xa90157f4);
+  emit(ldst_pair(0xa9800000u, 19, 30, 31, -64)); // stp x19, x30, [sp, #-64]!
+  emit(ldst_pair(0xa9000000u, 20, 21, 31, 16));  // stp x20, x21, [sp, #16]
+  emit(ldst_pair(0xa9000000u, 22, 23, 31, 32));  // stp x22, x23, [sp, #32]
+  emit(ldst_pair(0xa9000000u, 24, 25, 31, 48));  // stp x24, x25, [sp, #48]
   // mov x19, x0 (guest CpuContext*)
   emit(0xaa0003f3);
   // mov x20, x1 (host base of guest memory)
   emit(0xaa0103f4);
   // sub x21, x2, #8 (highest valid start address of an 8-byte access)
   emit(0xd1002055);
+  // x22 = 0 (instructions retired by chained blocks), x23 = x3 (chain budget)
+  movz(true, 22, 0);
+  mov_reg(23, 3);
 }
 
 void Arm64Emitter::emit_epilogue() {
-  // ldp x20, x21, [sp, #16]
-  emit(0xa94157f4);
-  // ldp x19, x30, [sp], #32
-  emit(0xa8c27bf3);
+  emit(ldst_pair(0xa9400000u, 24, 25, 31, 48)); // ldp x24, x25, [sp, #48]
+  emit(ldst_pair(0xa9400000u, 22, 23, 31, 32)); // ldp x22, x23, [sp, #32]
+  emit(ldst_pair(0xa9400000u, 20, 21, 31, 16)); // ldp x20, x21, [sp, #16]
+  emit(ldst_pair(0xa8c00000u, 19, 30, 31, 64)); // ldp x19, x30, [sp], #64
   // ret
   emit(0xd65f03c0);
 }
@@ -520,6 +626,22 @@ enum class Kind : u8 {
   Jcc,       // 70-7F rel8, 0F 80-8F rel32 (block end; reg = condition code)
   Cmov,      // 0F 40-4F (reg = condition code)
   Setcc,     // 0F 90-9F (reg = condition code)
+  ShiftCl,   // D3 /4 /5 /6 /7, 32/64-bit (count = CL)
+  RotImm,    // C0/C1/D0/D1 /0 /1 (ROL/ROR by a constant)
+  Imul,      // 0F AF, 69, 6B, 32/64-bit
+  Neg,       // F6/F7 /3
+  Not,       // F6/F7 /2
+  SignExt,   // 98 CWDE/CDQE, 99 CDQ/CQO (32/64-bit)
+  Bextr,     // VEX.LZ.0F38 F7, pp=0
+  ShiftX,    // VEX.LZ.0F38 F7, pp=1/2/3 (SHLX/SARX/SHRX; alu_op = pp)
+  Andn,      // VEX.LZ.0F38 F2
+  Sse,       // VEX.0F scalar float / xor subset (vex_op + vex_pp select it)
+  CallRel,   // E8 (block end; target known)
+  CallInd,   // FF /2 (block end; target in x12)
+  JmpInd,    // FF /4 (block end; target in x12)
+  Ret,       // C3 (block end; target in x12)
+  Div,       // F7 /6 /7, 32/64-bit (alu_op = 6 DIV / 7 IDIV); #DE cases side-exit
+  Vec,       // VEX.128 packed-integer / move subset (vex_op, vex_pp, reg = map)
 };
 
 struct JitInsn {
@@ -539,6 +661,11 @@ struct JitInsn {
   GuestAddr target{0};
   u64 flags_written{0};
   u64 flags_read{0}; // must be in ctx->rflags before this instruction
+  // VEX fields (Bextr/ShiftX/Andn/Sse)
+  u8 vex_op{0};
+  u8 vex_pp{0};
+  u8 vex_vvvv{0};
+  bool vex_l{false};
 
   [[nodiscard]] bool has_mem() const noexcept {
     switch (kind) {
@@ -553,6 +680,19 @@ struct JitInsn {
     case Kind::PushRm:
     case Kind::Cmov:
     case Kind::Setcc:
+    case Kind::ShiftCl:
+    case Kind::RotImm:
+    case Kind::Imul:
+    case Kind::Neg:
+    case Kind::Not:
+    case Kind::Bextr:
+    case Kind::ShiftX:
+    case Kind::Andn:
+    case Kind::Sse:
+    case Kind::CallInd:
+    case Kind::JmpInd:
+    case Kind::Div:
+    case Kind::Vec:
       return !m.is_reg;
     default:
       return false;
@@ -607,12 +747,65 @@ bool is_block_terminator(const u8 *code, usize avail, const x86::Prefixes &p) {
   const usize c = p.length;
   const u8 op0 = code[c];
   const u8 op1 = (c + 1 < avail) ? code[c + 1] : 0;
-  if (op0 == 0xF4 || op0 == 0xCC || op0 == 0xC3 || op0 == 0xC2 ||
-      op0 == 0xE8)
+  if (op0 == 0xF4 || op0 == 0xCC || op0 == 0xC2)
     return true;
   if (op0 == 0x0F && (op1 == 0x05 || op1 == 0x0B))
     return true;
   return false;
+}
+
+/// The VEX packed-integer / move forms emit_vec() translates (128-bit unless
+/// noted). Everything else stays with the interpreter.
+bool vec_supported(u8 map, u8 op, u8 pp, bool l, const x86::ModRM &m) {
+  if (map == 2) {
+    if (pp != 1)
+      return false;
+    if ((op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35)) // VPMOVSX / VPMOVZX
+      return !(l == false && (op & 0x0F) == 2); // BQ from 2 bytes stays interpreted
+    return !l && (op == 0x00 || op == 0x40 || op == 0x2B); // VPSHUFB, VPMULLD, VPACKUSDW
+  }
+  if (map == 3) {
+    if (pp != 1)
+      return false;
+    if (op == 0x18 || op == 0x19) // VINSERTF128 / VEXTRACTF128
+      return l;
+    if (op == 0x0E) // VPBLENDW
+      return !l;
+    if (op == 0x4A || op == 0x4B) // VBLENDVPS / VBLENDVPD
+      return true;
+    return false;
+  }
+  if (map != 1)
+    return false;
+  switch (op) {
+  case 0x6F: case 0x7F: // VMOVDQA (66) / VMOVDQU (F3), 128 or 256-bit
+    return pp == 1 || pp == 2;
+  case 0x10: case 0x11: case 0x28: case 0x29: // VMOVUPS/UPD/APS/APD
+    return pp <= 1;
+  case 0x6E: // VMOVD/Q xmm, r/m
+    return pp == 1 && !l;
+  case 0x7E: // VMOVD/Q r/m, xmm (66) ; VMOVQ xmm, xmm/m64 (F3)
+    return (pp == 1 || pp == 2) && !l;
+  case 0xD6: // VMOVQ xmm/m64, xmm
+    return pp == 1 && !l;
+  case 0x70: // VPSHUFD (66), VPSHUFHW (F3), VPSHUFLW (F2)
+    return pp >= 1 && !l;
+  case 0x63: case 0x67: case 0x6B: // VPACKSSWB, VPACKUSWB, VPACKSSDW
+    return pp == 1 && !l;
+  case 0x71: case 0x72: case 0x73: // shifts by immediate (/2 /4 /6; no /4 for q)
+    return pp == 1 && !l && m.is_reg && ((m.reg & 7) == 2 || (m.reg & 7) == 6 || ((m.reg & 7) == 4 && op != 0x73));
+  case 0xFC: case 0xFD: case 0xFE: case 0xD4: // VPADDB/W/D/Q
+  case 0xF8: case 0xF9: case 0xFA: case 0xFB: // VPSUBB/W/D/Q
+  case 0xDB: case 0xDF: case 0xEB:            // VPAND / VPANDN / VPOR
+  case 0xD5:                                  // VPMULLW
+  case 0x60: case 0x61: case 0x62: case 0x6C: // VPUNPCKL BW/WD/DQ/QDQ
+  case 0x68: case 0x69: case 0x6A: case 0x6D: // VPUNPCKH BW/WD/DQ/QDQ
+    return pp == 1 && !l;
+  case 0x54: case 0x55: case 0x56: // VANDPS/PD, VANDNPS/PD, VORPS/PD (also 256-bit)
+    return pp <= 1;
+  default:
+    return false;
+  }
 }
 
 /// Decode one instruction into a JitInsn. Returns false when the JIT does not
@@ -655,9 +848,123 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return true;
   };
 
+  // VEX (C4 / C5): BMI1/BMI2 GPR ops and the scalar SSE subset. Legacy
+  // 66/F2/F3/REX prefixes before VEX are #UD; leave those to the interpreter.
+  if ((op0 == 0xC4 || op0 == 0xC5) && !p.opsize16 && !p.rep && !p.has_rex && !p.lock) {
+    if (pos + 2 > avail)
+      return false;
+    u8 map = 1;
+    bool w = false;
+    const u8 b1 = code[pos++];
+    p.rex_r = !(b1 & 0x80);
+    u8 b2 = b1;
+    if (op0 == 0xC4) {
+      p.rex_x = !(b1 & 0x40);
+      p.rex_b = !(b1 & 0x20);
+      map = b1 & 0x1F;
+      if (pos >= avail)
+        return false;
+      b2 = code[pos++];
+      w = (b2 & 0x80) != 0;
+    }
+    p.rex_w = w;
+    d.vex_vvvv = static_cast<u8>((~b2 >> 3) & 15);
+    d.vex_l = (b2 & 4) != 0;
+    d.vex_pp = b2 & 3;
+    if (pos >= avail)
+      return false;
+    d.vex_op = code[pos++];
+    if (!modrm())
+      return false;
+    const u8 op = d.vex_op, pp = d.vex_pp;
+    if (map == 2 && op == 0xF7 && !d.vex_l) {
+      d.width = w ? 64 : 32;
+      if (pp == 0) {
+        d.kind = Kind::Bextr;
+        d.flags_written = CpuContext::FLAG_ZF | CpuContext::FLAG_CF | CpuContext::FLAG_OF;
+      } else {
+        d.kind = Kind::ShiftX;
+        d.alu_op = pp;
+      }
+      return finish();
+    }
+    if (map == 2 && op == 0xF2 && pp == 0 && !d.vex_l) {
+      d.kind = Kind::Andn;
+      d.width = w ? 64 : 32;
+      d.flags_written = CpuContext::FLAG_SF | CpuContext::FLAG_ZF | CpuContext::FLAG_CF |
+                        CpuContext::FLAG_OF;
+      return finish();
+    }
+    if (vec_supported(map, op, pp, d.vex_l, d.m)) {
+      d.kind = Kind::Vec;
+      d.reg = map;
+      d.width = w ? 64 : 32; // VMOVD/VMOVQ GPR width
+      if (map == 3 || (map == 1 && (op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73))) {
+        if (pos >= avail)
+          return false;
+        d.imm = code[pos++];
+      }
+      return finish();
+    }
+    if (map != 1)
+      return false;
+    const bool scalar = pp == 2 || pp == 3;
+    bool ok = false;
+    if ((op == 0x10 || op == 0x11 || op == 0x2A) && scalar)
+      ok = true;
+    else if ((op == 0x58 || op == 0x59 || (op >= 0x5C && op <= 0x5F)) && scalar)
+      ok = true;
+    else if ((op == 0x57 && pp <= 1) || (op == 0xEF && pp == 1))
+      ok = !d.vex_l || d.m.is_reg; // 256-bit only from registers
+    else if ((op == 0x2E || op == 0x2F) && pp <= 1) {
+      ok = true;
+      d.flags_written = FLAGS_ARITH | CpuContext::FLAG_AF;
+    }
+    if (!ok)
+      return false;
+    d.kind = Kind::Sse;
+    d.width = w ? 64 : 32; // VCVTSI2SS/SD source width
+    return finish();
+  }
+
   // NOP / PAUSE (REX.B 90 is XCHG r8, rAX)
   if (op0 == 0x90 && !p.rex_b) {
     d.kind = Kind::Nop;
+    return finish();
+  }
+
+  // CWDE/CDQE (98), CDQ/CQO (99). 16-bit forms are left to the interpreter.
+  if ((op0 == 0x98 || op0 == 0x99) && op_bits != 16) {
+    d.kind = Kind::SignExt;
+    d.width = op_bits;
+    d.reg = op0 & 1;
+    return finish();
+  }
+
+  // IMUL r, r/m, imm32 / imm8 (32/64-bit)
+  if ((op0 == 0x69 || op0 == 0x6B) && op_bits != 16) {
+    if (!modrm() || !imm(op0 == 0x6B ? 1 : 4))
+      return false;
+    d.kind = Kind::Imul;
+    d.width = op_bits;
+    d.rm_is_dst = true; // marks the immediate form
+    d.flags_written = CpuContext::FLAG_CF | CpuContext::FLAG_OF;
+    return finish();
+  }
+
+  // SHL/SHR/SAR r/m32/64, CL. The count is only known at run time: a zero
+  // count leaves every flag alone, so the previous flags must be in rflags.
+  if (op0 == 0xD3 && op_bits != 16) {
+    if (!modrm())
+      return false;
+    const u8 sub = d.m.reg & 7;
+    if (sub < 4)
+      return false;
+    d.kind = Kind::ShiftCl;
+    d.width = op_bits;
+    d.alu_op = (sub == 6) ? 4 : sub;
+    d.flags_written = FLAGS_ARITH;
+    d.flags_read = FLAGS_ARITH;
     return finish();
   }
 
@@ -723,11 +1030,15 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return finish();
   }
 
-  // ALU r/m, r and r, r/m: ADD/OR/AND/SUB/XOR/CMP (ADC/SBB not translated)
+  // ALU r/m, r and r, r/m: ADD/OR/AND/SUB/XOR/CMP; ADC/SBB at 32/64 bits
   if (op0 <= 0x3B && (op0 & 7) <= 3) {
     const u8 major = (op0 >> 3) & 7;
-    if (major == 2 || major == 3 || !modrm())
+    if ((major == 2 || major == 3) && ((op0 & 1) == 0 || op_bits == 16))
       return false;
+    if (!modrm())
+      return false;
+    if (major == 2 || major == 3)
+      d.flags_read = CpuContext::FLAG_CF;
     d.kind = Kind::Alu;
     d.alu_op = major;
     d.width = (op0 & 1) ? op_bits : 8;
@@ -759,8 +1070,10 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     if (!modrm())
       return false;
     const u8 sub = d.m.reg & 7;
-    if (sub == 2 || sub == 3)
+    if ((sub == 2 || sub == 3) && (op0 == 0x80 || op_bits == 16))
       return false;
+    if (sub == 2 || sub == 3)
+      d.flags_read = CpuContext::FLAG_CF;
     d.width = (op0 == 0x80) ? 8 : op_bits;
     if (!imm(op0 == 0x81 ? imm_for(op_bits) : 1))
       return false;
@@ -798,6 +1111,30 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return finish();
   }
 
+  // DIV / IDIV r/m32/64 (F7 /6 /7). Flags are left alone, as in the interpreter.
+  if (op0 == 0xF7 && op_bits != 16 && pos < avail && ((code[pos] >> 3) & 7) >= 6) {
+    if (!modrm())
+      return false;
+    d.kind = Kind::Div;
+    d.width = op_bits;
+    d.alu_op = d.m.reg & 7;
+    return finish();
+  }
+
+  // NOT / NEG r/m (F6/F7 /2 /3)
+  if ((op0 == 0xF6 || op0 == 0xF7) && pos < avail && (((code[pos] >> 3) & 7) == 2 || ((code[pos] >> 3) & 7) == 3)) {
+    if (!modrm())
+      return false;
+    d.width = (op0 == 0xF6) ? 8 : op_bits;
+    if ((d.m.reg & 7) == 2) {
+      d.kind = Kind::Not;
+    } else {
+      d.kind = Kind::Neg;
+      d.flags_written = FLAGS_ARITH;
+    }
+    return finish();
+  }
+
   // TEST r/m, imm (F6 /0, F7 /0)
   if (op0 == 0xF6 || op0 == 0xF7) {
     if (!modrm() || (d.m.reg & 7) != 0)
@@ -824,7 +1161,7 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     if (!modrm())
       return false;
     const u8 sub = d.m.reg & 7;
-    if (sub < 4)
+    if (sub == 2 || sub == 3) // RCL / RCR
       return false;
     d.width = (op0 & 1) ? op_bits : 8;
     if (op0 <= 0xC1) {
@@ -834,6 +1171,13 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
       d.imm = 1;
     }
     d.imm &= (d.width == 64) ? 0x3F : 0x1F;
+    if (sub < 2) {
+      // ROL / ROR: CF always (once the count is non-zero), OF for count 1.
+      d.kind = Kind::RotImm;
+      d.alu_op = sub;
+      d.flags_written = d.imm ? (CpuContext::FLAG_CF | (d.imm == 1 ? CpuContext::FLAG_OF : 0)) : 0;
+      return finish();
+    }
     d.kind = Kind::ShiftImm;
     d.alu_op = (sub == 6) ? 4 : sub; // SAL == SHL
     d.flags_written = d.imm ? FLAGS_ARITH : 0;
@@ -845,6 +1189,13 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     if (!modrm())
       return false;
     const u8 sub = d.m.reg & 7;
+    if (op0 == 0xFF && (sub == 2 || sub == 4)) { // CALL / JMP r/m64
+      if (p.opsize16)
+        return false;
+      d.kind = sub == 2 ? Kind::CallInd : Kind::JmpInd;
+      d.width = 64;
+      return finish();
+    }
     if (op0 == 0xFF && sub == 6) {
       if (p.opsize16) // the interpreter always pushes 8 bytes
         return false;
@@ -879,6 +1230,20 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     if (p.opsize16 || !imm(op0 == 0x6A ? 1 : 4))
       return false;
     d.kind = Kind::PushImm;
+    return finish();
+  }
+
+  // CALL rel32 / RET (66-prefixed forms are left to the interpreter)
+  if (op0 == 0xE8 && !p.opsize16) {
+    if (!imm(4))
+      return false;
+    d.kind = Kind::CallRel;
+    finish();
+    d.target = rip + d.len + d.imm;
+    return true;
+  }
+  if (op0 == 0xC3 && !p.opsize16) {
+    d.kind = Kind::Ret;
     return finish();
   }
 
@@ -938,6 +1303,16 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
       d.reg = op1 & 0x0F;
       d.width = 8;
       d.flags_read = FLAGS_ARITH;
+      return finish();
+    }
+
+    // IMUL r, r/m (32/64-bit)
+    if (op1 == 0xAF && op_bits != 16) {
+      if (!modrm())
+        return false;
+      d.kind = Kind::Imul;
+      d.width = op_bits;
+      d.flags_written = CpuContext::FLAG_CF | CpuContext::FLAG_OF;
       return finish();
     }
 
@@ -1088,6 +1463,98 @@ public:
       m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
       store_gpr(d.reg, 64, 0); // after RSP, so POP RSP keeps the popped value
       break;
+    case Kind::ShiftCl:
+      emit_shift_cl(d, flags_needed);
+      break;
+    case Kind::RotImm:
+      emit_rotate(d, flags_needed);
+      break;
+    case Kind::Imul:
+      emit_imul(d, flags_needed);
+      break;
+    case Kind::Neg:
+      m_e.movz(true, 0, 0);
+      load_rm(1, w);
+      emit_alu(ALU_SUB, w, d.flags_written, flags_needed);
+      store_rm(0, w);
+      break;
+    case Kind::Not:
+      load_rm(0, w);
+      m_e.mov_imm64(1, truncate(~0ULL, w));
+      m_e.eor_reg(0, 0, 1);
+      store_rm(0, w);
+      break;
+    case Kind::SignExt:
+      if (d.reg == 0) { // CWDE / CDQE
+        load_gpr(0, 0, w / 2);
+        m_e.sxt(true, 0, 0, static_cast<u8>(w / 2));
+        store_gpr(0, w, 0);
+      } else {          // CDQ / CQO
+        load_gpr(0, 0, w);
+        if (w == 32)
+          m_e.sxt(true, 0, 0, 32);
+        m_e.asr_imm(true, 0, 0, 63);
+        store_gpr(2, w, 0);
+      }
+      break;
+    case Kind::Bextr:
+      emit_bextr(d, flags_needed);
+      break;
+    case Kind::ShiftX: {
+      const bool sf = w == 64;
+      load_rm(0, w);
+      load_gpr(1, d.vex_vvvv, w); // the count is masked by the shift itself
+      if (d.alu_op == 1)
+        m_e.lslv(sf, 0, 0, 1);
+      else if (d.alu_op == 2)
+        m_e.asrv(sf, 0, 0, 1);
+      else
+        m_e.lsrv(sf, 0, 0, 1);
+      store_gpr(d.m.reg, w, 0);
+      break;
+    }
+    case Kind::Andn: {
+      const bool sf = w == 64;
+      load_rm(0, w);
+      load_gpr(1, d.vex_vvvv, w);
+      m_e.bic_shifted(sf, 0, 0, 1); // rm & ~src1
+      if (flags_needed) {
+        m_e.ands_shifted(sf, 31, 0, 0);
+        emit_flags(false, d.flags_written, 0);
+      }
+      store_gpr(d.m.reg, w, 0);
+      break;
+    }
+    case Kind::Sse:
+      emit_sse(d, flags_needed);
+      break;
+    case Kind::CallRel:
+    case Kind::CallInd:
+      if (d.kind == Kind::CallInd)
+        load_rm(12, 64); // target, read before RSP moves
+      m_e.ldr_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      m_e.sub_imm(R_EA, R_EA, 8);
+      emit_bounds_check();
+      m_e.mov_imm64(0, d.rip + d.len);
+      m_e.str_x_idx(0, R_GBASE, R_EA);
+      m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      break;
+    case Kind::JmpInd:
+      load_rm(12, 64);
+      break;
+    case Kind::Div:
+      emit_div(d);
+      break;
+    case Kind::Vec:
+      emit_vec(d);
+      break;
+    case Kind::Ret:
+      m_e.ldr_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      emit_bounds_check();
+      m_e.ldr_x_idx(12, R_GBASE, R_EA);
+      m_e.add_imm(R_EA, R_EA, 8);
+      m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      break;
     }
   }
 
@@ -1098,6 +1565,7 @@ public:
       m_e.mov_imm64(0, x.rip);
       m_e.str_reg(0, R_CTX, offsetof(CpuContext, rip));
       m_e.mov_imm64(0, x.retired);
+      m_e.add_reg(0, 0, 22); // plus what chained blocks before this one retired
       m_e.emit_epilogue();
     }
     m_exits.clear();
@@ -1269,6 +1737,17 @@ private:
     case ALU_ADD:
       m_e.adds_shifted(sf, 0, 0, 1, Arm64Emitter::SHIFT_LSL, sh);
       break;
+    case 2:   // ADC (32/64-bit only): ARM C = x86 CF, then ADCS
+    case 3: { // SBB: ARM C = !CF (ARM borrows on C clear), then SBCS
+      m_e.ldr_reg(2, R_CTX, offsetof(CpuContext, rflags));
+      m_e.ubfx(true, 2, 2, 0, 1);
+      if (op == 3)
+        m_e.emit(0xd2400042u); // eor x2, x2, #1
+      m_e.cmp_imm(true, 2, 1); // C = (x2 >= 1)
+      m_e.emit((op == 2 ? 0x3a000000u : 0x7a000000u) | (sf ? 0x80000000u : 0u) | (1u << 16) | (0u << 5) | 0u);
+      borrow = op == 3;
+      break;
+    }
     case ALU_SUB:
     case ALU_CMP:
       m_e.subs_shifted(sf, 0, 0, 1, Arm64Emitter::SHIFT_LSL, sh);
@@ -1379,6 +1858,657 @@ private:
     store_rm(0, w);
   }
 
+  /// SHL/SHR/SAR r32/64, CL with the interpreter's semantics: count masked to
+  /// 5/6 bits; a zero count writes nothing but still zero-extends a 32-bit
+  /// register; otherwise ZF/SF/PF from the result, CF = last bit out, OF =
+  /// (count 1 only) SHL: MSB(result) ^ CF, SHR: MSB(source), SAR: 0.
+  void emit_shift_cl(const JitInsn &d, u64 flags_needed) {
+    const u8 w = d.width;
+    const bool sf = w == 64;
+    load_rm(0, w);
+    m_e.ldrb_imm(7, R_CTX, get_gpr_offset(1));
+    m_e.ubfx(true, 7, 7, 0, sf ? 6 : 5); // count
+    switch (d.alu_op) {
+    case 4: m_e.lslv(sf, 1, 0, 7); break;
+    case 5: m_e.lsrv(sf, 1, 0, 7); break;
+    default: m_e.asrv(sf, 1, 0, 7); break;
+    }
+    store_rm(1, w);
+    if (!flags_needed)
+      return;
+    const usize skip = m_e.pos();
+    m_e.cbz(true, 7, 0); // count 0: flags unchanged
+    // CF: SHL -> bit (w - count) of the source, SHR/SAR -> bit (count - 1).
+    if (d.alu_op == 4) {
+      m_e.movz(true, 8, w);
+      m_e.sub_reg(8, 8, 7);
+    } else {
+      m_e.sub_imm(8, 7, 1);
+    }
+    m_e.lsrv(true, 6, 0, 8);
+    m_e.ubfx(true, 6, 6, 0, 1);
+    // OF candidate (x10), applied only when count == 1.
+    if (d.alu_op == 4) {
+      m_e.ubfx(true, 10, 1, static_cast<u8>(w - 1), 1);
+      m_e.eor_reg(10, 10, 6);
+    } else if (d.alu_op == 5) {
+      m_e.ubfx(true, 10, 0, static_cast<u8>(w - 1), 1);
+    } else {
+      m_e.movz(true, 10, 0);
+    }
+    m_e.ands_shifted(sf, 31, 1, 1); // N/Z of the result, C = V = 0
+    emit_flags(false, FLAGS_ARITH, 1, 6);
+    m_e.cmp_imm(true, 7, 1);
+    m_e.csel(true, 10, 10, 31, 0 /* EQ */);
+    m_e.ldr_reg(11, R_CTX, offsetof(CpuContext, rflags));
+    m_e.bfi(true, 11, 10, 11, 1); // OF -> bit 11
+    m_e.str_reg(11, R_CTX, offsetof(CpuContext, rflags));
+    m_e.patch_b_cond(skip, m_e.pos());
+  }
+
+  /// ROL/ROR by a constant: CF = LSB (ROL) / MSB (ROR) of the result; for a
+  /// count of 1, OF = MSB ^ CF (ROL) / MSB ^ next bit (ROR). Other flags kept.
+  void emit_rotate(const JitInsn &d, u64 flags_needed) {
+    const u8 w = d.width;
+    const u8 c = static_cast<u8>(d.imm);
+    if (c == 0) {
+      if (w == 32 && d.m.is_reg) {
+        load_rm(0, 32);
+        store_rm(0, 32);
+      }
+      return;
+    }
+    const u8 n = c % w;
+    const bool rol = d.alu_op == 0;
+    load_rm(0, w);
+    if (n != 0) {
+      if (w >= 32) {
+        m_e.ror_imm(w == 64, 0, 0, rol ? static_cast<u8>(w - n) : n);
+      } else {
+        const u8 left = rol ? n : static_cast<u8>(w - n);
+        m_e.lsl_imm(false, 1, 0, left);
+        m_e.lsr_imm(false, 0, 0, static_cast<u8>(w - left));
+        m_e.orr_reg(0, 0, 1);
+        m_e.ubfx(false, 0, 0, 0, w);
+      }
+    }
+    store_rm(0, w);
+    if (!flags_needed)
+      return;
+    m_e.ldr_reg(11, R_CTX, offsetof(CpuContext, rflags));
+    m_e.ubfx(true, 6, 0, rol ? 0 : static_cast<u8>(w - 1), 1); // CF
+    m_e.bfi(true, 11, 6, 0, 1);
+    if (c == 1) {
+      m_e.ubfx(true, 10, 0, static_cast<u8>(w - 1), 1);
+      if (rol)
+        m_e.eor_reg(10, 10, 6);
+      else {
+        m_e.ubfx(true, 8, 0, static_cast<u8>(w - 2), 1);
+        m_e.eor_reg(10, 10, 8);
+      }
+      m_e.bfi(true, 11, 10, 11, 1);
+    }
+    m_e.str_reg(11, R_CTX, offsetof(CpuContext, rflags));
+  }
+
+  /// IMUL r, r/m [, imm]: the low half of the signed product; CF = OF = the
+  /// product does not fit the destination. Other flags are left alone.
+  void emit_imul(const JitInsn &d, u64 flags_needed) {
+    const u8 w = d.width;
+    load_rm(1, w);
+    if (d.rm_is_dst)
+      m_e.mov_imm64(0, d.imm);
+    else
+      load_gpr(0, d.m.reg, w);
+    if (w == 32) {
+      m_e.smull(2, 0, 1);
+      m_e.sxt(true, 3, 2, 32);
+      m_e.cmp_reg(true, 3, 2);
+    } else {
+      m_e.mul(true, 2, 0, 1);
+      m_e.smulh(3, 0, 1);
+      m_e.asr_imm(true, 4, 2, 63);
+      m_e.cmp_reg(true, 3, 4);
+    }
+    store_gpr(d.m.reg, w, 2);
+    if (!flags_needed)
+      return;
+    m_e.cset(true, 5, 1 /* NE */);
+    m_e.ldr_reg(11, R_CTX, offsetof(CpuContext, rflags));
+    m_e.bfi(true, 11, 5, 0, 1);  // CF
+    m_e.bfi(true, 11, 5, 11, 1); // OF
+    m_e.str_reg(11, R_CTX, offsetof(CpuContext, rflags));
+  }
+
+  /// BEXTR dst, src, ctrl: start = ctrl[7:0], len = ctrl[15:8]; ZF from the
+  /// result, CF = OF = 0 (the interpreter leaves SF/PF alone).
+  void emit_bextr(const JitInsn &d, u64 flags_needed) {
+    const u8 w = d.width;
+    const bool sf = w == 64;
+    load_rm(0, w);
+    load_gpr(1, d.vex_vvvv, w);
+    m_e.ubfx(true, 2, 1, 0, 8);    // start
+    m_e.ubfx(true, 3, 1, 8, 8);    // len
+    m_e.lsrv(true, 4, 0, 2);       // src >> (start & 63)
+    m_e.cmp_imm(true, 2, w);
+    m_e.csel(true, 4, 31, 4, 2 /* HS */); // start >= w -> 0
+    m_e.movz(true, 5, 1);
+    m_e.lslv(true, 5, 5, 3);
+    m_e.sub_imm(5, 5, 1);          // (1 << len) - 1
+    m_e.mov_imm64(6, ~0ULL);
+    m_e.cmp_imm(true, 3, 64);
+    m_e.csel(true, 5, 6, 5, 2 /* HS */); // len >= 64 -> all ones
+    m_e.and_reg(0, 4, 5);
+    store_gpr(d.m.reg, w, 0);
+    if (flags_needed) {
+      m_e.ands_shifted(sf, 31, 0, 0);
+      emit_flags(false, d.flags_written, 0);
+    }
+  }
+
+  /// DIV / IDIV r/m32/64 with the interpreter's results; divide by zero and a
+  /// quotient that does not fit side-exit, and the interpreter raises #DE.
+  void emit_div(const JitInsn &d) {
+    const u8 w = d.width;
+    const bool sgn = d.alu_op == 7;
+    auto exit_if = [&](u8 cond) {
+      m_exits.push_back({m_e.pos(), m_cur->rip, m_retired});
+      m_e.b_cond(cond, 0);
+    };
+    auto exit_if_zero = [&](u8 reg) {
+      m_exits.push_back({m_e.pos(), m_cur->rip, m_retired});
+      m_e.cbz(true, reg, 0);
+    };
+    load_rm(1, w); // divisor (zero-extended)
+    exit_if_zero(1);
+    if (w == 32) {
+      // x0 = EDX:EAX
+      m_e.ldr_w(0, R_CTX, get_gpr_offset(0));
+      m_e.ldr_w(2, R_CTX, get_gpr_offset(2));
+      m_e.orr_shifted(true, 0, 0, 2, Arm64Emitter::SHIFT_LSL, 32);
+      if (sgn) {
+        m_e.sxt(true, 1, 1, 32);
+        m_e.emit(0x9ac00c00u | (1u << 16) | (0u << 5) | 3u); // sdiv x3, x0, x1
+        m_e.sxt(true, 4, 3, 32);
+      } else {
+        m_e.emit(0x9ac00800u | (1u << 16) | (0u << 5) | 3u); // udiv x3, x0, x1
+        m_e.mov_w(4, 3);
+      }
+      m_e.cmp_reg(true, 4, 3);
+      exit_if(1 /* NE: quotient overflows 32 bits */);
+    } else {
+      m_e.ldr_reg(0, R_CTX, get_gpr_offset(0));
+      m_e.ldr_reg(2, R_CTX, get_gpr_offset(2));
+      // Only RDX = sign/zero extension of RAX (CQO / xor edx,edx) is handled
+      // here; a real 128-bit dividend goes to the interpreter.
+      if (sgn) {
+        m_e.asr_imm(true, 4, 0, 63);
+        m_e.cmp_reg(true, 2, 4);
+        exit_if(1);
+        // INT64_MIN / -1 overflows
+        m_e.mov_imm64(5, 0x8000000000000000ULL);
+        m_e.cmp_reg(true, 0, 5);
+        m_e.cset(true, 6, 0 /* EQ */);
+        m_e.mov_imm64(5, ~0ULL);
+        m_e.cmp_reg(true, 1, 5);
+        m_e.cset(true, 7, 0);
+        m_e.and_reg(6, 6, 7);
+        exit_if_zero(6); // placeholder: patched below to exit when x6 != 0
+        m_e.invert_last_cbz(); // cbnz: exit when non-zero
+        m_e.emit(0x9ac00c00u | (1u << 16) | (0u << 5) | 3u); // sdiv x3, x0, x1
+      } else {
+        exit_if_zero(2);
+        m_e.invert_last_cbz(); // cbnz: exit when non-zero
+        m_e.emit(0x9ac00800u | (1u << 16) | (0u << 5) | 3u); // udiv x3, x0, x1
+      }
+    }
+    // remainder = dividend - quotient * divisor
+    m_e.emit(0x9b008000u | (1u << 16) | (0u << 10) | (3u << 5) | 5u); // msub x5, x3, x1, x0
+    store_gpr(0, w, 3);
+    store_gpr(2, w, 5);
+  }
+
+  /// The VEX packed-integer / move subset (see vec_supported), with NEON.
+  /// v0 = src1 (vvvv), v1 = r/m; the result is written to the destination
+  /// and bits 255:128 are cleared, as every VEX.128 write does.
+  void emit_vec(const JitInsn &d) {
+    const u8 op = d.vex_op, pp = d.vex_pp, map = d.reg;
+    const u8 dst = d.m.reg & 15, src1 = d.vex_vvvv & 15;
+    auto v3 = [&](u32 base, u8 vd, u8 vn, u8 vm) {
+      m_e.emit(base | (static_cast<u32>(vm) << 16) | (static_cast<u32>(vn) << 5) | vd);
+    };
+    auto load_rm_q = [&](u8 v, u32 half) {
+      if (d.m.is_reg) {
+        m_e.fp_ldr(4, v, R_CTX, ymm_off(d.m.rm) + half);
+      } else if (half == 0) {
+        m_e.fp_ldr_idx(4, v, R_GBASE, R_EA);
+      } else {
+        m_e.add_imm(10, R_EA, half);
+        m_e.fp_ldr_idx(4, v, R_GBASE, 10);
+      }
+    };
+    auto store_dst = [&](u8 v) {
+      m_e.fp_str(4, v, R_CTX, ymm_off(dst));
+      zero_upper(dst);
+    };
+
+    if (map == 1) {
+      const bool load = op == 0x6F || op == 0x10 || op == 0x28;
+      const bool store = op == 0x7F || op == 0x11 || op == 0x29;
+      if (load || store) { // full-register moves, 128 or 256-bit
+        const u32 bytes = d.vex_l ? 32 : 16;
+        if (!d.m.is_reg)
+          emit_bounds_check_wide(bytes);
+        for (u32 half = 0; half < bytes; half += 16) {
+          if (load) {
+            load_rm_q(0, half);
+            m_e.fp_str(4, 0, R_CTX, ymm_off(dst) + half);
+          } else {
+            m_e.fp_ldr(4, 0, R_CTX, ymm_off(dst) + half);
+            if (d.m.is_reg) {
+              m_e.fp_str(4, 0, R_CTX, ymm_off(d.m.rm) + half);
+            } else if (half == 0) {
+              m_e.fp_str_idx(4, 0, R_GBASE, R_EA);
+            } else {
+              m_e.add_imm(10, R_EA, half);
+              m_e.fp_str_idx(4, 0, R_GBASE, 10);
+            }
+          }
+        }
+        if (!d.vex_l) {
+          if (load)
+            zero_upper(dst);
+          else if (d.m.is_reg)
+            zero_upper(d.m.rm);
+        }
+        return;
+      }
+      const bool q64 = d.width == 64;
+      switch (op) {
+      case 0x6E: // VMOVD/VMOVQ xmm, r/m
+        load_rm(0, q64 ? 64 : 32);
+        m_e.fmov_from_gpr(q64, 0, 0); // zeroes the rest of v0
+        store_dst(0);
+        return;
+      case 0x7E:
+        if (pp == 1) { // VMOVD/VMOVQ r/m, xmm
+          m_e.fp_ldr(q64 ? 3 : 2, 0, R_CTX, ymm_off(dst));
+          m_e.fmov_to_gpr(q64, 0, 0);
+          store_rm(0, q64 ? 64 : 32);
+        } else {       // VMOVQ xmm, xmm/m64
+          if (d.m.is_reg)
+            m_e.fp_ldr(3, 0, R_CTX, ymm_off(d.m.rm));
+          else
+            m_e.fp_ldr_idx(3, 0, R_GBASE, R_EA);
+          store_dst(0);
+        }
+        return;
+      case 0xD6: // VMOVQ xmm/m64, xmm
+        m_e.fp_ldr(3, 0, R_CTX, ymm_off(dst));
+        if (d.m.is_reg) {
+          m_e.fp_str(4, 0, R_CTX, ymm_off(d.m.rm));
+          zero_upper(d.m.rm);
+        } else {
+          m_e.fp_str_idx(3, 0, R_GBASE, R_EA);
+        }
+        return;
+      case 0x70: { // VPSHUFD (66) / VPSHUFHW (F3) / VPSHUFLW (F2)
+        if (!d.m.is_reg)
+          emit_bounds_check_wide(16);
+        load_rm_q(1, 0);
+        if (pp == 1) {
+          for (u32 i = 0; i < 4; ++i) {
+            const u32 j = (d.imm >> (2 * i)) & 3;
+            m_e.emit(0x6e000400u | (((i << 3) | 4u) << 16) | ((j << 2) << 11) | (1u << 5) | 0u);
+          }
+        } else {
+          // INS Vd.H[i], Vn.H[j]: imm5 = i:010, imm4 = j:0
+          const u32 base = pp == 2 ? 4 : 0; // the shuffled half
+          v3(0x4ea01c00u, 0, 1, 1);         // mov v0, v1 (keeps the other half)
+          for (u32 i = 0; i < 4; ++i) {
+            const u32 j = base + ((d.imm >> (2 * i)) & 3);
+            m_e.emit(0x6e000400u | ((((base + i) << 2) | 2u) << 16) | ((j << 1) << 11) | (1u << 5) | 0u);
+          }
+        }
+        store_dst(0);
+        return;
+      }
+      case 0x71: case 0x72: case 0x73: { // shifts by immediate (dest = vvvv)
+        const u32 esize = op == 0x71 ? 16 : op == 0x72 ? 32 : 64;
+        const u32 sub = d.m.reg & 7;
+        const u32 sh = static_cast<u32>(d.imm);
+        m_e.fp_ldr(4, 0, R_CTX, ymm_off(d.m.rm));
+        if (sh == 0) {
+          // unchanged
+        } else if (sub == 6) { // left
+          if (sh >= esize)
+            m_e.eor_v16(0, 0, 0);
+          else
+            m_e.emit(0x4f005400u | ((esize + sh) << 16) | (0u << 5) | 0u);
+        } else {               // 2: logical right, 4: arithmetic right
+          if (sub == 2 && sh >= esize) {
+            m_e.eor_v16(0, 0, 0);
+          } else {
+            const u32 s = std::min(sh, esize);
+            m_e.emit((sub == 2 ? 0x6f000400u : 0x4f000400u) | ((2 * esize - s) << 16) | (0u << 5) | 0u);
+          }
+        }
+        m_e.fp_str(4, 0, R_CTX, ymm_off(src1));
+        zero_upper(src1);
+        return;
+      }
+      default:
+        break;
+      }
+    }
+
+    if (map == 2 && ((op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35))) {
+      // VPMOVSX / VPMOVZX: widen the low elements of r/m. kind: 0 BW, 1 BD,
+      // 2 BQ, 3 WD, 4 WQ, 5 DQ; each step doubles the element size.
+      static constexpr u8 kFrom[6] = {8, 8, 8, 16, 16, 32};
+      static constexpr u8 kSteps[6] = {1, 2, 3, 1, 2, 1};
+      const u8 kind = op & 0x0F;
+      const u32 out = d.vex_l ? 32 : 16, in = out >> kSteps[kind];
+      const bool sgn = op < 0x30;
+      auto widen = [&](u8 vd, u8 vn, u32 esize, bool upper) {
+        m_e.emit((sgn ? 0x0f00a400u : 0x2f00a400u) | (upper ? 0x40000000u : 0u) | ((esize / 8) << 19) |
+                 (static_cast<u32>(vn) << 5) | vd);
+      };
+      const u8 lg = in == 16 ? 4 : in == 8 ? 3 : 2;
+      if (d.m.is_reg) {
+        m_e.fp_ldr(lg, 1, R_CTX, ymm_off(d.m.rm));
+      } else {
+        if (in > 8)
+          emit_bounds_check_wide(in);
+        m_e.fp_ldr_idx(lg, 1, R_GBASE, R_EA);
+      }
+      u32 esize = kFrom[kind];
+      for (u8 st = 1; st < kSteps[kind]; ++st, esize *= 2)
+        widen(1, 1, esize, false);
+      widen(0, 1, esize, false);
+      if (d.vex_l) {
+        widen(2, 1, esize, true);
+        m_e.fp_str(4, 0, R_CTX, ymm_off(dst));
+        m_e.fp_str(4, 2, R_CTX, ymm_off(dst) + 16);
+      } else {
+        store_dst(0);
+      }
+      return;
+    }
+
+    if (map == 3 && (op == 0x18 || op == 0x19)) { // VINSERTF128 / VEXTRACTF128
+      const u32 lane = (d.imm & 1) * 16;
+      if (!d.m.is_reg)
+        emit_bounds_check_wide(16);
+      if (op == 0x18) {
+        m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1));
+        m_e.fp_ldr(4, 1, R_CTX, ymm_off(src1) + 16);
+        load_rm_q(2, 0);
+        m_e.fp_str(4, lane ? 0 : 2, R_CTX, ymm_off(dst));
+        m_e.fp_str(4, lane ? 2 : 1, R_CTX, ymm_off(dst) + 16);
+      } else {
+        m_e.fp_ldr(4, 0, R_CTX, ymm_off(dst) + lane);
+        if (d.m.is_reg) {
+          m_e.fp_str(4, 0, R_CTX, ymm_off(d.m.rm));
+          zero_upper(d.m.rm);
+        } else {
+          m_e.fp_str_idx(4, 0, R_GBASE, R_EA);
+        }
+      }
+      return;
+    }
+
+    if (map == 3 && (op == 0x4A || op == 0x4B)) { // VBLENDVPS / VBLENDVPD
+      // dest = src2 where the mask element's sign bit is set, else src1.
+      const u8 mask = static_cast<u8>((d.imm >> 4) & 15);
+      const u32 halves = d.vex_l ? 2 : 1;
+      if (!d.m.is_reg)
+        emit_bounds_check_wide(16 * halves);
+      for (u32 h = 0; h < halves; ++h) {
+        m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1) + 16 * h);
+        load_rm_q(1, 16 * h);
+        m_e.fp_ldr(4, 2, R_CTX, ymm_off(mask) + 16 * h);
+        // sshr v2, v2, #esize-1: all ones where the sign bit is set
+        m_e.emit(op == 0x4A ? 0x4f210442u : 0x4f410442u);
+        v3(0x6ea01c00u, 0, 1, 2); // bit v0, v1, v2
+        m_e.fp_str(4, 0, R_CTX, ymm_off(dst) + 16 * h);
+      }
+      if (!d.vex_l)
+        zero_upper(dst);
+      return;
+    }
+
+    if (map == 1 && d.vex_l) { // 256-bit VANDPS / VANDNPS / VORPS (and PD)
+      if (!d.m.is_reg)
+        emit_bounds_check_wide(32);
+      for (u32 h = 0; h < 2; ++h) {
+        m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1) + 16 * h);
+        load_rm_q(1, 16 * h);
+        if (op == 0x54)
+          v3(0x4e201c00u, 0, 0, 1);
+        else if (op == 0x56)
+          v3(0x4ea01c00u, 0, 0, 1);
+        else
+          v3(0x4e601c00u, 0, 1, 0);
+        m_e.fp_str(4, 0, R_CTX, ymm_off(dst) + 16 * h);
+      }
+      return;
+    }
+
+    // Two-source ops: dest = src1 OP r/m (128-bit).
+    if (!d.m.is_reg)
+      emit_bounds_check_wide(16);
+    m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1));
+    load_rm_q(1, 0);
+    if (map == 3) { // VPBLENDW: word i from r/m when imm bit i is set
+      u64 lo = 0, hi = 0;
+      for (u32 i = 0; i < 8; ++i)
+        if (d.imm & (1u << i))
+          (i < 4 ? lo : hi) |= 0xFFFFULL << ((i & 3) * 16);
+      m_e.mov_imm64(2, lo);
+      m_e.mov_imm64(3, hi);
+      m_e.fmov_from_gpr(true, 2, 2);
+      m_e.emit(0x4e181c62u); // ins v2.d[1], x3
+      v3(0x6ea01c00u, 0, 1, 2); // bit v0, v1, v2
+      store_dst(0);
+      return;
+    }
+    if (map == 1 && (op == 0x63 || op == 0x67 || op == 0x6B)) {
+      // Saturating packs: low half from src1, high half from r/m.
+      const u32 narrow = op == 0x67 ? 0x2e212800u   // sqxtun .8b, .8h
+                       : op == 0x63 ? 0x0e214800u   // sqxtn  .8b, .8h
+                                    : 0x0e614800u;  // sqxtn  .4h, .4s
+      m_e.emit(narrow | (0u << 5) | 2u);
+      m_e.emit(narrow | 0x40000000u | (1u << 5) | 2u);
+      store_dst(2);
+      return;
+    }
+    if (map == 2 && op == 0x2B) { // VPACKUSDW: sqxtun .4h / sqxtun2 .8h from .4s
+      m_e.emit(0x2e612800u | (0u << 5) | 2u);
+      m_e.emit(0x6e612800u | (1u << 5) | 2u);
+      store_dst(2);
+      return;
+    }
+    if (map == 2) {
+      if (op == 0x00) { // VPSHUFB: index bit 7 -> 0, else src1[idx & 15]
+        m_e.emit(0x4f00e400u | (4u << 16) | (0x0fu << 5) | 2u); // movi v2.16b, #0x8f
+        v3(0x4e201c00u, 1, 1, 2);                              // and v1, v1, v2
+        v3(0x4e000000u, 0, 0, 1);                              // tbl v0, {v0}, v1
+      } else {          // VPMULLD
+        v3(0x4ea09c00u, 0, 0, 1);
+      }
+      store_dst(0);
+      return;
+    }
+    u32 base = 0;
+    bool swap = false; // operands as (r/m, src1)
+    switch (op) {
+    case 0xFC: base = 0x4e208400u; break; // add .16b
+    case 0xFD: base = 0x4e608400u; break; // add .8h
+    case 0xFE: base = 0x4ea08400u; break; // add .4s
+    case 0xD4: base = 0x4ee08400u; break; // add .2d
+    case 0xF8: base = 0x6e208400u; break; // sub .16b
+    case 0xF9: base = 0x6e608400u; break; // sub .8h
+    case 0xFA: base = 0x6ea08400u; break; // sub .4s
+    case 0xFB: base = 0x6ee08400u; break; // sub .2d
+    case 0xDB: case 0x54: base = 0x4e201c00u; break; // and
+    case 0xEB: case 0x56: base = 0x4ea01c00u; break; // orr
+    case 0xDF: case 0x55: base = 0x4e601c00u; swap = true; break; // ~src1 & rm = bic(rm, src1)
+    case 0xD5: base = 0x4e609c00u; break; // mul .8h
+    case 0x60: base = 0x4e003800u; break; // zip1 .16b
+    case 0x61: base = 0x4e403800u; break; // zip1 .8h
+    case 0x62: base = 0x4e803800u; break; // zip1 .4s
+    case 0x6C: base = 0x4ec03800u; break; // zip1 .2d
+    case 0x68: base = 0x4e007800u; break; // zip2 .16b
+    case 0x69: base = 0x4e407800u; break; // zip2 .8h
+    case 0x6A: base = 0x4e807800u; break; // zip2 .4s
+    case 0x6D: base = 0x4ec07800u; break; // zip2 .2d
+    default: break;
+    }
+    if (swap)
+      v3(base, 0, 1, 0);
+    else
+      v3(base, 0, 0, 1);
+    store_dst(0);
+  }
+
+  static u32 ymm_off(u8 reg) {
+    return static_cast<u32>(offsetof(CpuContext, ymm) + (reg & 15) * sizeof(CpuContext::YmmReg));
+  }
+
+  /// Zero bits 255:128 of ymm[reg] (every VEX.128 / scalar write does).
+  void zero_upper(u8 reg) {
+    m_e.str_zero(R_CTX, ymm_off(reg) + 16);
+    m_e.str_zero(R_CTX, ymm_off(reg) + 24);
+  }
+
+  /// Side exit unless [x9, x9 + bytes) lies inside guest memory (the generic
+  /// check covers 8 bytes).
+  void emit_bounds_check_wide(u32 bytes) {
+    m_e.add_imm(10, R_EA, bytes - 8);
+    m_e.cmp_reg(true, 10, R_GLIMIT);
+    m_exits.push_back({m_e.pos(), m_cur->rip, m_retired});
+    m_e.b_cond(COND_HI, 0);
+  }
+
+  /// The VEX scalar float / xor subset, with the interpreter's semantics:
+  /// scalar ops take bits 127:N from src1 (vvvv) and zero 255:128; created
+  /// NaNs are x86's negative "indefinite"; MIN/MAX return src2 unless src1
+  /// compares strictly less/greater; UCOMISS/COMISS set ZF/PF/CF and clear
+  /// OF/SF/AF.
+  void emit_sse(const JitInsn &d, u64 flags_needed) {
+    const u8 op = d.vex_op, pp = d.vex_pp;
+    const u8 dst = d.m.reg & 15, src1 = d.vex_vvvv & 15;
+    const bool dbl = pp == 3 || ((op == 0x2E || op == 0x2F) && pp == 1);
+    const u8 lg = dbl ? 3 : 2; // element size log2
+    auto load_src2 = [&](u8 v, u8 size_log2) {
+      if (d.m.is_reg)
+        m_e.fp_ldr(size_log2, v, R_CTX, ymm_off(d.m.rm));
+      else
+        m_e.fp_ldr_idx(size_log2, v, R_GBASE, R_EA);
+    };
+
+    if (op == 0x10 || op == 0x11) { // VMOVSS / VMOVSD
+      const bool load = op == 0x10;
+      if (!d.m.is_reg) {
+        if (load) {
+          m_e.fp_ldr_idx(lg, 0, R_GBASE, R_EA); // zeroes the rest of v0
+          m_e.fp_str(4, 0, R_CTX, ymm_off(dst));
+          zero_upper(dst);
+        } else {
+          m_e.fp_ldr(lg, 0, R_CTX, ymm_off(dst));
+          m_e.fp_str_idx(lg, 0, R_GBASE, R_EA);
+        }
+        return;
+      }
+      // Register form: dest = src1[127:N] : other[N-1:0].
+      const u8 to = load ? dst : static_cast<u8>(d.m.rm & 15);
+      const u8 from = load ? static_cast<u8>(d.m.rm & 15) : dst;
+      m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1));
+      m_e.fp_ldr(lg, 1, R_CTX, ymm_off(from));
+      m_e.ins_lane0(dbl, 0, 1);
+      m_e.fp_str(4, 0, R_CTX, ymm_off(to));
+      zero_upper(to);
+      return;
+    }
+
+    if (op == 0x57 || op == 0xEF) { // VXORPS / VXORPD / VPXOR
+      if (!d.m.is_reg)
+        emit_bounds_check_wide(16);
+      for (u8 half = 0; half < (d.vex_l ? 2 : 1); ++half) {
+        m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1) + half * 16);
+        if (d.m.is_reg)
+          m_e.fp_ldr(4, 1, R_CTX, ymm_off(d.m.rm) + half * 16);
+        else
+          m_e.fp_ldr_idx(4, 1, R_GBASE, R_EA);
+        m_e.eor_v16(0, 0, 1);
+        m_e.fp_str(4, 0, R_CTX, ymm_off(dst) + half * 16);
+      }
+      if (!d.vex_l)
+        zero_upper(dst);
+      return;
+    }
+
+    if (op == 0x2E || op == 0x2F) { // (V)UCOMISS/SD, (V)COMISS/SD
+      if (!flags_needed)
+        return;
+      m_e.fp_ldr(lg, 0, R_CTX, ymm_off(dst));
+      load_src2(1, lg);
+      m_e.fcmp(dbl, 0, 1);
+      m_e.cset(true, 3, 11 /* LT: less or unordered */);
+      m_e.cset(true, 4, 0 /* EQ */);
+      m_e.cset(true, 5, 6 /* VS: unordered */);
+      m_e.orr_reg(4, 4, 5);
+      m_e.bfi(true, 3, 5, 2, 1); // PF
+      m_e.bfi(true, 3, 4, 6, 1); // ZF
+      m_e.ldr_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      m_e.mov_imm64(5, FLAGS_ARITH | CpuContext::FLAG_AF);
+      m_e.bic_shifted(true, 4, 4, 5);
+      m_e.orr_reg(4, 4, 3);
+      m_e.str_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      return;
+    }
+
+    m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1)); // v0 = src1
+    if (op == 0x2A) {                         // VCVTSI2SS / VCVTSI2SD
+      load_rm(1, d.width);
+      m_e.scvtf(dbl, d.width == 64, 2, 1);
+    } else {
+      load_src2(1, lg);
+      switch (op) {
+      case 0x5D: // MIN: src1 < src2 ? src1 : src2
+        m_e.fcmp(dbl, 0, 1);
+        m_e.fcsel(dbl, 2, 0, 1, 4 /* MI */);
+        break;
+      case 0x5F: // MAX: src1 > src2 ? src1 : src2
+        m_e.fcmp(dbl, 0, 1);
+        m_e.fcsel(dbl, 2, 0, 1, 12 /* GT */);
+        break;
+      default: {
+        const u8 fop = op == 0x58 ? Arm64Emitter::FP_ADD
+                     : op == 0x59 ? Arm64Emitter::FP_MUL
+                     : op == 0x5C ? Arm64Emitter::FP_SUB : Arm64Emitter::FP_DIV;
+        m_e.fp_arith(dbl, fop, 2, 0, 1);
+        // A NaN created from two non-NaN inputs is x86's negative QNaN.
+        m_e.fcmp(dbl, 0, 1);
+        m_e.cset(true, 3, 7 /* VC: inputs ordered */);
+        m_e.fcmp(dbl, 2, 2);
+        m_e.cset(true, 4, 6 /* VS: result NaN */);
+        m_e.and_reg(3, 3, 4);
+        m_e.fmov_to_gpr(dbl, 5, 2);
+        m_e.mov_imm64(6, dbl ? 0xFFF8000000000000ULL : 0xFFC00000ULL);
+        m_e.cmp_imm(true, 3, 0);
+        m_e.csel(true, 5, 6, 5, 1 /* NE */);
+        m_e.fmov_from_gpr(dbl, 2, 5);
+        break;
+      }
+      }
+    }
+    m_e.ins_lane0(dbl, 0, 2);
+    m_e.fp_str(4, 0, R_CTX, ymm_off(dst));
+    zero_upper(dst);
+  }
+
   /// Convert NZCV (plus the parity of the low byte of `res`) to x86 flags and
   /// merge the bits selected by `mask` into ctx.rflags. CF comes from the C
   /// flag, or from bit 0 of register `cf_reg` when given.
@@ -1425,6 +2555,32 @@ JitCompiler::JitCompiler(usize code_cache_size)
   if (m_code_buffer == MAP_FAILED) {
     m_code_buffer = nullptr;
   }
+  m_chain.resize(kChainSlots);
+  chain_clear();
+}
+
+void JitCompiler::add_chain_barrier(GuestAddr rip) {
+  std::unique_lock lock(m_cache_mutex);
+  m_barriers.insert(rip);
+}
+
+void JitCompiler::chain_clear() {
+  for (ChainSlot &s : m_chain) {
+    __atomic_store_n(&s.rip, ~0ULL, __ATOMIC_RELAXED);
+    __atomic_store_n(&s.entry, 0ULL, __ATOMIC_RELAXED);
+  }
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+// Readers load {rip, entry} with one atomic LDP; invalidate the slot before
+// changing its entry so no reader can pair a new entry with an old rip.
+void JitCompiler::chain_insert(GuestAddr rip, const void *entry) {
+  ChainSlot &s = m_chain[(rip ^ (rip >> 16)) & (kChainSlots - 1)];
+  __atomic_store_n(&s.rip, ~0ULL, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  __atomic_store_n(&s.entry, reinterpret_cast<u64>(entry), __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  __atomic_store_n(&s.rip, rip, __ATOMIC_RELEASE);
 }
 
 JitCompiler::~JitCompiler() {
@@ -1441,7 +2597,8 @@ JitCompiler::JitCompiler(JitCompiler &&other) noexcept
       m_total_invocations(other.m_total_invocations),
       m_blocks(std::move(other.m_blocks)),
       m_metrics(std::move(other.m_metrics)),
-      m_failed(std::move(other.m_failed)) {
+      m_failed(std::move(other.m_failed)),
+      m_chain(std::move(other.m_chain)) {
   other.m_code_buffer = nullptr;
   other.m_code_buffer_size = 0;
   other.m_code_buffer_offset = 0;
@@ -1461,6 +2618,7 @@ JitCompiler &JitCompiler::operator=(JitCompiler &&other) noexcept {
     m_blocks = std::move(other.m_blocks);
     m_metrics = std::move(other.m_metrics);
     m_failed = std::move(other.m_failed);
+    m_chain = std::move(other.m_chain);
 
     other.m_code_buffer = nullptr;
     other.m_code_buffer_size = 0;
@@ -1519,6 +2677,7 @@ void JitCompiler::clear_cache() {
   m_blocks.clear();
   m_metrics.clear();
   m_failed.clear();
+  chain_clear();
   m_code_buffer_offset = 0;
   m_epoch.store(g_jit_epoch.fetch_add(1, std::memory_order_relaxed), std::memory_order_release);
 }
@@ -1575,6 +2734,8 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
 
   while (!block_ended && insns.size() < MAX_BLOCK_INSNS) {
     insn_rip = current_rip;
+    if (current_rip != guest_rip && m_barriers.count(current_rip) != 0)
+      break; // a barrier starts its own block
     if (!memory.is_valid_address(current_rip, 1)) {
       break;
     }
@@ -1604,8 +2765,12 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
       block_ended = true;
       break;
     }
-    if (insn.kind == Kind::Jmp) {
+    if (insn.kind == Kind::Jmp || insn.kind == Kind::CallRel) {
       current_rip = insn.target;
+      block_ended = true;
+      break;
+    }
+    if (insn.kind == Kind::Ret || insn.kind == Kind::JmpInd || insn.kind == Kind::CallInd) {
       block_ended = true;
       break;
     }
@@ -1640,6 +2805,8 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
   // Pass 3: emit.
   m_emitter.clear();
   m_emitter.emit_prologue();
+  m_emitter.mov_imm64(24, reinterpret_cast<u64>(m_chain.data()));
+  const usize chain_entry_pos = m_emitter.pos(); // chained blocks enter here
   BlockTranslator translator(m_emitter);
   for (usize i = 0; i < insns.size(); ++i) {
     translator.emit(insns[i], flags_needed[i], i);
@@ -1647,14 +2814,33 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
 
   const usize instructions = insns.size();
 
-  // Always update RIP at end of block; return the retired-instruction count
-  if (insns.back().kind == Kind::Jcc) {
+  // Always update RIP at end of block.
+  const Kind last = insns.back().kind;
+  if (last == Kind::Jcc) {
     emit_jcc_rip(m_emitter, insns.back());
+  } else if (last == Kind::Ret || last == Kind::JmpInd || last == Kind::CallInd) {
+    m_emitter.mov_reg(0, 12);
   } else {
     m_emitter.mov_imm64(0, current_rip);
   }
   m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
-  m_emitter.mov_imm64(0, instructions);
+  // x22 += retired; while under the chain budget (x23), continue straight
+  // into the next block if it is compiled: chain[(rip ^ rip >> 16) & 0xffff].
+  m_emitter.add_imm(22, 22, static_cast<u32>(instructions));
+  m_emitter.cmp_reg(true, 22, 23);
+  const usize to_return = m_emitter.pos();
+  m_emitter.b_cond(2 /* HS */, 0);
+  m_emitter.eor_shifted(true, 1, 0, 0, Arm64Emitter::SHIFT_LSR, 16);
+  m_emitter.ubfx(true, 1, 1, 0, 16);
+  m_emitter.add_shifted(true, 1, 24, 1, Arm64Emitter::SHIFT_LSL, 4);
+  m_emitter.emit(0xa9400c22); // ldp x2, x3, [x1]
+  m_emitter.cmp_reg(true, 2, 0);
+  const usize miss = m_emitter.pos();
+  m_emitter.b_cond(1 /* NE */, 0);
+  m_emitter.emit(0xd61f0060); // br x3
+  m_emitter.patch_b_cond(to_return, m_emitter.pos());
+  m_emitter.patch_b_cond(miss, m_emitter.pos());
+  m_emitter.mov_reg(0, 22);
   m_emitter.emit_epilogue();
 
   translator.emit_side_exits();
@@ -1669,6 +2855,8 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
 
   auto fn = reinterpret_cast<JittedBlockFunc>(code_ptr);
   m_blocks[guest_rip] = fn;
+  if (m_barriers.count(guest_rip) == 0)
+    chain_insert(guest_rip, static_cast<const u8 *>(code_ptr) + chain_entry_pos * sizeof(u32));
   m_metrics[guest_rip] = JitBlockMetrics{
       .instructions_compiled = instructions,
       .bytes_emitted = code_size,
@@ -1701,7 +2889,7 @@ thread_local ThreadBlockCache t_block_cache;
 } // namespace
 
 bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
-                                usize *retired) {
+                                usize *retired, usize chain_budget) {
   if (retired)
     *retired = 0;
   JittedBlockFunc fn = nullptr;
@@ -1770,7 +2958,7 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
   // Compiled code stores to guest memory: the MemoryManager is only const
   // because compilation does not modify it.
   u8 *guest_base = const_cast<u8 *>(memory.base_address());
-  const u64 n = fn(&ctx, guest_base, memory.total_size());
+  const u64 n = fn(&ctx, guest_base, memory.total_size(), chain_budget);
   if (retired)
     *retired = static_cast<usize>(n);
   // A block that side-exited on its first instruction made no progress: the
