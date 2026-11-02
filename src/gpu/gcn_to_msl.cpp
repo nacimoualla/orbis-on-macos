@@ -200,6 +200,39 @@ static inline uint gcn_sel(uint4 r, uint sel, bool is_int) {
     }
 }
 
+// Pack one component for a format store: unorm/snorm from float, half for
+// 16-bit float, raw bits otherwise (uint/sint and 32-bit float).
+static inline uint gcn_pack(uint x, uint bits, uint nfmt) {
+    const uint mask = bits >= 32u ? 0xffffffffu : ((1u << bits) - 1u);
+    switch (nfmt) {
+    case 0u: return uint(rint(clamp(as_type<float>(x), 0.0f, 1.0f) * float(mask))) & mask;
+    case 1u: return uint(int(rint(clamp(as_type<float>(x), -1.0f, 1.0f) * float(mask >> 1)))) & mask;
+    case 7u: return bits == 16u ? uint(as_type<ushort>(half(as_type<float>(x)))) : (x & mask);
+    default: return x & mask;
+    }
+}
+
+template <typename ConstsT>
+static inline void gcn_store_format(device uchar* mem, constant ConstsT& dc, ulong a, uint dfmt, uint nfmt,
+                                    uint4 v) {
+    switch (dfmt) {
+    case 1u: gcn_st8(mem, dc, a, gcn_pack(v.x, 8u, nfmt)); break;
+    case 2u: gcn_st16(mem, dc, a, gcn_pack(v.x, 16u, nfmt)); break;
+    case 3u: gcn_st16(mem, dc, a, gcn_pack(v.x, 8u, nfmt) | (gcn_pack(v.y, 8u, nfmt) << 8)); break;
+    case 4u: gcn_st32(mem, dc, a, v.x); break;
+    case 5u: gcn_st32(mem, dc, a, gcn_pack(v.x, 16u, nfmt) | (gcn_pack(v.y, 16u, nfmt) << 16)); break;
+    case 10u: gcn_st32(mem, dc, a, gcn_pack(v.x, 8u, nfmt) | (gcn_pack(v.y, 8u, nfmt) << 8) |
+                                   (gcn_pack(v.z, 8u, nfmt) << 16) | (gcn_pack(v.w, 8u, nfmt) << 24)); break;
+    case 11u: gcn_st32(mem, dc, a, v.x); gcn_st32(mem, dc, a + 4, v.y); break;
+    case 12u: gcn_st32(mem, dc, a, gcn_pack(v.x, 16u, nfmt) | (gcn_pack(v.y, 16u, nfmt) << 16));
+              gcn_st32(mem, dc, a + 4, gcn_pack(v.z, 16u, nfmt) | (gcn_pack(v.w, 16u, nfmt) << 16)); break;
+    case 13u: gcn_st32(mem, dc, a, v.x); gcn_st32(mem, dc, a + 4, v.y); gcn_st32(mem, dc, a + 8, v.z); break;
+    case 14u: gcn_st32(mem, dc, a, v.x); gcn_st32(mem, dc, a + 4, v.y);
+              gcn_st32(mem, dc, a + 8, v.z); gcn_st32(mem, dc, a + 12, v.w); break;
+    default: break;
+    }
+}
+
 // MUBUF/MTBUF address + bounds check. Returns false for out-of-range accesses
 // (GCN returns zero for those).
 static inline bool gcn_buf_addr(uint w0, uint w1, uint w2, uint index, uint offset, thread ulong& a) {
@@ -726,7 +759,9 @@ void Emitter::emit_smrd(const Instruction& i) {
 void Emitter::emit_buffer(const Instruction& i) {
     const bool tbuf = i.enc == Encoding::MTBUF;
     const bool is_store = tbuf ? (i.op >= 4) : ((i.op >= 4 && i.op <= 7) || i.op >= 24);
-    if (is_store && tbuf) { fail("unsupported " + mnemonic(i) + " (stores)"); return; }
+    // Format stores: tbuffer_store_format_* (MTBUF) and buffer_store_format_*
+    // (MUBUF 4..7) convert through the descriptor's (or instruction's) format.
+    const bool format_store = is_store && (tbuf || i.op <= 7);
     const u32 r = i.srsrc;
     track_s(r); track_s(r + 1); track_s(r + 2); track_s(r + 3);
     std::string idx = "0u", off = "0u";
@@ -737,6 +772,17 @@ void Emitter::emit_buffer(const Instruction& i) {
     body << "    { ulong a_ = 0ul; bool in_ = gcn_buf_addr(" << w0 << ", " << w1 << ", " << w2 << ", " << idx << ", "
          << off << " + " << usrc(i.soffset) << " + " << i.offset << "u, a_);\n";
     const std::string g = exec_guard();
+    if (format_store) {
+        const u32 comps = (i.op & 3) + 1;
+        const std::string dfmt = tbuf ? std::to_string(i.dfmt) + "u" : "((" + w3 + " >> 15) & 0xfu)";
+        const std::string nfmt = tbuf ? std::to_string(i.nfmt) + "u" : "((" + w3 + " >> 12) & 0x7u)";
+        std::string v4 = "uint4(";
+        for (u32 c = 0; c < 4; ++c) v4 += (c ? ", " : "") + (c < comps ? vreg(i.dst + c) : std::string("0u"));
+        v4 += ")";
+        body << "      " << g << "if (in_) gcn_store_format(mem, dc, a_, " << dfmt << ", " << nfmt << ", " << v4
+             << ");\n    }\n";
+        return;
+    }
     if (is_store) {
         switch (i.op) {
         case 24: body << "      " << g << "if (in_) gcn_st8(mem, dc, a_, " << vreg(i.dst) << ");\n"; break;
@@ -792,21 +838,36 @@ void Emitter::emit_buffer(const Instruction& i) {
 
 void Emitter::emit_mimg(const Instruction& i) {
     const bool is_load = i.op == 0x00 || i.op == 0x01;
+    const bool is_store = i.op == 0x08 || i.op == 0x09;   // image_store / image_store_mip
     const bool is_sample = i.op == 0x20 || i.op == 0x24 || i.op == 0x25 || i.op == 0x27;
-    if (!is_load && !is_sample) { fail("unsupported " + mnemonic(i)); return; }
+    if (!is_load && !is_sample && !is_store) { fail("unsupported " + mnemonic(i)); return; }
     if (i.da) { fail("array/cube images unsupported"); return; }
     u32 slot = 0;
     bool found = false;
     for (u32 k = 0; k < images.size(); ++k) {
         if (images[k].srsrc == i.srsrc && (!is_sample || images[k].ssamp == i.ssamp) &&
-            images[k].sampled == is_sample) { slot = k; found = true; break; }
+            images[k].sampled == is_sample && images[k].storage == is_store) { slot = k; found = true; break; }
     }
     if (!found) {
         slot = static_cast<u32>(images.size());
-        images.push_back(ImageSlot{i.srsrc, is_sample ? i.ssamp : ~0u, is_sample});
+        images.push_back(ImageSlot{i.srsrc, is_sample ? i.ssamp : ~0u, is_sample, is_store});
     }
     const std::string t = "tex" + std::to_string(slot);
     const std::string g = exec_guard();
+    if (is_store) {
+        // vdata holds one VGPR per dmask bit, in component order; the rest
+        // are zero. The mip of image_store_mip is ignored: host surfaces have
+        // one level.
+        static const char* comp_zero[4] = {"0.0f", "0.0f", "0.0f", "0.0f"};
+        std::string c[4];
+        u32 src = i.dst;
+        for (u32 k = 0; k < 4; ++k) c[k] = (i.dmask & (1u << k)) ? "F(" + vreg(src++) + ")" : comp_zero[k];
+        const std::string x = vreg(i.vaddr), y = vreg(i.vaddr + 1);
+        body << "    " << g << "if (" << x << " < " << t << ".get_width() && " << y << " < " << t
+             << ".get_height()) " << t << ".write(float4(" << c[0] << ", " << c[1] << ", " << c[2] << ", " << c[3]
+             << "), uint2(" << x << ", " << y << "));\n";
+        return;
+    }
     body << "    { float4 r_;\n";
     if (is_load) {
         body << "      r_ = " << t << ".read(uint2(" << vreg(i.vaddr) << ", " << vreg(i.vaddr + 1) << ")"
@@ -984,10 +1045,16 @@ bool Emitter::run() {
     return error.empty();
 }
 
+// Storage slots (image_store) are write-only textures; the rest are read.
+const char* image_type(const ImageSlot& slot) {
+    return slot.storage ? "texture2d<float, access::write>" : "texture2d<float>";
+}
+
 std::string image_params(const std::vector<ImageSlot>& images) {
     std::string p;
     for (u32 k = 0; k < images.size(); ++k) {
-        p += ",\n    texture2d<float> tex" + std::to_string(k) + " [[texture(" + std::to_string(k) + ")]]";
+        p += ",\n    " + std::string(image_type(images[k])) + " tex" + std::to_string(k) + " [[texture(" +
+             std::to_string(k) + ")]]";
         if (images[k].sampled)
             p += ",\n    sampler smp" + std::to_string(k) + " [[sampler(" + std::to_string(k) + ")]]";
     }
@@ -1006,7 +1073,7 @@ std::string image_args(const std::vector<ImageSlot>& images) {
 std::string image_decl_args(const std::vector<ImageSlot>& images) {
     std::string p;
     for (u32 k = 0; k < images.size(); ++k) {
-        p += ", texture2d<float> tex" + std::to_string(k);
+        p += ", " + std::string(image_type(images[k])) + " tex" + std::to_string(k);
         if (images[k].sampled) p += ", sampler smp" + std::to_string(k);
     }
     return p;
@@ -1194,8 +1261,11 @@ TranslatedComputePipeline translate_compute_pipeline(const Program& cs,
         cs_vgprs = std::max(cs_vgprs, rsrc1_vgprs);
         cs_sgprs = std::max(cs_sgprs, rsrc1_sgprs);
     }
+    // COMPUTE_PGM_RSRC2.USER_SGPR (bits 1..5) is the number of user SGPRs;
+    // the workgroup ids follow them. It was doubled, so tgid landed in
+    // s[2n..] and kernels read garbage for their group position.
     if (opts.rsrc2 != 0) {
-        const u32 user_sgprs = ((opts.rsrc2 >> 1) & 0x1fu) * 2u;
+        const u32 user_sgprs = (opts.rsrc2 >> 1) & 0x1fu;
         cs_sgprs = std::max(cs_sgprs, user_sgprs);
     }
 
@@ -1222,7 +1292,7 @@ TranslatedComputePipeline translate_compute_pipeline(const Program& cs,
         m << "  s[1] = tgid.y;\n";
         m << "  s[2] = tgid.z;\n";
     } else {
-        const u32 user_sgprs = ((opts.rsrc2 >> 1) & 0x1fu) * 2u;
+        const u32 user_sgprs = (opts.rsrc2 >> 1) & 0x1fu;
         u32 s_idx = user_sgprs;
         if (opts.rsrc2 & (1u << 7)) { // TGID_X_EN
             m << "  s[" << s_idx++ << "] = tgid.x;\n";
@@ -1425,9 +1495,15 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
             break;
         }
         case Encoding::MIMG: {
+            const bool store = i.op == 0x08 || i.op == 0x09;
+            const bool sample = i.op == 0x20 || i.op == 0x24 || i.op == 0x25 || i.op == 0x27;
             for (u32 k = 0; k < slots.size(); ++k) {
                 const ImageSlot& sl = slots[k];
                 if (sl.srsrc != i.srsrc) continue;
+                // A shader can reuse the T# registers (load from one image,
+                // reload s[0:7], store to another): fill only the slot of
+                // this instruction's kind.
+                if (sl.storage != store || sl.sampled != sample) continue;
                 if (sl.sampled && sl.ssamp != i.ssamp) continue;
                 if (!need(i.srsrc, 8, "image T#")) return rs;
                 for (u32 w = 0; w < 8; ++w) rs.images[k].tsharp[w] = val[i.srsrc + w];

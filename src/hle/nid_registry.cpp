@@ -9452,6 +9452,87 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager& mem) {
             guest_abort("_Unwind_Resume: resuming an unwind, unwinder not emulated", ctx, mem);
         });
+    // __dynamic_cast(const void* sub, const __class_type_info* src,
+    //                const __class_type_info* dst, ptrdiff_t src2dst) -- Itanium
+    // C++ ABI. Unregistered, it returned NULL, so every dynamic_cast failed
+    // (Dragon Ball Xenoverse 2's movie thread hits it right after opening
+    // movie.cpk). The type_info vtables are data imports, so each type_info's
+    // vptr is the trampoline of __class_type_info / __si_class_type_info /
+    // __vmi_class_type_info plus 16; that tells the walk how to read bases.
+    register_symbol(0x84C01EF93592F664ULL, "__dynamic_cast", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr sub = ctx.rdi, dst = ctx.rdx;
+            const i64 src2dst = static_cast<i64>(ctx.rcx);
+            ctx.rax = 0;
+            DynamicLinker* linker = ps4::active_linker();
+            if (sub == 0 || dst == 0 || !linker) return;
+            static GuestAddr s_si = 0, s_vmi = 0;
+            if (!s_si) {
+                s_si = linker->get_or_create_trampoline(0xA59F565DC0A53CEFULL) + 16;  // __si_class_type_info
+                s_vmi = linker->get_or_create_trampoline(0xF41C9131DA3BCB08ULL) + 16; // __vmi_class_type_info
+            }
+            auto rd = [&](GuestAddr a) { u64 v = 0; mem.read_value(a, v); return v; };
+            auto name_of = [&](GuestAddr ti) {
+                std::string n;
+                const GuestAddr p = rd(ti + 8);
+                for (GuestSize i = 0; p && i < 512; ++i) {
+                    char c = 0;
+                    if (!mem.read_value(p + i, c) || c == 0) break;
+                    n.push_back(c);
+                }
+                return n;
+            };
+            const std::string dst_name = name_of(dst);
+            auto same = [&](GuestAddr ti) { return ti == dst || (!dst_name.empty() && name_of(ti) == dst_name); };
+
+            const GuestAddr vptr = rd(sub);
+            if (vptr == 0) return;
+            const i64 offset_to_top = static_cast<i64>(rd(vptr - 16));
+            const GuestAddr dyn_ti = rd(vptr - 8);
+            const GuestAddr whole = sub + offset_to_top;
+
+            // Every public dst subobject of the complete object.
+            std::vector<GuestAddr> hits;
+            std::function<void(GuestAddr, GuestAddr, int)> walk = [&](GuestAddr ti, GuestAddr obj, int depth) {
+                if (ti == 0 || depth > 32) return;
+                if (same(ti)) {
+                    hits.push_back(obj);
+                    return;
+                }
+                const GuestAddr kind = rd(ti);
+                if (kind == s_si) {
+                    walk(rd(ti + 16), obj, depth + 1);
+                } else if (kind == s_vmi) {
+                    u32 count = 0;
+                    mem.read_value(ti + 20, count);
+                    for (u32 b = 0; b < count && b < 64; ++b) {
+                        const GuestAddr base_ti = rd(ti + 24 + 16 * b);
+                        const i64 offset_flags = static_cast<i64>(rd(ti + 32 + 16 * b));
+                        if (!(offset_flags & 2)) continue;   // __public_mask
+                        i64 off = offset_flags >> 8;
+                        if (offset_flags & 1) {              // __virtual_mask: offset is in the vtable
+                            const GuestAddr obj_vptr = rd(obj);
+                            off = static_cast<i64>(rd(obj_vptr + off));
+                        }
+                        walk(base_ti, obj + off, depth + 1);
+                    }
+                }
+            };
+            walk(dyn_ti, whole, 0);
+            if (hits.empty()) return;
+            std::sort(hits.begin(), hits.end());
+            hits.erase(std::unique(hits.begin(), hits.end()), hits.end());
+            if (hits.size() == 1) {
+                ctx.rax = hits[0];
+                return;
+            }
+            // Ambiguous: the static hint (dst at sub - src2dst) picks one.
+            if (src2dst >= 0) {
+                const GuestAddr hint = sub - static_cast<GuestAddr>(src2dst);
+                if (std::find(hits.begin(), hits.end(), hint) != hits.end()) ctx.rax = hint;
+            }
+        });
+
     register_symbol(0xA98867A1EBDDF5B2ULL, "_ZSt9terminatev", "libstdc++",
         [](CpuContext& ctx, MemoryManager& mem) {
             guest_abort("std::terminate() called", ctx, mem);

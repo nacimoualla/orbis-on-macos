@@ -93,6 +93,15 @@ public:
 
     /// Find color target texture by guest key
     [[nodiscard]] void* find_color_target(u64 key) const noexcept;
+    /// Host texture holding the surface at guest `key`: the screen for a
+    /// display buffer, else the offscreen colour target (nullptr if none).
+    [[nodiscard]] void* surface_texture(u64 key) const noexcept;
+    /// Writable host texture for a compute image_store at guest `key`: the
+    /// screen for a display buffer, else the offscreen surface, created at
+    /// `width` x `height` / `pixel_format` (MTLPixelFormat, 0: RGBA8Unorm)
+    /// when nothing has drawn there yet. Marked initialised so a later render
+    /// pass loads what compute wrote instead of clearing it.
+    [[nodiscard]] void* storage_target(u64 key, u32 width, u32 height, u32 pixel_format);
     [[nodiscard]] void* color_target_texture(u32 slot) const noexcept;
 
     /// Read back pixel from a specific color target (or main framebuffer if key == 0)

@@ -227,10 +227,11 @@ struct GcnPipelineCache::Impl {
             log_once("unsupported image type " + std::to_string(td.type) + " (only 1D/2D); using white");
             return white_texture();
         }
-        // A texture at the address of an offscreen render target samples what
-        // was rendered there (the guest copy is never written by the GPU path).
+        // A texture at the address of a render target (offscreen, or a display
+        // buffer: the screen) samples what was rendered there; the guest copy
+        // is never written by the GPU path.
         if (metal && td.base > 0x1000) {
-            id<MTLTexture> offscreen = (__bridge id<MTLTexture>)metal->find_color_target(td.base);
+            id<MTLTexture> offscreen = (__bridge id<MTLTexture>)metal->surface_texture(td.base);
             if (offscreen) {
                 if (offscreen.width != td.width || offscreen.height != td.height)
                     log_once("texture " + std::to_string(td.width) + "x" + std::to_string(td.height) +
@@ -273,13 +274,31 @@ struct GcnPipelineCache::Impl {
         return tex;
     }
 
+    /// Writable host texture for an image_store T#: the surface the GPU path
+    /// already keeps at that address (render target or screen), or a new one
+    /// in the T#'s format, so later draws and samples see what compute wrote.
+    id<MTLTexture> storage_texture_for(const gcn::ImageDescriptors& img) {
+        const gcn::TextureDesc td = gcn::decode_tsharp(img.tsharp);
+        if (!metal || td.base <= 0x1000 || td.width == 0 || td.height == 0) return nil;
+        MTLPixelFormat fmt = MTLPixelFormatRGBA8Unorm;
+        if (td.dfmt == 12 && td.nfmt == 7) fmt = MTLPixelFormatRGBA16Float;
+        else if (td.dfmt == 14 && td.nfmt == 7) fmt = MTLPixelFormatRGBA32Float;
+        else if (td.dfmt == 4 && td.nfmt == 7) fmt = MTLPixelFormatR32Float;
+        else if (td.dfmt != 10) log_once("image_store format " + std::to_string(td.dfmt) + "/" +
+                                         std::to_string(td.nfmt) + " stored as RGBA8Unorm");
+        return (__bridge id<MTLTexture>)metal->storage_target(td.base, td.width, td.height,
+                                                              static_cast<u32>(fmt));
+    }
+
     void dump(const PipeKey& key, const gcn::Program& vs, const gcn::Program& ps, const gcn::TranslatedPipeline& tp) {
         const char* dir = std::getenv("PS4_GCN_DUMP_DIR");
         if (!dir || !*dir) return;
-        char name[96];
-        std::snprintf(name, sizeof(name), "%s/gcn_%016llx_%016llx", dir, (unsigned long long)key.vs_hash,
+        // The directory is concatenated, not formatted into a fixed buffer:
+        // a long path used to be truncated and every dump silently failed.
+        char leaf[64];
+        std::snprintf(leaf, sizeof(leaf), "/gcn_%016llx_%016llx", (unsigned long long)key.vs_hash,
                       (unsigned long long)key.ps_hash);
-        const std::string base = name;
+        const std::string base = dir + std::string(leaf);
         auto write_bin = [](const std::string& path, const std::vector<u32>& w) {
             std::ofstream f(path, std::ios::binary);
             f.write(reinterpret_cast<const char*>(w.data()), static_cast<std::streamsize>(w.size() * 4));
@@ -684,6 +703,17 @@ bool GcnPipelineCache::encode_dispatch(void* compute_encoder, const GcnComputeRe
         Impl::ComputeEntry e;
         const auto t_compile = std::chrono::steady_clock::now();
         e.tp = gcn::translate_compute_pipeline(cs, opts);
+        if (const char* dir = std::getenv("PS4_GCN_DUMP_DIR"); dir && *dir) {
+            char leaf[40];
+            std::snprintf(leaf, sizeof(leaf), "/gcn_cs_%016llx", (unsigned long long)cs.hash);
+            const std::string name = dir + std::string(leaf);
+            std::ofstream t(name + ".txt");
+            t << "; CS threads " << req.threads_x << "x" << req.threads_y << "x" << req.threads_z << " rsrc1 0x"
+              << std::hex << req.cs_rsrc1 << " rsrc2 0x" << req.cs_rsrc2 << std::dec << "\n";
+            for (const auto& i : cs.insts) t << "  " << gcn::disassemble(i) << "\n";
+            if (!e.tp.ok) t << "; translation error: " << e.tp.error << "\n";
+            if (e.tp.ok) std::ofstream(name + ".metal") << e.tp.msl;
+        }
         if (!e.tp.ok) {
             e.error = "translate: " + e.tp.error;
         } else @autoreleasepool {
@@ -718,9 +748,29 @@ bool GcnPipelineCache::encode_dispatch(void* compute_encoder, const GcnComputeRe
 
     if (!pe->pso) return fail(pe->error);
 
+    gcn::ResourceScan scan;
+    if (!pe->tp.images.empty()) {
+        scan = gcn::scan_resources(cs, pe->tp.images, req.cs_user, std::min<u32>(cs_user_count, 16), read, 0);
+        if (!scan.ok) {
+            im.log_once("CS resource scan: " + scan.error);
+            return fail("CS resource scan: " + scan.error);
+        }
+    }
+
     @autoreleasepool {
         id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)compute_encoder;
         [enc setComputePipelineState:pe->pso];
+        for (usize k = 0; k < pe->tp.images.size(); ++k) {
+            const gcn::ImageSlot& slot = pe->tp.images[k];
+            if (slot.storage) {
+                id<MTLTexture> t = im.storage_texture_for(scan.images[k]);
+                if (!t) return fail("image_store target unavailable");
+                [enc setTexture:t atIndex:k];
+            } else {
+                [enc setTexture:im.texture_for(scan.images[k]) atIndex:k];
+                if (slot.sampled) [enc setSamplerState:im.sampler_for(scan.images[k]) atIndex:k];
+            }
+        }
 
         id<MTLBuffer> mem = nil;
         if (im.memory && im.memory->base_address()) {

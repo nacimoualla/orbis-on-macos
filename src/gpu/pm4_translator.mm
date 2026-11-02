@@ -1765,7 +1765,14 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
         const u64 n = v ? std::strtoull(v, nullptr, 0) : 1;
         return n ? n : 1;
     }();
-    const bool sample = (m_impl->metal->submitted_frame_count() + 1) % dump_every == 0;
+    // PS4_GPU_READBACK_FROM=N: start sampling at frame N (a dump stalls the
+    // frame, so a late scene is reached at full speed first).
+    static const u64 dump_from = [] {
+        const char* v = std::getenv("PS4_GPU_READBACK_FROM");
+        return v ? std::strtoull(v, nullptr, 0) : 0ull;
+    }();
+    const u64 next_frame = m_impl->metal->submitted_frame_count() + 1;
+    const bool sample = next_frame >= dump_from && next_frame % dump_every == 0;
     const bool readback = std::getenv("PS4_GPU_READBACK") != nullptr && sample;
     const bool drew = m_impl->frame_draw_encoded;
     const bool submitted = m_impl->metal->submit_frame(wait_for_completion || (readback && drew));
@@ -1780,7 +1787,20 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
                      m_impl->gcn_enabled ? "on" : "off");
         const char* dir = std::getenv("PS4_GPU_READBACK");
         if (dir && dir[0] == '/') {   // also dump the frame as a PPM
+            // PS4_GPU_READBACK_KEY=<guest address>: dump that render target
+            // instead of the screen (8-bit RGBA/BGRA targets only).
             id<MTLTexture> fb = (__bridge id<MTLTexture>)m_impl->metal->raw_framebuffer();
+            u32 w = m_impl->metal->width(), h = m_impl->metal->height();
+            bool rgba_order = false;
+            if (const char* key = std::getenv("PS4_GPU_READBACK_KEY")) {
+                id<MTLTexture> t = (__bridge id<MTLTexture>)m_impl->metal->surface_texture(std::strtoull(key, nullptr, 0));
+                if (t && (t.pixelFormat == MTLPixelFormatRGBA8Unorm || t.pixelFormat == MTLPixelFormatBGRA8Unorm)) {
+                    fb = t;
+                    w = static_cast<u32>(t.width);
+                    h = static_cast<u32>(t.height);
+                    rgba_order = t.pixelFormat == MTLPixelFormatRGBA8Unorm;
+                }
+            }
             std::vector<u8> px(static_cast<usize>(w) * h * 4);
             [fb getBytes:px.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
             char path[512];
@@ -1790,7 +1810,7 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
             if (FILE* f = std::fopen(path, "wb")) {
                 std::fprintf(f, "P6\n%u %u\n255\n", w, h);
                 for (usize p = 0; p < static_cast<usize>(w) * h; ++p) {
-                    const u8 rgb[3] = {px[p * 4 + 2], px[p * 4 + 1], px[p * 4 + 0]};
+                    const u8 rgb[3] = {px[p * 4 + (rgba_order ? 0 : 2)], px[p * 4 + 1], px[p * 4 + (rgba_order ? 2 : 0)]};
                     std::fwrite(rgb, 1, 3, f);
                 }
                 std::fclose(f);

@@ -59,7 +59,8 @@ struct MetalBackend::Impl {
                                                                    width:tw
                                                                   height:th
                                                                mipmapped:NO];
-            d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            // ShaderWrite: compute image_store writes surfaces in place.
+            d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
             d.storageMode = MTLStorageModeShared;
             cb.texture = [device newTextureWithDescriptor:d];
             cb.width = tw;
@@ -147,7 +148,7 @@ bool MetalBackend::create_framebuffer(u32 width, u32 height) {
                                                                                          width:width
                                                                                         height:height
                                                                                      mipmapped:NO];
-        desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         desc.storageMode = MTLStorageModeShared; // Unified memory accessible by both CPU and GPU
 
         m_impl->framebuffer = [m_impl->device newTextureWithDescriptor:desc];
@@ -412,10 +413,13 @@ void MetalBackend::set_color_target(u32 slot, u64 key, u32 width, u32 height, u3
     if (!m_impl || slot >= 8) return;
     const bool offscreen = key != 0 && !m_impl->display_buffers.count(key);
     const MTLPixelFormat fmt = pixel_format ? static_cast<MTLPixelFormat>(pixel_format) : MTLPixelFormatBGRA8Unorm;
-    // A changed size or format replaces the texture: the open pass may
-    // still reference the old one.
+    // A changed format, or a size the texture cannot hold, replaces it: the
+    // open pass may still reference the old one. A smaller request keeps the
+    // texture. The size comes from the screen scissor, which games change
+    // per pass (Dragon Ball Xenoverse 2: 1080, 1078, 1073, 1064 rows), and
+    // replacing the surface each time discarded the scene drawn into it.
     const Impl::ColorBuffer* cur = offscreen ? m_impl->find_color(key) : nullptr;
-    const bool reshape = offscreen && (!cur || (width && cur->width != width) || (height && cur->height != height) ||
+    const bool reshape = offscreen && (!cur || (width && width > cur->width) || (height && height > cur->height) ||
                                        cur->format != fmt);
     if (m_impl->color_keys[slot] == key && !reshape) return;
     if (m_impl->active_render_encoder) {
@@ -424,7 +428,12 @@ void MetalBackend::set_color_target(u32 slot, u64 key, u32 width, u32 height, u3
         if (bound) end_render_encoder();
     }
     m_impl->color_keys[slot] = key;
-    if (reshape) m_impl->color_buffer(key, width, height, fmt);
+    if (reshape) {
+        // Growing in one dimension must not shrink the other.
+        const bool same_fmt = cur && cur->format == fmt;
+        m_impl->color_buffer(key, same_fmt ? std::max(width, cur->width) : width,
+                             same_fmt ? std::max(height, cur->height) : height, fmt);
+    }
     if (m_impl->color_buffers.size() > 32) {
         for (auto it = m_impl->color_buffers.begin(); it != m_impl->color_buffers.end();) {
             bool in_use = false;
@@ -505,6 +514,25 @@ void* MetalBackend::find_color_target(u64 key) const noexcept {
         return (__bridge void*)it->second.texture;
     }
     return nullptr;
+}
+
+void* MetalBackend::surface_texture(u64 key) const noexcept {
+    if (!m_impl || key == 0) return nullptr;
+    if (m_impl->display_buffers.count(key)) return (__bridge void*)m_impl->framebuffer;
+    return find_color_target(key);
+}
+
+void* MetalBackend::storage_target(u64 key, u32 width, u32 height, u32 pixel_format) {
+    if (!is_initialized() || key == 0) return nullptr;
+    if (m_impl->display_buffers.count(key)) return (__bridge void*)m_impl->framebuffer;
+    if (Impl::ColorBuffer* cb = m_impl->find_color(key)) {
+        cb->initialized = true;
+        return (__bridge void*)cb->texture;
+    }
+    const MTLPixelFormat fmt = pixel_format ? static_cast<MTLPixelFormat>(pixel_format) : MTLPixelFormatRGBA8Unorm;
+    Impl::ColorBuffer& cb = m_impl->color_buffer(key, width, height, fmt);
+    cb.initialized = true;
+    return (__bridge void*)cb.texture;
 }
 
 void* MetalBackend::color_target_texture(u32 slot) const noexcept {

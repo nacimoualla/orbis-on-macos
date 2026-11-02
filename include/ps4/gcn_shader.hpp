@@ -112,6 +112,7 @@ struct ImageSlot {
     u32 srsrc{0};   // first SGPR of the T#
     u32 ssamp{0};   // first SGPR of the S# (~0u for image_load)
     bool sampled{true};
+    bool storage{false};  // image_store target: bound as a writable texture
 };
 
 using ImageDesc = ImageSlot;
