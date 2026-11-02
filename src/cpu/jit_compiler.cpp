@@ -697,7 +697,7 @@ bool is_block_terminator(const u8 *code, usize avail, const x86::Prefixes &p) {
     return true;
   if ((op0 == 0xC3 || op0 == 0xC2 || op0 == 0xE8) && !jit_translates_calls())
     return true;
-  if (op0 == 0x0F && (op1 == 0x05 || op1 == 0x0B))
+  if (op0 == 0x0F && (op1 == 0x05 || op1 == 0x0B || op1 == 0x01 || op1 == 0x31 || op1 == 0xA2))
     return true;
   return false;
 }

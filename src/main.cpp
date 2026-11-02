@@ -395,6 +395,7 @@ int main(int argc, char* argv[]) {
                 // a blocking HLE wait, so give it a moment to finish its slice and
                 // otherwise leave it: shutdown hard-exits parked threads anyway.
                 stop_guest.store(true);
+                syscalls.set_exited(true);
                 for (int i = 0; i < 50 && !guest_done.load(); ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 if (guest_done.load()) {

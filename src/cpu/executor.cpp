@@ -4467,6 +4467,32 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
+        // 0x0F 0x01: Group 7 instructions (RDTSCP, XGETBV, etc.)
+        if (op1 == 0x01) {
+            const u8 modrm_byte = (cursor < 15) ? raw_code[cursor] : 0;
+            if (modrm_byte == 0xF9) { // RDTSCP
+                cursor++;
+                const u64 tsc = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
+                m_context.rax = static_cast<u32>(tsc);
+                m_context.rdx = static_cast<u32>(tsc >> 32);
+                m_context.rcx = 0; // IA32_TSC_AUX
+                m_context.rip = start_rip + cursor;
+                return StepResult::Ok;
+            }
+            if (modrm_byte == 0xD0) { // XGETBV
+                cursor++;
+                if (static_cast<u32>(m_context.rcx) == 0) {
+                    m_context.rax = 7; // XCR0: x87 (1) | SSE (2) | AVX (4)
+                    m_context.rdx = 0;
+                } else {
+                    m_context.rax = 0;
+                    m_context.rdx = 0;
+                }
+                m_context.rip = start_rip + cursor;
+                return StepResult::Ok;
+            }
+        }
+
         // 0x0F 0x1F: NOP r/m (multi-byte NOP)
         if (op1 == 0x1F) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);

@@ -618,6 +618,9 @@ static std::atomic<bool> s_sem_shutdown{false};
 // alone does not cover the HLT, instruction-budget, or fault exits.
 void request_semaphore_shutdown() {
     s_sem_shutdown.store(true, std::memory_order_relaxed);
+    if (g_syscalls) {
+        g_syscalls->set_exited(true);
+    }
     s_sem_cv.notify_all();
     {
         std::lock_guard<std::mutex> lock(s_sema_table_mtx);
@@ -3605,6 +3608,27 @@ void NidRegistry::register_default_libraries() {
             ctx.ymm[0].df[0] = base == 0 ? std::log(x) : base == 1 ? std::log10(x) : std::log2(x);
         });
 
+    // Dinkumware _FDtest(const float* px): short classification code
+    // _DENORM (-2), _FINITE (-1), _DZERO (0), _INFCODE (1), _NANCODE (2).
+    register_symbol(0x9A7B9F3E561B9CDDULL, "_FDtest", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            float val = 0.0f;
+            if (ctx.rdi != 0 && mem.is_valid_address(ctx.rdi, sizeof(float))) {
+                mem.read_value(ctx.rdi, val);
+            }
+            const int cls = std::fpclassify(val);
+            i16 ret = -1;
+            switch (cls) {
+                case FP_ZERO:      ret =  0; break;
+                case FP_NORMAL:    ret = -1; break;
+                case FP_SUBNORMAL: ret = -2; break;
+                case FP_INFINITE:  ret =  1; break;
+                case FP_NAN:       ret =  2; break;
+                default:           ret = -1; break;
+            }
+            ctx.rax = static_cast<u64>(static_cast<i64>(ret));
+        });
+
     // memcmp(const void* s1, const void* s2, size_t n)
     // NID: 0x0DF8AF3C0AE1B9C8ULL / 0xC8B9E10AC0F38A0DULL ("DfivPArhucg")
     auto memcmp_handler = [](CpuContext& ctx, MemoryManager& mem) {
@@ -3650,6 +3674,11 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0xBA85292C6364CA09ULL, "sceCommonDialogInitialize", "libSceCommonDialog",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
+        });
+    // sceCommonDialogIsUsed
+    register_symbol(0x050DED7B2D099903ULL, "sceCommonDialogIsUsed", "libSceCommonDialog",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 0; // false: no common dialog currently in use
         });
 
     // memset(void* dest, int ch, size_t n)
@@ -4287,7 +4316,7 @@ void NidRegistry::register_default_libraries() {
                 std::fprintf(stderr,
                              "[HLE WARNING TID=%d rip=0x%llx] sceKernelWaitSema(%u): unknown sema id; "
                              "returning ESRCH instead of pretending success\n", (int)t_guest_tid, (unsigned long long)t_guest_rip, id);
-                if (cur_th) cur_th->state.store(ThreadState::Running);
+                if (cur_th && cur_th->state.load() != ThreadState::Terminated) cur_th->state.store(ThreadState::Running);
                 ctx.rax = 0x80020003ULL; // SCE_KERNEL_ERROR_ESRCH
                 return;
             }
@@ -4297,6 +4326,7 @@ void NidRegistry::register_default_libraries() {
             auto pred = [&]() {
                 return sema->count >= need || sema->deleted ||
                        (sema->cancel_generation != start_cancel_gen) ||
+                       s_sem_shutdown.load(std::memory_order_relaxed) ||
                        (g_syscalls && g_syscalls->has_exited());
             };
             sema->waiters++;
@@ -4307,7 +4337,7 @@ void NidRegistry::register_default_libraries() {
                 if (sema_log_enabled()) std::fprintf(stderr, "[Sema] WaitSema(%u, need=%d, timeout=%uus)\n", id, need, usec);
                 if (!sema->cv.wait_for(lock, std::chrono::microseconds(usec), pred)) {
                     sema->waiters--;
-                    if (cur_th) cur_th->state.store(ThreadState::Running);
+                    if (cur_th && cur_th->state.load() != ThreadState::Terminated) cur_th->state.store(ThreadState::Running);
                     ctx.rax = 0x8002003CULL; // SCE_KERNEL_ERROR_ETIMEDOUT
                     return;
                 }
@@ -4327,9 +4357,12 @@ void NidRegistry::register_default_libraries() {
                     }
                 }
                 // Diagnostic: did we return without the semaphore actually being
-                // satisfied? That is a silent no-op wait -- the requester runs
-                // on while its producer is still in flight.
-                if (sema->count < need) {
+                // satisfied? Only warn if this was NOT due to deletion, cancellation,
+                // or emulator shutdown.
+                if (sema->count < need && !sema->deleted &&
+                    !s_sem_shutdown.load(std::memory_order_relaxed) &&
+                    !(g_syscalls && g_syscalls->has_exited()) &&
+                    sema->cancel_generation == start_cancel_gen) {
                     std::fprintf(stderr,
                         "[HLE WARNING TID=%d rip=0x%llx] WaitSema(%u) returned with count=%u < need=%d "
                         "-- woke on deleted=%d cancelled=%d has_exited=%d, NOT on a post\n",
@@ -4341,20 +4374,27 @@ void NidRegistry::register_default_libraries() {
             }
 
             sema->waiters--;
+            if (s_sem_shutdown.load(std::memory_order_relaxed) ||
+                (g_syscalls && g_syscalls->has_exited())) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (cur_th && cur_th->state.load() != ThreadState::Terminated) cur_th->state.store(ThreadState::Running);
+                ctx.rax = 0x80020055ULL; // SCE_KERNEL_ERROR_ECANCELED
+                return;
+            }
             if (sema->cancel_generation != start_cancel_gen) {
-                if (cur_th) cur_th->state.store(ThreadState::Running);
+                if (cur_th && cur_th->state.load() != ThreadState::Terminated) cur_th->state.store(ThreadState::Running);
                 ctx.rax = 0x80020055ULL; // SCE_KERNEL_ERROR_ECANCELED (FreeBSD 85)
                 return;
             }
             if (sema->deleted) {
-                if (cur_th) cur_th->state.store(ThreadState::Running);
+                if (cur_th && cur_th->state.load() != ThreadState::Terminated) cur_th->state.store(ThreadState::Running);
                 ctx.rax = 0x80020003ULL; // SCE_KERNEL_ERROR_ESRCH
                 return;
             }
             if (sema->count >= need) {
                 sema->count -= need;
             }
-            if (cur_th) cur_th->state.store(ThreadState::Running);
+            if (cur_th && cur_th->state.load() != ThreadState::Terminated) cur_th->state.store(ThreadState::Running);
             ctx.rax = SCE_OK;
         });
 
@@ -4715,6 +4755,7 @@ void NidRegistry::register_default_libraries() {
                 std::unique_lock<std::mutex> lock(evf->mtx);
                 auto pred = [&]() {
                     return evf->deleted || eventflag_satisfied(*evf, want, and_mode) ||
+                           s_sem_shutdown.load(std::memory_order_relaxed) ||
                            (g_syscalls && g_syscalls->has_exited());
                 };
                 evf->waiters++;
@@ -4731,6 +4772,18 @@ void NidRegistry::register_default_libraries() {
                     ok = true;
                 }
                 evf->waiters--;
+                if (evf->deleted || s_sem_shutdown.load(std::memory_order_relaxed) ||
+                    (g_syscalls && g_syscalls->has_exited())) {
+                    if (s_sem_shutdown.load(std::memory_order_relaxed) ||
+                        (g_syscalls && g_syscalls->has_exited())) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    if (cur_th && cur_th->state.load() != ThreadState::Terminated) {
+                        cur_th->state.store(ThreadState::Running);
+                    }
+                    ctx.rax = 0x80020001ULL; // SCE_KERNEL_ERROR_ESRCH
+                    return;
+                }
                 if (ok) {
                     matched = evf->bits & want;
                     if (clear_all) evf->bits = 0;
@@ -4741,7 +4794,7 @@ void NidRegistry::register_default_libraries() {
             if (out_ptr != 0 && mem.is_valid_address(out_ptr, sizeof(u32))) {
                 mem.write_value(out_ptr, matched);
             }
-            if (cur_th) cur_th->state.store(ThreadState::Running);
+            if (cur_th && cur_th->state.load() != ThreadState::Terminated) cur_th->state.store(ThreadState::Running);
             if (!ok) {
                 std::fprintf(stderr, "[EventFlag] Wait(%u, want=0x%x, mode=0x%x) -> ETIMEDOUT after %uus%s\n",
                              id, want, wait_mode, usec,
@@ -5000,7 +5053,7 @@ void NidRegistry::register_default_libraries() {
                     }
                 }
             }
-            if (cur_th) cur_th->state.store(ThreadState::Running);
+            if (cur_th && cur_th->state.load() != ThreadState::Terminated) cur_th->state.store(ThreadState::Running);
             const double waited_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (!valid) {
                 std::fprintf(stderr, "[Sem] TID=%d wait(0x%llx) -> EINVAL (waited=%.2fms, iters=%d)\n",
@@ -5011,7 +5064,7 @@ void NidRegistry::register_default_libraries() {
             if (!ok) {
                 // Process is shutting down. Park this worker thread until termination rather
                 // than returning to guest code to spin endlessly.
-                if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
+                if (cur_th && cur_th->state.load() != ThreadState::Terminated) cur_th->state.store(ThreadState::WaitingSync);
                 std::this_thread::sleep_for(std::chrono::seconds(10));
                 ctx.rax = static_cast<u64>(0x8002003CULL);
                 return;
@@ -5060,7 +5113,7 @@ void NidRegistry::register_default_libraries() {
             if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
             bool ok = false;
             const u64 deadline_us = now * 1000000ULL + wait_us;
-            while (!ok && (g_syscalls == nullptr || !g_syscalls->has_exited())) {
+            while (!ok && (g_syscalls == nullptr || !g_syscalls->has_exited()) && !s_sem_shutdown.load(std::memory_order_relaxed)) {
                 const u64 t = static_cast<u64>(
                     std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::system_clock::now().time_since_epoch())
@@ -5074,7 +5127,7 @@ void NidRegistry::register_default_libraries() {
                     ok = true;
                 }
             }
-            if (cur_th) cur_th->state.store(ThreadState::Running);
+            if (cur_th && cur_th->state.load() != ThreadState::Terminated) cur_th->state.store(ThreadState::Running);
             // Orbis errno values are FreeBSD's, not Linux's. FreeBSD ETIMEDOUT is 60;
 // 110 is the Linux value and was wrong here. (FreeBSD EAGAIN is 35 and
             // Linux's is 11 -- sem_trywait above already returns the correct
@@ -5515,6 +5568,18 @@ void NidRegistry::register_default_libraries() {
                 }
             }
             ctx.rax = static_cast<u64>(-14);
+        });
+
+    // sceSaveDataInitialize(const void* param)
+    register_symbol(0x664661B2408F5C5CULL, "sceSaveDataInitialize", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+
+    // sceSaveDataTerminate(void)
+    register_symbol(0xC8A0F2F12E722C0DULL, "sceSaveDataTerminate", "libSceSaveData",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
         });
 
     // sceSaveDataInitialize3(const void* param)
@@ -6474,6 +6539,15 @@ void NidRegistry::register_default_libraries() {
                 mem.write_value<u64>(status_ptr, vblank_count);
                 mem.write_value<u64>(status_ptr + 8, static_cast<u64>(elapsed_us));
             }
+            ctx.rax = SCE_OK;
+        });
+
+    register_symbol(0x0D886159B2527918ULL, "sceVideoOutColorSettingsSetGamma_", "libSceVideoOut",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0xA6FF42239542F91DULL, "sceVideoOutAdjustColor_", "libSceVideoOut",
+        [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
 
@@ -7473,6 +7547,11 @@ void NidRegistry::register_default_libraries() {
                 ctx.rax = SCE_OK;
             });
     }
+
+    register_symbol(0x8E0DF7AC428B7D5BULL, "sceGnmIsUserPaEnabled", "libSceGnmDriver",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 0;
+        });
 
     // sceGnmDrawInitDefaultHardwareState{,175,200,350}(u32* cmd, u64 numDwords)
     // -> DWORDs written; the caller advances its command pointer by the return
@@ -8645,6 +8724,47 @@ void NidRegistry::register_default_libraries() {
         {0x85DA551140C55B7BULL, "sceSslInit"},
     });
 
+    // libSceNpToolkit
+    register_symbol(0x65B009710E7F9CF8ULL, "ZbAJcQ5-nPg", "libSceNpToolkit",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr p = ctx.rdi;
+            if (p != 0 && mem.is_valid_address(p, 0x400)) {
+                mem.zero_memory(p, 0x400);
+                mem.write_value<u32>(p + 0x18, 0x400);
+            }
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x0275609908F7C918ULL, "AnVgmQj3yRg", "libSceNpToolkit",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr p = ctx.rdi;
+            if (p != 0 && mem.is_valid_address(p, 0x400)) {
+                mem.zero_memory(p, 0x400);
+                mem.write_value<u32>(p + 0x18, 0x400);
+            }
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x8E903E21CBC62C94ULL, "jpA+IcvGLJQ", "libSceNpToolkit",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+
+    add_stubs("libSceGameLiveStreaming", {
+        {0x92F604C369419DD9ULL, "sceGameLiveStreamingInitialize"},
+        {0xFC41E753AF201315ULL, "sceGameLiveStreamingPermitServerSideRecording"},
+        {0xABF931B9A17B5115ULL, "sceGameLiveStreamingSetMaxBitrate"},
+    }, SCE_OK);
+    add_stubs("libSceSharePlay", {
+        {0x8ACAEEAAD86961CCULL, "sceSharePlayInitialize"},
+        {0x728D8D0A3FFFA677ULL, "sceSharePlaySetProhibition"},
+    }, SCE_OK);
+    add_stubs("libSceRemoteplay", {
+        {0x9354B082431238CFULL, "sceRemoteplayInitialize"},
+        {0xC50788AF24D7EDD6ULL, "sceRemoteplayApprove"},
+    }, SCE_OK);
+    add_stubs("libSceScreenShot", {
+        {0xEF7590E098F49C92ULL, "sceScreenShotSetOverlayImageWithOrigin"},
+    }, SCE_OK);
+
     // libSceRtc: the local clock stands in for network time (no NTP offline).
     register_symbol(0xD7C076352D72F545ULL, "sceRtcGetCurrentTick", "libSceRtc",
         [](CpuContext& ctx, MemoryManager& mem) {
@@ -8654,6 +8774,87 @@ void NidRegistry::register_default_libraries() {
     register_symbol(0xCCEF542F7A8820D4ULL, "sceRtcGetCurrentNetworkTick", "libSceRtc",
         [](CpuContext& ctx, MemoryManager& mem) {
             if (mem.is_valid_address(ctx.rdi, sizeof(u64))) mem.write_value<u64>(ctx.rdi, guest_rtc_now());
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x3354EF16CB7F8EB3ULL, "sceRtcConvertUtcToLocalTime", "libSceRtc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr utc_ptr = ctx.rdi;
+            const GuestAddr loc_ptr = ctx.rsi;
+            u64 utc_tick = 0;
+            if (utc_ptr != 0 && mem.is_valid_address(utc_ptr, sizeof(u64))) {
+                mem.read_value(utc_ptr, utc_tick);
+            }
+            constexpr u64 kUnixEpochTicks = 62135596800ULL * 1000000ULL;
+            u64 loc_tick = utc_tick;
+            if (utc_tick >= kUnixEpochTicks) {
+                const time_t sec = static_cast<time_t>((utc_tick - kUnixEpochTicks) / 1000000ULL);
+                struct tm tm_loc{};
+                localtime_r(&sec, &tm_loc);
+                loc_tick = static_cast<u64>(static_cast<i64>(utc_tick) + static_cast<i64>(tm_loc.tm_gmtoff) * 1000000LL);
+            }
+            if (loc_ptr != 0 && mem.is_valid_address(loc_ptr, sizeof(u64))) {
+                mem.write_value(loc_ptr, loc_tick);
+            }
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0xB9E7A06BABF7194CULL, "sceRtcSetTick", "libSceRtc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dt_ptr = ctx.rdi;
+            const GuestAddr tick_ptr = ctx.rsi;
+            u64 tick = 0;
+            if (tick_ptr != 0 && mem.is_valid_address(tick_ptr, sizeof(u64))) {
+                mem.read_value(tick_ptr, tick);
+            }
+            constexpr u64 kUnixEpochTicks = 62135596800ULL * 1000000ULL;
+            time_t sec = 0;
+            u32 usec = 0;
+            if (tick >= kUnixEpochTicks) {
+                sec = static_cast<time_t>((tick - kUnixEpochTicks) / 1000000ULL);
+                usec = static_cast<u32>((tick - kUnixEpochTicks) % 1000000ULL);
+            }
+            struct tm tm_val{};
+            gmtime_r(&sec, &tm_val);
+            if (dt_ptr != 0 && mem.is_valid_address(dt_ptr, 16)) {
+                mem.write_value<u16>(dt_ptr + 0, static_cast<u16>(tm_val.tm_year + 1900));
+                mem.write_value<u16>(dt_ptr + 2, static_cast<u16>(tm_val.tm_mon + 1));
+                mem.write_value<u16>(dt_ptr + 4, static_cast<u16>(tm_val.tm_mday));
+                mem.write_value<u16>(dt_ptr + 6, static_cast<u16>(tm_val.tm_hour));
+                mem.write_value<u16>(dt_ptr + 8, static_cast<u16>(tm_val.tm_min));
+                mem.write_value<u16>(dt_ptr + 10, static_cast<u16>(tm_val.tm_sec));
+                mem.write_value<u32>(dt_ptr + 12, usec);
+            }
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0xF30FC7D7D8A9E3C2ULL, "sceRtcGetTick", "libSceRtc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr dt_ptr = ctx.rdi;
+            const GuestAddr tick_ptr = ctx.rsi;
+            u64 tick = 0;
+            if (dt_ptr != 0 && mem.is_valid_address(dt_ptr, 16)) {
+                u16 year = 0, mon = 0, mday = 0, hour = 0, min = 0, sec = 0;
+                u32 usec = 0;
+                mem.read_value(dt_ptr + 0, year);
+                mem.read_value(dt_ptr + 2, mon);
+                mem.read_value(dt_ptr + 4, mday);
+                mem.read_value(dt_ptr + 6, hour);
+                mem.read_value(dt_ptr + 8, min);
+                mem.read_value(dt_ptr + 10, sec);
+                mem.read_value(dt_ptr + 12, usec);
+
+                struct tm tm_val{};
+                tm_val.tm_year = year > 1900 ? year - 1900 : 0;
+                tm_val.tm_mon = mon > 0 ? mon - 1 : 0;
+                tm_val.tm_mday = mday > 0 ? mday : 1;
+                tm_val.tm_hour = hour;
+                tm_val.tm_min = min;
+                tm_val.tm_sec = sec;
+                time_t tsec = timegm(&tm_val);
+                constexpr u64 kUnixEpochTicks = 62135596800ULL * 1000000ULL;
+                tick = kUnixEpochTicks + static_cast<u64>(tsec) * 1000000ULL + usec;
+            }
+            if (tick_ptr != 0 && mem.is_valid_address(tick_ptr, sizeof(u64))) {
+                mem.write_value(tick_ptr, tick);
+            }
             ctx.rax = SCE_OK;
         });
 
@@ -8870,6 +9071,10 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
     register_symbol(0x18D705E2889D6346ULL, "sceNpTrophyDestroyHandle", "libSceNpTrophy",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x1355ABC1DD3B2EBFULL, "sceNpTrophyDestroyContext", "libSceNpTrophy",
         [](CpuContext& ctx, MemoryManager&) {
             ctx.rax = SCE_OK;
         });
