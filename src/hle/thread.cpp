@@ -737,7 +737,7 @@ void ThreadManager::dump_stall_snapshot(const char* tag) const {
 u32 ThreadManager::mutex_create(std::string_view) {
     std::lock_guard<std::mutex> lock(m_sync_mutex);
     const u32 id = m_next_mutex_id++;
-    m_mutexes[id] = std::make_unique<std::recursive_mutex>();
+    m_mutexes[id] = std::make_shared<std::recursive_mutex>();
     return id;
 }
 
@@ -747,40 +747,53 @@ bool ThreadManager::mutex_exists(u32 mutex_id) {
 }
 
 bool ThreadManager::mutex_lock(u32 mutex_id) {
-    std::recursive_mutex* mtx = nullptr;
+    std::shared_ptr<std::recursive_mutex> mtx;
     {
         std::lock_guard<std::mutex> lock(m_sync_mutex);
         auto it = m_mutexes.find(mutex_id);
         if (it == m_mutexes.end()) return false;
-        mtx = it->second.get();
+        mtx = it->second;
     }
     GuestThread* cur_th = current_thread();
     if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
-    mtx->lock();
+    try {
+        mtx->lock();
+    } catch (...) {
+        if (cur_th) cur_th->state.store(ThreadState::Running);
+        return false;
+    }
     if (cur_th) cur_th->state.store(ThreadState::Running);
     return true;
 }
 
 bool ThreadManager::mutex_trylock(u32 mutex_id) {
-    std::recursive_mutex* mtx = nullptr;
+    std::shared_ptr<std::recursive_mutex> mtx;
     {
         std::lock_guard<std::mutex> lock(m_sync_mutex);
         auto it = m_mutexes.find(mutex_id);
         if (it == m_mutexes.end()) return false;
-        mtx = it->second.get();
+        mtx = it->second;
     }
-    return mtx->try_lock();
+    try {
+        return mtx->try_lock();
+    } catch (...) {
+        return false;
+    }
 }
 
 bool ThreadManager::mutex_unlock(u32 mutex_id) {
-    std::recursive_mutex* mtx = nullptr;
+    std::shared_ptr<std::recursive_mutex> mtx;
     {
         std::lock_guard<std::mutex> lock(m_sync_mutex);
         auto it = m_mutexes.find(mutex_id);
         if (it == m_mutexes.end()) return false;
-        mtx = it->second.get();
+        mtx = it->second;
     }
-    mtx->unlock();
+    try {
+        mtx->unlock();
+    } catch (...) {
+        return false;
+    }
     return true;
 }
 
@@ -792,42 +805,53 @@ bool ThreadManager::mutex_destroy(u32 mutex_id) {
 u32 ThreadManager::cond_create(std::string_view) {
     std::lock_guard<std::mutex> lock(m_sync_mutex);
     const u32 id = m_next_cond_id++;
-    m_conds[id] = std::make_unique<std::condition_variable_any>();
+    m_conds[id] = std::make_shared<std::condition_variable_any>();
     return id;
 }
 
 bool ThreadManager::cond_wait(u32 cond_id, u32 mutex_id) {
-    std::condition_variable_any* cv = nullptr;
-    std::recursive_mutex* mtx = nullptr;
+    std::shared_ptr<std::condition_variable_any> cv;
+    std::shared_ptr<std::recursive_mutex> mtx;
     {
         std::lock_guard<std::mutex> lock(m_sync_mutex);
         auto it_cv = m_conds.find(cond_id);
         auto it_mtx = m_mutexes.find(mutex_id);
         if (it_cv == m_conds.end() || it_mtx == m_mutexes.end()) return false;
-        cv = it_cv->second.get();
-        mtx = it_mtx->second.get();
+        cv = it_cv->second;
+        mtx = it_mtx->second;
     }
     GuestThread* cur_th = current_thread();
     if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
-    cv->wait(*mtx);
+    try {
+        cv->wait(*mtx);
+    } catch (...) {
+        if (cur_th) cur_th->state.store(ThreadState::Running);
+        return false;
+    }
     if (cur_th) cur_th->state.store(ThreadState::Running);
     return true;
 }
 
 bool ThreadManager::cond_timedwait(u32 cond_id, u32 mutex_id, u64 timeout_usec) {
-    std::condition_variable_any* cv = nullptr;
-    std::recursive_mutex* mtx = nullptr;
+    std::shared_ptr<std::condition_variable_any> cv;
+    std::shared_ptr<std::recursive_mutex> mtx;
     {
         std::lock_guard<std::mutex> lock(m_sync_mutex);
         auto it_cv = m_conds.find(cond_id);
         auto it_mtx = m_mutexes.find(mutex_id);
         if (it_cv == m_conds.end() || it_mtx == m_mutexes.end()) return false;
-        cv = it_cv->second.get();
-        mtx = it_mtx->second.get();
+        cv = it_cv->second;
+        mtx = it_mtx->second;
     }
     GuestThread* cur_th = current_thread();
     if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
-    const auto status = cv->wait_for(*mtx, std::chrono::microseconds(timeout_usec));
+    std::cv_status status = std::cv_status::timeout;
+    try {
+        status = cv->wait_for(*mtx, std::chrono::microseconds(timeout_usec));
+    } catch (...) {
+        if (cur_th) cur_th->state.store(ThreadState::Running);
+        return false;
+    }
     if (cur_th) cur_th->state.store(ThreadState::Running);
     return status == std::cv_status::no_timeout;
 }

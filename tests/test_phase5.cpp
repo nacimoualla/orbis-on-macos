@@ -503,6 +503,34 @@ int main() {
         std::cout << "  ✓ Test 12: VPACKSSDW, VPACKUSWB and unsupported VEX handling verified\n";
     }
 
+    // Test 13: VPEXTRB and VPEXTRW to GPR (zero-extension, registers 4-7 like ESI/RSI)
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x40a000ULL;
+        const ps4::u8 code[] = {
+            // VPEXTRB esi, xmm1, 0  (extract byte 0 to ESI, zero-extending to 32-bit, clearing upper 32 bits)
+            0xC4, 0xE3, 0x79, 0x14, 0xCE, 0x00,
+            // VPEXTRW edi, xmm1, 1  (extract word 1 to EDI, zero-extending to 32-bit, clearing upper 32 bits)
+            0xC4, 0xE3, 0x79, 0x15, 0xCF, 0x01,
+        };
+        assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        cpu.context().ymm[1].b[0] = 0x42;
+        cpu.context().ymm[1].w[1] = 0x1234;
+        cpu.context().rsi = 0xFFFFFFFFFFFFFFFFULL;
+        cpu.context().rdi = 0xFFFFFFFFFFFFFFFFULL;
+        cpu.context().rdx = 0xDEADBEEFCAFEBABEULL;
+        cpu.set_entry_point(code_addr);
+
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().rsi == 0x42ULL); // ESI written, upper 32 bits zeroed
+        assert(cpu.context().rdx == 0xDEADBEEFCAFEBABEULL); // RDX/DH must not be touched
+
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().rdi == 0x1234ULL); // EDI written, upper 32 bits zeroed
+
+        std::cout << "  ✓ Test 13: VPEXTRB and VPEXTRW to GPR (zero-extension & reg 4-7 handling) verified\n";
+    }
+
     std::cout << "[PHASE 5] PASS: All CPU Execution and Instruction Dispatch tests passed!\n";
     return 0;
 }

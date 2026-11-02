@@ -3524,10 +3524,20 @@ StepResult CpuExecutor::step() {
                 }
             } else if (vex_op == 0x15) {
                 const u16 val = m_context.ymm[src].w[imm8 & 7];
-                write_rm(m, val, 16);
+                if (m.is_reg) {
+                    if (vex_w) set_gpr64(m_context, m.rm_id & 15, val);
+                    else set_gpr32(m_context, m.rm_id & 15, val);
+                } else {
+                    write_rm(m, val, 16);
+                }
             } else {
                 const u8 val = m_context.ymm[src].b[imm8 & 15];
-                write_rm(m, val, 8);
+                if (m.is_reg) {
+                    if (vex_w) set_gpr64(m_context, m.rm_id & 15, val);
+                    else set_gpr32(m_context, m.rm_id & 15, val);
+                } else {
+                    write_rm(m, val, 8);
+                }
             }
             m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
             return StepResult::Ok;
@@ -3992,7 +4002,7 @@ StepResult CpuExecutor::step() {
             const u8 pp = rep_prefix == 0xF3 ? 2 : rep_prefix == 0xF2 ? 3 : operand_size_16 ? 1 : 0;
             bool mine = false, has_imm = map3;
             if (map3) {
-                mine = pp == 1 && (op == 0x0C || op == 0x0D || op == 0x16 || op == 0x21 || op == 0x22);
+                mine = pp == 1 && (op == 0x0C || op == 0x0D || op == 0x14 || op == 0x15 || op == 0x16 || op == 0x21 || op == 0x22);
             } else {
                 switch (op) {
                 case 0x12: mine = true; break;
@@ -4043,6 +4053,26 @@ StepResult CpuExecutor::step() {
                         if (op == 0x0C) { for (int i = 0; i < 4; ++i) if ((imm >> i) & 1) r.d[i] = b.d[i]; }
                         else { for (int i = 0; i < 2; ++i) if ((imm >> i) & 1) r.q[i] = b.q[i]; }
                         break;
+                    case 0x14: { // PEXTRB r/m8, xmm, imm8
+                        const u8 val = a.b[imm & 15];
+                        if (m.is_reg) {
+                            if (rex_w) set_gpr64(m_context, m.rm_id & 15, val);
+                            else set_gpr32(m_context, m.rm_id & 15, val);
+                        } else {
+                            write_rm(m, val, 8);
+                        }
+                        break;
+                    }
+                    case 0x15: { // PEXTRW r/m16, xmm, imm8
+                        const u16 val = a.w[imm & 7];
+                        if (m.is_reg) {
+                            if (rex_w) set_gpr64(m_context, m.rm_id & 15, val);
+                            else set_gpr32(m_context, m.rm_id & 15, val);
+                        } else {
+                            write_rm(m, val, 16);
+                        }
+                        break;
+                    }
                     case 0x16: // PEXTRD / PEXTRQ r/m, xmm, imm8
                         write_rm(m, rex_w ? a.q[imm & 1] : a.d[imm & 3], rex_w ? 64 : 32);
                         break;

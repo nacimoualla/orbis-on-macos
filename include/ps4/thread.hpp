@@ -254,10 +254,10 @@ private:
     // Synchronization tables
     std::mutex m_sync_mutex;
     u32 m_next_mutex_id{1};
-    std::unordered_map<u32, std::unique_ptr<std::recursive_mutex>> m_mutexes;
+    std::unordered_map<u32, std::shared_ptr<std::recursive_mutex>> m_mutexes;
 
     u32 m_next_cond_id{1};
-    std::unordered_map<u32, std::unique_ptr<std::condition_variable_any>> m_conds;
+    std::unordered_map<u32, std::shared_ptr<std::condition_variable_any>> m_conds;
 
     std::mutex m_equeues_mutex;
     u32 m_next_equeue_id{1};
