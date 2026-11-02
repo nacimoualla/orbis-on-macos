@@ -200,6 +200,12 @@ static inline uint gcn_sel(uint4 r, uint sel, bool is_int) {
     }
 }
 
+// image_sample_*_o offset VGPR: signed 6-bit texel offsets, x in bits 5:0
+// and y in bits 13:8.
+static inline float2 gcn_texel_offset(uint o) {
+    return float2(float(int(o << 26u) >> 26), float(int((o >> 8u) << 26u) >> 26));
+}
+
 // Pack one component for a format store: unorm/snorm from float, half for
 // 16-bit float, raw bits otherwise (uint/sint and 32-bit float).
 static inline uint gcn_pack(uint x, uint bits, uint nfmt) {
@@ -839,7 +845,11 @@ void Emitter::emit_buffer(const Instruction& i) {
 void Emitter::emit_mimg(const Instruction& i) {
     const bool is_load = i.op == 0x00 || i.op == 0x01;
     const bool is_store = i.op == 0x08 || i.op == 0x09;   // image_store / image_store_mip
-    const bool is_sample = i.op == 0x20 || i.op == 0x24 || i.op == 0x25 || i.op == 0x27;
+    // image_sample{,_l,_b,_lz}_o (0x30/0x34/0x35/0x37) are the base ops with a
+    // packed texel offset in the first address VGPR.
+    const bool has_offset = i.op == 0x30 || i.op == 0x34 || i.op == 0x35 || i.op == 0x37;
+    const u32 sop = has_offset ? i.op - 0x10 : i.op;
+    const bool is_sample = sop == 0x20 || sop == 0x24 || sop == 0x25 || sop == 0x27;
     if (!is_load && !is_sample && !is_store) { fail("unsupported " + mnemonic(i)); return; }
     if (i.da) { fail("array/cube images unsupported"); return; }
     u32 slot = 0;
@@ -874,14 +884,20 @@ void Emitter::emit_mimg(const Instruction& i) {
              << (i.op == 0x01 ? ", " + vreg(i.vaddr + 2) : std::string()) << ");\n";
     } else {
         u32 c = i.vaddr;
+        std::string offset;
+        if (has_offset) { offset = "gcn_texel_offset(" + vreg(c) + ")"; ++c; }
         std::string bias;
-        if (i.op == 0x25) { bias = "F(" + vreg(c) + ")"; ++c; }
+        if (sop == 0x25) { bias = "F(" + vreg(c) + ")"; ++c; }
+        const std::string size = "float2(" + t + ".get_width(), " + t + ".get_height())";
         std::string uv = "float2(F(" + vreg(c) + "), F(" + vreg(c + 1) + "))";
-        if (i.unorm) uv = "(" + uv + " / float2(" + t + ".get_width(), " + t + ".get_height()))";
+        // The offset is in texels of the sampled level; Metal's offset
+        // argument must be a constant, so it is folded into the coordinate.
+        if (i.unorm) uv = "((" + uv + (has_offset ? " + " + offset : std::string()) + ") / " + size + ")";
+        else if (has_offset) uv = "(" + uv + " + " + offset + " / " + size + ")";
         const std::string smp = "smp" + std::to_string(slot);
-        if (i.op == 0x20) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ");\n";
-        else if (i.op == 0x24) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ", level(F(" << vreg(c + 2) << ")));\n";
-        else if (i.op == 0x25) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ", bias(" << bias << "));\n";
+        if (sop == 0x20) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ");\n";
+        else if (sop == 0x24) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ", level(F(" << vreg(c + 2) << ")));\n";
+        else if (sop == 0x25) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ", bias(" << bias << "));\n";
         else body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ", level(0.0f));\n";
     }
     u32 out = i.dst;
@@ -1089,6 +1105,9 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
         out.error = "VS: " + ev.error;
         return out;
     }
+    // No PS program: a depth-only draw (Gnm binds no pixel shader for Z
+    // prepasses and shadow maps). Only the VS is emitted.
+    const bool has_ps = !ps.insts.empty();
     Emitter ep(ps, Stage::Pixel, ps_input_cntl, 0);
     if (!ep.run()) {
         out.error = "PS: " + ep.error;
@@ -1196,40 +1215,43 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     m << "  if ((dc.flags & " << kDrawFlipY << "u) != 0u) out.position.y = -out.position.y;\n";
     m << "  return out;\n}\n\n";
 
-    const u32 ps_vgprs = std::max<u32>(ep.max_vgpr, 4);
-    // One float4 return for mrt0 alone; a struct for more targets or depth.
-    const u8 cmask = ep.ps_color_mask | 1; // color0 is always returned
-    const bool ps_struct = ep.ps_depth || cmask != 1;
-    if (ps_struct) {
-        m << "struct GcnPsOut {\n";
+    if (has_ps) {
+        const u32 ps_vgprs = std::max<u32>(ep.max_vgpr, 4);
+        // One float4 return for mrt0 alone; a struct for more targets or depth.
+        const u8 cmask = ep.ps_color_mask | 1; // color0 is always returned
+        const bool ps_struct = ep.ps_depth || cmask != 1;
+        if (ps_struct) {
+            m << "struct GcnPsOut {\n";
+            for (u32 n = 0; n < 8; ++n)
+                if ((cmask >> n) & 1) m << "    float4 c" << n << " [[color(" << n << ")]];\n";
+            if (ep.ps_depth) m << "    float depth [[depth(any)]];\n";
+            m << "};\n\n";
+        }
+        m << "fragment " << (ps_struct ? "GcnPsOut" : "float4") << " gcn_ps_main(GcnPsIn in [[stage_in]],\n"
+          << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]]"
+          << (uses_front_face ? ", bool front_face [[front_facing]]" : "")
+          << image_params(ep.images) << ") {\n";
+        m << "  uint s[128]; uint v[" << ps_vgprs << "]; uint scc = 0u;\n";
+        m << "  for (uint k = 0; k < 128u; ++k) s[k] = 0u;\n";
+        m << "  for (uint k = 0; k < " << ps_vgprs << "u; ++k) v[k] = 0u;\n";
+        m << "  for (uint k = 0; k < 16u; ++k) s[k] = dc.ps_user[k];\n";
+        m << "  s[126] = 1u; s[124] = 0u;\n";
+        m << preload.str();
         for (u32 n = 0; n < 8; ++n)
-            if ((cmask >> n) & 1) m << "    float4 c" << n << " [[color(" << n << ")]];\n";
-        if (ep.ps_depth) m << "    float depth [[depth(any)]];\n";
-        m << "};\n\n";
-    }
-    m << "fragment " << (ps_struct ? "GcnPsOut" : "float4") << " gcn_ps_main(GcnPsIn in [[stage_in]],\n"
-      << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]]"
-      << (uses_front_face ? ", bool front_face [[front_facing]]" : "")
-      << image_params(ep.images) << ") {\n";
-    m << "  uint s[128]; uint v[" << ps_vgprs << "]; uint scc = 0u;\n";
-    m << "  for (uint k = 0; k < 128u; ++k) s[k] = 0u;\n";
-    m << "  for (uint k = 0; k < " << ps_vgprs << "u; ++k) v[k] = 0u;\n";
-    m << "  for (uint k = 0; k < 16u; ++k) s[k] = dc.ps_user[k];\n";
-    m << "  s[126] = 1u; s[124] = 0u;\n";
-    m << preload.str();
-    for (u32 n = 0; n < 8; ++n)
-        if ((cmask >> n) & 1) m << "  float4 color" << n << " = float4(0.0f);\n";
-    if (ep.ps_depth) m << "  float depth0 = in.position.z;\n";
-    m << ep.body.str();
-    if (ep.uses_exec_write) m << "  if ((s[126] & 1u) == 0u) discard_fragment();\n";
-    if (ps_struct) {
-        m << "  GcnPsOut o_;\n";
-        for (u32 n = 0; n < 8; ++n)
-            if ((cmask >> n) & 1) m << "  o_.c" << n << " = color" << n << ";\n";
-        if (ep.ps_depth) m << "  o_.depth = depth0;\n";
-        m << "  return o_;\n}\n";
-    } else {
-        m << "  return color0;\n}\n";
+            if ((cmask >> n) & 1) m << "  float4 color" << n << " = float4(0.0f);\n";
+        if (ep.ps_depth) m << "  float depth0 = in.position.z;\n";
+        m << ep.body.str();
+        if (ep.uses_exec_write) m << "  if ((s[126] & 1u) == 0u) discard_fragment();\n";
+        if (ps_struct) {
+            m << "  GcnPsOut o_;\n";
+            for (u32 n = 0; n < 8; ++n)
+                if ((cmask >> n) & 1) m << "  o_.c" << n << " = color" << n << ";\n";
+            if (ep.ps_depth) m << "  o_.depth = depth0;\n";
+            m << "  return o_;\n}\n";
+        } else {
+            m << "  return color0;\n}\n";
+        }
+
     }
 
     out.ok = true;
@@ -1241,6 +1263,7 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     out.ps_writes_color = ep.ps_color;
     out.ps_color_mask = ep.ps_color_mask;
     out.ps_writes_depth = ep.ps_depth;
+    out.has_ps = has_ps;
     return out;
 }
 
@@ -1496,7 +1519,8 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
         }
         case Encoding::MIMG: {
             const bool store = i.op == 0x08 || i.op == 0x09;
-            const bool sample = i.op == 0x20 || i.op == 0x24 || i.op == 0x25 || i.op == 0x27;
+            const u32 sop = (i.op == 0x30 || i.op == 0x34 || i.op == 0x35 || i.op == 0x37) ? i.op - 0x10 : i.op;
+            const bool sample = sop == 0x20 || sop == 0x24 || sop == 0x25 || sop == 0x27;
             for (u32 k = 0; k < slots.size(); ++k) {
                 const ImageSlot& sl = slots[k];
                 if (sl.srsrc != i.srsrc) continue;

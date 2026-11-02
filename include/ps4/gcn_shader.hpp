@@ -140,6 +140,7 @@ struct TranslatedPipeline {
     bool ps_writes_color{false};     // exports mrt0
     u8 ps_color_mask{0};             // exported colour targets (bit n = mrt<n>)
     bool ps_writes_depth{false};     // exp mrtz
+    bool has_ps{true};               // false: depth-only draw, no fragment function
 };
 
 /// Translate a VS/PS pair to MSL. `ps_input_cntl` holds SPI_PS_INPUT_CNTL_n

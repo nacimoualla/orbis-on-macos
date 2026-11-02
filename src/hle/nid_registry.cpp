@@ -1474,6 +1474,11 @@ static u64 guest_inet_pton(MemoryManager& mem, u64 af, GuestAddr src, GuestAddr 
 }
 
 void NidRegistry::register_default_libraries() {
+    // A new registry is a new emulation session. request_semaphore_shutdown()
+    // from an earlier registry's teardown left s_sem_shutdown set, and since
+    // WaitSema treats it as "cancel every wait", each later wait in the same
+    // process returned ECANCELED (test_phase9's Test 11 after Test 10).
+    s_sem_shutdown.store(false, std::memory_order_relaxed);
     // =========================================================================
     // libkernel: Core Orbis OS runtime services
     // =========================================================================

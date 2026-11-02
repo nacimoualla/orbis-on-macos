@@ -1124,7 +1124,8 @@ static MTLPixelFormat mtl_color_format(const ColorTarget& c) {
 // is unsupported, so the caller falls through to the fixed mesh shader.
 bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_addr, MTLIndexType idx_type,
                                        PrimitiveType prim_type, i32 base_vertex, u32 instance_count) {
-    if (!gcn_enabled || !memory || !metal || vs_shader_addr <= 0x1000 || ps_shader_addr <= 0x1000) return false;
+    // ps_shader_addr 0 is a depth-only draw; the translated path handles it.
+    if (!gcn_enabled || !memory || !metal || vs_shader_addr <= 0x1000) return false;
     @autoreleasepool {
         if (!gcn_cache) gcn_cache = std::make_unique<GcnPipelineCache>(metal->raw_device(), memory);
         gcn_cache->set_memory(memory);

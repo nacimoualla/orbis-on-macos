@@ -340,7 +340,9 @@ struct GcnPipelineCache::Impl {
             } else {
                 MTLRenderPipelineDescriptor* d = [[MTLRenderPipelineDescriptor alloc] init];
                 d.vertexFunction = [lib newFunctionWithName:@"gcn_vs_main"];
-                d.fragmentFunction = [lib newFunctionWithName:@"gcn_ps_main"];
+                // A depth-only draw has no fragment function; every colour
+                // attachment is then write-masked off (ps_color_mask is 0).
+                d.fragmentFunction = e.tp.has_ps ? [lib newFunctionWithName:@"gcn_ps_main"] : nil;
                 if (depth_format) {
                     const MTLPixelFormat df = static_cast<MTLPixelFormat>(depth_format);
                     d.depthAttachmentPixelFormat = df;
@@ -422,7 +424,7 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         return false;
     };
     if (!im.device || !im.memory || !render_encoder || !req.vs_user || !req.ps_user) return fail("not configured");
-    if (req.vs_addr < 0x1000 || req.ps_addr < 0x1000) return fail("no shaders bound");
+    if (req.vs_addr < 0x1000) return fail("no vertex shader bound");
 
     const gcn::MemReader read = im.reader();
     const u32 vs_user_count = (req.vs_rsrc2 >> 1) & 0x1F;
@@ -434,7 +436,9 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         im.log_once("VS 0x" + std::to_string(req.vs_addr) + " load failed: " + err);
         return fail("VS load: " + err);
     }
-    if (!gcn::load_program(read, req.ps_addr, req.ps_user, std::min<u32>(ps_user_count, 16), ps, err)) {
+    // No PS address (0): a depth-only draw; `ps` stays empty.
+    if (req.ps_addr >= 0x1000 &&
+        !gcn::load_program(read, req.ps_addr, req.ps_user, std::min<u32>(ps_user_count, 16), ps, err)) {
         im.log_once("PS 0x" + std::to_string(req.ps_addr) + " load failed: " + err);
         return fail("PS load: " + err);
     }
