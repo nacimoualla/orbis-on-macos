@@ -333,7 +333,16 @@ int main(int argc, char* argv[]) {
                     return v ? std::atof(v) : 0.0;
                 }();
                 const auto t_start = std::chrono::steady_clock::now();
+                // PS4_RUN_SECONDS=N: close the window loop after N seconds so an
+                // unattended run reaches the normal shutdown (and its stats).
+                static const double s_run_seconds = [] {
+                    const char* v = std::getenv("PS4_RUN_SECONDS");
+                    return v ? std::atof(v) : 0.0;
+                }();
                 while (window->is_open() && !guest_done.load()) {
+                    if (s_run_seconds > 0 &&
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() > s_run_seconds)
+                        break;
                     window->poll_events();
                     ps4::PadState pad_state = window->input_pad_state();
                     if (s_auto_press > 0) {

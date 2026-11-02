@@ -1589,7 +1589,31 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // VPSHUFD (0x70)
+        // VPSHUFD (66 0x70) / VPSHUFHW (F3 0x70) / VPSHUFLW (F2 0x70). The
+        // word shuffles used to run as VPSHUFD whatever the prefix, which
+        // scrambled the IDCT of Dragon Ball Xenoverse 2's CRI movie decoder.
+        if (vex_map == 1 && vex_op == 0x70 && (vex_pp == 2 || vex_pp == 3)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            CpuContext::YmmReg src{};
+            if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+            else if (!m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16)) return StepResult::MemoryFault;
+            CpuContext::YmmReg res = src;   // the other four words of each lane pass through
+            const usize half = vex_pp == 2 ? 4 : 0;   // F3: high words, F2: low words
+            for (usize lane = 0; lane < (vex_l ? 2u : 1u); ++lane) {
+                const usize b = lane * 8 + half;
+                for (usize i = 0; i < 4; ++i) res.w[b + i] = src.w[b + ((imm8 >> (2 * i)) & 3)];
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
         if (vex_op == 0x70) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
             if (!m.valid) return StepResult::IllegalInstruction;
@@ -1896,7 +1920,11 @@ StepResult CpuExecutor::step() {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 dest = m.reg_id & 15;
-            const bool is_signed = (vex_op >= 0x30);
+            // 0x20..0x25 are VPMOVSX* (sign-extend), 0x30..0x35 VPMOVZX*. This
+            // was inverted, so vpmovzxbw turned every pixel byte >= 128 into a
+            // negative word: the CRI movie decoder's motion compensation then
+            // saturated bright luma and mid-grey chroma to 0 (black / green).
+            const bool is_signed = (vex_op <= 0x25);
             const u8 op_type = vex_op & 0x0F;
 
             usize src_bytes = 0;
@@ -4010,7 +4038,7 @@ StepResult CpuExecutor::step() {
                 case 0x13: case 0x17: mine = pp <= 1; break;
                 case 0xC2: mine = has_imm = true; break;
                 case 0xC6: mine = pp <= 1; has_imm = true; break;
-                case 0x70: mine = pp == 1; has_imm = true; break;
+                case 0x70: mine = pp >= 1; has_imm = true; break;   // PSHUFD / PSHUFHW / PSHUFLW
                 case 0xD0: mine = pp == 1 || pp == 3; break;
                 case 0xD4: case 0xFA: case 0xFB: case 0xFE:
                 case 0x62: case 0x6A: case 0x6C: case 0x6D: mine = pp == 1; break;
@@ -4134,9 +4162,15 @@ StepResult CpuExecutor::step() {
                             r.q[0] = a.q[imm & 1]; r.q[1] = b.q[(imm >> 1) & 1];
                         }
                         break;
-                    case 0x70: // PSHUFD
+                    case 0x70: // PSHUFD (66) / PSHUFHW (F3) / PSHUFLW (F2)
                         ok = load_b(16);
-                        for (int i = 0; i < 4; ++i) r.d[i] = b.d[(imm >> (2 * i)) & 3];
+                        if (pp == 1) {
+                            for (int i = 0; i < 4; ++i) r.d[i] = b.d[(imm >> (2 * i)) & 3];
+                        } else {
+                            const int half = pp == 2 ? 4 : 0;
+                            r = b;   // the other four words pass through
+                            for (int i = 0; i < 4; ++i) r.w[half + i] = b.w[half + ((imm >> (2 * i)) & 3)];
+                        }
                         break;
                     case 0xD0: // ADDSUBPD (66) / ADDSUBPS (F2)
                         ok = load_b(16);
@@ -4215,6 +4249,34 @@ StepResult CpuExecutor::step() {
                     const u32 val = __builtin_bswap32(static_cast<u32>(get_gpr64(m_context, m.reg_id)));
                     if (!m_memory.write_value(m.mem_addr, val)) return StepResult::MemoryFault;
                 }
+                m_context.rip = start_rip + cursor + m.bytes_consumed;
+                return StepResult::Ok;
+            }
+
+            // 66 0F 38 20..25: PMOVSX{BW,BD,BQ,WD,WQ,DQ}; 30..35: PMOVZX*.
+            if (operand_size_16 && ((op2 >= 0x20 && op2 <= 0x25) || (op2 >= 0x30 && op2 <= 0x35))) {
+                auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f38, rex_r, rex_x, rex_b, seg_override, m_context);
+                if (!m.valid) return StepResult::IllegalInstruction;
+                static constexpr u8 kSrcBytes[6] = {8, 4, 2, 8, 4, 8};
+                static constexpr u8 kFrom[6] = {1, 1, 1, 2, 2, 4}, kTo[6] = {2, 4, 8, 4, 8, 8};
+                const u8 t = op2 & 0x0F;
+                const bool sx = op2 <= 0x25;
+                CpuContext::YmmReg src{};
+                if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+                else if (!m_memory.read_bytes(m.mem_addr, &src, kSrcBytes[t])) return StepResult::MemoryFault;
+                CpuContext::YmmReg res = m_context.ymm[m.reg_id & 15];   // legacy SSE keeps bits 255:128
+                res.q[0] = res.q[1] = 0;
+                const usize n = 16 / kTo[t];
+                for (usize i = 0; i < n; ++i) {
+                    u64 v = 0;
+                    std::memcpy(&v, src.b + i * kFrom[t], kFrom[t]);
+                    if (sx) {
+                        const unsigned sh = 64u - 8u * kFrom[t];
+                        v = static_cast<u64>(static_cast<i64>(v << sh) >> sh);
+                    }
+                    std::memcpy(res.b + i * kTo[t], &v, kTo[t]);
+                }
+                m_context.ymm[m.reg_id & 15] = res;
                 m_context.rip = start_rip + cursor + m.bytes_consumed;
                 return StepResult::Ok;
             }
