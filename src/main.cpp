@@ -347,6 +347,26 @@ int main(int argc, char* argv[]) {
                         pad_state.buttons |= std::fmod(t, 3.0) < 2.0 ? 0x20 : 0x80;
                     }
                     nid_registry.set_pad_state(pad_state);
+                    // PS4_HLE_HIST_EVERY=N (with PS4_HLE_HIST): per-thread HLE
+                    // calls of each N-second window, to see what a running but
+                    // stuck game polls.
+                    static const double s_hist_every = [] {
+                        const char* v = std::getenv("PS4_HLE_HIST_EVERY");
+                        return v ? std::atof(v) : 0.0;
+                    }();
+                    if (s_hist_every > 0) {
+                        static auto s_next = t_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                           std::chrono::duration<double>(s_hist_every));
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now >= s_next) {
+                            char label[64];
+                            std::snprintf(label, sizeof(label), "t=%.0fs",
+                                          std::chrono::duration<double>(now - t_start).count());
+                            ps4::dump_hle_time_window(label);
+                            s_next = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                               std::chrono::duration<double>(s_hist_every));
+                        }
+                    }
                     nid_registry.set_mouse_state(window->input_mouse_state());
                     const ps4::u64 ready = frames_ready.load(std::memory_order_acquire);
                     if (ready != presented) {

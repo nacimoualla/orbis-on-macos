@@ -176,6 +176,9 @@ void set_active_linker(DynamicLinker* linker) noexcept;
 GuestAddr module_base_allocator(GuestSize need) noexcept;
 
 void dump_hle_histogram();
+/// PS4_HLE_HIST_EVERY: print the per-thread HLE calls made since the last
+/// window (needs PS4_HLE_HIST) and start a new one.
+void dump_hle_time_window(const char* label);
 void dump_prx_calls();
 void dump_export_tables();
 std::string describe_guest_addr(GuestAddr a);

@@ -718,6 +718,18 @@ void ThreadManager::dump_stall_snapshot(const char* tag) const {
                              names[i], (unsigned long long)regs[i], (unsigned long long)v);
             }
         }
+        // Frame-pointer chain: which callers led into a spinning loop.
+        std::fprintf(stderr, "    frames:");
+        GuestAddr fp = c.rbp;
+        for (int d = 0; d < 12 && fp > 0x1000 && m_memory.is_valid_address(fp, 16); ++d) {
+            u64 next = 0, ret = 0;
+            m_memory.read_value(fp, next);
+            m_memory.read_value(fp + 8, ret);
+            std::fprintf(stderr, " 0x%llx", (unsigned long long)ret);
+            if (next <= fp) break;
+            fp = next;
+        }
+        std::fprintf(stderr, "\n");
     }
     std::fprintf(stderr, "========================================\n");
 }

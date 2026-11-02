@@ -118,6 +118,23 @@ void dump_hle_histogram() {
 
 
 
+void dump_hle_time_window(const char* label) {
+    std::vector<std::pair<u64, std::string>> rows;
+    {
+        std::lock_guard<std::mutex> lock(g_hle_time_mtx);
+        for (const auto& [key, v] : g_hle_time) {
+            char b[160];
+            std::snprintf(b, sizeof(b), "T%-3u %-44s calls=%-7llu %.1fms", key.second, key.first.c_str(),
+                          (unsigned long long)v.second, v.first / 1e6);
+            rows.emplace_back(v.second, b);
+        }
+        g_hle_time.clear();
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "[HLEWIN] --- %s: %zu (name, thread) pairs ---\n", label, rows.size());
+    for (usize i = 0; i < rows.size() && i < 40; ++i) std::fprintf(stderr, "[HLEWIN] %s\n", rows[i].second.c_str());
+}
+
 DynamicLinker::DynamicLinker(MemoryManager& memory, SyscallTable& syscalls, NidRegistry& registry)
     : m_memory(memory), m_syscalls(syscalls), m_registry(registry) {
     // Initialize default benign whitelist with CRT bootstrap stubs:
