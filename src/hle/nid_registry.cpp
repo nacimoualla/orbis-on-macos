@@ -211,6 +211,55 @@ struct FiosFile {
 static std::unordered_map<i32, FiosFile> s_fios_files;
 static i32 s_next_fios_fd = 200;
 
+// Async FIOS2 operations. sceFiosFHOpen returns an SceFiosOp id (never SCE_OK)
+// so the engine's async layer can track it. The open completes inside the call,
+// so each op is recorded as done with the error it finished with.
+struct FiosOp {
+    i32 error{0};
+};
+static std::unordered_map<u64, FiosOp> s_fios_ops;
+static u64 s_next_fios_op = 0x10000;
+
+// Shared body of sceFiosFHOpenSync and sceFiosFHOpen: resolve the guest path,
+// open it, and write the new handle to *pfh_addr. Returns SCE_OK or -1.
+static i64 fios_open_file_handle(const char* tag, MemoryManager& mem, GuestAddr pfh_addr, GuestAddr path_addr) {
+    const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
+                           ? mem.to_host_ptr<char>(path_addr) : nullptr;
+    if (!path) {
+        return -1;
+    }
+    auto& vfs = get_vfs();
+    auto resolved = vfs.resolve_path(path);
+    if (!resolved) {
+        std::fprintf(stderr, "[FIOS2] %s('%s') -> not found, returning -1\n", tag, path);
+        return -1;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(*resolved, ec)) {
+        std::fprintf(stderr, "[FIOS2] %s('%s' -> '%s') -> not regular file\n", tag, path, resolved->c_str());
+        return -1;
+    }
+    auto stream = std::make_unique<std::ifstream>(*resolved, std::ios::binary);
+    if (!stream->is_open()) {
+        std::fprintf(stderr, "[FIOS2] %s('%s' -> '%s') -> open failed\n", tag, path, resolved->c_str());
+        return -1;
+    }
+    const u64 sz = std::filesystem::file_size(*resolved, ec);
+    const i32 fd = s_next_fios_fd++;
+    s_fios_files[fd] = FiosFile{
+        .stream = std::move(stream),
+        .size = sz,
+        .offset = 0,
+        .path = path
+    };
+    if (pfh_addr != 0 && mem.is_valid_address(pfh_addr, sizeof(i32))) {
+        mem.write_value(pfh_addr, fd);
+    }
+    std::fprintf(stderr, "[FIOS2] %s('%s' -> '%s') -> handle %d (size=%llu) written to 0x%llx\n",
+                 tag, path, resolved->c_str(), fd, (unsigned long long)sz, (unsigned long long)pfh_addr);
+    return SCE_OK;
+}
+
 // PS4_LOG_SEMA=1: log every sceKernelWaitSema/SignalSema (FMOD hits these
 // hundreds of times a second, so they are off by default).
 static bool sema_log_enabled() {
@@ -588,6 +637,7 @@ void NidRegistry::shutdown() {
         g_audio_manager.reset();
     }
     s_fios_files.clear();
+    s_fios_ops.clear();
 
     // 3. Clear pointers to stack-allocated subsystems in main()
     g_syscalls = nullptr;
@@ -4740,46 +4790,44 @@ void NidRegistry::register_default_libraries() {
     // NID: 0x6F8E1A9D5D83ECADULL ("b44anV2D7K0")
     register_symbol(0x6F8E1A9D5D83ECADULL, "sceFiosFHOpenSync", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr pfh_addr = ctx.rsi;
-            const GuestAddr path_addr = ctx.rdx;
-            const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
-                                   ? mem.to_host_ptr<char>(path_addr) : nullptr;
-            if (!path) {
-                ctx.rax = static_cast<u64>(-1);
-                return;
-            }
-            auto& vfs = get_vfs();
-            auto resolved = vfs.resolve_path(path);
-            if (!resolved) {
-                std::fprintf(stderr, "[FIOS2] sceFiosFHOpenSync('%s') -> not found, returning -1\n", path);
-                ctx.rax = static_cast<u64>(-1);
-                return;
-            }
-            std::error_code ec;
-            if (!std::filesystem::is_regular_file(*resolved, ec)) {
-                std::fprintf(stderr, "[FIOS2] sceFiosFHOpenSync('%s' -> '%s') -> not regular file\n", path, resolved->c_str());
-                ctx.rax = static_cast<u64>(-1);
-                return;
-            }
-            auto stream = std::make_unique<std::ifstream>(*resolved, std::ios::binary);
-            if (!stream->is_open()) {
-                std::fprintf(stderr, "[FIOS2] sceFiosFHOpenSync('%s' -> '%s') -> open failed\n", path, resolved->c_str());
-                ctx.rax = static_cast<u64>(-1);
-                return;
-            }
-            const u64 sz = std::filesystem::file_size(*resolved, ec);
-            const i32 fd = s_next_fios_fd++;
-            s_fios_files[fd] = FiosFile{
-                .stream = std::move(stream),
-                .size = sz,
-                .offset = 0,
-                .path = path
-            };
-            if (pfh_addr != 0 && mem.is_valid_address(pfh_addr, sizeof(i32))) {
-                mem.write_value(pfh_addr, fd);
-            }
-            std::fprintf(stderr, "[FIOS2] sceFiosFHOpenSync('%s' -> '%s') -> handle %d (size=%llu) written to 0x%llx\n",
-                         path, resolved->c_str(), fd, (unsigned long long)sz, (unsigned long long)pfh_addr);
+            ctx.rax = static_cast<u64>(fios_open_file_handle("sceFiosFHOpenSync", mem, ctx.rsi, ctx.rdx));
+        });
+
+    // sceFiosFHOpen(int profile, SceFiosFH* pFH, const char* path, const SceFiosOpenParams* pParams) -> SceFiosOp
+    // NID: 0x7ABE93910154BE9DULL. Same arguments as the Sync variant, but it
+    // returns an op id instead of SCE_OK. Without a registration the call fell
+    // through to the unimplemented-stub path and returned 0, which the
+    // caller's async layer treats as "no operation" and polls forever.
+    register_symbol(0x7ABE93910154BE9DULL, "sceFiosFHOpen", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const i64 status = fios_open_file_handle("sceFiosFHOpen", mem, ctx.rsi, ctx.rdx);
+            const u64 op = s_next_fios_op++;
+            s_fios_ops[op] = FiosOp{ .error = static_cast<i32>(status) };
+            ctx.rax = op;
+        });
+
+    // int sceFiosOpIsDone(SceFiosOp op). NID: 0x6DF828D8EB66AB3DULL.
+    // Every op this runtime creates is complete when the call returns, so
+    // report done. Unknown ops also report done: a 0 here would make the
+    // caller poll indefinitely on a handle we never issued.
+    register_symbol(0x6DF828D8EB66AB3DULL, "sceFiosOpIsDone", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = 1;
+        });
+
+    // SceFiosErrorCode sceFiosOpGetError(SceFiosOp op). NID: 0x5FEEEB21F63DECFBULL.
+    register_symbol(0x5FEEEB21F63DECFBULL, "sceFiosOpGetError", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager&) {
+            const auto it = s_fios_ops.find(ctx.rdi);
+            const i64 err = (it == s_fios_ops.end()) ? static_cast<i64>(SCE_OK)
+                                                     : static_cast<i64>(it->second.error);
+            ctx.rax = static_cast<u64>(err);
+        });
+
+    // SceFiosErrorCode sceFiosOpDelete(SceFiosOp op). NID: 0xE5CC8472294EFC9DULL.
+    register_symbol(0xE5CC8472294EFC9DULL, "sceFiosOpDelete", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager&) {
+            s_fios_ops.erase(ctx.rdi);
             ctx.rax = SCE_OK;
         });
 
