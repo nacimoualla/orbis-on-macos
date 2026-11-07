@@ -737,12 +737,23 @@ void Emitter::emit_salu(const Instruction& i) {
 constexpr u32 kNoUniformSlot = ~0u;
 constexpr u32 kMaxUniformLoads = 1000;  // Metal's setBytes takes up to 4 KB
 
-/// Where each scalar load of the shader's straight-line start goes in the
-/// draw's table of evaluated loads (kNoUniformSlot: the shader loads it itself).
-/// Up to the first branch or branch target those loads run once with values
-/// the draw fixes, so scan_resources can evaluate them. On every fragment they
+/// Where each scalar load of the shader's start goes in the table of loads
+/// evaluated when the draw or dispatch is encoded (kNoUniformSlot: the shader
+/// loads it itself). Slot 0 is a flag: 1 when scan_resources evaluated the
+/// table, else the shader takes its own loads.
+///
+/// Up to the first branch target (or backward or unconditional branch) every
+/// load runs at most once, in program order, with values the draw fixes: a
+/// forward conditional branch can only skip some of them. scan_resources walks
+/// the same instructions linearly, so it gets the same values.
+///
+/// Two reasons to read them from the table. Speed: on every fragment the load
 /// would otherwise search the range table and read memory for each dword,
-/// which dominates post-processing shaders.
+/// which dominated post-processing shaders. Correctness for compute: dispatches
+/// read guest memory directly when the GPU runs them, which is later than on
+/// the console; by then a game may have reused the constant memory (Dragon
+/// Ball Xenoverse 2's texture copies read the next copy's size and wrote
+/// nothing).
 std::vector<u32> uniform_load_slots(const Program& prog) {
     static const u32 kCount[] = {1, 2, 4, 8, 16};
     std::set<u32> targets;
@@ -750,11 +761,12 @@ std::vector<u32> uniform_load_slots(const Program& prog) {
         if (i.enc == Encoding::SOPP && i.op >= 2 && i.op <= 9)
             targets.insert(static_cast<u32>(static_cast<i64>(i.pc) + i.size + i.simm));
     std::vector<u32> slots(prog.insts.size(), kNoUniformSlot);
-    u32 next = 0;
+    u32 next = 1;
     for (usize k = 0; k < prog.insts.size(); ++k) {
         const Instruction& i = prog.insts[k];
         if (targets.count(i.pc)) break;
-        if (i.enc == Encoding::SOPP && i.op >= 2 && i.op <= 9) break;
+        if (i.enc == Encoding::SOPP && i.op == 2) break;  // s_branch
+        if (i.enc == Encoding::SOPP && i.op >= 4 && i.op <= 9 && i.simm < 0) break;
         if (i.enc == Encoding::SOP1 && (i.op == 32 || i.op == 33)) break;  // s_setpc, s_swappc
         if (i.enc != Encoding::SMRD || i.op == 29 || i.op == 30 || i.op == 31) continue;
         if ((i.op & 7) > 4 || (i.op & ~7u) > 8 || !(i.imm || i.offset == 255)) continue;
@@ -780,10 +792,21 @@ void Emitter::emit_smrd(const Instruction& i) {
     for (u32 k = 0; k < n; ++k) track_s(i.dst + k);
     // Evaluated once per draw on the CPU: read the answer from the draw's table.
     const usize index = static_cast<usize>(&i - prog.insts.data());
-    if (index < uniform_slots.size() && uniform_slots[index] != kNoUniformSlot) {
+    const bool uniform = index < uniform_slots.size() && uniform_slots[index] != kNoUniformSlot;
+    if (uniform && stage != Stage::Compute) {
+        // A draw whose loads cannot be evaluated is rejected before it is
+        // encoded, so the table is always valid here. Keeping the shader's own
+        // load as a fallback would stop Metal from optimising it away.
         for (u32 k = 0; k < n; ++k)
             body << "    s[" << i.dst + k << "] = ul[" << uniform_slots[index] + k << "];\n";
         return;
+    }
+    if (uniform) {
+        // Compute runs even when the scan failed (ul[0] == 0).
+        body << "    if (ul[0] != 0u) {\n";
+        for (u32 k = 0; k < n; ++k)
+            body << "      s[" << i.dst + k << "] = ul[" << uniform_slots[index] + k << "];\n";
+        body << "    } else\n";
     }
     track_s(i.sbase); track_s(i.sbase + 1);
     if (!i.imm && i.offset < 128) track_s(i.offset);
@@ -1079,7 +1102,7 @@ bool Emitter::run() {
         if (i.enc == Encoding::VOP3 && i.op < 0x100 && (i.op & 0x10)) uses_exec_write = true;
         if (i.enc == Encoding::VOP3 && i.op < 0x100 && i.sdst == operand::kExecLo) uses_exec_write = true;
     }
-    if (stage != Stage::Compute) uniform_slots = uniform_load_slots(prog);
+    uniform_slots = uniform_load_slots(prog);
     const bool structured = prog.has_branches;
     std::set<u32> labels;
     if (structured) {
@@ -1340,7 +1363,8 @@ TranslatedComputePipeline translate_compute_pipeline(const Program& cs,
       << "    uint3 tgid [[threadgroup_position_in_grid]],\n"
       << "    uint3 global_tid [[thread_position_in_grid]],\n"
       << "    device uchar* mem [[buffer(0)]],\n"
-      << "    constant GcnComputeConsts& dc [[buffer(1)]]"
+      << "    constant GcnComputeConsts& dc [[buffer(1)]],\n"
+      << "    constant uint* ul [[buffer(2)]]"
       << image_params(ec.images) << ") {\n";
     m << "  uint s[128];\n";
     m << "  uint v[" << cs_vgprs << "];\n";
@@ -1619,6 +1643,7 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
     }
     rs.ranges = std::move(merged);
     rs.ok = true;
+    if (!rs.uniform_loads.empty()) rs.uniform_loads[0] = 1;  // table evaluated
     return rs;
 }
 

@@ -47,6 +47,7 @@ struct MetalBackend::Impl {
         bool initialized{false};
     };
     std::map<u64, ColorBuffer> color_buffers;
+    std::function<void(u64, void*)> evict_hook;
     std::array<u64, 8> color_keys{};
     std::array<u64, 8> encoder_color_keys{};
     std::set<u64> display_buffers;
@@ -465,8 +466,13 @@ void MetalBackend::set_color_target(u32 slot, u64 key, u32 width, u32 height, u3
                     break;
                 }
             }
-            if (!in_use) it = m_impl->color_buffers.erase(it);
-            else ++it;
+            if (in_use) {
+                ++it;
+                continue;
+            }
+            if (m_impl->evict_hook && it->second.initialized && it->second.texture)
+                m_impl->evict_hook(it->first, (__bridge void*)it->second.texture);
+            it = m_impl->color_buffers.erase(it);
         }
     }
 }
@@ -555,6 +561,21 @@ void* MetalBackend::storage_target(u64 key, u32 width, u32 height, u32 pixel_for
     Impl::ColorBuffer& cb = m_impl->color_buffer(key, width, height, fmt);
     cb.initialized = true;
     return (__bridge void*)cb.texture;
+}
+
+void MetalBackend::set_surface_evict_hook(std::function<void(u64, void*)> hook) {
+    if (m_impl) m_impl->evict_hook = std::move(hook);
+}
+
+void MetalBackend::run_after_gpu(std::function<void()> fn) {
+    if (!fn) return;
+    id<MTLCommandBuffer> cb = m_impl ? m_impl->active_command_buffer : nil;
+    if (!cb) {
+        fn();
+        return;
+    }
+    auto shared = std::make_shared<std::function<void()>>(std::move(fn));
+    [cb addCompletedHandler:^(id<MTLCommandBuffer>) { (*shared)(); }];
 }
 
 void* MetalBackend::color_target_texture(u32 slot) const noexcept {

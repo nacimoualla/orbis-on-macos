@@ -316,8 +316,43 @@ struct GcnPipelineCache::Impl {
         else if (td.dfmt == 4 && td.nfmt == 7) fmt = MTLPixelFormatR32Float;
         else if (td.dfmt != 10) log_once("image_store format " + std::to_string(td.dfmt) + "/" +
                                          std::to_string(td.nfmt) + " stored as RGBA8Unorm");
+        // A linear RGBA8 target lives only on the host once compute wrote it;
+        // remember its guest layout so it can be written back if the cache
+        // drops it (Dragon Ball Xenoverse 2 copies its 2x1 UI ramp texture
+        // this way at boot and samples it a minute later, after the movie's
+        // post-processing had pushed it out of the cache).
+        if (fmt == MTLPixelFormatRGBA8Unorm && td.dfmt == 10 && td.nfmt == 0 && gcn::is_linear_tiling(td.tiling_index))
+            storage_layouts[td.base] = StorageLayout{td.width, td.height, std::max(td.pitch, td.width)};
         return (__bridge id<MTLTexture>)metal->storage_target(td.base, td.width, td.height,
                                                               static_cast<u32>(fmt));
+    }
+
+    struct StorageLayout {
+        u32 width, height, pitch;  // pitch in texels
+    };
+    std::map<u64, StorageLayout> storage_layouts;
+
+    // MetalBackend's eviction hook: copy a dropped image_store target back,
+    // once the GPU has run what was encoded into it. (The cache can fill up in
+    // the same frame as the dispatch that wrote the target.)
+    void write_back_surface(u64 key, void* texture) {
+        auto it = storage_layouts.find(key);
+        if (it == storage_layouts.end()) return;
+        const StorageLayout l = it->second;
+        storage_layouts.erase(it);
+        id<MTLTexture> t = (__bridge id<MTLTexture>)texture;
+        if (!memory || !metal || !t || t.pixelFormat != MTLPixelFormatRGBA8Unorm) return;
+        const u32 w = std::min<u32>(l.width, static_cast<u32>(t.width));
+        const u32 h = std::min<u32>(l.height, static_cast<u32>(t.height));
+        if (!memory->is_valid_address(key, static_cast<usize>(l.pitch) * 4 * h)) return;
+        MemoryManager* mem = memory;
+        metal->run_after_gpu([t, mem, key, l, w, h] {
+            std::vector<u8> row(static_cast<usize>(w) * 4);
+            for (u32 y = 0; y < h; ++y) {
+                [t getBytes:row.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, y, w, 1) mipmapLevel:0];
+                mem->write_bytes(key + static_cast<u64>(y) * l.pitch * 4, row.data(), row.size());
+            }
+        });
     }
 
     void dump(const PipeKey& key, const gcn::Program& vs, const gcn::Program& ps, const gcn::TranslatedPipeline& tp) {
@@ -433,10 +468,20 @@ GcnPipelineCache::GcnPipelineCache(void* mtl_device, MemoryManager* memory) : m_
     m_impl->memory = memory;
 }
 
-GcnPipelineCache::~GcnPipelineCache() = default;
+GcnPipelineCache::~GcnPipelineCache() {
+    if (m_impl && m_impl->metal) m_impl->metal->set_surface_evict_hook({});
+}
 
 void GcnPipelineCache::set_memory(MemoryManager* memory) noexcept { m_impl->memory = memory; }
-void GcnPipelineCache::set_metal_backend(MetalBackend* metal) noexcept { m_impl->metal = metal; }
+void GcnPipelineCache::set_metal_backend(MetalBackend* metal) noexcept {
+    if (m_impl->metal == metal) return;
+    if (m_impl->metal) m_impl->metal->set_surface_evict_hook({});
+    m_impl->metal = metal;
+    if (metal) {
+        Impl* im = m_impl.get();
+        metal->set_surface_evict_hook([im](u64 key, void* texture) { im->write_back_surface(key, texture); });
+    }
+}
 
 const GcnPipelineStats& GcnPipelineCache::stats() const noexcept { return m_impl->stats; }
 
@@ -792,14 +837,14 @@ bool GcnPipelineCache::encode_dispatch(void* compute_encoder, const GcnComputeRe
 
     if (!pe->pso) return fail(pe->error);
 
-    gcn::ResourceScan scan;
-    if (!pe->tp.images.empty()) {
-        scan = gcn::scan_resources(cs, pe->tp.images, req.cs_user, std::min<u32>(cs_user_count, 16), read, 0);
-        if (!scan.ok) {
-            im.log_once("CS resource scan: " + scan.error);
-            return fail("CS resource scan: " + scan.error);
-        }
+    // Always scanned: it also evaluates the scalar loads (uniform_loads).
+    gcn::ResourceScan scan =
+        gcn::scan_resources(cs, pe->tp.images, req.cs_user, std::min<u32>(cs_user_count, 16), read, 0);
+    if (!scan.ok && !pe->tp.images.empty()) {
+        im.log_once("CS resource scan: " + scan.error);
+        return fail("CS resource scan: " + scan.error);
     }
+    if (!scan.ok) scan.uniform_loads.clear();  // the shader then loads them itself
 
     @autoreleasepool {
         id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)compute_encoder;
@@ -836,6 +881,12 @@ bool GcnPipelineCache::encode_dispatch(void* compute_encoder, const GcnComputeRe
             std::memcpy(cc.cs_user, req.cs_user, sizeof(cc.cs_user));
         }
         [enc setBytes:&cc length:sizeof(cc) atIndex:gcn::binding::kDrawConsts];
+        static const u32 kNoTable = 0;
+        if (scan.uniform_loads.empty())
+            [enc setBytes:&kNoTable length:sizeof(kNoTable) atIndex:gcn::binding::kUniformLoads];
+        else
+            [enc setBytes:scan.uniform_loads.data() length:scan.uniform_loads.size() * sizeof(u32)
+                  atIndex:gcn::binding::kUniformLoads];
 
         MTLSize threadgroups = MTLSizeMake(std::max<u32>(1, req.grid_x),
                                            std::max<u32>(1, req.grid_y),

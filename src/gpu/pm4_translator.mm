@@ -1223,7 +1223,10 @@ bool Pm4Translator::Impl::try_gcn_dispatch(u32 dim_x, u32 dim_y, u32 dim_z) {
 
         std::string why;
         if (!gcn_cache->encode_dispatch(compute_enc, req, &why)) {
-            PM4_LOG("[GCN] dispatch failed: %s\n", why.c_str());
+            static std::set<std::string> s_dispatch_failures;
+            if (s_dispatch_failures.insert(why).second)
+                std::fprintf(stderr, "[GCN] dispatch CS=0x%llx skipped (first of its kind): %s\n",
+                             (unsigned long long)cs_shader_addr, why.c_str());
             return false;
         }
         if (draw_diagnostics_enabled) {
@@ -3068,6 +3071,14 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                                  packet.payload.size(),
                                  packet.payload.size() > 0 ? packet.payload[0] : 0,
                                  packet.payload.size() > 1 ? packet.payload[1] : 0);
+                }
+                {
+                    // Once per opcode, always: a skipped packet can be the reason
+                    // memory the GPU should have written stays empty.
+                    static std::set<u32> s_unimpl_logged;
+                    if (s_unimpl_logged.insert(packet.header.opcode).second)
+                        std::fprintf(stderr, "[PM4] unimplemented packet op=0x%02x (%s), first seen; skipped\n",
+                                     packet.header.opcode, pm4_opcode_to_name(packet.header.opcode));
                 }
                 ++st.unsupported_packets;
                 return false;

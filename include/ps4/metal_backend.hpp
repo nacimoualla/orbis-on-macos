@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps4/common.hpp"
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -102,6 +103,13 @@ public:
     /// when nothing has drawn there yet. Marked initialised so a later render
     /// pass loads what compute wrote instead of clearing it.
     [[nodiscard]] void* storage_target(u64 key, u32 width, u32 height, u32 pixel_format);
+    /// Called with (guest key, id<MTLTexture>) just before a written offscreen
+    /// surface is dropped from the cache, so its contents can go back to guest
+    /// memory. Pass an empty function to remove it.
+    void set_surface_evict_hook(std::function<void(u64, void*)> hook);
+    /// Run `fn` once the GPU has finished the work encoded so far (on a Metal
+    /// completion thread), or now when no frame is open.
+    void run_after_gpu(std::function<void()> fn);
     [[nodiscard]] void* color_target_texture(u32 slot) const noexcept;
 
     /// Read back pixel from a specific color target (or main framebuffer if key == 0)
