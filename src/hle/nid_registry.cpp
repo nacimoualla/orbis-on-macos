@@ -4810,8 +4810,19 @@ void NidRegistry::register_default_libraries() {
     // Every op this runtime creates is complete when the call returns, so
     // report done. Unknown ops also report done: a 0 here would make the
     // caller poll indefinitely on a handle we never issued.
+    // Logging: the poll loop can call IsDone tens of thousands of times, so the
+    // first 32 calls are logged in full, then every 4096th. Unknown op ids are
+    // always logged, since they show the game polling an op we never issued.
     register_symbol(0x6DF828D8EB66AB3DULL, "sceFiosOpIsDone", "libSceFios2",
         [](CpuContext& ctx, MemoryManager&) {
+            static u64 s_isdone_calls = 0;
+            const u64 n = ++s_isdone_calls;
+            const bool known = s_fios_ops.count(ctx.rdi) != 0;
+            if (!known || n <= 32 || n % 4096 == 0) {
+                std::fprintf(stderr, "[FIOS2] sceFiosOpIsDone(op=0x%llx) -> 1 (%s, call #%llu, caller=0x%llx)\n",
+                             (unsigned long long)ctx.rdi, known ? "known" : "UNKNOWN op",
+                             (unsigned long long)n, (unsigned long long)t_guest_rip);
+            }
             ctx.rax = 1;
         });
 
@@ -4821,13 +4832,20 @@ void NidRegistry::register_default_libraries() {
             const auto it = s_fios_ops.find(ctx.rdi);
             const i64 err = (it == s_fios_ops.end()) ? static_cast<i64>(SCE_OK)
                                                      : static_cast<i64>(it->second.error);
+            std::fprintf(stderr, "[FIOS2] sceFiosOpGetError(op=0x%llx) -> %lld (%s, caller=0x%llx)\n",
+                         (unsigned long long)ctx.rdi, (long long)err,
+                         it == s_fios_ops.end() ? "UNKNOWN op" : "known",
+                         (unsigned long long)t_guest_rip);
             ctx.rax = static_cast<u64>(err);
         });
 
     // SceFiosErrorCode sceFiosOpDelete(SceFiosOp op). NID: 0xE5CC8472294EFC9DULL.
     register_symbol(0xE5CC8472294EFC9DULL, "sceFiosOpDelete", "libSceFios2",
         [](CpuContext& ctx, MemoryManager&) {
-            s_fios_ops.erase(ctx.rdi);
+            const bool known = s_fios_ops.erase(ctx.rdi) != 0;
+            std::fprintf(stderr, "[FIOS2] sceFiosOpDelete(op=0x%llx) -> OK (%s, caller=0x%llx)\n",
+                         (unsigned long long)ctx.rdi, known ? "known" : "UNKNOWN op",
+                         (unsigned long long)t_guest_rip);
             ctx.rax = SCE_OK;
         });
 
