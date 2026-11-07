@@ -13,6 +13,7 @@ int main() {
         assert(default_cfg.height == 720);
         assert(default_cfg.resizable == true);
         assert(default_cfg.headless == false);
+        assert(default_cfg.show_stats_overlay == true);
         assert(default_cfg.title == "PlayStation 4 Runtime - macOS");
 
         ps4::WindowConfig custom_cfg{
@@ -107,6 +108,11 @@ int main() {
         assert(window.is_open());
         assert(window.width() == 640);
         assert(window.height() == 360);
+        assert(window.is_stats_overlay_visible());
+        window.toggle_stats_overlay();
+        assert(!window.is_stats_overlay_visible());
+        window.toggle_stats_overlay();
+        assert(window.is_stats_overlay_visible());
 
         // Clear screen and present real Metal frame to the CAMetalLayer
         assert(metal.clear_screen({0.0f, 0.15f, 0.45f, 1.0f}));

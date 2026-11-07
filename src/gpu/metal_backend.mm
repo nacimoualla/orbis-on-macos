@@ -14,6 +14,10 @@
 #include <map>
 #include <set>
 
+namespace {
+std::atomic<double> g_last_frame_gpu_ms{0.0};
+} // namespace
+
 namespace ps4 {
 
 struct MetalBackend::Impl {
@@ -273,6 +277,11 @@ bool MetalBackend::submit_frame(bool wait_for_completion) {
         wait_for_completion = wait_for_completion || debug::capture_active();
 
         id<MTLCommandBuffer> command_buffer = m_impl->active_command_buffer;
+        [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            if (cb.GPUEndTime > cb.GPUStartTime) {
+                g_last_frame_gpu_ms.store((cb.GPUEndTime - cb.GPUStartTime) * 1000.0, std::memory_order_relaxed);
+            }
+        }];
         // PS4_FLIP_STATS: how busy the GPU is, once a second.
         static const bool gpu_stats = std::getenv("PS4_FLIP_STATS") != nullptr;
         if (gpu_stats) {
@@ -667,6 +676,10 @@ bool MetalBackend::frame_in_progress() const noexcept {
 
 u64 MetalBackend::submitted_frame_count() const noexcept {
     return m_impl ? m_impl->submitted_frames : 0;
+}
+
+double MetalBackend::last_gpu_time_ms() const noexcept {
+    return g_last_frame_gpu_ms.load(std::memory_order_relaxed);
 }
 
 bool MetalBackend::read_pixel(u32 x, u32 y, u8& out_r, u8& out_g, u8& out_b, u8& out_a) const {

@@ -2,6 +2,8 @@
 #import <GameController/GameController.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/QuartzCore.h>
+#include <mach/mach.h>
 #include "ps4/display_window.hpp"
 #include <algorithm>
 #include <iostream>
@@ -78,6 +80,20 @@ struct DisplayWindow::Impl {
     // Buttons pressed since the last input_buttons() query: a click whose
     // down and up arrive in the same event batch would otherwise never be seen.
     mutable u32 pressed_latch{0};
+
+    // Telemetry HUD overlay
+    bool show_overlay{true};
+    CALayer* hud_layer{nil};
+    CATextLayer* hud_text_layer{nil};
+    std::chrono::steady_clock::time_point last_stats_time{};
+    u64 last_presented_count{0};
+    double current_fps{0.0};
+    double current_frame_time_ms{0.0};
+    float current_cpu_pct{0.0f};
+    float current_ram_mb{0.0f};
+    double current_gpu_ms{0.0f};
+
+    void update_stats_overlay();
 };
 
 namespace {
@@ -88,7 +104,7 @@ constexpr u32 kPadOptions = kPadStart, kPadTouchPad = kPadTouchPadClick;
 
 // Keyboard -> pad. Space and a left click press Cross and the touch pad
 // together: games that say "touch pad to start" read the pad, others Cross.
-u32 key_to_pad(unsigned short code) {
+[[maybe_unused]] u32 key_to_pad(unsigned short code) {
     switch (code) {
     case 123: return kPadLeft;                  // arrows
     case 124: return kPadRight;
@@ -241,6 +257,56 @@ bool DisplayWindow::initialize(MetalBackend& metal, const WindowConfig& config) 
         [contentView setWantsLayer:YES];
         [contentView setLayer:m_impl->metal_layer];
 
+        // 5. Setup stats HUD overlay
+        const char* env_overlay = std::getenv("PS4_STATS_OVERLAY");
+        if (env_overlay) {
+            m_impl->show_overlay = (std::strcmp(env_overlay, "0") != 0 &&
+                                    std::strcmp(env_overlay, "false") != 0 &&
+                                    std::strcmp(env_overlay, "off") != 0);
+        } else {
+            m_impl->show_overlay = config.show_stats_overlay;
+        }
+
+        m_impl->hud_layer = [CALayer layer];
+        m_impl->hud_layer.backgroundColor = CGColorCreateGenericRGB(0.06, 0.08, 0.12, 0.85);
+        m_impl->hud_layer.borderColor = CGColorCreateGenericRGB(0.25, 0.38, 0.50, 0.65);
+        m_impl->hud_layer.borderWidth = 1.0;
+        m_impl->hud_layer.cornerRadius = 8.0;
+        m_impl->hud_layer.masksToBounds = YES;
+        m_impl->hud_layer.zPosition = 1000.0;
+
+        m_impl->hud_text_layer = [CATextLayer layer];
+        m_impl->hud_text_layer.font = (__bridge CFTypeRef)[NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightMedium];
+        m_impl->hud_text_layer.fontSize = 11.0;
+        m_impl->hud_text_layer.contentsScale = [m_impl->window backingScaleFactor];
+        m_impl->hud_text_layer.alignmentMode = kCAAlignmentLeft;
+        m_impl->hud_text_layer.zPosition = 1001.0;
+
+        NSDictionary* no_anim = @{
+            @"contents": [NSNull null],
+            @"bounds": [NSNull null],
+            @"position": [NSNull null],
+            @"string": [NSNull null],
+            @"hidden": [NSNull null],
+            @"frame": [NSNull null]
+        };
+        m_impl->hud_layer.actions = no_anim;
+        m_impl->hud_text_layer.actions = no_anim;
+
+        const CGFloat hud_w = 210.0;
+        const CGFloat hud_h = 92.0;
+        const CGFloat pad = 14.0;
+        const CGFloat view_h = contentView.bounds.size.height > 0 ? contentView.bounds.size.height : config.height;
+        m_impl->hud_layer.frame = CGRectMake(pad, view_h - hud_h - pad, hud_w, hud_h);
+        m_impl->hud_text_layer.frame = CGRectMake(12, 8, hud_w - 24, hud_h - 14);
+
+        [m_impl->hud_layer addSublayer:m_impl->hud_text_layer];
+        [m_impl->hud_layer setHidden:!m_impl->show_overlay];
+        [m_impl->metal_layer addSublayer:m_impl->hud_layer];
+
+        m_impl->last_stats_time = std::chrono::steady_clock::now();
+        m_impl->last_presented_count = 0;
+
         [m_impl->window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
 
@@ -279,6 +345,10 @@ void DisplayWindow::poll_events() {
 
             if (eventType == NSEventTypeKeyDown) {
                 const unsigned short code = [event keyCode];
+                // F11 (103) or Grave/Tilde (50) toggles stats HUD overlay
+                if (code == 103 || code == 50) {
+                    toggle_stats_overlay();
+                }
                 if (code < 512) {
                     m_impl->key_down[code] = true;
                 }
@@ -489,9 +559,123 @@ bool DisplayWindow::present_frame() {
         [cmd_buffer presentDrawable:drawable];
         [cmd_buffer commit];
 
+        m_impl->update_stats_overlay();
         ++m_impl->presented_frames;
         poll_events();
         return true;
+    }
+}
+
+void DisplayWindow::Impl::update_stats_overlay() {
+    if (!is_open || config.headless || !window) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - last_stats_time).count();
+    if (elapsed < 0.25) {
+        return;
+    }
+
+    const u64 frames = presented_frames - last_presented_count;
+    current_fps = elapsed > 0.0 ? (static_cast<double>(frames) / elapsed) : 0.0;
+    current_frame_time_ms = current_fps > 0.001 ? (1000.0 / current_fps) : 0.0;
+    last_presented_count = presented_frames;
+    last_stats_time = now;
+
+    // 1. RAM: Resident memory in MB
+    struct mach_task_basic_info t_info;
+    mach_msg_type_number_t t_count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&t_info, &t_count) == KERN_SUCCESS) {
+        current_ram_mb = static_cast<float>(t_info.resident_size) / (1024.0f * 1024.0f);
+    }
+
+    // 2. CPU: Cumulative CPU % across all active host threads
+    thread_array_t thread_list;
+    mach_msg_type_number_t thread_count;
+    if (task_threads(mach_task_self(), &thread_list, &thread_count) == KERN_SUCCESS) {
+        float cpu_sum = 0.0f;
+        for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
+            thread_basic_info_data_t tb_info;
+            mach_msg_type_number_t tb_count = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(thread_list[i], THREAD_BASIC_INFO, (thread_info_t)&tb_info, &tb_count) == KERN_SUCCESS) {
+                if (!(tb_info.flags & TH_FLAGS_IDLE)) {
+                    cpu_sum += static_cast<float>(tb_info.cpu_usage) / static_cast<float>(TH_USAGE_SCALE) * 100.0f;
+                }
+            }
+            mach_port_deallocate(mach_task_self(), thread_list[i]);
+        }
+        vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(thread_list), thread_count * sizeof(thread_act_t));
+        current_cpu_pct = cpu_sum;
+    }
+
+    // 3. GPU: Last frame GPU time in ms from MetalBackend
+    if (metal) {
+        current_gpu_ms = metal->last_gpu_time_ms();
+    }
+
+    // 4. Update Window Title
+    NSString* title_str = [NSString stringWithFormat:@"%s — %.1f FPS | CPU: %.1f%% | RAM: %.0f MB | GPU: %.1f ms",
+                           config.title.c_str(), current_fps, current_cpu_pct, current_ram_mb, current_gpu_ms];
+    [window setTitle:title_str];
+
+    // 5. Update On-Screen HUD Overlay
+    if (hud_layer && hud_text_layer && show_overlay) {
+        NSView* contentView = [window contentView];
+        if (contentView) {
+            const CGSize viewSize = contentView.bounds.size;
+            const CGFloat hud_w = 210.0;
+            const CGFloat hud_h = 92.0;
+            const CGFloat pad = 14.0;
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            hud_layer.frame = CGRectMake(pad, viewSize.height - hud_h - pad, hud_w, hud_h);
+            hud_text_layer.frame = CGRectMake(12, 8, hud_w - 24, hud_h - 14);
+
+            NSMutableAttributedString* attr = [[NSMutableAttributedString alloc] init];
+            NSFont* font = [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightMedium];
+            NSFont* hint_font = [NSFont monospacedSystemFontOfSize:9.0 weight:NSFontWeightRegular];
+            NSDictionary* label_attr = @{
+                NSFontAttributeName: font,
+                NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.65 alpha:1.0]
+            };
+            NSDictionary* hint_attr = @{
+                NSFontAttributeName: hint_font,
+                NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.45 alpha:1.0]
+            };
+
+            auto add_line = [&](NSString* label, NSString* val, NSColor* col) {
+                [attr appendAttributedString:[[NSAttributedString alloc] initWithString:label attributes:label_attr]];
+                [attr appendAttributedString:[[NSAttributedString alloc] initWithString:val attributes:@{
+                    NSFontAttributeName: font,
+                    NSForegroundColorAttributeName: col
+                }]];
+                [attr appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:label_attr]];
+            };
+
+            // FPS line: bright green (or amber/red if low)
+            NSColor* fps_col = current_fps >= 45.0 ? [NSColor colorWithCalibratedRed:0.0 green:0.92 blue:0.45 alpha:1.0]
+                             : current_fps >= 25.0 ? [NSColor colorWithCalibratedRed:1.0 green:0.80 blue:0.20 alpha:1.0]
+                             : [NSColor colorWithCalibratedRed:1.0 green:0.35 blue:0.35 alpha:1.0];
+            NSString* fps_val = [NSString stringWithFormat:@"%.1f (%.1f ms)", current_fps, current_frame_time_ms];
+            add_line(@"FPS:  ", fps_val, fps_col);
+
+            // CPU line: amber/yellow
+            NSString* cpu_val = [NSString stringWithFormat:@"%.1f%%", current_cpu_pct];
+            add_line(@"CPU:  ", cpu_val, [NSColor colorWithCalibratedRed:1.0 green:0.82 blue:0.35 alpha:1.0]);
+
+            // RAM line: cyan/light blue
+            NSString* ram_val = [NSString stringWithFormat:@"%.0f MB", current_ram_mb];
+            add_line(@"RAM:  ", ram_val, [NSColor colorWithCalibratedRed:0.40 green:0.85 blue:1.0 alpha:1.0]);
+
+            // GPU line: light purple/magenta
+            NSString* gpu_val = [NSString stringWithFormat:@"%.1f ms", current_gpu_ms];
+            add_line(@"GPU:  ", gpu_val, [NSColor colorWithCalibratedRed:0.88 green:0.50 blue:1.0 alpha:1.0]);
+
+            // Hotkey hint
+            [attr appendAttributedString:[[NSAttributedString alloc] initWithString:@"[F11: Toggle Overlay]" attributes:hint_attr]];
+
+            hud_text_layer.string = attr;
+            [CATransaction commit];
+        }
     }
 }
 
@@ -500,12 +684,32 @@ void DisplayWindow::close() {
         m_impl->is_open = false;
         if (m_impl->window) {
             @autoreleasepool {
+                if (m_impl->hud_layer) {
+                    [m_impl->hud_layer removeFromSuperlayer];
+                    m_impl->hud_layer = nil;
+                    m_impl->hud_text_layer = nil;
+                }
                 [m_impl->window setDelegate:nil];
                 [m_impl->window close];
                 m_impl->window = nil;
             }
         }
     }
+}
+
+void DisplayWindow::toggle_stats_overlay() {
+    if (!m_impl) return;
+    m_impl->show_overlay = !m_impl->show_overlay;
+    if (m_impl->hud_layer) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        [m_impl->hud_layer setHidden:!m_impl->show_overlay];
+        [CATransaction commit];
+    }
+}
+
+bool DisplayWindow::is_stats_overlay_visible() const noexcept {
+    return m_impl && m_impl->show_overlay;
 }
 
 u32 DisplayWindow::width() const noexcept {
