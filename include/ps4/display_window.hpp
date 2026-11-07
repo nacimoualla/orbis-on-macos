@@ -15,6 +15,7 @@ struct WindowConfig {
     u32 height{720};
     bool resizable{true};
     bool headless{false}; // When true, runs offscreen/headless for automated testing
+    bool show_stats_overlay{true}; // On-screen telemetry HUD (FPS, CPU, RAM, GPU)
 };
 
 class DisplayWindow {
@@ -44,6 +45,12 @@ public:
 
     /// Request closing the window
     void close();
+
+    /// Toggle on-screen stats HUD overlay (FPS, CPU, RAM, GPU)
+    void toggle_stats_overlay();
+
+    /// Check if stats overlay is currently visible
+    [[nodiscard]] bool is_stats_overlay_visible() const noexcept;
 
     /// Get current controller/keyboard buttons bitmask (Bit 14 = Cross/Space/Click)
     [[nodiscard]] u32 input_buttons() const noexcept;

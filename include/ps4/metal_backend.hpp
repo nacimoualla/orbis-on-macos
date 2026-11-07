@@ -127,6 +127,9 @@ public:
     /// Number of frames submitted since initialization
     [[nodiscard]] u64 submitted_frame_count() const noexcept;
 
+    /// Most recent frame GPU execution time in milliseconds
+    [[nodiscard]] double last_gpu_time_ms() const noexcept;
+
     /// Read back pixel value at (x, y) into 8-bit RGBA channels
     bool read_pixel(u32 x, u32 y, u8& out_r, u8& out_g, u8& out_b, u8& out_a) const;
 
