@@ -1,3 +1,5 @@
+#include "ps4/debug/page_watch.hpp"
+#include "ps4/debug/capture.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -241,6 +243,12 @@ int main(int argc, char* argv[]) {
         std::cerr << "[Error] Failed to allocate stack.\n";
         return 1;
     }
+    ps4::debug::set_frame_dump([&] {
+        memory.dump_mappings();
+        nid_registry.thread_manager(memory).dump_thread_states();
+    });
+    ps4::debug::start_page_watch(memory);
+    struct PageWatchLifetime { ~PageWatchLifetime() { ps4::debug::stop_page_watch(); ps4::debug::set_frame_dump({}); } } page_watch_lifetime;
     cpu.set_entry_point(loader.entry_point());
     std::cout << "[CPU] RIP set to entry point: 0x" << std::hex << loader.entry_point() << std::dec << "\n";
     std::cout << "[CPU] RSP initialized to:     0x" << std::hex << cpu.context().rsp << std::dec << "\n";

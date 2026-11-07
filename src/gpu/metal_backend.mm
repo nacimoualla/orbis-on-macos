@@ -4,6 +4,7 @@
 #include <cstdlib>
 #import <Foundation/Foundation.h>
 #include "ps4/metal_backend.hpp"
+#include "ps4/debug/capture.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -207,6 +208,7 @@ bool MetalBackend::begin_frame() {
     }
 
     @autoreleasepool {
+        debug::capture_begin(m_impl->submitted_frames + 1, (__bridge void*)m_impl->device);
         m_impl->active_command_buffer = [m_impl->command_queue commandBuffer];
         if (!m_impl->active_command_buffer) {
             std::cerr << "[Metal] Failed to create frame command buffer\n";
@@ -247,8 +249,8 @@ bool MetalBackend::encode_clear(ColorRGBA color) {
             return false;
         }
 
-        [m_impl->active_render_encoder endEncoding];
-        m_impl->active_render_encoder = nil;
+        debug::capture_render_pass((__bridge void*)pass_desc, m_impl->color_keys.data());
+        end_render_encoder();
         return true;
     }
 }
@@ -265,14 +267,9 @@ bool MetalBackend::submit_frame(bool wait_for_completion) {
     }
 
     @autoreleasepool {
-        if (m_impl->active_render_encoder) {
-            [m_impl->active_render_encoder endEncoding];
-            m_impl->active_render_encoder = nil;
-        }
-        if (m_impl->active_compute_encoder) {
-            [m_impl->active_compute_encoder endEncoding];
-            m_impl->active_compute_encoder = nil;
-        }
+        end_render_encoder();
+        end_compute_encoder();
+        wait_for_completion = wait_for_completion || debug::capture_active();
 
         id<MTLCommandBuffer> command_buffer = m_impl->active_command_buffer;
         // PS4_FLIP_STATS: how busy the GPU is, once a second.
@@ -304,11 +301,18 @@ bool MetalBackend::submit_frame(bool wait_for_completion) {
         }
         m_impl->last_submitted_command_buffer =
             m_impl->last_frame_completed ? nil : command_buffer;
+        if (debug::capture_active()) {
+            debug::capture_texture(0, (__bridge void*)m_impl->framebuffer);
+            for (const auto& [key, cb] : m_impl->color_buffers)
+                if (cb.initialized) debug::capture_texture(key, (__bridge void*)cb.texture);
+        }
+        debug::capture_end();
         ++m_impl->submitted_frames;
         m_impl->active_command_buffer = nil;
         m_impl->active_render_encoder = nil;
         m_impl->active_compute_encoder = nil;
 
+        debug::at_frame(m_impl->submitted_frames);
         return command_buffer.status != MTLCommandBufferStatusError &&
                (!wait_for_completion || m_impl->last_frame_completed);
     }
@@ -365,6 +369,7 @@ bool MetalBackend::ensure_render_encoder(bool clear, ColorRGBA color) {
             pass_desc.stencilAttachment.storeAction = MTLStoreActionStore;
             db.initialized = true;
         }
+        debug::capture_render_pass((__bridge void*)pass_desc, m_impl->color_keys.data());
         m_impl->active_render_encoder =
             [m_impl->active_command_buffer renderCommandEncoderWithDescriptor:pass_desc];
         m_impl->encoder_depth_key = m_impl->depth_key;
@@ -397,6 +402,10 @@ void MetalBackend::end_compute_encoder() {
     if (m_impl && m_impl->active_compute_encoder) {
         [m_impl->active_compute_encoder endEncoding];
         m_impl->active_compute_encoder = nil;
+        if (debug::capture_active()) {
+            debug::capture_pass((__bridge void*)m_impl->active_command_buffer, "compute");
+            m_impl->active_command_buffer = [m_impl->command_queue commandBuffer];
+        }
     }
 }
 
@@ -595,6 +604,10 @@ void MetalBackend::end_render_encoder() {
     if (m_impl && m_impl->active_render_encoder) {
         [m_impl->active_render_encoder endEncoding];
         m_impl->active_render_encoder = nil;
+        if (debug::capture_active()) {
+            debug::capture_pass((__bridge void*)m_impl->active_command_buffer, "render");
+            m_impl->active_command_buffer = [m_impl->command_queue commandBuffer];
+        }
     }
 }
 
