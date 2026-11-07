@@ -44,6 +44,7 @@ find_library(GAMECONTROLLER_FRAMEWORK GameController REQUIRED)
 
 # Core library
 add_library(ps4_core
+    src/debug/scenario.mm
     src/debug/capture.mm
     src/debug/page_watch.cpp
     src/core/elf_loader.cpp
@@ -187,6 +188,9 @@ add_test(NAME JitStats COMMAND test_jit_stats)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if (Python3_EXECUTABLE)
+    add_test(NAME ScenarioTools
+        COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+            -s "${CMAKE_SOURCE_DIR}/scripts/scenario" -p "test_*.py")
     add_test(NAME GoldenFrameRegression
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/golden_frame_test.py"
             --runner "$<TARGET_FILE:ps4-runner>"

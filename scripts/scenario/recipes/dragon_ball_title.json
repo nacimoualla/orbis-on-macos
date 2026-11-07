@@ -1,0 +1,241 @@
+{
+  "version": 1,
+  "name": "dragon-ball-title",
+  "eboot": "games/dragon_ball_xenoverse_2/UP0700-CUSA05350_00-DRAGONBALLXV2000/eboot.elf",
+  "timeout": 180,
+  "fast_forward_until": "save_dialog",
+  "milestones": [
+    {
+      "name": "boot",
+      "source": {
+        "type": "start"
+      }
+    },
+    {
+      "name": "video_open",
+      "after": "boot",
+      "source": {
+        "type": "nid",
+        "name": "sceVideoOutOpen"
+      }
+    },
+    {
+      "name": "logos",
+      "after": "video_open",
+      "source": {
+        "type": "shader",
+        "stage": "PS",
+        "hash": "0x0f610c07621ba53a"
+      },
+      "role": "scene"
+    },
+    {
+      "name": "movie",
+      "after": "logos",
+      "source": {
+        "type": "shader",
+        "stage": "VS",
+        "hash": "0x245393fae5691dfa"
+      },
+      "role": "scene"
+    },
+    {
+      "name": "post_movie_ui",
+      "after": "movie",
+      "role": "scene",
+      "source": {
+        "type": "texture",
+        "address": "0x661dfc00"
+      }
+    },
+    {
+      "name": "dialog_open",
+      "after": "video_open",
+      "source": {
+        "type": "nid",
+        "name": "sceMsgDialogOpen"
+      }
+    },
+    {
+      "name": "save_dialog",
+      "after": "dialog_open",
+      "source": {
+        "type": "log",
+        "pattern": "(?i)\\[MsgDialog\\].*(?:save data|saved data|saving)"
+      },
+      "role": "scene"
+    },
+    {
+      "name": "precautions",
+      "after": "save_dialog",
+      "source": {
+        "type": "log",
+        "pattern": "(?i)(?:\\[MsgDialog\\]|\\[Guest[^]]*\\]|\\[printf\\]).*Precautions When Downloading Save Data"
+      },
+      "role": "scene"
+    },
+    {
+      "name": "eula_shown",
+      "after": "save_dialog",
+      "source": {
+        "type": "texture",
+        "address": "0x67034200"
+      },
+      "role": "scene"
+    },
+    {
+      "name": "after_eula",
+      "after": "eula_shown",
+      "source": {
+        "type": "log",
+        "pattern": "(?i)(?:\\[MsgDialog\\]|\\[Guest[^]]*\\]|\\[printf\\]).*(?:privacy policy|terms of service)"
+      },
+      "role": "scene"
+    },
+    {
+      "name": "title_menu",
+      "after": "eula_shown",
+      "source": {
+        "type": "log",
+        "pattern": "(?i)(?:\\[Guest[^]]*\\]|\\[printf\\]).*(?:PRESS ANY BUTTON|PRESS.*START|TITLE MENU)"
+      },
+      "role": "scene"
+    },
+    {
+      "name": "precaution_navigation_done",
+      "after": "post_movie_ui",
+      "source": {
+        "type": "input",
+        "id": "precaution_continue_0_release"
+      }
+    },
+    {
+      "name": "eula_navigation_done",
+      "after": "eula_shown",
+      "source": {
+        "type": "input",
+        "id": "eula_accept_0_release"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "id": "skip_movie",
+      "after": "movie",
+      "delay": 2,
+      "action": "press",
+      "buttons": [
+        "escape"
+      ],
+      "duration": 0.2
+    },
+    {
+      "id": "movie_capture",
+      "after": "movie",
+      "delay": 0.5,
+      "action": "capture"
+    },
+    {
+      "id": "save_dialog_capture",
+      "after": "save_dialog",
+      "delay": 0.5,
+      "action": "capture"
+    },
+    {
+      "id": "precautions_capture",
+      "after": "precautions",
+      "delay": 0.5,
+      "action": "capture"
+    },
+    {
+      "id": "eula_shown_capture",
+      "after": "eula_shown",
+      "delay": 0.5,
+      "action": "capture"
+    },
+    {
+      "id": "after_eula_capture",
+      "after": "after_eula",
+      "delay": 0.5,
+      "action": "capture"
+    },
+    {
+      "id": "title_menu_capture",
+      "after": "title_menu",
+      "delay": 0.5,
+      "action": "capture"
+    },
+    {
+      "id": "finished",
+      "after": "title_menu",
+      "delay": 3,
+      "action": "stop"
+    },
+    {
+      "id": "post_ui_capture",
+      "after": "post_movie_ui",
+      "delay": 1,
+      "action": "capture"
+    },
+    {
+      "id": "precaution_pages",
+      "after": "post_movie_ui",
+      "delay": 2,
+      "action": "press",
+      "buttons": [
+        "right"
+      ],
+      "repeat": 6,
+      "duration": 0.15,
+      "gap": 0.3
+    },
+    {
+      "id": "precaution_continue",
+      "after": "post_movie_ui",
+      "delay": 6,
+      "action": "press",
+      "buttons": [
+        "cross"
+      ],
+      "duration": 0.2
+    },
+    {
+      "id": "eula_pages",
+      "after": "eula_shown",
+      "delay": 2,
+      "action": "press",
+      "buttons": [
+        "right"
+      ],
+      "repeat": 28,
+      "duration": 0.15,
+      "gap": 0.3
+    },
+    {
+      "id": "eula_accept",
+      "after": "eula_shown",
+      "delay": 16,
+      "action": "press",
+      "buttons": [
+        "cross"
+      ],
+      "duration": 0.2
+    },
+    {
+      "id": "after_eula_navigation",
+      "after": "eula_navigation_done",
+      "delay": 2,
+      "action": "capture"
+    }
+  ],
+  "expected": {
+    "milestones": [
+      "logos",
+      "movie",
+      "save_dialog",
+      "eula_shown",
+      "title_menu"
+    ]
+  },
+  "navigation_note": "The post-movie UI backdrop triggers six Right presses then Cross using the user-confirmed seven-page Precautions ordering. Precautions text itself was not readable in the first UI capture and remains a separate optional log milestone. A save-data dialog then appeared, followed by a visually verified EULA whose Accept-button texture is 0x67034200 on this dump/build. Twenty-eight Right presses and Cross are gated on that EULA texture. Delivery waits for guest pad reads; later scene recognition still requires independent evidence."
+}

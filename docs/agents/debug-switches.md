@@ -155,3 +155,25 @@ Tested with the Investigate build based on `1b046f3`:
 Local validation artifacts are under `/tmp/ps4-debug-validation/`; these are
 machine-local and are not part of the commit. The captured early Dragon Ball
 frame exercises the boot/title draw, not a completed gameplay scene.
+
+
+## Event-driven scenarios
+
+Use `python3 scripts/scenario/runner.py <recipe.json>` for milestone-driven runs,
+controller sequences, next-frame GPU capture, golden comparisons and JSON repeat
+reports. See [the scenario guide](../../scripts/scenario/README.md) and
+[measured validation](../../scripts/scenario/VALIDATION.md).
+
+The runner owns these internal switches; normally do not set them manually:
+
+| Switch | Behavior |
+| --- | --- |
+| `PS4_SCENARIO=path` | Enable the debug scenario service with the frozen JSON recipe. Unset disables all scenario instrumentation. |
+| `PS4_SCENARIO_CONTROL=path` | Private FIFO containing newline-delimited JSON input/log/capture/stop commands. Created mode 0600 by the runner. |
+| `PS4_SCENARIO_FAST_FORWARD=1` | Disable debug frame pacing until the recipe's event milestone; any other value paces throughout. The headless runner supplies `PS4_NO_VSYNC=1` to use this switchable pacing instead of native window pacing. |
+| `PS4_SCENARIO_DISCOVERY=1` | Emit first-seen shader hashes and sampled texture bases, bounded to 2048 distinct fingerprints. Enabled by `--discover`. |
+
+`[milestone]` lines contain JSON with event name/source, elapsed monotonic seconds,
+backend frame and guest flip count. Input events distinguish state application
+from actual guest-pad sampling; page sequences wait for the latter. Fast-forward
+preserves guest clocks, HLE sleeps and GPU work. It is off by default.
