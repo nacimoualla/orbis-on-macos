@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cfenv>
 #include <cstring>
+#include <optional>
 #include <cmath>
 #include <limits>
 #include <iostream>
@@ -639,7 +640,7 @@ struct Xfer {
     GuestAddr to_rip;
     GuestAddr rsp;
     GuestAddr rbp;
-    u8 kind; // 0=CALL 1=RET 2=IND-JMP 3=SYSCALL 4=IRET 5=JIT block (PS4_JIT_TRACE)
+    u8 kind; // 0=CALL 1=RET 2=IND-JMP 3=SYSCALL 4=IRET
 };
 static constexpr usize kXferRing = 64;
 static thread_local Xfer t_xfer[kXferRing];
@@ -652,14 +653,14 @@ static void record_xfer(GuestAddr from, GuestAddr to, GuestAddr rsp, GuestAddr r
 }
 
 void dump_control_xfers(int tid) {
-    static const char* kNames[] = {"CALL ", "RET  ", "IJMP ", "SYSC ", "IRET ", "JIT  "};
+    static const char* kNames[] = {"CALL ", "RET  ", "IJMP ", "SYSC ", "IRET "};
     const usize n = t_xfer_n;
     std::fprintf(stderr, "[xfer] thread %d: %zu transfers recorded\n", tid, n);
     const usize start = (n > kXferRing) ? (n - kXferRing) : 0;
     for (usize i = start; i < n; ++i) {
         const Xfer& e = t_xfer[i % kXferRing];
         std::fprintf(stderr, "[xfer] #%-3zu %s 0x%016llx -> 0x%016llx  rsp=0x%llx rbp=0x%llx\n",
-                     i, kNames[e.kind < 6 ? e.kind : 0],
+                     i, kNames[e.kind < 5 ? e.kind : 0],
                      (unsigned long long)e.from_rip, (unsigned long long)e.to_rip,
                      (unsigned long long)e.rsp, (unsigned long long)e.rbp);
     }
@@ -1166,6 +1167,41 @@ StepResult CpuExecutor::step() {
         return StepResult::Halted;
     }
 
+    // 0xF5: CMC (Complement Carry Flag)
+    if (op0 == 0xF5) {
+        m_context.set_flag(CpuContext::FLAG_CF, !m_context.flag_cf());
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
+    // 0xF8: CLC (Clear Carry Flag)
+    if (op0 == 0xF8) {
+        m_context.set_flag(CpuContext::FLAG_CF, false);
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
+    // 0xF9: STC (Set Carry Flag)
+    if (op0 == 0xF9) {
+        m_context.set_flag(CpuContext::FLAG_CF, true);
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
+    // 0xFC: CLD (Clear Direction Flag)
+    if (op0 == 0xFC) {
+        m_context.set_flag(CpuContext::FLAG_DF, false);
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
+    // 0xFD: STD (Set Direction Flag)
+    if (op0 == 0xFD) {
+        m_context.set_flag(CpuContext::FLAG_DF, true);
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
     // 0x0F 0x05: SYSCALL
     if (op0 == 0x0F && m_memory.is_valid_address(start_rip + cursor, 1) && raw_code[cursor] == 0x05) {
         SyscallContext sctx(m_memory);
@@ -1533,11 +1569,11 @@ StepResult CpuExecutor::step() {
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 dest = m.reg_id & 15;
             if (vex_pp == 2) { // VMOVSS (32-bit float)
-                if (m.is_reg) { // dest = src1[127:32] : src2[31:0], 255:128 zeroed
-                    CpuContext::YmmReg res = m_context.ymm[vex_vvvv & 15];
-                    res.d[0] = m_context.ymm[m.rm_id & 15].d[0];
-                    res.q[2] = res.q[3] = 0;
-                    m_context.ymm[dest] = res;
+                if (m.is_reg) { // dest = src1 with rm's low element; bits 255:128 zeroed
+                    CpuContext::YmmReg r = m_context.ymm[vex_vvvv & 15];
+                    r.d[0] = m_context.ymm[m.rm_id & 15].d[0];
+                    r.q[2] = r.q[3] = 0;
+                    m_context.ymm[dest] = r;
                 } else {
                     u32 val = 0;
                     m_memory.read_value(m.mem_addr, val);
@@ -1546,10 +1582,10 @@ StepResult CpuExecutor::step() {
                 }
             } else if (vex_pp == 3) { // VMOVSD (64-bit float)
                 if (m.is_reg) {
-                    CpuContext::YmmReg res = m_context.ymm[vex_vvvv & 15];
-                    res.q[0] = m_context.ymm[m.rm_id & 15].q[0];
-                    res.q[2] = res.q[3] = 0;
-                    m_context.ymm[dest] = res;
+                    CpuContext::YmmReg r = m_context.ymm[vex_vvvv & 15];
+                    r.q[0] = m_context.ymm[m.rm_id & 15].q[0];
+                    r.q[2] = r.q[3] = 0;
+                    m_context.ymm[dest] = r;
                 } else {
                     u64 val = 0;
                     m_memory.read_value(m.mem_addr, val);
@@ -1577,20 +1613,20 @@ StepResult CpuExecutor::step() {
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 src = m.reg_id & 15;
             if (vex_pp == 2) { // VMOVSS
-                if (m.is_reg) { // rm = src1[127:32] : reg[31:0], 255:128 zeroed
-                    CpuContext::YmmReg res = m_context.ymm[vex_vvvv & 15];
-                    res.d[0] = m_context.ymm[src].d[0];
-                    res.q[2] = res.q[3] = 0;
-                    m_context.ymm[m.rm_id & 15] = res;
+                if (m.is_reg) { // rm = src1 (vvvv) with the low element of reg
+                    CpuContext::YmmReg r = m_context.ymm[vex_vvvv & 15];
+                    r.d[0] = m_context.ymm[src].d[0];
+                    r.q[2] = r.q[3] = 0;
+                    m_context.ymm[m.rm_id & 15] = r;
                 } else {
                     m_memory.write_value(m.mem_addr, m_context.ymm[src].d[0]);
                 }
             } else if (vex_pp == 3) { // VMOVSD
                 if (m.is_reg) {
-                    CpuContext::YmmReg res = m_context.ymm[vex_vvvv & 15];
-                    res.q[0] = m_context.ymm[src].q[0];
-                    res.q[2] = res.q[3] = 0;
-                    m_context.ymm[m.rm_id & 15] = res;
+                    CpuContext::YmmReg r = m_context.ymm[vex_vvvv & 15];
+                    r.q[0] = m_context.ymm[src].q[0];
+                    r.q[2] = r.q[3] = 0;
+                    m_context.ymm[m.rm_id & 15] = r;
                 } else {
                     m_memory.write_value(m.mem_addr, m_context.ymm[src].q[0]);
                 }
@@ -1665,7 +1701,31 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // VPSHUFD (0x70)
+        // VPSHUFD (66 0x70) / VPSHUFHW (F3 0x70) / VPSHUFLW (F2 0x70). The
+        // word shuffles used to run as VPSHUFD whatever the prefix, which
+        // scrambled the IDCT of Dragon Ball Xenoverse 2's CRI movie decoder.
+        if (vex_map == 1 && vex_op == 0x70 && (vex_pp == 2 || vex_pp == 3)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            CpuContext::YmmReg src{};
+            if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+            else if (!m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16)) return StepResult::MemoryFault;
+            CpuContext::YmmReg res = src;   // the other four words of each lane pass through
+            const usize half = vex_pp == 2 ? 4 : 0;   // F3: high words, F2: low words
+            for (usize lane = 0; lane < (vex_l ? 2u : 1u); ++lane) {
+                const usize b = lane * 8 + half;
+                for (usize i = 0; i < 4; ++i) res.w[b + i] = src.w[b + ((imm8 >> (2 * i)) & 3)];
+            }
+            if (!vex_l) {
+                res.q[2] = 0;
+                res.q[3] = 0;
+            }
+            m_context.ymm[dest] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
         if (vex_op == 0x70) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context, 1);
             if (!m.valid) return StepResult::IllegalInstruction;
@@ -1972,7 +2032,11 @@ StepResult CpuExecutor::step() {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 dest = m.reg_id & 15;
-            const bool is_signed = (vex_op < 0x30); // 0F38 2x = PMOVSX*, 3x = PMOVZX*
+            // 0x20..0x25 are VPMOVSX* (sign-extend), 0x30..0x35 VPMOVZX*. This
+            // was inverted, so vpmovzxbw turned every pixel byte >= 128 into a
+            // negative word: the CRI movie decoder's motion compensation then
+            // saturated bright luma and mid-grey chroma to 0 (black / green).
+            const bool is_signed = (vex_op <= 0x25);
             const u8 op_type = vex_op & 0x0F;
 
             usize src_bytes = 0;
@@ -2360,47 +2424,21 @@ StepResult CpuExecutor::step() {
             const bool is_pd = (vex_pp == 1);
             const usize elements = is_pd ? (vex_l ? 4 : 2) : (vex_l ? 8 : 4);
             const bool is_low = (vex_op == 0x14);
-
-            for (usize lane = 0; lane < (vex_l ? 2 : 1); ++lane) {
-                const usize base = lane * elements;
-                const usize src1_base = lane * elements;
-                const usize src2_base = lane * elements;
-                for (usize i = 0; i < elements; ++i) {
-                    const usize res_idx = base + i;
-                    if (is_low) {
-                        // UNPCKL: interleave low elements from src1 and src2
-                        if (i < elements / 2) {
-                            if (is_pd) {
-                                res.q[res_idx] = m_context.ymm[src1].q[src1_base + i];
-                            } else {
-                                res.d[res_idx] = m_context.ymm[src1].d[src1_base + i];
-                            }
-                        } else {
-                            const usize src2_idx = i - elements / 2;
-                            if (is_pd) {
-                                res.q[res_idx] = src2.q[src2_base + src2_idx];
-                            } else {
-                                res.d[res_idx] = src2.d[src2_base + src2_idx];
-                            }
-                        }
-                    } else {
-                        // UNPCKH: interleave high elements from src1 and src2
-                        if (i < elements / 2) {
-                            const usize src1_idx = elements / 2 + i;
-                            if (is_pd) {
-                                res.q[res_idx] = m_context.ymm[src1].q[src1_base + src1_idx];
-                            } else {
-                                res.d[res_idx] = m_context.ymm[src1].d[src1_base + src1_idx];
-                            }
-                        } else {
-                            const usize src2_idx = elements / 2 + i - elements / 2;
-                            if (is_pd) {
-                                res.q[res_idx] = src2.q[src2_base + elements / 2 + src2_idx];
-                            } else {
-                                res.d[res_idx] = src2.d[src2_base + elements / 2 + src2_idx];
-                            }
-                        }
-                    }
+            (void)elements;
+            // Per 128-bit lane: low = [a0, b0, a1, b1] / [a0, b0];
+            // high = [a2, b2, a3, b3] / [a1, b1].
+            const CpuContext::YmmReg a = m_context.ymm[src1];
+            for (usize lane = 0; lane < (vex_l ? 2u : 1u); ++lane) {
+                if (is_pd) {
+                    const usize k = lane * 2 + (is_low ? 0 : 1);
+                    res.q[lane * 2] = a.q[k];
+                    res.q[lane * 2 + 1] = src2.q[k];
+                } else {
+                    const usize k = lane * 4 + (is_low ? 0 : 2);
+                    res.d[lane * 4 + 0] = a.d[k];
+                    res.d[lane * 4 + 1] = src2.d[k];
+                    res.d[lane * 4 + 2] = a.d[k + 1];
+                    res.d[lane * 4 + 3] = src2.d[k + 1];
                 }
             }
             m_context.ymm[dest] = res;
@@ -2588,7 +2626,7 @@ StepResult CpuExecutor::step() {
         }
 
         // VMOVAPS / VMOVAPD (0x28 load, 0x29 store)
-        if (vex_op == 0x28) {
+        if (vex_map == 1 && vex_op == 0x28) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 dest = m.reg_id & 15;
@@ -2600,7 +2638,7 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        if (vex_op == 0x29) {
+        if (vex_map == 1 && vex_op == 0x29) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 src = m.reg_id & 15;
@@ -2762,8 +2800,8 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // VPCMPGTQ (map 2, op 0x37, pp=1): compare packed qwords for greater than (signed)
-        if (vex_map == 2 && vex_op == 0x37 && vex_pp == 1) {
+        // VPCMPEQQ (0x29) / VPCMPGTQ (0x37) (map 2, pp=1): compare packed qwords
+        if (vex_map == 2 && (vex_op == 0x29 || vex_op == 0x37) && vex_pp == 1) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 dest = m.reg_id & 15;
@@ -2775,9 +2813,13 @@ StepResult CpuExecutor::step() {
             CpuContext::YmmReg res{};
             const usize count = vex_l ? 4 : 2;
             for (usize i = 0; i < count; ++i) {
-                const i64 a = static_cast<i64>(m_context.ymm[src1].q[i]);
-                const i64 b = static_cast<i64>(src2.q[i]);
-                res.q[i] = (a > b) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                if (vex_op == 0x29) {
+                    res.q[i] = (m_context.ymm[src1].q[i] == src2.q[i]) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                } else {
+                    const i64 a = static_cast<i64>(m_context.ymm[src1].q[i]);
+                    const i64 b = static_cast<i64>(src2.q[i]);
+                    res.q[i] = (a > b) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                }
             }
             m_context.ymm[dest] = res;
             if (!vex_l) {
@@ -2952,7 +2994,7 @@ StepResult CpuExecutor::step() {
             for (usize lane = 0; lane < lanes; ++lane) {
                 const usize base = lane * 2;
                 for (usize i = 0; i < 2; ++i) {
-                    const u8 sel = (imm8 >> i) & 1;
+                    const u8 sel = (imm8 >> (base + i)) & 1;
                     res.q[base + i] = src.q[base + sel];
                 }
             }
@@ -3343,17 +3385,18 @@ StepResult CpuExecutor::step() {
             const u8 src1 = vex_vvvv & 15;
             CpuContext::YmmReg src2{};
             if (m.is_reg) src2 = m_context.ymm[m.rm_id & 15];
-            else m_memory.read_bytes(m.mem_addr, &src2, (vex_pp >= 2) ? 8 : (vex_l ? 32 : 16));
+            else m_memory.read_bytes(m.mem_addr, &src2, vex_pp == 2 ? 4 : vex_pp == 3 ? 8 : (vex_l ? 32 : 16));
 
             CpuContext::YmmReg res{};
-            const bool is_double = (vex_pp == 1 || vex_pp == 3); // PD / SD
+            const bool is_pd = (vex_pp == 1 || vex_pp == 3); // pd / sd
             const bool is_scalar = (vex_pp >= 2);
-            const usize count = is_scalar ? 1 : (is_double ? (vex_l ? 4 : 2) : (vex_l ? 8 : 4));
+            const usize count = is_scalar ? 1 : (is_pd ? (vex_l ? 4 : 2) : (vex_l ? 8 : 4));
+
             // The 32 AVX predicates; 16-31 repeat 0-15 with the other
             // signalling behaviour, which does not change the result.
-            auto pred = [imm8](auto a, auto b) {
-                const bool uno = std::isnan(a) || std::isnan(b);
-                const bool lt = a < b, eq = a == b, gt = a > b;
+            auto pred = [imm8](auto x, auto y) {
+                const bool uno = std::isnan(x) || std::isnan(y);
+                const bool lt = x < y, eq = x == y, gt = x > y;
                 switch (imm8 & 0x0F) {
                     case 0: return eq;                 // EQ_OQ
                     case 1: return lt;                 // LT_OS
@@ -3373,29 +3416,25 @@ StepResult CpuExecutor::step() {
                     default: return true;              // TRUE_UQ
                 }
             };
-
             for (usize i = 0; i < count; ++i) {
-                if (is_double) {
-                    double a = 0.0, b = 0.0;
-                    std::memcpy(&a, &m_context.ymm[src1].q[i], 8);
-                    std::memcpy(&b, &src2.q[i], 8);
-                    res.q[i] = pred(a, b) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                if (is_pd) {
+                    double x = 0.0, y = 0.0;
+                    std::memcpy(&x, &m_context.ymm[src1].q[i], 8);
+                    std::memcpy(&y, &src2.q[i], 8);
+                    res.q[i] = pred(x, y) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
                 } else {
-                    float a = 0.0f, b = 0.0f;
-                    std::memcpy(&a, &m_context.ymm[src1].d[i], 4);
-                    std::memcpy(&b, &src2.d[i], 4);
-                    res.d[i] = pred(a, b) ? 0xFFFFFFFFU : 0U;
+                    float x = 0.0f, y = 0.0f;
+                    std::memcpy(&x, &m_context.ymm[src1].d[i], 4);
+                    std::memcpy(&y, &src2.d[i], 4);
+                    res.d[i] = pred(x, y) ? 0xFFFFFFFFU : 0U;
                 }
             }
             if (is_scalar) {
-                // Scalar: bits 127:N from src1, 255:128 zeroed (VEX.128).
-                if (is_double) {
-                    res.q[1] = m_context.ymm[src1].q[1];
-                } else {
-                    res.d[1] = m_context.ymm[src1].d[1];
-                    res.d[2] = m_context.ymm[src1].d[2];
-                    res.d[3] = m_context.ymm[src1].d[3];
-                }
+                // Scalar: the other lanes come from src1; VEX zeroes 255:128.
+                const CpuContext::YmmReg& a = m_context.ymm[src1];
+                if (is_pd) res.q[1] = a.q[1];
+                else { res.d[1] = a.d[1]; res.q[1] = a.q[1]; }
+                res.q[2] = 0; res.q[3] = 0;
             } else if (!vex_l) {
                 res.q[2] = 0; res.q[3] = 0;
             }
@@ -3638,10 +3677,20 @@ StepResult CpuExecutor::step() {
                 }
             } else if (vex_op == 0x15) {
                 const u16 val = m_context.ymm[src].w[imm8 & 7];
-                write_rm(m, val, 16);
+                if (m.is_reg) {
+                    if (vex_w) set_gpr64(m_context, m.rm_id & 15, val);
+                    else set_gpr32(m_context, m.rm_id & 15, val);
+                } else {
+                    write_rm(m, val, 16);
+                }
             } else {
                 const u8 val = m_context.ymm[src].b[imm8 & 15];
-                write_rm(m, val, 8);
+                if (m.is_reg) {
+                    if (vex_w) set_gpr64(m_context, m.rm_id & 15, val);
+                    else set_gpr32(m_context, m.rm_id & 15, val);
+                } else {
+                    write_rm(m, val, 8);
+                }
             }
             m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
             return StepResult::Ok;
@@ -4071,6 +4120,331 @@ StepResult CpuExecutor::step() {
         const u8 op1 = raw_code[cursor++];
         const GuestAddr next_ip_base_0f = start_rip + cursor;
 
+        // Legacy (non-VEX) SSE never changes bits 255:128 of a YMM register,
+        // but many handlers below build a whole 256-bit result. Put the upper
+        // halves back on every exit path. (XRSTOR, the one legacy instruction
+        // that may write them, is not implemented.)
+        struct UpperYmmGuard {
+            CpuContext& ctx;
+            u64 saved[16][2];
+            explicit UpperYmmGuard(CpuContext& c) : ctx(c) {
+                for (usize r = 0; r < 16; ++r) { saved[r][0] = c.ymm[r].q[2]; saved[r][1] = c.ymm[r].q[3]; }
+            }
+            ~UpperYmmGuard() {
+                for (usize r = 0; r < 16; ++r) { ctx.ymm[r].q[2] = saved[r][0]; ctx.ymm[r].q[3] = saved[r][1]; }
+            }
+        };
+        const bool sse_opcode = (op1 >= 0x10 && op1 <= 0x17) || (op1 >= 0x28 && op1 <= 0x2F) ||
+                                (op1 >= 0x50 && op1 <= 0x7F) || (op1 >= 0xC2 && op1 <= 0xC6) ||
+                                op1 >= 0xD0 || op1 == 0x38 || op1 == 0x3A;
+        std::optional<UpperYmmGuard> upper_ymm;
+        if (sse_opcode) upper_ymm.emplace(m_context);
+
+        // Legacy SSE forms that had no handler (they reached the ModR/M
+        // fallback below and ran as NOPs): unpack/shuffle/compare/blend/
+        // insert/extract and 64-bit half moves. Same semantics as the JIT's
+        // SSE translation; both are checked by scripts/x86_diff.
+        {
+            usize c = cursor;
+            u8 op = op1;
+            const bool map3 = op1 == 0x3A;
+            if (map3) {
+                if (!m_memory.is_valid_address(start_rip + c, 1)) return StepResult::IllegalInstruction;
+                op = raw_code[c++];
+            }
+            const u8 pp = rep_prefix == 0xF3 ? 2 : rep_prefix == 0xF2 ? 3 : operand_size_16 ? 1 : 0;
+            bool mine = false, has_imm = map3;
+            if (map3) {
+                mine = pp == 1 && (op == 0x0C || op == 0x0D || op == 0x14 || op == 0x15 || op == 0x16 || op == 0x21 || op == 0x22);
+            } else {
+                switch (op) {
+                case 0x12: mine = true; break;
+                case 0x16: mine = pp <= 2; break;
+                case 0x13: case 0x17: mine = pp <= 1; break;
+                case 0xC2: mine = has_imm = true; break;
+                case 0xC6: mine = pp <= 1; has_imm = true; break;
+                case 0x70: mine = pp >= 1; has_imm = true; break;   // PSHUFD / PSHUFHW / PSHUFLW
+                case 0xD0: mine = pp == 1 || pp == 3; break;
+                case 0xD4: case 0xFA: case 0xFB: case 0xFE:
+                case 0x60: case 0x61: case 0x62: case 0x63: case 0x67: case 0x68: case 0x69: case 0x6A: case 0x6B: case 0x6C: case 0x6D:
+                case 0xD5: case 0xD8: case 0xD9: case 0xDA: case 0xDC: case 0xDD: case 0xDE:
+                case 0xE0: case 0xE3: case 0xE4: case 0xE5: case 0xE8: case 0xE9: case 0xEA:
+                case 0xEC: case 0xED: case 0xEE: case 0xF4: case 0xF5:
+                case 0xF8: case 0xF9: case 0xFC: case 0xFD: mine = pp == 1; break;
+                case 0x14: case 0x15: case 0x54: case 0x55: case 0x56: mine = pp <= 1; break;
+                default: break;
+                }
+            }
+            if (mine) {
+                auto m = decode_modrm(raw_code + c, 15 - c, start_rip + c, rex_r, rex_x, rex_b, seg_override,
+                                      m_context, has_imm ? 1 : 0);
+                if (!m.valid) return StepResult::IllegalInstruction;
+                const u8 imm = has_imm ? raw_code[c + m.bytes_consumed] : 0;
+                auto& dst = m_context.ymm[m.reg_id & 15];
+                const CpuContext::YmmReg a = dst; // first operand
+                CpuContext::YmmReg b{};           // second operand (register or memory)
+                auto load_b = [&](usize n) -> bool {
+                    if (m.is_reg) { b = m_context.ymm[m.rm_id & 15]; return true; }
+                    return m_memory.read_bytes(m.mem_addr, &b, n);
+                };
+                CpuContext::YmmReg r = a;
+                auto sat8 = [](int v) { return static_cast<u8>(static_cast<i8>(std::clamp(v, -128, 127))); };
+                auto sat16 = [](int v) { return static_cast<u16>(static_cast<i16>(std::clamp(v, -32768, 32767))); };
+                const bool dbl = pp == 1 || pp == 3;
+                auto cmp = [](auto x, auto y, u8 pred) {
+                    const bool unord = std::isnan(x) || std::isnan(y);
+                    switch (pred & 7) {
+                    case 0: return x == y;
+                    case 1: return x < y;
+                    case 2: return x <= y;
+                    case 3: return unord;
+                    case 4: return !(x == y);
+                    case 5: return !(x < y);
+                    case 6: return !(x <= y);
+                    default: return !unord;
+                    }
+                };
+                bool ok = true;
+                if (map3) {
+                    switch (op) {
+                    case 0x0C: case 0x0D: // BLENDPS / BLENDPD
+                        ok = load_b(16);
+                        if (op == 0x0C) { for (int i = 0; i < 4; ++i) if ((imm >> i) & 1) r.d[i] = b.d[i]; }
+                        else { for (int i = 0; i < 2; ++i) if ((imm >> i) & 1) r.q[i] = b.q[i]; }
+                        break;
+                    case 0x14: { // PEXTRB r/m8, xmm, imm8
+                        const u8 val = a.b[imm & 15];
+                        if (m.is_reg) {
+                            if (rex_w) set_gpr64(m_context, m.rm_id & 15, val);
+                            else set_gpr32(m_context, m.rm_id & 15, val);
+                        } else {
+                            write_rm(m, val, 8);
+                        }
+                        break;
+                    }
+                    case 0x15: { // PEXTRW r/m16, xmm, imm8
+                        const u16 val = a.w[imm & 7];
+                        if (m.is_reg) {
+                            if (rex_w) set_gpr64(m_context, m.rm_id & 15, val);
+                            else set_gpr32(m_context, m.rm_id & 15, val);
+                        } else {
+                            write_rm(m, val, 16);
+                        }
+                        break;
+                    }
+                    case 0x16: // PEXTRD / PEXTRQ r/m, xmm, imm8
+                        write_rm(m, rex_w ? a.q[imm & 1] : a.d[imm & 3], rex_w ? 64 : 32);
+                        break;
+                    case 0x21: { // INSERTPS
+                        u32 elem = 0;
+                        if (m.is_reg) elem = m_context.ymm[m.rm_id & 15].d[(imm >> 6) & 3];
+                        else ok = m_memory.read_value(m.mem_addr, elem);
+                        r.d[(imm >> 4) & 3] = elem;
+                        for (int k = 0; k < 4; ++k) if ((imm >> k) & 1) r.d[k] = 0;
+                        break;
+                    }
+                    default: { // 0x22: PINSRD / PINSRQ xmm, r/m, imm8
+                        const u64 v = read_rm(m, rex_w ? 64 : 32);
+                        if (rex_w) r.q[imm & 1] = v; else r.d[imm & 3] = static_cast<u32>(v);
+                        break;
+                    }
+                    }
+                } else {
+                    switch (op) {
+                    case 0x12:
+                        if (pp <= 1) { // MOVLPS/MOVLPD m64 / MOVHLPS
+                            if (m.is_reg) { if (pp == 1) return StepResult::IllegalInstruction; r.q[0] = m_context.ymm[m.rm_id & 15].q[1]; }
+                            else ok = m_memory.read_value(m.mem_addr, r.q[0]);
+                        } else if (pp == 2) { // MOVSLDUP
+                            ok = load_b(16);
+                            r.d[0] = r.d[1] = b.d[0]; r.d[2] = r.d[3] = b.d[2];
+                        } else { // MOVDDUP
+                            ok = load_b(8);
+                            r.q[0] = r.q[1] = b.q[0];
+                        }
+                        break;
+                    case 0x16:
+                        if (pp <= 1) { // MOVHPS/MOVHPD m64 / MOVLHPS
+                            if (m.is_reg) { if (pp == 1) return StepResult::IllegalInstruction; r.q[1] = m_context.ymm[m.rm_id & 15].q[0]; }
+                            else ok = m_memory.read_value(m.mem_addr, r.q[1]);
+                        } else { // MOVSHDUP
+                            ok = load_b(16);
+                            r.d[0] = r.d[1] = b.d[1]; r.d[2] = r.d[3] = b.d[3];
+                        }
+                        break;
+                    case 0x13: case 0x17: // MOVLPS/MOVHPS m64, xmm
+                        if (m.is_reg) return StepResult::IllegalInstruction;
+                        ok = m_memory.write_value(m.mem_addr, a.q[op == 0x17 ? 1 : 0]);
+                        break;
+                    case 0xC2: // CMPPS / CMPPD / CMPSS / CMPSD
+                        ok = load_b(pp == 2 ? 4 : pp == 3 ? 8 : 16);
+                        if (dbl) {
+                            for (int i = 0; i < (pp == 3 ? 1 : 2); ++i) r.q[i] = cmp(a.df[i], b.df[i], imm) ? ~0ULL : 0;
+                        } else {
+                            for (int i = 0; i < (pp == 2 ? 1 : 4); ++i) r.d[i] = cmp(a.f[i], b.f[i], imm) ? ~0U : 0;
+                        }
+                        break;
+                    case 0xC6: // SHUFPS / SHUFPD
+                        ok = load_b(16);
+                        if (pp == 0) {
+                            r.d[0] = a.d[imm & 3]; r.d[1] = a.d[(imm >> 2) & 3];
+                            r.d[2] = b.d[(imm >> 4) & 3]; r.d[3] = b.d[(imm >> 6) & 3];
+                        } else {
+                            r.q[0] = a.q[imm & 1]; r.q[1] = b.q[(imm >> 1) & 1];
+                        }
+                        break;
+                    case 0x70: // PSHUFD (66) / PSHUFHW (F3) / PSHUFLW (F2)
+                        ok = load_b(16);
+                        if (pp == 1) {
+                            for (int i = 0; i < 4; ++i) r.d[i] = b.d[(imm >> (2 * i)) & 3];
+                        } else {
+                            const int half = pp == 2 ? 4 : 0;
+                            r = b;   // the other four words pass through
+                            for (int i = 0; i < 4; ++i) r.w[half + i] = b.w[half + ((imm >> (2 * i)) & 3)];
+                        }
+                        break;
+                    case 0xD0: // ADDSUBPD (66) / ADDSUBPS (F2)
+                        ok = load_b(16);
+                        if (pp == 1) {
+                            r.df[0] = x86_nan(a.df[0] - b.df[0], a.df[0], b.df[0]);
+                            r.df[1] = x86_nan(a.df[1] + b.df[1], a.df[1], b.df[1]);
+                        } else {
+                            for (int i = 0; i < 4; ++i)
+                                r.f[i] = x86_nan((i & 1) ? a.f[i] + b.f[i] : a.f[i] - b.f[i], a.f[i], b.f[i]);
+                        }
+                        break;
+                    case 0xD4: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = a.q[i] + b.q[i]; break; // PADDQ
+                    case 0xFB: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = a.q[i] - b.q[i]; break; // PSUBQ
+                    case 0xFE: ok = load_b(16); for (int i = 0; i < 4; ++i) r.d[i] = a.d[i] + b.d[i]; break; // PADDD
+                    case 0xFA: ok = load_b(16); for (int i = 0; i < 4; ++i) r.d[i] = a.d[i] - b.d[i]; break; // PSUBD
+                    case 0x60: ok = load_b(16); for (int i = 0; i < 8; ++i) { r.b[2 * i] = a.b[i]; r.b[2 * i + 1] = b.b[i]; } break; // PUNPCKLBW
+                    case 0x61: ok = load_b(16); for (int i = 0; i < 4; ++i) { r.w[2 * i] = a.w[i]; r.w[2 * i + 1] = b.w[i]; } break; // PUNPCKLWD
+                    case 0x62: ok = load_b(16); r.d[0] = a.d[0]; r.d[1] = b.d[0]; r.d[2] = a.d[1]; r.d[3] = b.d[1]; break;
+                    case 0x63: // PACKSSWB
+                        ok = load_b(16);
+                        for (int i = 0; i < 8; ++i) {
+                            r.b[i] = sat8(static_cast<i16>(a.w[i]));
+                            r.b[8 + i] = sat8(static_cast<i16>(b.w[i]));
+                        }
+                        break;
+                    case 0x67: // PACKUSWB
+                        ok = load_b(16);
+                        for (int i = 0; i < 8; ++i) {
+                            r.b[i] = static_cast<u8>(std::clamp<int>(static_cast<i16>(a.w[i]), 0, 255));
+                            r.b[8 + i] = static_cast<u8>(std::clamp<int>(static_cast<i16>(b.w[i]), 0, 255));
+                        }
+                        break;
+                    case 0x68: ok = load_b(16); for (int i = 0; i < 8; ++i) { r.b[2 * i] = a.b[8 + i]; r.b[2 * i + 1] = b.b[8 + i]; } break; // PUNPCKHBW
+                    case 0x69: ok = load_b(16); for (int i = 0; i < 4; ++i) { r.w[2 * i] = a.w[4 + i]; r.w[2 * i + 1] = b.w[4 + i]; } break; // PUNPCKHWD
+                    case 0x6A: ok = load_b(16); r.d[0] = a.d[2]; r.d[1] = b.d[2]; r.d[2] = a.d[3]; r.d[3] = b.d[3]; break;
+                    case 0x6B: // PACKSSDW
+                        ok = load_b(16);
+                        for (int i = 0; i < 4; ++i) {
+                            r.w[i] = sat16(static_cast<i32>(a.d[i]));
+                            r.w[4 + i] = sat16(static_cast<i32>(b.d[i]));
+                        }
+                        break;
+                    case 0x6C: ok = load_b(16); r.q[0] = a.q[0]; r.q[1] = b.q[0]; break;
+                    case 0x6D: ok = load_b(16); r.q[0] = a.q[1]; r.q[1] = b.q[1]; break;
+                    case 0xD5: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>(u32{a.w[i]} * b.w[i]); break; // PMULLW
+                    case 0xD8: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] > b.b[i] ? a.b[i] - b.b[i] : 0; break; // PSUBSB unsigned (PSUBUSB)
+                    case 0xD9: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = a.w[i] > b.w[i] ? a.w[i] - b.w[i] : 0; break; // PSUBUSW
+                    case 0xDA: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = std::min(a.b[i], b.b[i]); break; // PMINUB
+                    case 0xDC: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = static_cast<u8>(std::min(a.b[i] + b.b[i], 0xFF)); break; // PADDUSB
+                    case 0xDD: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>(std::min(a.w[i] + b.w[i], 0xFFFF)); break; // PADDUSW
+                    case 0xDE: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = std::max(a.b[i], b.b[i]); break; // PMAXUB
+                    case 0xE0: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = static_cast<u8>((static_cast<u32>(a.b[i]) + static_cast<u32>(b.b[i]) + 1) >> 1); break; // PAVGB
+                    case 0xE3: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>((static_cast<u32>(a.w[i]) + static_cast<u32>(b.w[i]) + 1) >> 1); break; // PAVGW
+                    case 0xE4: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>((u32{a.w[i]} * b.w[i]) >> 16); break; // PMULHUW
+                    case 0xE5: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>((static_cast<i32>(static_cast<i16>(a.w[i])) * static_cast<i32>(static_cast<i16>(b.w[i]))) >> 16); break; // PMULHW
+                    case 0xE8: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = sat8(static_cast<i32>(static_cast<i8>(a.b[i])) - static_cast<i32>(static_cast<i8>(b.b[i]))); break; // PSUBSB
+                    case 0xE9: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = sat16(static_cast<i32>(static_cast<i16>(a.w[i])) - static_cast<i32>(static_cast<i16>(b.w[i]))); break; // PSUBSW
+                    case 0xEA: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>(std::min(static_cast<i16>(a.w[i]), static_cast<i16>(b.w[i]))); break; // PMINSW
+                    case 0xEC: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = sat8(static_cast<i32>(static_cast<i8>(a.b[i])) + static_cast<i32>(static_cast<i8>(b.b[i]))); break; // PADDSB
+                    case 0xED: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = sat16(static_cast<i32>(static_cast<i16>(a.w[i])) + static_cast<i32>(static_cast<i16>(b.w[i]))); break; // PADDSW
+                    case 0xEE: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>(std::max(static_cast<i16>(a.w[i]), static_cast<i16>(b.w[i]))); break; // PMAXSW
+                    case 0xF4: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = static_cast<u64>(a.d[2 * i]) * static_cast<u64>(b.d[2 * i]); break; // PMULUDQ
+                    case 0xF5: // PMADDWD
+                        ok = load_b(16);
+                        for (int i = 0; i < 4; ++i)
+                            r.d[i] = static_cast<u32>(static_cast<i32>(static_cast<i16>(a.w[2 * i])) * static_cast<i32>(static_cast<i16>(b.w[2 * i])) +
+                                                      static_cast<i32>(static_cast<i16>(a.w[2 * i + 1])) * static_cast<i32>(static_cast<i16>(b.w[2 * i + 1])));
+                        break;
+                    case 0xF8: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] - b.b[i]; break; // PSUBB
+                    case 0xF9: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = a.w[i] - b.w[i]; break; // PSUBW
+                    case 0xFC: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] + b.b[i]; break; // PADDB
+                    case 0xFD: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = a.w[i] + b.w[i]; break; // PADDW
+                    case 0x14: case 0x15: { // UNPCKLPS/PD, UNPCKHPS/PD
+                        ok = load_b(16);
+                        const int hi = op == 0x15;
+                        if (pp == 1) { r.q[0] = a.q[hi]; r.q[1] = b.q[hi]; }
+                        else { r.d[0] = a.d[2 * hi]; r.d[1] = b.d[2 * hi]; r.d[2] = a.d[2 * hi + 1]; r.d[3] = b.d[2 * hi + 1]; }
+                        break;
+                    }
+                    case 0x54: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = a.q[i] & b.q[i]; break;  // ANDPS/PD
+                    case 0x55: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = ~a.q[i] & b.q[i]; break; // ANDNPS/PD
+                    case 0x56: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = a.q[i] | b.q[i]; break;  // ORPS/PD
+                    default:   break;
+                    }
+                }
+                if (!ok) return StepResult::MemoryFault;
+                if (!(map3 && op == 0x16) && !(!map3 && (op == 0x13 || op == 0x17))) dst = r;
+                m_context.rip = start_rip + c + m.bytes_consumed + (has_imm ? 1 : 0);
+                return StepResult::Ok;
+            }
+        }
+
+        // 66 0F 71 / 72 / 73: Shift packed integers by immediate
+        if (operand_size_16 && (op1 == 0x71 || op1 == 0x72 || op1 == 0x73)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context, 1);
+            if (!m.valid || !m.is_reg) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 sub_op = m.reg_id & 7;
+            const u8 target = m.rm_id & 15;
+            CpuContext::YmmReg src = m_context.ymm[target];
+            CpuContext::YmmReg res = src;
+            if (op1 == 0x73) {
+                if (sub_op == 7) { // PSLLDQ (shift left bytes)
+                    for (usize i = 0; i < 16; ++i) {
+                        res.b[i] = (i >= imm8) ? src.b[i - imm8] : 0;
+                    }
+                } else if (sub_op == 3) { // PSRLDQ (shift right bytes)
+                    for (usize i = 0; i < 16; ++i) {
+                        res.b[i] = (i + imm8 < 16) ? src.b[i + imm8] : 0;
+                    }
+                } else if (sub_op == 6) { // PSLLQ (shift left qwords by bits)
+                    for (usize q = 0; q < 2; ++q) {
+                        const u64 v = src.q[q];
+                        res.q[q] = (imm8 < 64) ? (v << imm8) : 0;
+                    }
+                } else if (sub_op == 2) { // PSRLQ (shift right qwords by bits)
+                    for (usize q = 0; q < 2; ++q) {
+                        const u64 v = src.q[q];
+                        res.q[q] = (imm8 < 64) ? (v >> imm8) : 0;
+                    }
+                }
+            } else if (op1 == 0x72) {
+                // PSRLD (2), PSRAD (4), PSLLD (6)
+                for (usize d = 0; d < 4; ++d) {
+                    const u32 v = src.d[d];
+                    if (sub_op == 6) res.d[d] = (imm8 < 32) ? (v << imm8) : 0;
+                    else if (sub_op == 2) res.d[d] = (imm8 < 32) ? (v >> imm8) : 0;
+                    else if (sub_op == 4) res.d[d] = (imm8 < 32) ? (static_cast<u32>(static_cast<i32>(v) >> imm8)) : (static_cast<i32>(v) < 0 ? 0xFFFFFFFFU : 0U);
+                }
+            } else if (op1 == 0x71) {
+                // PSRLW (2), PSRAW (4), PSLLW (6)
+                for (usize w = 0; w < 8; ++w) {
+                    const u16 v = src.w[w];
+                    if (sub_op == 6) res.w[w] = (imm8 < 16) ? static_cast<u16>(v << imm8) : 0;
+                    else if (sub_op == 2) res.w[w] = (imm8 < 16) ? static_cast<u16>(v >> imm8) : 0;
+                    else if (sub_op == 4) res.w[w] = (imm8 < 16) ? (static_cast<u16>(static_cast<i16>(v) >> imm8)) : (static_cast<i16>(v) < 0 ? 0xFFFFU : 0U);
+                }
+            }
+            m_context.ymm[target] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
+        }
+
         // 0x0F 0x38: 3-byte escape prefix
         if (op1 == 0x38 && m_memory.is_valid_address(start_rip + cursor, 1)) {
             const u8 op2 = raw_code[cursor++];
@@ -4111,6 +4485,34 @@ StepResult CpuExecutor::step() {
                     const u32 val = __builtin_bswap32(static_cast<u32>(get_gpr64(m_context, m.reg_id)));
                     if (!m_memory.write_value(m.mem_addr, val)) return StepResult::MemoryFault;
                 }
+                m_context.rip = start_rip + cursor + m.bytes_consumed;
+                return StepResult::Ok;
+            }
+
+            // 66 0F 38 20..25: PMOVSX{BW,BD,BQ,WD,WQ,DQ}; 30..35: PMOVZX*.
+            if (operand_size_16 && ((op2 >= 0x20 && op2 <= 0x25) || (op2 >= 0x30 && op2 <= 0x35))) {
+                auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f38, rex_r, rex_x, rex_b, seg_override, m_context);
+                if (!m.valid) return StepResult::IllegalInstruction;
+                static constexpr u8 kSrcBytes[6] = {8, 4, 2, 8, 4, 8};
+                static constexpr u8 kFrom[6] = {1, 1, 1, 2, 2, 4}, kTo[6] = {2, 4, 8, 4, 8, 8};
+                const u8 t = op2 & 0x0F;
+                const bool sx = op2 <= 0x25;
+                CpuContext::YmmReg src{};
+                if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
+                else if (!m_memory.read_bytes(m.mem_addr, &src, kSrcBytes[t])) return StepResult::MemoryFault;
+                CpuContext::YmmReg res = m_context.ymm[m.reg_id & 15];   // legacy SSE keeps bits 255:128
+                res.q[0] = res.q[1] = 0;
+                const usize n = 16 / kTo[t];
+                for (usize i = 0; i < n; ++i) {
+                    u64 v = 0;
+                    std::memcpy(&v, src.b + i * kFrom[t], kFrom[t]);
+                    if (sx) {
+                        const unsigned sh = 64u - 8u * kFrom[t];
+                        v = static_cast<u64>(static_cast<i64>(v << sh) >> sh);
+                    }
+                    std::memcpy(res.b + i * kTo[t], &v, kTo[t]);
+                }
+                m_context.ymm[m.reg_id & 15] = res;
                 m_context.rip = start_rip + cursor + m.bytes_consumed;
                 return StepResult::Ok;
             }
@@ -4164,6 +4566,71 @@ StepResult CpuExecutor::step() {
                 }
                 m_context.ymm[dest] = res;
                 m_context.ymm[dest].q[2] = 0; m_context.ymm[dest].q[3] = 0;
+                m_context.rip = start_rip + cursor + m.bytes_consumed;
+                return StepResult::Ok;
+            }
+
+            // SSE4.1 packed integer instructions (66 0F 38):
+            // PCMPEQQ (0x29), PACKUSDW (0x2B), PCMPGTQ (0x37),
+            // PMINSB/SD/UW/UD (0x38..0x3B), PMAXSB/SD/UW/UD (0x3C..0x3F), PMULLD (0x40)
+            if (operand_size_16 && (op2 == 0x29 || op2 == 0x2B || op2 == 0x37 ||
+                                    (op2 >= 0x38 && op2 <= 0x40))) {
+                auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f38, rex_r, rex_x, rex_b, seg_override, m_context);
+                if (!m.valid) return StepResult::IllegalInstruction;
+                const u8 dest = m.reg_id & 15;
+                CpuContext::YmmReg b{};
+                if (m.is_reg) b = m_context.ymm[m.rm_id & 15];
+                else if (!m_memory.read_bytes(m.mem_addr, &b, 16)) return StepResult::MemoryFault;
+                CpuContext::YmmReg a = m_context.ymm[dest];
+                CpuContext::YmmReg res = a;
+                switch (op2) {
+                case 0x29: // PCMPEQQ
+                    for (int i = 0; i < 2; ++i) res.q[i] = (a.q[i] == b.q[i]) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                    break;
+                case 0x2B: // PACKUSDW
+                    for (int i = 0; i < 4; ++i) {
+                        res.w[i] = static_cast<u16>(std::clamp<i64>(static_cast<i64>(static_cast<i32>(a.d[i])), 0, 65535));
+                        res.w[4 + i] = static_cast<u16>(std::clamp<i64>(static_cast<i64>(static_cast<i32>(b.d[i])), 0, 65535));
+                    }
+                    break;
+                case 0x37: // PCMPGTQ
+                    for (int i = 0; i < 2; ++i)
+                        res.q[i] = (static_cast<i64>(a.q[i]) > static_cast<i64>(b.q[i])) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                    break;
+                case 0x38: // PMINSB
+                    for (int i = 0; i < 16; ++i)
+                        res.b[i] = static_cast<u8>(std::min(static_cast<i8>(a.b[i]), static_cast<i8>(b.b[i])));
+                    break;
+                case 0x39: // PMINSD
+                    for (int i = 0; i < 4; ++i)
+                        res.d[i] = static_cast<u32>(std::min(static_cast<i32>(a.d[i]), static_cast<i32>(b.d[i])));
+                    break;
+                case 0x3A: // PMINUW
+                    for (int i = 0; i < 8; ++i) res.w[i] = std::min(a.w[i], b.w[i]);
+                    break;
+                case 0x3B: // PMINUD
+                    for (int i = 0; i < 4; ++i) res.d[i] = std::min(a.d[i], b.d[i]);
+                    break;
+                case 0x3C: // PMAXSB
+                    for (int i = 0; i < 16; ++i)
+                        res.b[i] = static_cast<u8>(std::max(static_cast<i8>(a.b[i]), static_cast<i8>(b.b[i])));
+                    break;
+                case 0x3D: // PMAXSD
+                    for (int i = 0; i < 4; ++i)
+                        res.d[i] = static_cast<u32>(std::max(static_cast<i32>(a.d[i]), static_cast<i32>(b.d[i])));
+                    break;
+                case 0x3E: // PMAXUW
+                    for (int i = 0; i < 8; ++i) res.w[i] = std::max(a.w[i], b.w[i]);
+                    break;
+                case 0x3F: // PMAXUD
+                    for (int i = 0; i < 4; ++i) res.d[i] = std::max(a.d[i], b.d[i]);
+                    break;
+                case 0x40: // PMULLD
+                    for (int i = 0; i < 4; ++i)
+                        res.d[i] = static_cast<u32>(static_cast<i64>(static_cast<i32>(a.d[i])) * static_cast<i64>(static_cast<i32>(b.d[i])));
+                    break;
+                }
+                m_context.ymm[dest] = res;
                 m_context.rip = start_rip + cursor + m.bytes_consumed;
                 return StepResult::Ok;
             }
@@ -4361,6 +4828,32 @@ StepResult CpuExecutor::step() {
             }
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
+        }
+
+        // 0x0F 0x01: Group 7 instructions (RDTSCP, XGETBV, etc.)
+        if (op1 == 0x01) {
+            const u8 modrm_byte = (cursor < 15) ? raw_code[cursor] : 0;
+            if (modrm_byte == 0xF9) { // RDTSCP
+                cursor++;
+                const u64 tsc = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
+                m_context.rax = static_cast<u32>(tsc);
+                m_context.rdx = static_cast<u32>(tsc >> 32);
+                m_context.rcx = 0; // IA32_TSC_AUX
+                m_context.rip = start_rip + cursor;
+                return StepResult::Ok;
+            }
+            if (modrm_byte == 0xD0) { // XGETBV
+                cursor++;
+                if (static_cast<u32>(m_context.rcx) == 0) {
+                    m_context.rax = 7; // XCR0: x87 (1) | SSE (2) | AVX (4)
+                    m_context.rdx = 0;
+                } else {
+                    m_context.rax = 0;
+                    m_context.rdx = 0;
+                }
+                m_context.rip = start_rip + cursor;
+                return StepResult::Ok;
+            }
         }
 
         // 0x0F 0x1F: NOP r/m (multi-byte NOP)
@@ -6096,6 +6589,25 @@ StepResult CpuExecutor::step() {
         return StepResult::Ok;
     }
 
+    // 0x9C: PUSHFQ, 0x9D: POPFQ. The interpreter lacked both, so a guest that
+    // saved its flags (Dragon Ball Xenoverse 2 does `pushfq; pop rcx`) stopped
+    // with "Illegal or unimplemented instruction". Only the user-modifiable
+    // flags (CF PF AF ZF SF TF IF DF OF) are restored by POPFQ.
+    if (op0 == 0x9C || op0 == 0x9D) {
+        if (op0 == 0x9C) {
+            m_context.rsp -= 8;
+            if (!m_memory.write_value(m_context.rsp, m_context.rflags | 0x02)) return StepResult::MemoryFault;
+        } else {
+            u64 val = 0;
+            if (!m_memory.read_value(m_context.rsp, val)) return StepResult::MemoryFault;
+            constexpr u64 kPopfMask = 0xDD5ULL;
+            m_context.rflags = (m_context.rflags & ~kPopfMask) | (val & kPopfMask) | 0x02;
+            m_context.rsp += 8;
+        }
+        m_context.rip = start_rip + cursor;
+        return StepResult::Ok;
+    }
+
     if (op0 == 0x98) {
         if (rex_w) {
             m_context.rax = static_cast<u64>(static_cast<i64>(static_cast<i32>(m_context.rax)));
@@ -6518,87 +7030,23 @@ RunResult CpuExecutor::run(usize max_instructions) {
         ~CurrentExecutor() { t_current_executor = prev; }
     } current_executor_scope(this);
 
-    // PS4_REG_HOOK=<rip>:<reg>=<value>[,<reg>=<value>...][;<rip>:...]: whenever
-    // execution reaches <rip> at an instruction boundary that starts a block
-    // (a CALL, and the instruction after a returning CALL, always do), set
-    // guest registers first -- e.g. redirect a call's arguments to reach a
-    // scene or mode directly while testing.
-    struct RegHook {
-        GuestAddr rip{0};
-        std::vector<std::pair<u64 CpuContext::*, u64>> sets;
-    };
-    static const std::vector<RegHook> s_hooks = [] {
-        std::vector<RegHook> hooks;
-        const char* p = std::getenv("PS4_REG_HOOK");
-        static constexpr struct { const char* name; u64 CpuContext::*reg; } kRegs[] = {
-            {"rax", &CpuContext::rax}, {"rcx", &CpuContext::rcx}, {"rdx", &CpuContext::rdx},
-            {"rbx", &CpuContext::rbx}, {"rsi", &CpuContext::rsi}, {"rdi", &CpuContext::rdi},
-            {"r8", &CpuContext::r8},   {"r9", &CpuContext::r9},
-        };
-        while (p && *p) {
-            RegHook h;
-            char* q = nullptr;
-            h.rip = std::strtoull(p, &q, 0);
-            while (q && (*q == ':' || *q == ',')) {
-                ++q;
-                const char* eq = std::strchr(q, '=');
-                if (!eq) break;
-                const std::string name(static_cast<const char*>(q), eq);
-                const u64 v = std::strtoull(eq + 1, &q, 0);
-                for (const auto& r : kRegs)
-                    if (name == r.name) h.sets.emplace_back(r.reg, v);
-            }
-            std::fprintf(stderr, "[reg-hook] at 0x%llx: %zu register(s)\n", (unsigned long long)h.rip, h.sets.size());
-            hooks.push_back(std::move(h));
-            p = (q && *q == ';') ? q + 1 : nullptr;
-        }
-        return hooks;
-    }();
-
     while (true) {
         if (max_instructions > 0 && result.instructions_executed >= max_instructions) {
             result.status = StepResult::Ok;
             break;
         }
-        for (const RegHook& h : s_hooks) {
-            if (m_context.rip == h.rip)
-                for (const auto& [reg, v] : h.sets) m_context.*reg = v;
-        }
 
         // Try JIT block execution if compiler attached
         if (m_jit && !m_syscalls.has_exited()) {
             usize retired = 0;
-            // PS4_JIT_TRACE=1 records every JIT block in the transfer ring;
-            // PS4_JIT_TRACE=<addr> prints each run of the block at addr.
-            static const char* s_jit_trace_env = std::getenv("PS4_JIT_TRACE");
-            static const bool s_jit_trace = s_jit_trace_env != nullptr;
-            static const GuestAddr s_jit_trace_at =
-                s_jit_trace ? std::strtoull(s_jit_trace_env, nullptr, 0) : 0;
-            const GuestAddr block_rip = m_context.rip;
-            // Let compiled code chain from block to block, unless something
-            // here has to see every block (register hooks, JIT telemetry).
-            const bool s_chain = !s_jit_trace && !jit_stats_enabled(); // telemetry can be toggled at run time
-            if (!s_hooks.empty() && m_chain_barriers_set != m_jit) {
-                for (const RegHook& h : s_hooks) m_jit->add_chain_barrier(h.rip);
-                m_chain_barriers_set = m_jit;
-            }
-            usize chain_budget = 0;
-            if (s_chain) {
-                chain_budget = 1u << 16;
-                if (max_instructions > 0)
-                    chain_budget = std::min<usize>(chain_budget, max_instructions - result.instructions_executed);
-            }
-            if (m_jit->execute_block(m_context, m_memory, &retired, chain_budget)) {
-                if (s_jit_trace) {
-                    if (s_jit_trace_at <= 1) {
-                        record_xfer(block_rip, m_context.rip, m_context.rsp, m_context.rbp, 5);
-                    } else if (block_rip == s_jit_trace_at) {
-                        std::fprintf(stderr, "[jit-trace] block 0x%llx -> 0x%llx retired=%zu rax=0x%llx rdx=0x%llx rsi=0x%llx\n",
-                                     (unsigned long long)block_rip, (unsigned long long)m_context.rip, retired,
-                                     (unsigned long long)m_context.rax, (unsigned long long)m_context.rdx,
-                                     (unsigned long long)m_context.rsi);
-                    }
-                }
+            // Blocks chain without returning here, so bound the chain: this
+            // loop has to see a budget that ran out, or a guest that exited.
+            constexpr u64 kMaxChain = 4096;
+            u64 chain = kMaxChain;
+            if (max_instructions > 0)
+                chain = std::min<u64>(kMaxChain, (max_instructions - result.instructions_executed) / JitCompiler::MAX_BLOCK_INSNS);
+            if (jit_stats_enabled()) chain = 0; // the stats count blocks
+            if (m_jit->execute_block(m_context, m_memory, &retired, chain)) {
                 // A block that side-exits retires fewer instructions than it
                 // compiled; count what actually ran.
                 result.instructions_executed += retired;

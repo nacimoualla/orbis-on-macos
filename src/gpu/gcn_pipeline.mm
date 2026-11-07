@@ -1,9 +1,11 @@
+#include "ps4/debug/capture.hpp"
 #import <Metal/Metal.h>
 
 #include "ps4/gcn_pipeline.hpp"
 #include "ps4/gcn_shader.hpp"
 #include "ps4/gpu_state.hpp"
 #include "ps4/memory.hpp"
+#include "ps4/metal_backend.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -95,15 +97,35 @@ MTLSamplerAddressMode address_mode(u32 c) {
 struct GcnPipelineCache::Impl {
     id<MTLDevice> device{nil};
     MemoryManager* memory{nullptr};
+    // All of guest memory as one no-copy buffer, for compute shaders (they
+    // read and write it in place). Made once: wrapping the 8 GB range again
+    // for every dispatch made each command buffer wait for that range to be
+    // made resident, so a game dispatching every frame (Sonic Mania) ran at
+    // 4-17 fps with the GPU nearly idle.
+    id<MTLBuffer> guest_buffer{nil};
+    const void* guest_buffer_base{nullptr};
+    id<MTLBuffer> guest_memory_buffer() {
+        if (!memory || !memory->base_address()) return nil;
+        if (guest_buffer && guest_buffer_base == memory->base_address()) return guest_buffer;
+        const NSUInteger len = std::min<NSUInteger>(memory->total_size(), [device maxBufferLength]) & ~16383UL;
+        guest_buffer = [device newBufferWithBytesNoCopy:memory->base_address()
+                                                 length:len
+                                                options:MTLResourceStorageModeShared
+                                            deallocator:nil];
+        guest_buffer_base = guest_buffer ? memory->base_address() : nullptr;
+        return guest_buffer;
+    }
+    MetalBackend* metal{nullptr};
     GcnPipelineStats stats{};
 
     struct PipeKey {
         u64 vs_hash{0}, ps_hash{0}, cntl_hash{0};
         u32 remap{0}, blend{0}, mask{0}, format{0}, depth_format{0}, ps_inputs{0};
+        u64 mrt{0}; // formats and blend controls of attachments 1-7
         bool operator<(const PipeKey& o) const noexcept {
-            return std::tie(vs_hash, ps_hash, cntl_hash, remap, blend, mask, format, depth_format, ps_inputs) <
+            return std::tie(vs_hash, ps_hash, cntl_hash, remap, blend, mask, format, depth_format, ps_inputs, mrt) <
                    std::tie(o.vs_hash, o.ps_hash, o.cntl_hash, o.remap, o.blend, o.mask, o.format, o.depth_format,
-                            o.ps_inputs);
+                            o.ps_inputs, o.mrt);
         }
     };
     struct PipeEntry {
@@ -112,6 +134,25 @@ struct GcnPipelineCache::Impl {
         std::string error;
     };
     std::map<PipeKey, PipeEntry> pipes;
+
+    struct ComputeKey {
+        u64 cs_hash{0};
+        u32 threads_x{0};
+        u32 threads_y{0};
+        u32 threads_z{0};
+        u32 rsrc1{0};
+        u32 rsrc2{0};
+        bool operator<(const ComputeKey& o) const noexcept {
+            return std::tie(cs_hash, threads_x, threads_y, threads_z, rsrc1, rsrc2) <
+                   std::tie(o.cs_hash, o.threads_x, o.threads_y, o.threads_z, o.rsrc1, o.rsrc2);
+        }
+    };
+    struct ComputeEntry {
+        id<MTLComputePipelineState> pso{nil};
+        gcn::TranslatedComputePipeline tp;
+        std::string error;
+    };
+    std::map<ComputeKey, ComputeEntry> compute_pipes;
 
     struct TexEntry {
         id<MTLTexture> tex{nil};
@@ -263,18 +304,61 @@ struct GcnPipelineCache::Impl {
             log_once("unsupported image type " + std::to_string(td.type) + " (only 1D/2D); using white");
             return white_texture();
         }
+        // A texture at the address of a render target (offscreen, or a display
+        // buffer: the screen) samples what was rendered there; the guest copy
+        // is never written by the GPU path.
+        if (metal && td.base > 0x1000) {
+            id<MTLTexture> offscreen = (__bridge id<MTLTexture>)metal->surface_texture(td.base);
+            if (offscreen) {
+                if (offscreen.width != td.width || offscreen.height != td.height)
+                    log_once("texture " + std::to_string(td.width) + "x" + std::to_string(td.height) +
+                             " samples a " + std::to_string(offscreen.width) + "x" +
+                             std::to_string(offscreen.height) + " render target");
+                return offscreen;
+            }
+        }
         const usize size = gcn::texture_guest_size(td);
         if (size == 0 || size > 64u * 1024 * 1024 || !memory || !memory->is_valid_address(td.base, size)) {
             log_once("texture memory unavailable/unsupported (dfmt " + std::to_string(td.dfmt) + "); using white");
             return white_texture();
         }
         const u8* src = memory->to_host_ptr<u8>(td.base);
-        const u64 h = hash_texture(src, size);
+        const u64 h = gcn::hash_memory(src, size);
         std::vector<u32> key(img.tsharp, img.tsharp + 8);
         auto it = textures.find(key);
         if (it != textures.end() && it->second.content_hash == h) {
             it->second.last_used = ++clock;
             return it->second.tex;
+        }
+        // Linear R8 (video planes change every frame) needs no conversion: the
+        // guest bytes upload as they are and the T#'s selector becomes a swizzle.
+        if (td.dfmt == 1 && td.nfmt == 0 && gcn::is_linear_tiling(td.tiling_index)) {
+            auto channel = [](u32 sel) {
+                switch (sel) {
+                case 1: return MTLTextureSwizzleOne;
+                case 4: return MTLTextureSwizzleRed;
+                case 5: return MTLTextureSwizzleGreen;
+                case 6: return MTLTextureSwizzleBlue;
+                case 7: return MTLTextureSwizzleAlpha;
+                default: return MTLTextureSwizzleZero;
+                }
+            };
+            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                                                         width:td.width
+                                                                                        height:td.height
+                                                                                     mipmapped:NO];
+            d.usage = MTLTextureUsageShaderRead;
+            d.allowGPUOptimizedContents = NO;
+            d.swizzle = MTLTextureSwizzleChannelsMake(channel(td.dst_sel[0]), channel(td.dst_sel[1]),
+                                                      channel(td.dst_sel[2]), channel(td.dst_sel[3]));
+            id<MTLTexture> tex = [device newTextureWithDescriptor:d];
+            if (!tex) return white_texture();
+            [tex replaceRegion:MTLRegionMake2D(0, 0, td.width, td.height) mipmapLevel:0 withBytes:src
+                   bytesPerRow:std::max(td.pitch, td.width)];
+            if (textures.size() > 256) textures.clear();
+            textures[key] = TexEntry{tex, h, ++clock};
+            ++stats.textures_uploaded;
+            return tex;
         }
         // Linear 8_8_8_8 / 5_6_5 unorm (software-rendered screens, movie
         // frames): Metal reads the guest bytes as they are, with the T#'s
@@ -306,13 +390,66 @@ struct GcnPipelineCache::Impl {
         return tex;
     }
 
+    /// Writable host texture for an image_store T#: the surface the GPU path
+    /// already keeps at that address (render target or screen), or a new one
+    /// in the T#'s format, so later draws and samples see what compute wrote.
+    id<MTLTexture> storage_texture_for(const gcn::ImageDescriptors& img) {
+        const gcn::TextureDesc td = gcn::decode_tsharp(img.tsharp);
+        if (!metal || td.base <= 0x1000 || td.width == 0 || td.height == 0) return nil;
+        MTLPixelFormat fmt = MTLPixelFormatRGBA8Unorm;
+        if (td.dfmt == 12 && td.nfmt == 7) fmt = MTLPixelFormatRGBA16Float;
+        else if (td.dfmt == 14 && td.nfmt == 7) fmt = MTLPixelFormatRGBA32Float;
+        else if (td.dfmt == 4 && td.nfmt == 7) fmt = MTLPixelFormatR32Float;
+        else if (td.dfmt != 10) log_once("image_store format " + std::to_string(td.dfmt) + "/" +
+                                         std::to_string(td.nfmt) + " stored as RGBA8Unorm");
+        // A linear RGBA8 target lives only on the host once compute wrote it;
+        // remember its guest layout so it can be written back if the cache
+        // drops it (Dragon Ball Xenoverse 2 copies its 2x1 UI ramp texture
+        // this way at boot and samples it a minute later, after the movie's
+        // post-processing had pushed it out of the cache).
+        if (fmt == MTLPixelFormatRGBA8Unorm && td.dfmt == 10 && td.nfmt == 0 && gcn::is_linear_tiling(td.tiling_index))
+            storage_layouts[td.base] = StorageLayout{td.width, td.height, std::max(td.pitch, td.width)};
+        return (__bridge id<MTLTexture>)metal->storage_target(td.base, td.width, td.height,
+                                                              static_cast<u32>(fmt));
+    }
+
+    struct StorageLayout {
+        u32 width, height, pitch;  // pitch in texels
+    };
+    std::map<u64, StorageLayout> storage_layouts;
+
+    // MetalBackend's eviction hook: copy a dropped image_store target back,
+    // once the GPU has run what was encoded into it. (The cache can fill up in
+    // the same frame as the dispatch that wrote the target.)
+    void write_back_surface(u64 key, void* texture) {
+        auto it = storage_layouts.find(key);
+        if (it == storage_layouts.end()) return;
+        const StorageLayout l = it->second;
+        storage_layouts.erase(it);
+        id<MTLTexture> t = (__bridge id<MTLTexture>)texture;
+        if (!memory || !metal || !t || t.pixelFormat != MTLPixelFormatRGBA8Unorm) return;
+        const u32 w = std::min<u32>(l.width, static_cast<u32>(t.width));
+        const u32 h = std::min<u32>(l.height, static_cast<u32>(t.height));
+        if (!memory->is_valid_address(key, static_cast<usize>(l.pitch) * 4 * h)) return;
+        MemoryManager* mem = memory;
+        metal->run_after_gpu([t, mem, key, l, w, h] {
+            std::vector<u8> row(static_cast<usize>(w) * 4);
+            for (u32 y = 0; y < h; ++y) {
+                [t getBytes:row.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, y, w, 1) mipmapLevel:0];
+                mem->write_bytes(key + static_cast<u64>(y) * l.pitch * 4, row.data(), row.size());
+            }
+        });
+    }
+
     void dump(const PipeKey& key, const gcn::Program& vs, const gcn::Program& ps, const gcn::TranslatedPipeline& tp) {
         const char* dir = std::getenv("PS4_GCN_DUMP_DIR");
         if (!dir || !*dir) return;
-        char name[96];
-        std::snprintf(name, sizeof(name), "%s/gcn_%016llx_%016llx", dir, (unsigned long long)key.vs_hash,
+        // The directory is concatenated, not formatted into a fixed buffer:
+        // a long path used to be truncated and every dump silently failed.
+        char leaf[64];
+        std::snprintf(leaf, sizeof(leaf), "/gcn_%016llx_%016llx", (unsigned long long)key.vs_hash,
                       (unsigned long long)key.ps_hash);
-        const std::string base = name;
+        const std::string base = dir + std::string(leaf);
         auto write_bin = [](const std::string& path, const std::vector<u32>& w) {
             std::ofstream f(path, std::ios::binary);
             f.write(reinterpret_cast<const char*>(w.data()), static_cast<std::streamsize>(w.size() * 4));
@@ -332,8 +469,10 @@ struct GcnPipelineCache::Impl {
         }
     }
 
+    /// formats[n] / blends[n]: MTLPixelFormat (0 = not attached) and
+    /// CB_BLEND<n>_CONTROL of colour attachment n; mask: CB_TARGET_MASK.
     PipeEntry& pipeline(const PipeKey& key, const gcn::Program& vs, const gcn::Program& ps, const u32* cntl,
-                        gcn::TranslateOptions opts, u32 blend, u32 mask, u32 format, u32 depth_format) {
+                        gcn::TranslateOptions opts, const u32* blends, u32 mask, const u32* formats, u32 depth_format) {
         auto it = pipes.find(key);
         if (it != pipes.end()) return it->second;
         PipeEntry e;
@@ -352,33 +491,42 @@ struct GcnPipelineCache::Impl {
             } else {
                 MTLRenderPipelineDescriptor* d = [[MTLRenderPipelineDescriptor alloc] init];
                 d.vertexFunction = [lib newFunctionWithName:@"gcn_vs_main"];
-                d.fragmentFunction = [lib newFunctionWithName:@"gcn_ps_main"];
-                d.colorAttachments[0].pixelFormat = static_cast<MTLPixelFormat>(format);
+                // A depth-only draw has no fragment function; every colour
+                // attachment is then write-masked off (ps_color_mask is 0).
+                d.fragmentFunction = e.tp.has_ps ? [lib newFunctionWithName:@"gcn_ps_main"] : nil;
                 if (depth_format) {
                     const MTLPixelFormat df = static_cast<MTLPixelFormat>(depth_format);
                     d.depthAttachmentPixelFormat = df;
                     if (df == MTLPixelFormatDepth32Float_Stencil8 || df == MTLPixelFormatDepth24Unorm_Stencil8)
                         d.stencilAttachmentPixelFormat = df;
                 }
-                MTLColorWriteMask wm = MTLColorWriteMaskNone;
-                if (e.tp.ps_writes_color) {
-                    if (mask & 1) wm |= MTLColorWriteMaskRed;
-                    if (mask & 2) wm |= MTLColorWriteMaskGreen;
-                    if (mask & 4) wm |= MTLColorWriteMaskBlue;
-                    if (mask & 8) wm |= MTLColorWriteMaskAlpha;
-                }
-                d.colorAttachments[0].writeMask = wm;
-                if (blend & (1u << 30)) {
-                    const bool separate = (blend >> 29) & 1;
-                    auto* ca = d.colorAttachments[0];
-                    ca.blendingEnabled = YES;
-                    ca.sourceRGBBlendFactor = blend_factor(blend & 0x1F);
-                    ca.rgbBlendOperation = blend_op((blend >> 5) & 7);
-                    ca.destinationRGBBlendFactor = blend_factor((blend >> 8) & 0x1F);
-                    ca.sourceAlphaBlendFactor = blend_factor(separate ? ((blend >> 16) & 0x1F) : (blend & 0x1F));
-                    ca.alphaBlendOperation = blend_op(separate ? ((blend >> 21) & 7) : ((blend >> 5) & 7));
-                    ca.destinationAlphaBlendFactor =
-                        blend_factor(separate ? ((blend >> 24) & 0x1F) : ((blend >> 8) & 0x1F));
+                // Every attachment of the pass must be declared; one the PS
+                // does not export (mrt<n>) is left unwritten.
+                for (u32 n = 0; n < 8; ++n) {
+                    if (!formats[n]) continue;
+                    auto* ca = d.colorAttachments[n];
+                    ca.pixelFormat = static_cast<MTLPixelFormat>(formats[n]);
+                    const u32 m = (mask >> (4 * n)) & 0xF;
+                    MTLColorWriteMask wm = MTLColorWriteMaskNone;
+                    if ((e.tp.ps_color_mask >> n) & 1) {
+                        if (m & 1) wm |= MTLColorWriteMaskRed;
+                        if (m & 2) wm |= MTLColorWriteMaskGreen;
+                        if (m & 4) wm |= MTLColorWriteMaskBlue;
+                        if (m & 8) wm |= MTLColorWriteMaskAlpha;
+                    }
+                    ca.writeMask = wm;
+                    const u32 blend = blends[n];
+                    if (blend & (1u << 30)) {
+                        const bool separate = (blend >> 29) & 1;
+                        ca.blendingEnabled = YES;
+                        ca.sourceRGBBlendFactor = blend_factor(blend & 0x1F);
+                        ca.rgbBlendOperation = blend_op((blend >> 5) & 7);
+                        ca.destinationRGBBlendFactor = blend_factor((blend >> 8) & 0x1F);
+                        ca.sourceAlphaBlendFactor = blend_factor(separate ? ((blend >> 16) & 0x1F) : (blend & 0x1F));
+                        ca.alphaBlendOperation = blend_op(separate ? ((blend >> 21) & 7) : ((blend >> 5) & 7));
+                        ca.destinationAlphaBlendFactor =
+                            blend_factor(separate ? ((blend >> 24) & 0x1F) : ((blend >> 8) & 0x1F));
+                    }
                 }
                 e.pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
                 if (!e.pso)
@@ -406,9 +554,20 @@ GcnPipelineCache::GcnPipelineCache(void* mtl_device, MemoryManager* memory) : m_
     m_impl->memory = memory;
 }
 
-GcnPipelineCache::~GcnPipelineCache() = default;
+GcnPipelineCache::~GcnPipelineCache() {
+    if (m_impl && m_impl->metal) m_impl->metal->set_surface_evict_hook({});
+}
 
 void GcnPipelineCache::set_memory(MemoryManager* memory) noexcept { m_impl->memory = memory; }
+void GcnPipelineCache::set_metal_backend(MetalBackend* metal) noexcept {
+    if (m_impl->metal == metal) return;
+    if (m_impl->metal) m_impl->metal->set_surface_evict_hook({});
+    m_impl->metal = metal;
+    if (metal) {
+        Impl* im = m_impl.get();
+        metal->set_surface_evict_hook([im](u64 key, void* texture) { im->write_back_surface(key, texture); });
+    }
+}
 
 const GcnPipelineStats& GcnPipelineCache::stats() const noexcept { return m_impl->stats; }
 
@@ -426,7 +585,7 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         return false;
     };
     if (!im.device || !im.memory || !render_encoder || !req.vs_user || !req.ps_user) return fail("not configured");
-    if (req.vs_addr < 0x1000 || req.ps_addr < 0x1000) return fail("no shaders bound");
+    if (req.vs_addr < 0x1000) return fail("no vertex shader bound");
 
     const gcn::MemReader read = im.reader();
     const u32 vs_user_count = (req.vs_rsrc2 >> 1) & 0x1F;
@@ -438,7 +597,9 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         im.log_once("VS 0x" + std::to_string(req.vs_addr) + " load failed: " + err);
         return fail("VS load: " + err);
     }
-    if (!gcn::load_program(read, req.ps_addr, req.ps_user, std::min<u32>(ps_user_count, 16), ps, err)) {
+    // No PS address (0): a depth-only draw; `ps` stays empty.
+    if (req.ps_addr >= 0x1000 &&
+        !gcn::load_program(read, req.ps_addr, req.ps_user, std::min<u32>(ps_user_count, 16), ps, err)) {
         im.log_once("PS 0x" + std::to_string(req.ps_addr) + " load failed: " + err);
         return fail("PS load: " + err);
     }
@@ -476,6 +637,9 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
     for (u32 k = 0; k < 32; ++k) cntl[k] = k;
     u32 blend = 0;
     u32 mask = 0xF;
+    u32 blends[8] = {};
+    u32 formats[8] = {color_format};
+    for (u32 n = 1; n < 8; ++n) formats[n] = req.color_formats[n];
     const bool have_ctx = req.ctx_regs && req.ctx_reg_count > kSpiPsInputCntl0 + 32;
     if (have_ctx) {
         for (u32 k = 0; k < 32; ++k) cntl[k] = req.ctx_regs[kSpiPsInputCntl0 + k];
@@ -484,8 +648,8 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
             opts.ps_input_addr = req.ctx_regs[ctx_reg::kSpiPsInputAddr] & 0xFFFF;
         }
         blend = req.ctx_regs[kCbBlend0Control];
-        mask = req.ctx_regs[kCbTargetMask] & 0xF;
-        if (mask == 0) mask = 0xF;   // shadow not populated yet
+        for (u32 n = 1; n < 8; ++n) blends[n] = req.ctx_regs[kCbBlend0Control + n];
+        mask = req.ctx_regs[kCbTargetMask]; // 0: no colour writes (depth-only pass)
     } else {
         blend = (1u << 30) | (5u << 8) | 4u;   // fixed path behaviour: src-alpha blending
     }
@@ -500,6 +664,12 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
     key.format = color_format;
     key.depth_format = req.depth_format;
     key.ps_inputs = opts.ps_input_ena | (opts.ps_input_addr << 16);
+    blends[0] = blend;
+    {
+        u32 mrt[14];
+        for (u32 n = 1; n < 8; ++n) { mrt[n - 1] = formats[n]; mrt[6 + n] = blends[n]; }
+        key.mrt = gcn::hash_words(mrt, 14);
+    }
 
     // Fixed-function 3D state. Without a known render target size the
     // viewport and scissor are left as the caller set them.
@@ -511,7 +681,7 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         return true;   // nothing would be rasterised
     }
 
-    Impl::PipeEntry& pe = im.pipeline(key, vs, ps, cntl, opts, blend, mask, color_format, req.depth_format);
+    Impl::PipeEntry& pe = im.pipeline(key, vs, ps, cntl, opts, blends, mask, formats, req.depth_format);
     if (!pe.pso) return fail(pe.error);
 
     // Resources.
@@ -520,6 +690,8 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
                                                     read, max_index);
     gcn::ResourceScan ps_scan = gcn::scan_resources(ps, pe.tp.ps_images, req.ps_user, std::min<u32>(ps_user_count, 16),
                                                     read, 0);
+    debug::capture_resources("VS", vs.hash, vs_scan, pe.tp.vs_images);
+    debug::capture_resources("PS", ps.hash, ps_scan, pe.tp.ps_images);
     if (!vs_scan.ok || !ps_scan.ok) {
         const std::string e = !vs_scan.ok ? "VS " + vs_scan.error : "PS " + ps_scan.error;
         im.log_once("resource scan: " + e);
@@ -622,6 +794,16 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         [enc setVertexBytes:&dc length:sizeof(dc) atIndex:gcn::binding::kDrawConsts];
         [enc setFragmentBuffer:mem offset:0 atIndex:gcn::binding::kMemBuffer];
         [enc setFragmentBytes:&dc length:sizeof(dc) atIndex:gcn::binding::kDrawConsts];
+        auto bind_uniform_loads = [](const std::vector<u32>& t, auto&& set) {
+            static const u32 kEmpty = 0;
+            set(t.empty() ? &kEmpty : t.data(), t.empty() ? sizeof(kEmpty) : t.size() * sizeof(u32));
+        };
+        bind_uniform_loads(vs_scan.uniform_loads, [&](const u32* p, usize n) {
+            [enc setVertexBytes:p length:n atIndex:gcn::binding::kUniformLoads];
+        });
+        bind_uniform_loads(ps_scan.uniform_loads, [&](const u32* p, usize n) {
+            [enc setFragmentBytes:p length:n atIndex:gcn::binding::kUniformLoads];
+        });
         for (usize k = 0; k < pe.tp.vs_images.size(); ++k) {
             [enc setVertexTexture:im.texture_for(vs_scan.images[k]) atIndex:k];
             if (pe.tp.vs_images[k].sampled) [enc setVertexSamplerState:im.sampler_for(vs_scan.images[k]) atIndex:k];
@@ -652,6 +834,146 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         }
     }
     ++im.stats.translated_draws;
+    return true;
+}
+
+bool GcnPipelineCache::encode_dispatch(void* compute_encoder, const GcnComputeRequest& req,
+                                       std::string* why) {
+    Impl& im = *m_impl;
+    auto fail = [&](const std::string& msg) {
+        if (why) *why = msg;
+        return false;
+    };
+    if (!im.device || !compute_encoder) return fail("not configured");
+    if (req.cs_addr < 0x1000) return fail("no compute shader bound");
+
+    const gcn::MemReader read = im.reader();
+    const u32 cs_user_count = (req.cs_rsrc2 >> 1) & 0x1F;
+
+    gcn::Program cs;
+    std::string err;
+    if (!gcn::load_program(read, req.cs_addr, req.cs_user, std::min<u32>(cs_user_count, 16), cs, err)) {
+        im.log_once("CS 0x" + std::to_string(req.cs_addr) + " load failed: " + err);
+        return fail("CS load: " + err);
+    }
+
+    gcn::ComputePipelineOptions opts{};
+    opts.threads_x = req.threads_x;
+    opts.threads_y = req.threads_y;
+    opts.threads_z = req.threads_z;
+    opts.rsrc1 = req.cs_rsrc1;
+    opts.rsrc2 = req.cs_rsrc2;
+
+    Impl::ComputeKey key;
+    key.cs_hash = cs.hash;
+    key.threads_x = req.threads_x;
+    key.threads_y = req.threads_y;
+    key.threads_z = req.threads_z;
+    key.rsrc1 = req.cs_rsrc1;
+    key.rsrc2 = req.cs_rsrc2;
+
+    auto it = im.compute_pipes.find(key);
+    Impl::ComputeEntry* pe = nullptr;
+    if (it != im.compute_pipes.end()) {
+        pe = &it->second;
+    } else {
+        Impl::ComputeEntry e;
+        const auto t_compile = std::chrono::steady_clock::now();
+        e.tp = gcn::translate_compute_pipeline(cs, opts);
+        if (const char* dir = std::getenv("PS4_GCN_DUMP_DIR"); dir && *dir) {
+            char leaf[40];
+            std::snprintf(leaf, sizeof(leaf), "/gcn_cs_%016llx", (unsigned long long)cs.hash);
+            const std::string name = dir + std::string(leaf);
+            std::ofstream t(name + ".txt");
+            t << "; CS threads " << req.threads_x << "x" << req.threads_y << "x" << req.threads_z << " rsrc1 0x"
+              << std::hex << req.cs_rsrc1 << " rsrc2 0x" << req.cs_rsrc2 << std::dec << "\n";
+            for (const auto& i : cs.insts) t << "  " << gcn::disassemble(i) << "\n";
+            if (!e.tp.ok) t << "; translation error: " << e.tp.error << "\n";
+            if (e.tp.ok) std::ofstream(name + ".metal") << e.tp.msl;
+        }
+        if (!e.tp.ok) {
+            e.error = "translate: " + e.tp.error;
+        } else @autoreleasepool {
+            NSError* compile_err = nil;
+            NSString* src = [NSString stringWithUTF8String:e.tp.msl.c_str()];
+            MTLCompileOptions* co = [[MTLCompileOptions alloc] init];
+            id<MTLLibrary> lib = [im.device newLibraryWithSource:src options:co error:&compile_err];
+            if (!lib) {
+                e.error = std::string("MSL compile: ") + (compile_err ? [[compile_err localizedDescription] UTF8String] : "?");
+            } else {
+                id<MTLFunction> fn = [lib newFunctionWithName:@"gcn_cs_main"];
+                if (!fn) {
+                    e.error = "entry point gcn_cs_main not found";
+                } else {
+                    e.pso = [im.device newComputePipelineStateWithFunction:fn error:&compile_err];
+                    if (!e.pso) {
+                        e.error = std::string("compute pipeline: ") + (compile_err ? [[compile_err localizedDescription] UTF8String] : "?");
+                    }
+                }
+            }
+        }
+        if (e.pso) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_compile).count();
+            std::fprintf(stderr, "[GCN] compiled compute pipeline CS#%016llx in %.1f ms (cs %zu insts)\n",
+                         (unsigned long long)key.cs_hash, ms, cs.insts.size());
+        } else {
+            std::fprintf(stderr, "[GCN] compute pipeline CS#%016llx unsupported: %s\n",
+                         (unsigned long long)key.cs_hash, e.error.c_str());
+        }
+        pe = &im.compute_pipes.emplace(key, std::move(e)).first->second;
+    }
+
+    if (!pe->pso) return fail(pe->error);
+
+    // Always scanned: it also evaluates the scalar loads (uniform_loads).
+    gcn::ResourceScan scan =
+        gcn::scan_resources(cs, pe->tp.images, req.cs_user, std::min<u32>(cs_user_count, 16), read, 0);
+    if (!pe->tp.images.empty()) debug::capture_resources("CS", cs.hash, scan, pe->tp.images);
+    if (!scan.ok && !pe->tp.images.empty()) {
+        im.log_once("CS resource scan: " + scan.error);
+        return fail("CS resource scan: " + scan.error);
+    }
+    if (!scan.ok) scan.uniform_loads.clear();  // the shader then loads them itself
+
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)compute_encoder;
+        [enc setComputePipelineState:pe->pso];
+        for (usize k = 0; k < pe->tp.images.size(); ++k) {
+            const gcn::ImageSlot& slot = pe->tp.images[k];
+            if (slot.storage) {
+                id<MTLTexture> t = im.storage_texture_for(scan.images[k]);
+                if (!t) return fail("image_store target unavailable");
+                [enc setTexture:t atIndex:k];
+            } else {
+                [enc setTexture:im.texture_for(scan.images[k]) atIndex:k];
+                if (slot.sampled) [enc setSamplerState:im.sampler_for(scan.images[k]) atIndex:k];
+            }
+        }
+
+        id<MTLBuffer> mem = im.guest_memory_buffer();
+        if (!mem) mem = [im.device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+        [enc setBuffer:mem offset:0 atIndex:gcn::binding::kMemBuffer];
+
+        gcn::ComputeConsts cc{};
+        if (req.cs_user) {
+            std::memcpy(cc.cs_user, req.cs_user, sizeof(cc.cs_user));
+        }
+        [enc setBytes:&cc length:sizeof(cc) atIndex:gcn::binding::kDrawConsts];
+        static const u32 kNoTable = 0;
+        if (scan.uniform_loads.empty())
+            [enc setBytes:&kNoTable length:sizeof(kNoTable) atIndex:gcn::binding::kUniformLoads];
+        else
+            [enc setBytes:scan.uniform_loads.data() length:scan.uniform_loads.size() * sizeof(u32)
+                  atIndex:gcn::binding::kUniformLoads];
+
+        MTLSize threadgroups = MTLSizeMake(std::max<u32>(1, req.grid_x),
+                                           std::max<u32>(1, req.grid_y),
+                                           std::max<u32>(1, req.grid_z));
+        MTLSize threadsPerGroup = MTLSizeMake(std::max<u32>(1, req.threads_x),
+                                              std::max<u32>(1, req.threads_y),
+                                              std::max<u32>(1, req.threads_z));
+        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
+    }
     return true;
 }
 

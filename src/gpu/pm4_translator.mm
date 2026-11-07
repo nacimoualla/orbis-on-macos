@@ -4,6 +4,7 @@
 #include "ps4/pm4_translator.hpp"
 #include "ps4/gcn_pipeline.hpp"
 #include "ps4/gpu_state.hpp"
+#include "ps4/debug/capture.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -107,6 +108,15 @@ struct Pm4Translator::Impl {
     u32 ps_pgm_hi{0};
     u32 ps_rsrc1{0};
     u32 ps_rsrc2{0};
+
+    GuestAddr cs_shader_addr{0};
+    u32 cs_pgm_lo{0};
+    u32 cs_pgm_hi{0};
+    u32 cs_rsrc1{0};
+    u32 cs_rsrc2{0};
+    u32 cs_num_threads_x{64};
+    u32 cs_num_threads_y{1};
+    u32 cs_num_threads_z{1};
 
     struct VSharpBuffer {
         GuestAddr base_addr{0};
@@ -213,6 +223,7 @@ struct Pm4Translator::Impl {
     bool gcn_enabled{GcnPipelineCache::enabled_by_env()};
     bool try_gcn_draw(bool indexed, u32 count, GuestAddr idx_addr, MTLIndexType idx_type,
                       PrimitiveType prim_type, i32 base_vertex, u32 instance_count);
+    bool try_gcn_dispatch(u32 dim_x, u32 dim_y, u32 dim_z);
 
     bool init_mesh_pipeline();
     id<MTLRenderPipelineState> pipeline_for_current_shader();
@@ -231,6 +242,7 @@ struct Pm4Translator::Impl {
                              i32 base_vertex = 0, u32 instance_count = 1);
     bool render_auto_mesh(u32 vtx_count, PrimitiveType prim_type,
                           i32 base_vertex = 0, u32 instance_count = 1);
+    bool cb_special_draw();
     id<MTLBuffer> cached_buffer(id<MTLDevice> device, GuestAddr address, usize size,
                                 const void* bytes, u32 format = 0);
     void evict_resource_cache(usize requested);
@@ -247,6 +259,17 @@ struct Pm4Translator::Impl {
     void mark_pipeline_dirty() noexcept { dirty_bits |= DirtyPipeline; }
     void mark_resource_dirty() noexcept {
         dirty_bits |= DirtyVertexLayout | DirtyTexture | DirtyUniform | DirtyRenderTarget;
+    }
+
+    bool ensure_frame() {
+        if (!metal || !metal->is_initialized()) return true;
+        if (metal->frame_in_progress()) return true;
+        if (!metal->begin_frame()) return false;
+        frame_draw_encoded = false;
+        frame_submission_start = metal->submitted_frame_count();
+        frame_stats = GpuFrameStats{};
+        frame_stats.frame_index = frame_submission_start + 1;
+        return true;
     }
 };
 
@@ -1053,22 +1076,93 @@ void Pm4Translator::Impl::log_draw_diagnostics(const char* draw_type, u32 count,
     std::fprintf(stderr, "========================================================\n\n");
 }
 
+// Metal pixel format of a GCN colour target (CB_COLOR_INFO FORMAT,
+// NUMBER_TYPE, COMP_SWAP), or Invalid when there is none.
+static MTLPixelFormat mtl_color_format(const ColorTarget& c) {
+    enum { UNORM = 0, SNORM = 1, UINT = 4, SINT = 5, SRGB = 6, FLOAT = 7 };
+    const u32 nt = c.num_format;
+    auto pick = [nt](MTLPixelFormat un, MTLPixelFormat sn, MTLPixelFormat ui, MTLPixelFormat si,
+                     MTLPixelFormat fl, MTLPixelFormat srgb = MTLPixelFormatInvalid) {
+        switch (nt) {
+        case UNORM: return un;
+        case SNORM: return sn;
+        case UINT: return ui;
+        case SINT: return si;
+        case FLOAT: return fl;
+        case SRGB: return srgb;
+        default: return MTLPixelFormatInvalid;
+        }
+    };
+    constexpr MTLPixelFormat X = MTLPixelFormatInvalid;
+    if (c.format == 10) { // 8_8_8_8: STD = RGBA, ALT = BGRA
+        if (c.comp_swap == 0)
+            return pick(MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA8Snorm, MTLPixelFormatRGBA8Uint,
+                        MTLPixelFormatRGBA8Sint, X, MTLPixelFormatRGBA8Unorm_sRGB);
+        if (c.comp_swap == 1) return pick(MTLPixelFormatBGRA8Unorm, X, X, X, X, MTLPixelFormatBGRA8Unorm_sRGB);
+        return X;
+    }
+    if (c.comp_swap != 0) return X;
+    switch (c.format) {
+    case 1: return pick(MTLPixelFormatR8Unorm, MTLPixelFormatR8Snorm, MTLPixelFormatR8Uint, MTLPixelFormatR8Sint, X);
+    case 2: return pick(MTLPixelFormatR16Unorm, MTLPixelFormatR16Snorm, MTLPixelFormatR16Uint, MTLPixelFormatR16Sint,
+                        MTLPixelFormatR16Float);
+    case 3: return pick(MTLPixelFormatRG8Unorm, MTLPixelFormatRG8Snorm, MTLPixelFormatRG8Uint, MTLPixelFormatRG8Sint, X);
+    case 4: return pick(X, X, MTLPixelFormatR32Uint, MTLPixelFormatR32Sint, MTLPixelFormatR32Float);
+    case 5: return pick(MTLPixelFormatRG16Unorm, MTLPixelFormatRG16Snorm, MTLPixelFormatRG16Uint, MTLPixelFormatRG16Sint,
+                        MTLPixelFormatRG16Float);
+    case 6: return nt == FLOAT ? MTLPixelFormatRG11B10Float : X; // 10_11_11: R11 G11 B10 from the low bits
+    case 9: return pick(MTLPixelFormatRGB10A2Unorm, X, MTLPixelFormatRGB10A2Uint, X, X); // 2_10_10_10
+    case 11: return pick(X, X, MTLPixelFormatRG32Uint, MTLPixelFormatRG32Sint, MTLPixelFormatRG32Float);
+    case 12: return pick(MTLPixelFormatRGBA16Unorm, MTLPixelFormatRGBA16Snorm, MTLPixelFormatRGBA16Uint,
+                         MTLPixelFormatRGBA16Sint, MTLPixelFormatRGBA16Float);
+    case 14: return pick(X, X, MTLPixelFormatRGBA32Uint, MTLPixelFormatRGBA32Sint, MTLPixelFormatRGBA32Float);
+    default: return X;
+    }
+}
+
 // Phase 19: draw with the game's own GCN shaders translated to MSL. Returns
 // false (nothing encoded) when the translated path is disabled or anything
 // is unsupported, so the caller falls through to the fixed mesh shader.
 bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_addr, MTLIndexType idx_type,
                                        PrimitiveType prim_type, i32 base_vertex, u32 instance_count) {
-    if (!gcn_enabled || !memory || !metal || vs_shader_addr <= 0x1000 || ps_shader_addr <= 0x1000) return false;
+    // ps_shader_addr 0 is a depth-only draw; the translated path handles it.
+    if (!gcn_enabled || !memory || !metal || vs_shader_addr <= 0x1000) return false;
     @autoreleasepool {
         if (!gcn_cache) gcn_cache = std::make_unique<GcnPipelineCache>(metal->raw_device(), memory);
         gcn_cache->set_memory(memory);
+        gcn_cache->set_metal_backend(metal);
         // Bind the game's depth surface before the pass opens; draws without
         // one keep the current buffer with depth testing off.
         const u32* ctx = reg_file.data() + kPm4ContextRegBase;
-        if (ctx[ctx_reg::kDbZInfo] & 3) metal->set_depth_target(static_cast<u64>(ctx[ctx_reg::kDbZReadBase]) << 8);
+        const usize ctx_count = kPm4UconfigRegBase - kPm4ContextRegBase;
+        const GpuRenderState rs = decode_render_state(ctx, ctx_count, metal->width(), metal->height());
+        if (rs.depth.has_depth) metal->set_depth_target(rs.depth.base);
+
+        // Colour targets 0-7. A disabled slot 0 (depth-only pass) still
+        // binds the screen: the pipeline then writes no colour.
+        for (u32 slot = 0; slot < 8; ++slot) {
+            const ColorTarget& c = rs.color[slot];
+            if (!c.enabled) {
+                metal->set_color_target(slot, 0);
+                continue;
+            }
+            MTLPixelFormat f = mtl_color_format(c);
+            if (f == MTLPixelFormatInvalid) {
+                static std::set<u32> s_logged;
+                const u32 id = c.format | (c.num_format << 8) | (c.comp_swap << 12);
+                if (s_logged.insert(id).second)
+                    std::fprintf(stderr, "[GCN] colour target format %u number %u swap %u has no Metal equivalent; using BGRA8\n",
+                                 c.format, c.num_format, c.comp_swap);
+                f = MTLPixelFormatBGRA8Unorm;
+            }
+            metal->set_color_target(slot, c.base, c.width, c.height, static_cast<u32>(f));
+        }
+
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
+        debug::capture_bound();
         id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
-        id<MTLTexture> fb = (__bridge id<MTLTexture>)metal->raw_framebuffer();
+        id<MTLTexture> fb = (__bridge id<MTLTexture>)metal->color_target_texture(0);
+        if (!fb) fb = (__bridge id<MTLTexture>)metal->raw_framebuffer();
         if (!enc || !fb) return false;
         GcnDrawRequest req;
         req.vs_addr = vs_shader_addr;
@@ -1090,12 +1184,60 @@ bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_ad
         req.depth_format = metal->depth_stencil_format();
         req.fb_width = static_cast<u32>(fb.width);
         req.fb_height = static_cast<u32>(fb.height);
+        for (u32 slot = 1; slot < 8; ++slot) {
+            id<MTLTexture> t = (__bridge id<MTLTexture>)metal->color_target_texture(slot);
+            req.color_formats[slot] = t ? static_cast<u32>(t.pixelFormat) : 0;
+        }
         std::string why;
         if (!gcn_cache->encode_draw((__bridge void*)enc, static_cast<u32>(fb.pixelFormat), req, &why)) return false;
         if (draw_diagnostics_enabled) {
             PM4_LOG("[GCN] draw #%zu %s count=%u prim=%u VS=0x%llx PS=0x%llx (translated)\n",
                          draw_count + 1, indexed ? "indexed" : "auto", count, static_cast<u32>(prim_type),
                          (unsigned long long)vs_shader_addr, (unsigned long long)ps_shader_addr);
+        }
+        return true;
+    }
+}
+
+bool Pm4Translator::Impl::try_gcn_dispatch(u32 dim_x, u32 dim_y, u32 dim_z) {
+    if (!gcn_enabled || !memory || !metal || cs_shader_addr <= 0x1000) return false;
+    if (!ensure_frame()) return false;
+    debug::capture_operation("dispatch", 0, reg_file.data(), memory,
+        metal->width(), metal->height(), dim_x, dim_y, dim_z);
+    @autoreleasepool {
+        if (!gcn_cache) gcn_cache = std::make_unique<GcnPipelineCache>(metal->raw_device(), memory);
+        gcn_cache->set_memory(memory);
+        gcn_cache->set_metal_backend(metal);
+
+        if (!metal->ensure_compute_encoder()) return false;
+        debug::capture_bound();
+        void* compute_enc = metal->active_compute_encoder();
+        if (!compute_enc) return false;
+
+        GcnComputeRequest req;
+        req.cs_addr = cs_shader_addr;
+        req.cs_rsrc1 = cs_rsrc1;
+        req.cs_rsrc2 = cs_rsrc2;
+        req.threads_x = cs_num_threads_x ? cs_num_threads_x : 64;
+        req.threads_y = cs_num_threads_y ? cs_num_threads_y : 1;
+        req.threads_z = cs_num_threads_z ? cs_num_threads_z : 1;
+        req.grid_x = dim_x;
+        req.grid_y = dim_y;
+        req.grid_z = dim_z;
+        req.cs_user = reg_file.data() + kPm4ShRegBase + COMPUTE_USER_DATA_0;
+
+        std::string why;
+        if (!gcn_cache->encode_dispatch(compute_enc, req, &why)) {
+            static std::set<std::string> s_dispatch_failures;
+            if (s_dispatch_failures.insert(why).second)
+                std::fprintf(stderr, "[GCN] dispatch CS=0x%llx skipped (first of its kind): %s\n",
+                             (unsigned long long)cs_shader_addr, why.c_str());
+            return false;
+        }
+        if (draw_diagnostics_enabled) {
+            PM4_LOG("[GCN] dispatch direct (%u, %u, %u) threads (%u, %u, %u) CS=0x%llx (translated)\n",
+                         dim_x, dim_y, dim_z, req.threads_x, req.threads_y, req.threads_z,
+                         (unsigned long long)cs_shader_addr);
         }
         return true;
     }
@@ -1112,10 +1254,12 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         indexed_draw_count++;
         return true;
     }
-    if (!metal->frame_in_progress()) {
+    if (!ensure_frame()) {
         PM4_LOG("[PM4] draw outside frame\n");
         return false;
     }
+    debug::capture_operation("draw_indexed", idx_count, reg_file.data(), memory, metal->width(), metal->height());
+    if (cb_special_draw()) return true;
 
     if (try_gcn_draw(true, idx_count, idx_addr, idx_type, prim_type, base_vertex, instance_count)) {
         draw_count++;
@@ -1238,7 +1382,10 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         id<MTLBuffer> idx_buf = cached_buffer(device, idx_addr, required_idx_size, idx_ptr);
         if (!idx_buf) return false;
 
+        // The fixed mesh pipeline has one BGRA colour attachment: draw to the screen.
+        metal->reset_color_targets();
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
+        debug::capture_bound();
         id<MTLRenderCommandEncoder> enc =
             (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
         if (!enc) return false;
@@ -1321,6 +1468,27 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
     }
 }
 
+// A draw issued with CB_COLOR_CONTROL in a non-rendering mode is a CB
+// operation, not geometry. Resolve copies CB0 into CB1 (how Unity moves its
+// offscreen scene to the VideoOut buffer); fast-clear elimination and
+// (FMASK) decompression have no host equivalent: our targets are never
+// compressed. Returns true when the draw was consumed.
+bool Pm4Translator::Impl::cb_special_draw() {
+    const u32 ctl = reg_file[kPm4ContextRegBase + ctx_reg::kCbColorControl];
+    const u8 mode = static_cast<u8>((ctl >> 4) & 7);
+    if (mode == cb_mode::kEliminateFastClear || mode == cb_mode::kDecompress || mode == cb_mode::kFmaskDecompress)
+        return true;
+    if (mode != cb_mode::kResolve) return false;
+    const u32* cb0 = reg_file.data() + kPm4ContextRegBase + ctx_reg::kCbColor0BaseGfx7;
+    const u64 src = static_cast<u64>(cb0[0]) << 8;
+    const u64 dst = static_cast<u64>(cb0[ctx_reg::kCbColorStrideGfx7]) << 8;
+    const bool ok = metal->resolve_color(src, dst);
+    PM4_LOG("[PM4] CB resolve 0x%llx -> 0x%llx%s\n", (unsigned long long)src, (unsigned long long)dst,
+            ok ? "" : " (no source surface)");
+    if (ok && metal->is_display_buffer(dst)) frame_draw_encoded = true;
+    return true;
+}
+
 bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_type,
                                            i32 base_vertex, u32 instance_count) {
     if (vtx_count == 0) return true;
@@ -1329,10 +1497,12 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         draw_count++;
         return true;
     }
-    if (!metal->frame_in_progress()) {
+    if (!ensure_frame()) {
         PM4_LOG("[PM4] draw outside frame\n");
         return false;
     }
+    debug::capture_operation("draw", vtx_count, reg_file.data(), memory, metal->width(), metal->height());
+    if (cb_special_draw()) return true;
 
     if (try_gcn_draw(false, vtx_count, 0, MTLIndexTypeUInt16, prim_type, base_vertex, instance_count)) {
         draw_count++;
@@ -1488,7 +1658,10 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
             }
         }
 
+        // The fixed mesh pipeline has one BGRA colour attachment: draw to the screen.
+        metal->reset_color_targets();
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
+        debug::capture_bound();
         id<MTLRenderCommandEncoder> enc =
             (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
         if (!enc) return false;
@@ -1569,6 +1742,11 @@ bool Pm4Translator::begin_frame() {
     if (!m_impl) return false;
     std::lock_guard<std::recursive_mutex> frame_lock(m_impl->frame_mutex);
     if (!m_impl->metal) return true;
+    // A guest render thread opens a frame itself (ensure_frame on a draw, or
+    // the flip hook's submit + begin) whenever none is active, so between a
+    // host loop's submit_frame and this call one may already be open. Adopt
+    // it: refusing failed test_flappy_gpu with "GPU frame begin failed".
+    if (m_impl->metal->frame_in_progress()) return true;
     if (!m_impl->metal->begin_frame()) return false;
     m_impl->frame_draw_encoded = false;
     const usize upload_bytes = m_impl->frame_stats.upload_bytes;
@@ -1587,16 +1765,29 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
     if (!m_impl) return false;
     std::lock_guard<std::recursive_mutex> frame_lock(m_impl->frame_mutex);
     if (!m_impl->metal) return true;
-    if (!m_impl->metal->frame_in_progress()) return false;
+    // Nothing open: the guest's flip already submitted this frame (see
+    // begin_frame), so there is nothing left to do.
+    if (!m_impl->metal->frame_in_progress()) return true;
     m_impl->metal->end_render_encoder();
     // PS4_GPU_READBACK=1: wait for frames that drew and log the framebuffer
     // centre (diagnostic for comparing the GCN path with the fixed shader).
-    static const bool readback_on = std::getenv("PS4_GPU_READBACK") != nullptr;
-    // PS4_READBACK_EVERY=N: only every Nth submitted frame (default every one).
-    static const u64 readback_every = std::getenv("PS4_READBACK_EVERY")
-                                          ? std::max<u64>(1, std::strtoull(std::getenv("PS4_READBACK_EVERY"), nullptr, 0))
-                                          : 1;
-    const bool readback = readback_on && (m_impl->metal->submitted_frame_count() + 1) % readback_every == 0;
+    // PS4_GPU_READBACK_EVERY=N: dump only every Nth frame (a 1080p PPM is
+    // 6 MB) and wait for the GPU only on those, so frame pacing is unaffected.
+    static const u64 dump_every = [] {
+        const char* v = std::getenv("PS4_GPU_READBACK_EVERY");
+        if (!v) v = std::getenv("PS4_READBACK_EVERY");  // older name
+        const u64 n = v ? std::strtoull(v, nullptr, 0) : 1;
+        return n ? n : 1;
+    }();
+    // PS4_GPU_READBACK_FROM=N: start sampling at frame N (a dump stalls the
+    // frame, so a late scene is reached at full speed first).
+    static const u64 dump_from = [] {
+        const char* v = std::getenv("PS4_GPU_READBACK_FROM");
+        return v ? std::strtoull(v, nullptr, 0) : 0ull;
+    }();
+    const u64 next_frame = m_impl->metal->submitted_frame_count() + 1;
+    const bool sample = next_frame >= dump_from && next_frame % dump_every == 0;
+    const bool readback = std::getenv("PS4_GPU_READBACK") != nullptr && sample;
     const bool drew = m_impl->frame_draw_encoded;
     const bool submitted = m_impl->metal->submit_frame(wait_for_completion || (readback && drew));
     if (readback && drew && submitted) {
@@ -1610,7 +1801,20 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
                      m_impl->gcn_enabled ? "on" : "off");
         const char* dir = std::getenv("PS4_GPU_READBACK");
         if (dir && dir[0] == '/') {   // also dump the frame as a PPM
+            // PS4_GPU_READBACK_KEY=<guest address>: dump that render target
+            // instead of the screen (8-bit RGBA/BGRA targets only).
             id<MTLTexture> fb = (__bridge id<MTLTexture>)m_impl->metal->raw_framebuffer();
+            u32 w = m_impl->metal->width(), h = m_impl->metal->height();
+            bool rgba_order = false;
+            if (const char* key = std::getenv("PS4_GPU_READBACK_KEY")) {
+                id<MTLTexture> t = (__bridge id<MTLTexture>)m_impl->metal->surface_texture(std::strtoull(key, nullptr, 0));
+                if (t && (t.pixelFormat == MTLPixelFormatRGBA8Unorm || t.pixelFormat == MTLPixelFormatBGRA8Unorm)) {
+                    fb = t;
+                    w = static_cast<u32>(t.width);
+                    h = static_cast<u32>(t.height);
+                    rgba_order = t.pixelFormat == MTLPixelFormatRGBA8Unorm;
+                }
+            }
             std::vector<u8> px(static_cast<usize>(w) * h * 4);
             [fb getBytes:px.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
             char path[512];
@@ -1620,7 +1824,7 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
             if (FILE* f = std::fopen(path, "wb")) {
                 std::fprintf(f, "P6\n%u %u\n255\n", w, h);
                 for (usize p = 0; p < static_cast<usize>(w) * h; ++p) {
-                    const u8 rgb[3] = {px[p * 4 + 2], px[p * 4 + 1], px[p * 4 + 0]};
+                    const u8 rgb[3] = {px[p * 4 + (rgba_order ? 0 : 2)], px[p * 4 + 1], px[p * 4 + (rgba_order ? 2 : 0)]};
                     std::fwrite(rgb, 1, 3, f);
                 }
                 std::fclose(f);
@@ -2068,6 +2272,16 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                         PM4_LOG("[PM4] IT_NOP (tag=0x%08x, len=%zu): [%s]\n",
                                      tag, packet.payload.size(), dwords_str.c_str());
 
+                        // Handle Gnm flip label write embedded in NOP packet (e.g. 0x68750778)
+                        if (packet.payload.size() >= 4 && ((tag & 0xFFFF0000) == 0x68750000)) {
+                            const GuestAddr label_addr = (static_cast<u64>(packet.payload[2]) << 32) | packet.payload[1];
+                            const u32 val = packet.payload[3];
+                            if (label_addr > 0x1000 && m_impl->memory && m_impl->memory->is_valid_address(label_addr, sizeof(u32))) {
+                                m_impl->memory->write_value(label_addr, val);
+                                PM4_LOG("[PM4] IT_NOP flip label write: *0x%llx = %u\n", (unsigned long long)label_addr, val);
+                            }
+                        }
+
                         // Scan for potential 64-bit GPU base addresses in payload
                         for (size_t d = 0; d + 1 < packet.payload.size(); ++d) {
                             const u64 addr = (static_cast<u64>(packet.payload[d + 1]) << 32) | packet.payload[d];
@@ -2311,6 +2525,27 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                             if (i + 3 < packet.payload.size()) m_impl->ps_rsrc2 = packet.payload[i + 3];
                             PM4_LOG("[PM4 SH_REG] PS Shader ISA Addr: 0x%llx (lo=0x%08x, hi=0x%08x, rsrc1=0x%08x, rsrc2=0x%08x)\n",
                                          (unsigned long long)isa, lo, hi, m_impl->ps_rsrc1, m_impl->ps_rsrc2);
+                        } else if (reg == COMPUTE_PGM_LO && i + 1 < packet.payload.size()) {
+                            const u32 lo = val;
+                            const u32 hi = packet.payload[i + 1];
+                            const GuestAddr isa = ((static_cast<u64>(hi) << 32) | lo) << 8;
+                            m_impl->cs_shader_addr = isa;
+                            m_impl->cs_pgm_lo = lo;
+                            m_impl->cs_pgm_hi = hi;
+                            if (i + 2 < packet.payload.size()) m_impl->cs_rsrc1 = packet.payload[i + 2];
+                            if (i + 3 < packet.payload.size()) m_impl->cs_rsrc2 = packet.payload[i + 3];
+                            PM4_LOG("[PM4 SH_REG] CS Shader ISA Addr: 0x%llx (lo=0x%08x, hi=0x%08x, rsrc1=0x%08x, rsrc2=0x%08x)\n",
+                                         (unsigned long long)isa, lo, hi, m_impl->cs_rsrc1, m_impl->cs_rsrc2);
+                        } else if (reg == COMPUTE_PGM_RSRC1) {
+                            m_impl->cs_rsrc1 = val;
+                        } else if (reg == COMPUTE_PGM_RSRC2) {
+                            m_impl->cs_rsrc2 = val;
+                        } else if (reg == COMPUTE_NUM_THREAD_X) {
+                            m_impl->cs_num_threads_x = val ? val : 1;
+                        } else if (reg == COMPUTE_NUM_THREAD_Y) {
+                            m_impl->cs_num_threads_y = val ? val : 1;
+                        } else if (reg == COMPUTE_NUM_THREAD_Z) {
+                            m_impl->cs_num_threads_z = val ? val : 1;
                         } else if ((reg >= 0x004C && reg <= 0x005B) || reg == SPI_SHADER_USER_DATA_VS_0_LEGACY) {
                             if (reg == SPI_SHADER_USER_DATA_VS_0 || reg == SPI_SHADER_USER_DATA_VS_0_LEGACY) {
                                 const u32 vaddr_lo = val;
@@ -2376,6 +2611,17 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                 m_impl->mark_pipeline_dirty();
                 m_impl->mark_resource_dirty();
                 return true;
+            }
+
+            case IT_DISPATCH_DIRECT: {
+                if (!st.require_payload(packet, 3, "IT_DISPATCH_DIRECT")) return false;
+                const u32 dim_x = packet.payload[0];
+                const u32 dim_y = packet.payload[1];
+                const u32 dim_z = packet.payload[2];
+                const u32 initiator = packet.payload.size() > 3 ? packet.payload[3] : 1;
+                PM4_LOG("[PM4 Dispatch] IT_DISPATCH_DIRECT: grid=(%u, %u, %u) initiator=0x%08x\n",
+                             dim_x, dim_y, dim_z, initiator);
+                return st.try_gcn_dispatch(dim_x, dim_y, dim_z);
             }
 
             case IT_DRAW_INDEX_AUTO: {
@@ -2835,6 +3081,14 @@ bool Pm4Translator::execute_packet(const Pm4Packet& packet) {
                                  packet.payload.size(),
                                  packet.payload.size() > 0 ? packet.payload[0] : 0,
                                  packet.payload.size() > 1 ? packet.payload[1] : 0);
+                }
+                {
+                    // Once per opcode, always: a skipped packet can be the reason
+                    // memory the GPU should have written stays empty.
+                    static std::set<u32> s_unimpl_logged;
+                    if (s_unimpl_logged.insert(packet.header.opcode).second)
+                        std::fprintf(stderr, "[PM4] unimplemented packet op=0x%02x (%s), first seen; skipped\n",
+                                     packet.header.opcode, pm4_opcode_to_name(packet.header.opcode));
                 }
                 ++st.unsupported_packets;
                 return false;

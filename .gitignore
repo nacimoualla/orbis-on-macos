@@ -38,6 +38,8 @@ sce_module/
 # Emulator run logs (can reach GBs; regenerated every run, never published)
 flappy_*.txt
 log.txt
+Testing/
+vfs_root/savedata/
 
 # Python bytecode caches
 __pycache__/
@@ -45,6 +47,7 @@ __pycache__/
 # Agent working-memory directories (machine-local session notes)
 .agents/
 .superpowers/
+scripts/tools/
 
 # GUI run logs
 Logs/

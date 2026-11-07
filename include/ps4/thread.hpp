@@ -154,6 +154,9 @@ public:
                               std::string_view name = "ps4_thread",
                               std::function<void(GuestThread&)> host_task = nullptr);
 
+    /// Bind calling host thread to a guest thread ID (sets thread-local contexts).
+    void bind_current_host_thread(ScePthreadId id);
+
     /// Join an existing thread and wait for completion
     bool join_thread(ScePthreadId id, u64* out_return_value = nullptr);
 
@@ -251,10 +254,10 @@ private:
     // Synchronization tables
     std::mutex m_sync_mutex;
     u32 m_next_mutex_id{1};
-    std::unordered_map<u32, std::unique_ptr<std::recursive_mutex>> m_mutexes;
+    std::unordered_map<u32, std::shared_ptr<std::recursive_mutex>> m_mutexes;
 
     u32 m_next_cond_id{1};
-    std::unordered_map<u32, std::unique_ptr<std::condition_variable_any>> m_conds;
+    std::unordered_map<u32, std::shared_ptr<std::condition_variable_any>> m_conds;
 
     std::mutex m_equeues_mutex;
     u32 m_next_equeue_id{1};

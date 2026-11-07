@@ -574,6 +574,113 @@ int main() {
         std::cout << "  ✓ Test 13: Orbis Semaphore lifecycle and cancellation semantics verified\n";
     }
 
+    // Test 14: Verifying the 11 new NID handlers
+    {
+        ps4::CpuContext ctx{};
+
+        // 1. sceFiosTimeGetCurrent (0x35490118E640462E)
+        const auto* sym_fios_time = registry.find_by_nid(0x35490118E640462EULL);
+        assert(sym_fios_time != nullptr && sym_fios_time->name == "sceFiosTimeGetCurrent");
+        sym_fios_time->handler(ctx, memory);
+        assert(ctx.rax > 0);
+
+        // 2. sceFiosDeleteSync (0x2AC553734E2437D9)
+        const auto* sym_fios_del = registry.find_by_nid(0x2AC553734E2437D9ULL);
+        assert(sym_fios_del != nullptr && sym_fios_del->name == "sceFiosDeleteSync");
+        sym_fios_del->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+
+        // 3. sceFiosFHOpen (0x7ABE93910154BE9D)
+        const auto* sym_fios_open = registry.find_by_nid(0x7ABE93910154BE9DULL);
+        assert(sym_fios_open != nullptr && sym_fios_open->name == "sceFiosFHOpen");
+
+        // 4. scePlayGoSetLanguageMask (0x2E8B0B9473A936A4)
+        const auto* sym_pg_mask = registry.find_by_nid(0x2E8B0B9473A936A4ULL);
+        assert(sym_pg_mask != nullptr && sym_pg_mask->name == "scePlayGoSetLanguageMask");
+        ctx.rdi = 1;
+        sym_pg_mask->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+        ctx.rdi = 2; // bad handle
+        sym_pg_mask->handler(ctx, memory);
+        assert(ctx.rax == 0x80B20009ULL);
+
+        // 5. scePlayGoSetToDoList (0x8143C688E435B664)
+        const auto* sym_pg_set_todo = registry.find_by_nid(0x8143C688E435B664ULL);
+        assert(sym_pg_set_todo != nullptr && sym_pg_set_todo->name == "scePlayGoSetToDoList");
+        ctx.rdi = 1;
+        ctx.rsi = 0x408000ULL;
+        ctx.rdx = 1;
+        sym_pg_set_todo->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+
+        // 6. scePlayGoGetToDoList (0x367EF32B09C0E6AD)
+        const auto* sym_pg_get_todo = registry.find_by_nid(0x367EF32B09C0E6ADULL);
+        assert(sym_pg_get_todo != nullptr && sym_pg_get_todo->name == "scePlayGoGetToDoList");
+        ctx.rdi = 1;
+        ctx.rsi = 0x408000ULL;
+        ctx.rdx = 1;
+        ctx.rcx = 0x408010ULL;
+        sym_pg_get_todo->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+        ps4::u32 todo_entries = 999;
+        assert(memory.read_value(0x408010ULL, todo_entries) && todo_entries == 0);
+
+        // 7. sceSystemServiceParamGetString (0x4AC0BF9BF4BD2530)
+        const auto* sym_sys_str = registry.find_by_nid(0x4AC0BF9BF4BD2530ULL);
+        assert(sym_sys_str != nullptr && sym_sys_str->name == "sceSystemServiceParamGetString");
+        ctx.rdi = 1;
+        ctx.rsi = 0x408020ULL;
+        ctx.rdx = 16;
+        sym_sys_str->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+        char str_buf[8]{};
+        assert(memory.read_bytes(0x408020ULL, str_buf, 4) && std::string(str_buf) == "PS4");
+
+        // 8. sceNetInetNtop (0xF6F036696F821EE0)
+        const auto* sym_ntop = registry.find_by_nid(0xF6F036696F821EE0ULL);
+        assert(sym_ntop != nullptr && sym_ntop->name == "sceNetInetNtop");
+        const unsigned char ipv4[4] = {127, 0, 0, 1};
+        assert(memory.write_bytes(0x408030ULL, ipv4, 4));
+        ctx.rdi = 2; // AF_INET
+        ctx.rsi = 0x408030ULL;
+        ctx.rdx = 0x408040ULL;
+        ctx.rcx = 16;
+        sym_ntop->handler(ctx, memory);
+        assert(ctx.rax == 0x408040ULL);
+        char ip_str[16]{};
+        assert(memory.read_bytes(0x408040ULL, ip_str, 10) && std::string(ip_str) == "127.0.0.1");
+
+        // 9. sceKernelAddUserEvent (0xE11EBF3AF2367040)
+        const auto* sym_add_uev = registry.find_by_nid(0xE11EBF3AF2367040ULL);
+        assert(sym_add_uev != nullptr && sym_add_uev->name == "sceKernelAddUserEvent");
+        ctx.rdi = 1;
+        ctx.rsi = 1;
+        sym_add_uev->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+
+        // 10. sceGnmMapComputeQueue (0xDBDA0ABCA5F3119A)
+        const auto* sym_map_cq = registry.find_by_nid(0xDBDA0ABCA5F3119AULL);
+        assert(sym_map_cq != nullptr && sym_map_cq->name == "sceGnmMapComputeQueue");
+        ctx.rdi = 0x408050ULL;
+        sym_map_cq->handler(ctx, memory);
+        assert(ctx.rax == ps4::SCE_OK);
+        ps4::u32 vqueue = 0;
+        assert(memory.read_value(0x408050ULL, vqueue) && vqueue == 1);
+
+        // 11. strncasecmp (0xA57BDB0DF721BBA9)
+        const auto* sym_strncasecmp = registry.find_by_nid(0xA57BDB0DF721BBA9ULL);
+        assert(sym_strncasecmp != nullptr && sym_strncasecmp->name == "strncasecmp");
+        assert(memory.write_bytes(0x408060ULL, "HELLO", 6));
+        assert(memory.write_bytes(0x408070ULL, "hello", 6));
+        ctx.rdi = 0x408060ULL;
+        ctx.rsi = 0x408070ULL;
+        ctx.rdx = 5;
+        sym_strncasecmp->handler(ctx, memory);
+        assert(ctx.rax == 0);
+
+        std::cout << "  ✓ Test 14: All 11 new NIDs registered and handler semantics verified\n";
+    }
+
     std::cout << "[PHASE 7] PASS: All PRX Dynamic Linking & NID Resolution tests passed!\n";
     return 0;
 }

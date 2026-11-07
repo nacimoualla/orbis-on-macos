@@ -2,6 +2,7 @@
 
 #include "ps4/common.hpp"
 #include "ps4/cpu_context.hpp"
+#include "ps4/input.hpp"
 #include "ps4/memory.hpp"
 #include <functional>
 #include <optional>
@@ -79,6 +80,11 @@ public:
 
     /// Set pad digital buttons bitmask (e.g. from keyboard/mouse input)
     void set_pad_buttons(u32 buttons);
+    void set_pad_state(const PadState& state);
+    [[nodiscard]] PadState get_pad_state() const noexcept;
+
+    void set_mouse_state(const MouseState& state);
+    [[nodiscard]] MouseState get_mouse_state() const noexcept;
     /// Called on the guest thread after every sceVideoOut flip, once the
     /// frame's GPU work has been encoded (the windowed runner presents here).
     void set_flip_hook(std::function<void()> hook);

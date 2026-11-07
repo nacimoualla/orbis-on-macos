@@ -21,6 +21,7 @@
 // generated MSL does not depend on any data values and can be cached by ISA
 // hash.
 
+#include "ps4/bc_decode.hpp"
 #include "ps4/gcn_shader.hpp"
 
 #include <algorithm>
@@ -49,6 +50,11 @@ struct GcnDrawConsts {
     uint pad;
 };
 
+struct GcnComputeConsts {
+    uint cs_user[16];
+    uint pad[16];
+};
+
 #define F(x) as_type<float>(uint(x))
 #define U(x) as_type<uint>(float(x))
 
@@ -75,6 +81,62 @@ static inline uint gcn_ld16(device const uchar* mem, constant GcnDrawConsts& dc,
     return gcn_ld8(mem, dc, a) | (gcn_ld8(mem, dc, a + 1) << 8);
 }
 
+static inline uint gcn_ld8(device const uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    return uint(mem[a]);
+}
+static inline uint gcn_ld8(device uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    return uint(mem[a]);
+}
+
+static inline uint gcn_ld32(device const uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    device const uchar* p = mem + a;
+    return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
+}
+static inline uint gcn_ld32(device uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    device uchar* p = mem + a;
+    return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
+}
+
+static inline uint gcn_ld16(device const uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    return gcn_ld8(mem, dc, a) | (gcn_ld8(mem, dc, a + 1) << 8);
+}
+static inline uint gcn_ld16(device uchar* mem, constant GcnComputeConsts& dc, ulong a) {
+    return gcn_ld8(mem, dc, a) | (gcn_ld8(mem, dc, a + 1) << 8);
+}
+
+static inline void gcn_st8(device uchar* mem, constant GcnComputeConsts& dc, ulong a, uint v) {
+    mem[a] = uchar(v);
+}
+static inline void gcn_st16(device uchar* mem, constant GcnComputeConsts& dc, ulong a, uint v) {
+    device uchar* p = mem + a;
+    p[0] = uchar(v); p[1] = uchar(v >> 8);
+}
+static inline void gcn_st32(device uchar* mem, constant GcnComputeConsts& dc, ulong a, uint v) {
+    device uchar* p = mem + a;
+    p[0] = uchar(v); p[1] = uchar(v >> 8); p[2] = uchar(v >> 16); p[3] = uchar(v >> 24);
+}
+
+static inline void gcn_st8(device uchar* mem, constant GcnDrawConsts& dc, ulong a, uint v) {
+    for (uint i = 0; i < dc.range_count; ++i) {
+        ulong b = dc.range_base[i];
+        if (a >= b && a < b + ulong(dc.range_size[i])) { mem[dc.range_off[i] + uint(a - b)] = uchar(v); return; }
+    }
+}
+static inline void gcn_st16(device uchar* mem, constant GcnDrawConsts& dc, ulong a, uint v) {
+    gcn_st8(mem, dc, a, v & 0xffu);
+    gcn_st8(mem, dc, a + 1ul, (v >> 8) & 0xffu);
+}
+static inline void gcn_st32(device uchar* mem, constant GcnDrawConsts& dc, ulong a, uint v) {
+    for (uint i = 0; i < dc.range_count; ++i) {
+        ulong b = dc.range_base[i];
+        if (a >= b && a + 4ul <= b + ulong(dc.range_size[i])) {
+            device uchar* p = mem + dc.range_off[i] + uint(a - b);
+            p[0] = uchar(v); p[1] = uchar(v >> 8); p[2] = uchar(v >> 16); p[3] = uchar(v >> 24);
+            return;
+        }
+    }
+}
+
 static inline ulong gcn_vbase(uint w0, uint w1) { return ulong(w0) | (ulong(w1 & 0xffffu) << 32); }
 static inline uint gcn_vstride(uint w1) { return (w1 >> 16) & 0x3fffu; }
 
@@ -95,7 +157,8 @@ static inline uint gcn_cvt(uint c, uint bits, uint nfmt) {
     }
 }
 
-static inline uint4 gcn_fetch_format(device const uchar* mem, constant GcnDrawConsts& dc,
+template <typename MemT, typename ConstsT>
+static inline uint4 gcn_fetch_format(MemT mem, constant ConstsT& dc,
                                      ulong a, uint dfmt, uint nfmt) {
     bool is_int = (nfmt == 4u || nfmt == 5u);
     uint4 r = uint4(0u, 0u, 0u, is_int ? 1u : as_type<uint>(1.0f));
@@ -134,6 +197,45 @@ static inline uint gcn_sel(uint4 r, uint sel, bool is_int) {
     case 6u: return r.z;
     case 7u: return r.w;
     default: return 0u;
+    }
+}
+
+// image_sample_*_o offset VGPR: signed 6-bit texel offsets, x in bits 5:0
+// and y in bits 13:8.
+static inline float2 gcn_texel_offset(uint o) {
+    return float2(float(int(o << 26u) >> 26), float(int((o >> 8u) << 26u) >> 26));
+}
+
+// Pack one component for a format store: unorm/snorm from float, half for
+// 16-bit float, raw bits otherwise (uint/sint and 32-bit float).
+static inline uint gcn_pack(uint x, uint bits, uint nfmt) {
+    const uint mask = bits >= 32u ? 0xffffffffu : ((1u << bits) - 1u);
+    switch (nfmt) {
+    case 0u: return uint(rint(clamp(as_type<float>(x), 0.0f, 1.0f) * float(mask))) & mask;
+    case 1u: return uint(int(rint(clamp(as_type<float>(x), -1.0f, 1.0f) * float(mask >> 1)))) & mask;
+    case 7u: return bits == 16u ? uint(as_type<ushort>(half(as_type<float>(x)))) : (x & mask);
+    default: return x & mask;
+    }
+}
+
+template <typename ConstsT>
+static inline void gcn_store_format(device uchar* mem, constant ConstsT& dc, ulong a, uint dfmt, uint nfmt,
+                                    uint4 v) {
+    switch (dfmt) {
+    case 1u: gcn_st8(mem, dc, a, gcn_pack(v.x, 8u, nfmt)); break;
+    case 2u: gcn_st16(mem, dc, a, gcn_pack(v.x, 16u, nfmt)); break;
+    case 3u: gcn_st16(mem, dc, a, gcn_pack(v.x, 8u, nfmt) | (gcn_pack(v.y, 8u, nfmt) << 8)); break;
+    case 4u: gcn_st32(mem, dc, a, v.x); break;
+    case 5u: gcn_st32(mem, dc, a, gcn_pack(v.x, 16u, nfmt) | (gcn_pack(v.y, 16u, nfmt) << 16)); break;
+    case 10u: gcn_st32(mem, dc, a, gcn_pack(v.x, 8u, nfmt) | (gcn_pack(v.y, 8u, nfmt) << 8) |
+                                   (gcn_pack(v.z, 8u, nfmt) << 16) | (gcn_pack(v.w, 8u, nfmt) << 24)); break;
+    case 11u: gcn_st32(mem, dc, a, v.x); gcn_st32(mem, dc, a + 4, v.y); break;
+    case 12u: gcn_st32(mem, dc, a, gcn_pack(v.x, 16u, nfmt) | (gcn_pack(v.y, 16u, nfmt) << 16));
+              gcn_st32(mem, dc, a + 4, gcn_pack(v.z, 16u, nfmt) | (gcn_pack(v.w, 16u, nfmt) << 16)); break;
+    case 13u: gcn_st32(mem, dc, a, v.x); gcn_st32(mem, dc, a + 4, v.y); gcn_st32(mem, dc, a + 8, v.z); break;
+    case 14u: gcn_st32(mem, dc, a, v.x); gcn_st32(mem, dc, a + 4, v.y);
+              gcn_st32(mem, dc, a + 8, v.z); gcn_st32(mem, dc, a + 12, v.w); break;
+    default: break;
     }
 }
 
@@ -182,16 +284,19 @@ public:
     std::map<u32, u32> ps_attrs;          // PS attr index -> locn (VS param)
     std::set<u32> flat_attrs;
     bool ps_color{false};
+    u8 ps_color_mask{0};
     bool ps_depth{false};
     bool uses_exec_write{false};
     bool uses_frag_pos{false};
     u32 max_vgpr{0};
+    u32 max_sgpr{0};
 
 private:
     const Program& prog;
     Stage stage;
+    std::vector<u32> uniform_slots;     // parallel to prog.insts (see uniform_load_slots)
     const u32* input_cntl;
-    u32 input_ena;
+    [[maybe_unused]] u32 input_ena;
     const Instruction* cur{nullptr};
 
     void fail(const std::string& why) {
@@ -199,13 +304,14 @@ private:
     }
 
     void track_v(u32 v) { max_vgpr = std::max(max_vgpr, v + 1); }
+    void track_s(u32 s) { if (s < 104) max_sgpr = std::max(max_sgpr, s + 1); }
 
     std::string vreg(u32 r) { track_v(r); return "v[" + std::to_string(r) + "]"; }
 
     // 32-bit source operand as a uint expression.
     std::string usrc(u32 s) {
         if (s >= operand::kVgprBase) return vreg(s - 256);
-        if (s < 128) return "s[" + std::to_string(s) + "]";
+        if (s < 128) { track_s(s); return "s[" + std::to_string(s) + "]"; }
         if (s == operand::kZero) return "0u";
         if (s >= 129 && s <= 192) return std::to_string(s - 128) + "u";
         if (s >= 193 && s <= 208) return "uint(-" + std::to_string(s - 192) + ")";
@@ -230,7 +336,7 @@ private:
 
     // 64-bit scalar source.
     std::string usrc64(u32 s) {
-        if (s < 127) return "gcn_s64(s, " + std::to_string(s) + "u)";
+        if (s < 127) { track_s(s); track_s(s + 1); return "gcn_s64(s, " + std::to_string(s) + "u)"; }
         if (s == operand::kLiteral) return "ulong(" + hex(cur->literal) + ")";
         if (s >= 193 && s <= 208) return "ulong(long(-" + std::to_string(s - 192) + "))";
         return "ulong(" + usrc(s) + ")";
@@ -486,16 +592,22 @@ void Emitter::emit_valu(const Instruction& i) {
 }
 
 void Emitter::emit_salu(const Instruction& i) {
-    const std::string d = "s[" + std::to_string(i.dst) + "]";
     if (i.enc == Encoding::SOPP) {
         switch (i.op) {
-        case 0: case 10: case 12: case 13: case 14: case 15: case 16: case 17: case 19: case 20: case 21: case 22:
+        case 10:
+            if (stage == Stage::Compute) {
+                body << "    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n";
+            }
+            return;
+        case 0: case 12: case 13: case 14: case 15: case 16: case 17: case 19: case 20: case 21: case 22:
             return;
         default:
             fail("unsupported " + mnemonic(i));
             return;
         }
     }
+    const std::string d = "s[" + std::to_string(i.dst) + "]";
+    track_s(i.dst);
     if (i.enc == Encoding::SOPK) {
         const i32 k = i.simm;
         const u32 uk = static_cast<u32>(i.simm) & 0xFFFF;
@@ -625,13 +737,82 @@ void Emitter::emit_salu(const Instruction& i) {
     }
 }
 
+constexpr u32 kNoUniformSlot = ~0u;
+constexpr u32 kMaxUniformLoads = 1000;  // Metal's setBytes takes up to 4 KB
+
+/// Where each scalar load of the shader's start goes in the table of loads
+/// evaluated when the draw or dispatch is encoded (kNoUniformSlot: the shader
+/// loads it itself). Slot 0 is a flag: 1 when scan_resources evaluated the
+/// table, else the shader takes its own loads.
+///
+/// Up to the first branch target (or backward or unconditional branch) every
+/// load runs at most once, in program order, with values the draw fixes: a
+/// forward conditional branch can only skip some of them. scan_resources walks
+/// the same instructions linearly, so it gets the same values.
+///
+/// Two reasons to read them from the table. Speed: on every fragment the load
+/// would otherwise search the range table and read memory for each dword,
+/// which dominated post-processing shaders. Correctness for compute: dispatches
+/// read guest memory directly when the GPU runs them, which is later than on
+/// the console; by then a game may have reused the constant memory (Dragon
+/// Ball Xenoverse 2's texture copies read the next copy's size and wrote
+/// nothing).
+std::vector<u32> uniform_load_slots(const Program& prog) {
+    static const u32 kCount[] = {1, 2, 4, 8, 16};
+    std::set<u32> targets;
+    for (const Instruction& i : prog.insts)
+        if (i.enc == Encoding::SOPP && i.op >= 2 && i.op <= 9)
+            targets.insert(static_cast<u32>(static_cast<i64>(i.pc) + i.size + i.simm));
+    std::vector<u32> slots(prog.insts.size(), kNoUniformSlot);
+    u32 next = 1;
+    for (usize k = 0; k < prog.insts.size(); ++k) {
+        const Instruction& i = prog.insts[k];
+        if (targets.count(i.pc)) break;
+        if (i.enc == Encoding::SOPP && i.op == 2) break;  // s_branch
+        if (i.enc == Encoding::SOPP && i.op >= 4 && i.op <= 9 && i.simm < 0) break;
+        if (i.enc == Encoding::SOP1 && (i.op == 32 || i.op == 33)) break;  // s_setpc, s_swappc
+        if (i.enc != Encoding::SMRD || i.op == 29 || i.op == 30 || i.op == 31) continue;
+        if ((i.op & 7) > 4 || (i.op & ~7u) > 8 || !(i.imm || i.offset == 255)) continue;
+        const u32 n = kCount[i.op & 7];
+        if (next + n > kMaxUniformLoads) break;
+        slots[k] = next;
+        next += n;
+    }
+    return slots;
+}
+
 void Emitter::emit_smrd(const Instruction& i) {
     static const u32 kCount[] = {1, 2, 4, 8, 16};
     const u32 kind = i.op & 7;
     if (i.op == 29 || i.op == 31) return;            // cache invalidations
-    if (i.op == 30) { body << "    s[" << i.dst << "] = 0u; s[" << i.dst + 1 << "] = 0u;\n"; return; }
+    if (i.op == 30) {
+        track_s(i.dst); track_s(i.dst + 1);
+        body << "    s[" << i.dst << "] = 0u; s[" << i.dst + 1 << "] = 0u;\n";
+        return;
+    }
     if (kind > 4 || (i.op & ~7u) > 8) { fail("unsupported " + mnemonic(i)); return; }
     const u32 n = kCount[kind];
+    for (u32 k = 0; k < n; ++k) track_s(i.dst + k);
+    // Evaluated once per draw on the CPU: read the answer from the draw's table.
+    const usize index = static_cast<usize>(&i - prog.insts.data());
+    const bool uniform = index < uniform_slots.size() && uniform_slots[index] != kNoUniformSlot;
+    if (uniform && stage != Stage::Compute) {
+        // A draw whose loads cannot be evaluated is rejected before it is
+        // encoded, so the table is always valid here. Keeping the shader's own
+        // load as a fallback would stop Metal from optimising it away.
+        for (u32 k = 0; k < n; ++k)
+            body << "    s[" << i.dst + k << "] = ul[" << uniform_slots[index] + k << "];\n";
+        return;
+    }
+    if (uniform) {
+        // Compute runs even when the scan failed (ul[0] == 0).
+        body << "    if (ul[0] != 0u) {\n";
+        for (u32 k = 0; k < n; ++k)
+            body << "      s[" << i.dst + k << "] = ul[" << uniform_slots[index] + k << "];\n";
+        body << "    } else\n";
+    }
+    track_s(i.sbase); track_s(i.sbase + 1);
+    if (!i.imm && i.offset < 128) track_s(i.offset);
     std::string off;
     if (i.imm) off = std::to_string(i.offset * 4) + "ul";
     else if (i.offset == 255) off = std::to_string(static_cast<u64>(i.literal) * 4) + "ul";
@@ -650,8 +831,11 @@ void Emitter::emit_smrd(const Instruction& i) {
 void Emitter::emit_buffer(const Instruction& i) {
     const bool tbuf = i.enc == Encoding::MTBUF;
     const bool is_store = tbuf ? (i.op >= 4) : ((i.op >= 4 && i.op <= 7) || i.op >= 24);
-    if (is_store) { fail("unsupported " + mnemonic(i) + " (stores)"); return; }
+    // Format stores: tbuffer_store_format_* (MTBUF) and buffer_store_format_*
+    // (MUBUF 4..7) convert through the descriptor's (or instruction's) format.
+    const bool format_store = is_store && (tbuf || i.op <= 7);
     const u32 r = i.srsrc;
+    track_s(r); track_s(r + 1); track_s(r + 2); track_s(r + 3);
     std::string idx = "0u", off = "0u";
     if (i.idxen) { idx = vreg(i.vaddr); if (i.offen) off = vreg(i.vaddr + 1); }
     else if (i.offen) off = vreg(i.vaddr);
@@ -660,6 +844,40 @@ void Emitter::emit_buffer(const Instruction& i) {
     body << "    { ulong a_ = 0ul; bool in_ = gcn_buf_addr(" << w0 << ", " << w1 << ", " << w2 << ", " << idx << ", "
          << off << " + " << usrc(i.soffset) << " + " << i.offset << "u, a_);\n";
     const std::string g = exec_guard();
+    if (format_store) {
+        const u32 comps = (i.op & 3) + 1;
+        const std::string dfmt = tbuf ? std::to_string(i.dfmt) + "u" : "((" + w3 + " >> 15) & 0xfu)";
+        const std::string nfmt = tbuf ? std::to_string(i.nfmt) + "u" : "((" + w3 + " >> 12) & 0x7u)";
+        std::string v4 = "uint4(";
+        for (u32 c = 0; c < 4; ++c) v4 += (c ? ", " : "") + (c < comps ? vreg(i.dst + c) : std::string("0u"));
+        v4 += ")";
+        body << "      " << g << "if (in_) gcn_store_format(mem, dc, a_, " << dfmt << ", " << nfmt << ", " << v4
+             << ");\n    }\n";
+        return;
+    }
+    if (is_store) {
+        switch (i.op) {
+        case 24: body << "      " << g << "if (in_) gcn_st8(mem, dc, a_, " << vreg(i.dst) << ");\n"; break;
+        case 26: body << "      " << g << "if (in_) gcn_st16(mem, dc, a_, " << vreg(i.dst) << ");\n"; break;
+        case 28: body << "      " << g << "if (in_) gcn_st32(mem, dc, a_, " << vreg(i.dst) << ");\n"; break;
+        case 29:
+            body << "      " << g << "if (in_) { gcn_st32(mem, dc, a_, " << vreg(i.dst) << "); gcn_st32(mem, dc, a_ + 4ul, "
+                 << vreg(i.dst + 1) << "); }\n";
+            break;
+        case 31:
+            body << "      " << g << "if (in_) { gcn_st32(mem, dc, a_, " << vreg(i.dst) << "); gcn_st32(mem, dc, a_ + 4ul, "
+                 << vreg(i.dst + 1) << "); gcn_st32(mem, dc, a_ + 8ul, " << vreg(i.dst + 2) << "); }\n";
+            break;
+        case 30:
+            body << "      " << g << "if (in_) { gcn_st32(mem, dc, a_, " << vreg(i.dst) << "); gcn_st32(mem, dc, a_ + 4ul, "
+                 << vreg(i.dst + 1) << "); gcn_st32(mem, dc, a_ + 8ul, " << vreg(i.dst + 2)
+                 << "); gcn_st32(mem, dc, a_ + 12ul, " << vreg(i.dst + 3) << "); }\n";
+            break;
+        default: fail("unsupported " + mnemonic(i) + " (stores)"); break;
+        }
+        body << "    }\n";
+        return;
+    }
     if (tbuf || i.op <= 3) {
         const u32 comps = (i.op & 3) + 1;
         const std::string dfmt = tbuf ? std::to_string(i.dfmt) + "u" : "((" + w3 + " >> 15) & 0xfu)";
@@ -692,35 +910,60 @@ void Emitter::emit_buffer(const Instruction& i) {
 
 void Emitter::emit_mimg(const Instruction& i) {
     const bool is_load = i.op == 0x00 || i.op == 0x01;
-    const bool is_sample = i.op == 0x20 || i.op == 0x24 || i.op == 0x25 || i.op == 0x27;
-    if (!is_load && !is_sample) { fail("unsupported " + mnemonic(i)); return; }
+    const bool is_store = i.op == 0x08 || i.op == 0x09;   // image_store / image_store_mip
+    // image_sample{,_l,_b,_lz}_o (0x30/0x34/0x35/0x37) are the base ops with a
+    // packed texel offset in the first address VGPR.
+    const bool has_offset = i.op == 0x30 || i.op == 0x34 || i.op == 0x35 || i.op == 0x37;
+    const u32 sop = has_offset ? i.op - 0x10 : i.op;
+    const bool is_sample = sop == 0x20 || sop == 0x24 || sop == 0x25 || sop == 0x27;
+    if (!is_load && !is_sample && !is_store) { fail("unsupported " + mnemonic(i)); return; }
     if (i.da) { fail("array/cube images unsupported"); return; }
     u32 slot = 0;
     bool found = false;
     for (u32 k = 0; k < images.size(); ++k) {
         if (images[k].srsrc == i.srsrc && (!is_sample || images[k].ssamp == i.ssamp) &&
-            images[k].sampled == is_sample) { slot = k; found = true; break; }
+            images[k].sampled == is_sample && images[k].storage == is_store) { slot = k; found = true; break; }
     }
     if (!found) {
         slot = static_cast<u32>(images.size());
-        images.push_back(ImageSlot{i.srsrc, is_sample ? i.ssamp : ~0u, is_sample});
+        images.push_back(ImageSlot{i.srsrc, is_sample ? i.ssamp : ~0u, is_sample, is_store});
     }
     const std::string t = "tex" + std::to_string(slot);
     const std::string g = exec_guard();
+    if (is_store) {
+        // vdata holds one VGPR per dmask bit, in component order; the rest
+        // are zero. The mip of image_store_mip is ignored: host surfaces have
+        // one level.
+        static const char* comp_zero[4] = {"0.0f", "0.0f", "0.0f", "0.0f"};
+        std::string c[4];
+        u32 src = i.dst;
+        for (u32 k = 0; k < 4; ++k) c[k] = (i.dmask & (1u << k)) ? "F(" + vreg(src++) + ")" : comp_zero[k];
+        const std::string x = vreg(i.vaddr), y = vreg(i.vaddr + 1);
+        body << "    " << g << "if (" << x << " < " << t << ".get_width() && " << y << " < " << t
+             << ".get_height()) " << t << ".write(float4(" << c[0] << ", " << c[1] << ", " << c[2] << ", " << c[3]
+             << "), uint2(" << x << ", " << y << "));\n";
+        return;
+    }
     body << "    { float4 r_;\n";
     if (is_load) {
         body << "      r_ = " << t << ".read(uint2(" << vreg(i.vaddr) << ", " << vreg(i.vaddr + 1) << ")"
              << (i.op == 0x01 ? ", " + vreg(i.vaddr + 2) : std::string()) << ");\n";
     } else {
         u32 c = i.vaddr;
+        std::string offset;
+        if (has_offset) { offset = "gcn_texel_offset(" + vreg(c) + ")"; ++c; }
         std::string bias;
-        if (i.op == 0x25) { bias = "F(" + vreg(c) + ")"; ++c; }
+        if (sop == 0x25) { bias = "F(" + vreg(c) + ")"; ++c; }
+        const std::string size = "float2(" + t + ".get_width(), " + t + ".get_height())";
         std::string uv = "float2(F(" + vreg(c) + "), F(" + vreg(c + 1) + "))";
-        if (i.unorm) uv = "(" + uv + " / float2(" + t + ".get_width(), " + t + ".get_height()))";
+        // The offset is in texels of the sampled level; Metal's offset
+        // argument must be a constant, so it is folded into the coordinate.
+        if (i.unorm) uv = "((" + uv + (has_offset ? " + " + offset : std::string()) + ") / " + size + ")";
+        else if (has_offset) uv = "(" + uv + " + " + offset + " / " + size + ")";
         const std::string smp = "smp" + std::to_string(slot);
-        if (i.op == 0x20) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ");\n";
-        else if (i.op == 0x24) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ", level(F(" << vreg(c + 2) << ")));\n";
-        else if (i.op == 0x25) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ", bias(" << bias << "));\n";
+        if (sop == 0x20) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ");\n";
+        else if (sop == 0x24) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ", level(F(" << vreg(c + 2) << ")));\n";
+        else if (sop == 0x25) body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ", bias(" << bias << "));\n";
         else body << "      r_ = " << t << ".sample(" << smp << ", " << uv << ", level(0.0f));\n";
     }
     u32 out = i.dst;
@@ -760,6 +1003,7 @@ void Emitter::emit_export(const Instruction& i) {
         val = "float4(F(" + src(0) + "), F(" + src(1) + "), F(" + src(2) + "), F(" + src(3) + "))";
     }
     std::string mask;
+    if (stage == Stage::Compute) { fail("exp in compute stage"); return; }
     // Components not enabled keep their previous value (zero initialised).
     if (stage == Stage::Vertex) {
         if (i.target == 12) {
@@ -778,13 +1022,15 @@ void Emitter::emit_export(const Instruction& i) {
         // pos1..3 / null: ignored.
         return;
     }
-    if (i.target == 0) {
-        ps_color = true;
+    if (i.target < 8) { // mrt0..7
+        const std::string c = "color" + std::to_string(i.target);
+        ps_color_mask |= static_cast<u8>(1u << i.target);
+        if (i.target == 0) ps_color = true;
         body << "    { float4 e_ = " << val << ";\n";
         static const char* comp = "xyzw";
         const u32 en = i.compr ? ((i.en & 1 ? 3u : 0u) | (i.en & 4 ? 12u : 0u)) : i.en;
         for (u32 k = 0; k < 4; ++k)
-            if (en & (1u << k)) body << "      color0." << comp[k] << " = e_." << comp[k] << ";\n";
+            if (en & (1u << k)) body << "      " << c << "." << comp[k] << " = e_." << comp[k] << ";\n";
         body << "    }\n";
     }
     if (i.target == 8 && (i.en & 1) && !i.compr) {
@@ -792,7 +1038,7 @@ void Emitter::emit_export(const Instruction& i) {
         ps_depth = true;
         body << "    depth0 = F(" << src(0) << ");\n";
     }
-    // mrt1..7 and null exports are ignored (single render target).
+    // null exports are ignored.
 }
 
 void Emitter::emit_one(const Instruction& i, bool structured) {
@@ -859,6 +1105,7 @@ bool Emitter::run() {
         if (i.enc == Encoding::VOP3 && i.op < 0x100 && (i.op & 0x10)) uses_exec_write = true;
         if (i.enc == Encoding::VOP3 && i.op < 0x100 && i.sdst == operand::kExecLo) uses_exec_write = true;
     }
+    uniform_slots = uniform_load_slots(prog);
     const bool structured = prog.has_branches;
     std::set<u32> labels;
     if (structured) {
@@ -881,10 +1128,16 @@ bool Emitter::run() {
     return error.empty();
 }
 
+// Storage slots (image_store) are write-only textures; the rest are read.
+const char* image_type(const ImageSlot& slot) {
+    return slot.storage ? "texture2d<float, access::write>" : "texture2d<float>";
+}
+
 std::string image_params(const std::vector<ImageSlot>& images) {
     std::string p;
     for (u32 k = 0; k < images.size(); ++k) {
-        p += ",\n    texture2d<float> tex" + std::to_string(k) + " [[texture(" + std::to_string(k) + ")]]";
+        p += ",\n    " + std::string(image_type(images[k])) + " tex" + std::to_string(k) + " [[texture(" +
+             std::to_string(k) + ")]]";
         if (images[k].sampled)
             p += ",\n    sampler smp" + std::to_string(k) + " [[sampler(" + std::to_string(k) + ")]]";
     }
@@ -903,7 +1156,7 @@ std::string image_args(const std::vector<ImageSlot>& images) {
 std::string image_decl_args(const std::vector<ImageSlot>& images) {
     std::string p;
     for (u32 k = 0; k < images.size(); ++k) {
-        p += ", texture2d<float> tex" + std::to_string(k);
+        p += ", " + std::string(image_type(images[k])) + " tex" + std::to_string(k);
         if (images[k].sampled) p += ", sampler smp" + std::to_string(k);
     }
     return p;
@@ -919,6 +1172,9 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
         out.error = "VS: " + ev.error;
         return out;
     }
+    // No PS program: a depth-only draw (Gnm binds no pixel shader for Z
+    // prepasses and shadow maps). Only the VS is emitted.
+    const bool has_ps = !ps.insts.empty();
     Emitter ep(ps, Stage::Pixel, ps_input_cntl, 0);
     if (!ep.run()) {
         out.error = "PS: " + ep.error;
@@ -986,7 +1242,7 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     m << "};\n\n";
 
     const u32 vs_vgprs = std::max<u32>(ev.max_vgpr, 4);
-    m << "static void gcn_vs_body(uint vid, uint iid, constant GcnDrawConsts& dc, device const uchar* mem"
+    m << "static void gcn_vs_body(uint vid, uint iid, constant GcnDrawConsts& dc, device const uchar* mem, constant uint* ul"
       << image_decl_args(ev.images) << ", thread GcnVsOut& out) {\n";
     m << "  uint s[128]; uint v[" << vs_vgprs << "]; uint scc = 0u;\n";
     m << "  for (uint k = 0; k < 128u; ++k) s[k] = 0u;\n";
@@ -999,26 +1255,26 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     m << ev.body.str() << "}\n\n";
 
     m << "vertex GcnVsOut gcn_vs_main(uint vid [[vertex_id]], uint iid [[instance_id]],\n"
-      << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]]"
+      << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]], constant uint* ul [[buffer(2)]]"
       << image_params(ev.images) << ") {\n";
     m << "  GcnVsOut out;\n";
     using VR = TranslateOptions::VertexRemap;
     if (opts.remap == VR::None) {
-        m << "  gcn_vs_body(vid, iid, dc, mem" << image_args(ev.images) << ", out);\n";
+        m << "  gcn_vs_body(vid, iid, dc, mem, ul" << image_args(ev.images) << ", out);\n";
     } else if (opts.remap == VR::QuadList) {
         m << "  uint q = vid / 6u, c = vid % 6u;\n";
         m << "  const uint map_[6] = {0u, 1u, 2u, 0u, 2u, 3u};\n";
-        m << "  gcn_vs_body(dc.base_vertex + q * 4u + map_[c], iid, dc, mem" << image_args(ev.images) << ", out);\n";
+        m << "  gcn_vs_body(dc.base_vertex + q * 4u + map_[c], iid, dc, mem, ul" << image_args(ev.images) << ", out);\n";
     } else {
         // RectList: corners 0,1,2 are given, corner 3 = v1 + v2 - v0.
         m << "  uint r = vid / 6u, c = vid % 6u;\n";
         m << "  const uint map_[6] = {0u, 1u, 2u, 2u, 1u, 3u};\n";
         m << "  uint k = map_[c]; uint b = dc.base_vertex + r * 3u;\n";
-        m << "  if (k < 3u) {\n    gcn_vs_body(b + k, iid, dc, mem" << image_args(ev.images) << ", out);\n  } else {\n";
+        m << "  if (k < 3u) {\n    gcn_vs_body(b + k, iid, dc, mem, ul" << image_args(ev.images) << ", out);\n  } else {\n";
         m << "    GcnVsOut o0, o1, o2;\n";
-        m << "    gcn_vs_body(b, iid, dc, mem" << image_args(ev.images) << ", o0);\n";
-        m << "    gcn_vs_body(b + 1u, iid, dc, mem" << image_args(ev.images) << ", o1);\n";
-        m << "    gcn_vs_body(b + 2u, iid, dc, mem" << image_args(ev.images) << ", o2);\n";
+        m << "    gcn_vs_body(b, iid, dc, mem, ul" << image_args(ev.images) << ", o0);\n";
+        m << "    gcn_vs_body(b + 1u, iid, dc, mem, ul" << image_args(ev.images) << ", o1);\n";
+        m << "    gcn_vs_body(b + 2u, iid, dc, mem, ul" << image_args(ev.images) << ", o2);\n";
         m << "    out.position = o1.position + o2.position - o0.position;\n";
         for (u32 p = 0; p < nparams; ++p) m << "    out.p" << p << " = o1.p" << p << " + o2.p" << p << " - o0.p" << p << ";\n";
         m << "  }\n";
@@ -1026,24 +1282,44 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     m << "  if ((dc.flags & " << kDrawFlipY << "u) != 0u) out.position.y = -out.position.y;\n";
     m << "  return out;\n}\n\n";
 
-    const u32 ps_vgprs = std::max<u32>(ep.max_vgpr, 4);
-    if (ep.ps_depth) m << "struct GcnPsOut {\n    float4 color [[color(0)]];\n    float depth [[depth(any)]];\n};\n\n";
-    m << "fragment " << (ep.ps_depth ? "GcnPsOut" : "float4") << " gcn_ps_main(GcnPsIn in [[stage_in]],\n"
-      << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]]"
-      << (uses_front_face ? ", bool front_face [[front_facing]]" : "")
-      << image_params(ep.images) << ") {\n";
-    m << "  uint s[128]; uint v[" << ps_vgprs << "]; uint scc = 0u;\n";
-    m << "  for (uint k = 0; k < 128u; ++k) s[k] = 0u;\n";
-    m << "  for (uint k = 0; k < " << ps_vgprs << "u; ++k) v[k] = 0u;\n";
-    m << "  for (uint k = 0; k < 16u; ++k) s[k] = dc.ps_user[k];\n";
-    m << "  s[126] = 1u; s[124] = 0u;\n";
-    m << preload.str();
-    m << "  float4 color0 = float4(0.0f);\n";
-    if (ep.ps_depth) m << "  float depth0 = in.position.z;\n";
-    m << ep.body.str();
-    if (ep.uses_exec_write) m << "  if ((s[126] & 1u) == 0u) discard_fragment();\n";
-    if (ep.ps_depth) m << "  GcnPsOut o_;\n  o_.color = color0;\n  o_.depth = depth0;\n  return o_;\n}\n";
-    else m << "  return color0;\n}\n";
+    if (has_ps) {
+        const u32 ps_vgprs = std::max<u32>(ep.max_vgpr, 4);
+        // One float4 return for mrt0 alone; a struct for more targets or depth.
+        const u8 cmask = ep.ps_color_mask | 1; // color0 is always returned
+        const bool ps_struct = ep.ps_depth || cmask != 1;
+        if (ps_struct) {
+            m << "struct GcnPsOut {\n";
+            for (u32 n = 0; n < 8; ++n)
+                if ((cmask >> n) & 1) m << "    float4 c" << n << " [[color(" << n << ")]];\n";
+            if (ep.ps_depth) m << "    float depth [[depth(any)]];\n";
+            m << "};\n\n";
+        }
+        m << "fragment " << (ps_struct ? "GcnPsOut" : "float4") << " gcn_ps_main(GcnPsIn in [[stage_in]],\n"
+          << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]], constant uint* ul [[buffer(2)]]"
+          << (uses_front_face ? ", bool front_face [[front_facing]]" : "")
+          << image_params(ep.images) << ") {\n";
+        m << "  uint s[128]; uint v[" << ps_vgprs << "]; uint scc = 0u;\n";
+        m << "  for (uint k = 0; k < 128u; ++k) s[k] = 0u;\n";
+        m << "  for (uint k = 0; k < " << ps_vgprs << "u; ++k) v[k] = 0u;\n";
+        m << "  for (uint k = 0; k < 16u; ++k) s[k] = dc.ps_user[k];\n";
+        m << "  s[126] = 1u; s[124] = 0u;\n";
+        m << preload.str();
+        for (u32 n = 0; n < 8; ++n)
+            if ((cmask >> n) & 1) m << "  float4 color" << n << " = float4(0.0f);\n";
+        if (ep.ps_depth) m << "  float depth0 = in.position.z;\n";
+        m << ep.body.str();
+        if (ep.uses_exec_write) m << "  if ((s[126] & 1u) == 0u) discard_fragment();\n";
+        if (ps_struct) {
+            m << "  GcnPsOut o_;\n";
+            for (u32 n = 0; n < 8; ++n)
+                if ((cmask >> n) & 1) m << "  o_.c" << n << " = color" << n << ";\n";
+            if (ep.ps_depth) m << "  o_.depth = depth0;\n";
+            m << "  return o_;\n}\n";
+        } else {
+            m << "  return color0;\n}\n";
+        }
+
+    }
 
     out.ok = true;
     out.msl = m.str();
@@ -1052,7 +1328,97 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     out.vs_param_count = nparams;
     for (auto [attr, locn] : ep.ps_attrs) out.ps_attr_mask |= 1u << (attr & 31);
     out.ps_writes_color = ep.ps_color;
+    out.ps_color_mask = ep.ps_color_mask;
     out.ps_writes_depth = ep.ps_depth;
+    out.has_ps = has_ps;
+    return out;
+}
+
+TranslatedComputePipeline translate_compute_pipeline(const Program& cs,
+                                                    const ComputePipelineOptions& opts) {
+    TranslatedComputePipeline out;
+    Emitter ec(cs, Stage::Compute, nullptr, 0);
+    if (!ec.run()) {
+        out.error = "CS: " + ec.error;
+        return out;
+    }
+
+    u32 cs_vgprs = std::max<u32>(ec.max_vgpr, 4);
+    u32 cs_sgprs = std::max<u32>({ec.max_sgpr, 16u, 3u});
+    if (opts.rsrc1 != 0) {
+        const u32 rsrc1_vgprs = (((opts.rsrc1 >> 0) & 0x3fu) + 1u) * 4u;
+        const u32 rsrc1_sgprs = (((opts.rsrc1 >> 6) & 0x0fu) + 1u) * 8u;
+        cs_vgprs = std::max(cs_vgprs, rsrc1_vgprs);
+        cs_sgprs = std::max(cs_sgprs, rsrc1_sgprs);
+    }
+    // COMPUTE_PGM_RSRC2.USER_SGPR (bits 1..5) is the number of user SGPRs;
+    // the workgroup ids follow them. It was doubled, so tgid landed in
+    // s[2n..] and kernels read garbage for their group position.
+    if (opts.rsrc2 != 0) {
+        const u32 user_sgprs = (opts.rsrc2 >> 1) & 0x1fu;
+        cs_sgprs = std::max(cs_sgprs, user_sgprs);
+    }
+
+    std::ostringstream m;
+    m << kPrelude << "\n";
+    m << "kernel void gcn_cs_main(\n"
+      << "    uint3 tid_in_tg [[thread_position_in_threadgroup]],\n"
+      << "    uint3 tgid [[threadgroup_position_in_grid]],\n"
+      << "    uint3 global_tid [[thread_position_in_grid]],\n"
+      << "    device uchar* mem [[buffer(0)]],\n"
+      << "    constant GcnComputeConsts& dc [[buffer(1)]],\n"
+      << "    constant uint* ul [[buffer(2)]]"
+      << image_params(ec.images) << ") {\n";
+    m << "  uint s[128];\n";
+    m << "  uint v[" << cs_vgprs << "];\n";
+    m << "  uint scc = 0u;\n";
+    m << "  for (uint k = 0; k < 128u; ++k) s[k] = 0u;\n";
+    m << "  for (uint k = 0; k < " << cs_vgprs << "u; ++k) v[k] = 0u;\n";
+    m << "  for (uint k = 0; k < 16u; ++k) s[k] = dc.cs_user[k];\n";
+    m << "  s[126] = 1u; s[124] = 0u;\n\n";
+
+    m << "  // Setup workgroup ID in SGPRs (by default s[0..2] = tgid.xyz)\n";
+    if (opts.rsrc2 == 0) {
+        m << "  s[0] = tgid.x;\n";
+        m << "  s[1] = tgid.y;\n";
+        m << "  s[2] = tgid.z;\n";
+    } else {
+        const u32 user_sgprs = (opts.rsrc2 >> 1) & 0x1fu;
+        u32 s_idx = user_sgprs;
+        if (opts.rsrc2 & (1u << 7)) { // TGID_X_EN
+            m << "  s[" << s_idx++ << "] = tgid.x;\n";
+        } else if (user_sgprs == 0 && (opts.rsrc2 & 0x380u) == 0) {
+            m << "  s[0] = tgid.x;\n";
+        }
+        if (opts.rsrc2 & (1u << 8)) { // TGID_Y_EN
+            m << "  s[" << s_idx++ << "] = tgid.y;\n";
+        } else if (user_sgprs == 0 && (opts.rsrc2 & 0x380u) == 0) {
+            m << "  s[1] = tgid.y;\n";
+        }
+        if (opts.rsrc2 & (1u << 9)) { // TGID_Z_EN
+            m << "  s[" << s_idx++ << "] = tgid.z;\n";
+        } else if (user_sgprs == 0 && (opts.rsrc2 & 0x380u) == 0) {
+            m << "  s[2] = tgid.z;\n";
+        }
+    }
+
+    m << "\n  // Setup thread ID in VGPR (v[0] = tid_in_tg.x)\n";
+    m << "  v[0] = tid_in_tg.x;\n";
+    if (opts.rsrc2 != 0) {
+        const u32 tidig = (opts.rsrc2 >> 11) & 3u;
+        if (tidig >= 1u) m << "  v[1] = tid_in_tg.y;\n";
+        if (tidig >= 2u) m << "  v[2] = tid_in_tg.z;\n";
+    }
+
+    m << ec.body.str();
+    m << "}\n";
+
+    out.ok = true;
+    out.msl = m.str();
+    out.images = ec.images;
+    out.max_vgpr = cs_vgprs;
+    out.max_sgpr = cs_sgprs;
+    out.uses_exec_write = ec.uses_exec_write;
     return out;
 }
 
@@ -1064,6 +1430,9 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
                             u32 user_count, const MemReader& read, u32 max_vertex_index) {
     ResourceScan rs;
     rs.images.resize(slots.size());
+    const std::vector<u32> uniform_slots = uniform_load_slots(prog);
+    for (u32 slot : uniform_slots)
+        if (slot != kNoUniformSlot) rs.uniform_loads.resize(slot + 16, 0);
     u32 val[128] = {};
     bool known[128] = {};
     for (u32 k = 0; k < user_count && k < 16; ++k) { val[k] = user_sgprs[k]; known[k] = true; }
@@ -1105,6 +1474,7 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
         switch (i.enc) {
         case Encoding::SMRD: {
             if (i.op == 29 || i.op == 31) break;
+            const usize index = static_cast<usize>(&i - prog.insts.data());
             static const u32 kCount[] = {1, 2, 4, 8, 16};
             const u32 kind = i.op & 7;
             if (kind > 4 || i.op == 30) {
@@ -1143,6 +1513,7 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
                 u32 w = 0;
                 const bool got = ok && read(base + offv + k * 4, &w, 4);
                 set(i.dst + k, w, got);
+                if (uniform_slots[index] != kNoUniformSlot) rs.uniform_loads[uniform_slots[index] + k] = w;
             }
             break;
         }
@@ -1173,7 +1544,7 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
             break;
         case Encoding::SOP2: {
             u32 a = 0, b = 0;
-            const bool k = get(i.src0, i, a) & get(i.src1, i, b);
+            const bool k = get(i.src0, i, a) && get(i.src1, i, b);
             u32 r = 0;
             bool handled = true;
             switch (i.op) {
@@ -1220,9 +1591,16 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
             break;
         }
         case Encoding::MIMG: {
+            const bool store = i.op == 0x08 || i.op == 0x09;
+            const u32 sop = (i.op == 0x30 || i.op == 0x34 || i.op == 0x35 || i.op == 0x37) ? i.op - 0x10 : i.op;
+            const bool sample = sop == 0x20 || sop == 0x24 || sop == 0x25 || sop == 0x27;
             for (u32 k = 0; k < slots.size(); ++k) {
                 const ImageSlot& sl = slots[k];
                 if (sl.srsrc != i.srsrc) continue;
+                // A shader can reuse the T# registers (load from one image,
+                // reload s[0:7], store to another): fill only the slot of
+                // this instruction's kind.
+                if (sl.storage != store || sl.sampled != sample) continue;
                 if (sl.sampled && sl.ssamp != i.ssamp) continue;
                 if (!need(i.srsrc, 8, "image T#")) return rs;
                 for (u32 w = 0; w < 8; ++w) rs.images[k].tsharp[w] = val[i.srsrc + w];
@@ -1268,6 +1646,7 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
     }
     rs.ranges = std::move(merged);
     rs.ok = true;
+    if (!rs.uniform_loads.empty()) rs.uniform_loads[0] = 1;  // table evaluated
     return rs;
 }
 
@@ -1277,7 +1656,8 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
 
 TextureDesc decode_tsharp(const u32* t) {
     TextureDesc d;
-    d.base = (static_cast<u64>(t[0]) | (static_cast<u64>(t[1] & 0xFF) << 32)) << 8;
+    // Word 0 holds bits 39:8 of the base address; Word 1 bits 3:0 hold bits 43:40.
+    d.base = (static_cast<u64>(t[0]) << 8) | (static_cast<u64>(t[1] & 0x0F) << 40);
     d.dfmt = (t[1] >> 20) & 0x3F;
     d.nfmt = (t[1] >> 26) & 0xF;
     d.width = (t[2] & 0x3FFF) + 1;
@@ -1312,11 +1692,26 @@ u32 data_format_bytes(u32 dfmt) {
     case 11: case 12: return 8;
     case 13: return 12;
     case 14: return 16;
-    default: return 0;
+    default: return bc::block_bytes(dfmt);  // BC1-BC7: bytes per 4x4 block
     }
 }
 
+/// Tiling index 8 (and 31) is linear; the other supported index is 8x8 micro tiled.
+bool is_linear_tiling(u32 tiling_index) { return tiling_index == 8 || tiling_index == 31; }
+
 usize texture_guest_size(const TextureDesc& td) {
+    if (const u32 block = bc::block_bytes(td.dfmt)) {
+        // Block-compressed: pitch and height count 4x4 blocks. Micro tiles are
+        // 8x8 blocks, mirroring the element path below.
+        const u32 pitch_b = (std::max(td.pitch, td.width) + 3) / 4;
+        u32 h_b = (td.height + 3) / 4;
+        u32 p_b = pitch_b;
+        if (!is_linear_tiling(td.tiling_index)) {
+            p_b = (pitch_b + 7) & ~7u;
+            h_b = (h_b + 7) & ~7u;
+        }
+        return static_cast<usize>(p_b) * h_b * block;
+    }
     const u32 bpp = data_format_bytes(td.dfmt);
     const u32 pitch = std::max(td.pitch, td.width);
     u32 h = td.height;
@@ -1421,6 +1816,63 @@ u32 micro_tile_index(u32 x, u32 y) {
     return (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
 }
 
+/// Writes one texel's RGBA floats as 8 bits per channel, applying the T# dst_sel swizzle.
+void store_texel(u8* o, const u32* dst_sel, const float c[4]) {
+    for (u32 k = 0; k < 4; ++k) {
+        const u32 sel = dst_sel[k];
+        const float v = sel == 0 ? 0.0f : sel == 1 ? 1.0f : (sel >= 4 ? c[sel - 4] : 0.0f);
+        o[k] = to_u8(v);
+    }
+}
+
+/// BC1-BC7 texture. Tiling works as on the element path, with a 4x4 block as
+/// the element (micro tiles are 8x8 blocks). Edge blocks are cropped to the
+/// texture size.
+bool bc_texture_to_rgba8(const TextureDesc& td, const u8* src, bool linear, std::vector<u8>& out,
+                         std::string& error) {
+    const u32 bb = bc::block_bytes(td.dfmt);
+    const u32 blocks_w = (td.width + 3) / 4;
+    const u32 blocks_h = (td.height + 3) / 4;
+    const u32 pitch_b = (std::max(td.pitch, td.width) + 3) / 4;
+    const u32 tiles_per_row = (pitch_b + 7) / 8;
+    // RGBA8Unorm cannot hold negative values, so signed BC4/BC5 data is stored
+    // remapped from [-1,1] to [0,1]. Shaders that expect raw SNORM will see an
+    // offset of 0.5. BC6H is clamped to [0,1] by to_u8 (HDR range is lost), and
+    // SRGB data is kept as-is because the upload is RGBA8Unorm.
+    const bool remap_signed = td.nfmt == 1 && (td.dfmt == 38 || td.dfmt == 39);
+    out.assign(static_cast<usize>(td.width) * td.height * 4, 0);
+    float block[16][4];
+    for (u32 by = 0; by < blocks_h; ++by) {
+        for (u32 bx = 0; bx < blocks_w; ++bx) {
+            usize b;
+            if (linear) {
+                b = static_cast<usize>(by) * pitch_b + bx;
+            } else {
+                const usize tile = static_cast<usize>(by / 8) * tiles_per_row + (bx / 8);
+                b = tile * 64 + micro_tile_index(bx & 7, by & 7);
+            }
+            if (!bc::decode_block(td.dfmt, td.nfmt, src + b * bb, block)) {
+                error = "unsupported BC block, format " + std::to_string(td.dfmt) + "/" +
+                        std::to_string(td.nfmt);
+                return false;
+            }
+            for (u32 py = 0; py < 4; ++py) {
+                for (u32 px = 0; px < 4; ++px) {
+                    const u32 x = bx * 4 + px, y = by * 4 + py;
+                    if (x >= td.width || y >= td.height) continue;
+                    float c[4];
+                    for (u32 k = 0; k < 4; ++k) {
+                        const float v = block[py * 4 + px][k];
+                        c[k] = remap_signed ? v * 0.5f + 0.5f : v;
+                    }
+                    store_texel(out.data() + (static_cast<usize>(y) * td.width + x) * 4, td.dst_sel, c);
+                }
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size, std::vector<u8>& out,
@@ -1430,7 +1882,7 @@ bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size, std:
         error = "unsupported texture data format " + std::to_string(td.dfmt);
         return false;
     }
-    const bool linear = td.tiling_index == 8 || td.tiling_index == 31;
+    const bool linear = is_linear_tiling(td.tiling_index);
     const bool micro = td.tiling_index == 13 || td.tiling_index == 9;
     if (!linear && !micro) {
         error = "unsupported tiling index " + std::to_string(td.tiling_index);
@@ -1440,6 +1892,7 @@ bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size, std:
         error = "texture memory out of range";
         return false;
     }
+    if (bc::block_bytes(td.dfmt) != 0) return bc_texture_to_rgba8(td, src, linear, out, error);
     const u32 pitch = std::max(td.pitch, td.width);
     const u32 tiles_per_row = (pitch + 7) / 8;
     out.assign(static_cast<usize>(td.width) * td.height * 4, 0);
@@ -1495,12 +1948,7 @@ bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size, std:
                 error = "unsupported texture format " + std::to_string(td.dfmt) + "/" + std::to_string(td.nfmt);
                 return false;
             }
-            u8* o = out.data() + (static_cast<usize>(y) * td.width + x) * 4;
-            for (u32 k = 0; k < 4; ++k) {
-                const u32 sel = td.dst_sel[k];
-                float v = sel == 0 ? 0.0f : sel == 1 ? 1.0f : (sel >= 4 ? c[sel - 4] : 0.0f);
-                o[k] = to_u8(v);
-            }
+            store_texel(out.data() + (static_cast<usize>(y) * td.width + x) * 4, td.dst_sel, c);
         }
     }
     return true;

@@ -9,6 +9,8 @@
     <string>PS4 Game Library</string>
     <key>CFBundleExecutable</key>
     <string>ps4-gui</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>dev.ps4tomacos.gamelibrary</string>
     <key>CFBundlePackageType</key>

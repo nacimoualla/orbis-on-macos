@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ps4 {
@@ -35,6 +36,7 @@ struct LoadedModule {
     GuestAddr base{0};
     GuestAddr init{0};          // DT_INIT, 0 when the module has no entry point
     GuestAddr fini{0};          // DT_FINI
+    GuestAddr entry{0};         // ELF e_entry, module-relative: a PRX's start stub (often 0, the base)
     GuestSize size{0};          // total mapped span
     usize export_count{0};
 };
@@ -84,6 +86,13 @@ public:
     /// over every NID it exports. The trampoline stub carries only a dispatch
     /// id, so no GOT patching or stub rewriting is needed.
     [[nodiscard]] GuestAddr find_export(Nid nid) const noexcept;
+
+    /// Guest address of \p nid as exported by the one module \p handle, or 0.
+    ///
+    /// Unlike find_export() this does not fall through to other modules, which
+    /// is what sceKernelDlsym needs: a name looked up in a given handle must
+    /// come from that handle's own symbol table.
+    [[nodiscard]] GuestAddr find_module_export(u32 handle, Nid nid) const noexcept;
 
     [[nodiscard]] const LoadedModule* module(u32 handle) const noexcept;
     [[nodiscard]] usize module_count() const noexcept { return m_modules.size(); }
@@ -143,6 +152,8 @@ private:
 
     std::unordered_map<u32, LoadedModule> m_modules;
     std::unordered_map<Nid, GuestAddr> m_module_exports;
+    /// Per-module view of the same exports, keyed by the owning handle.
+    std::unordered_map<u32, std::unordered_map<Nid, GuestAddr>> m_module_symbols;
     std::vector<Nid> m_unresolved_nids;
     std::string m_last_error;
     u32 m_next_module_handle{0x2000};
@@ -151,6 +162,11 @@ private:
 /// Unimplemented-stub warning stats (suppressed-after-cap totals). Defined in
 /// dynamic_linker.cpp; called from the run exit path.
 void dump_hle_warning_stats();
+
+/// Orbis NID for a symbol name: the first 8 bytes of SHA-1(name + salt), read
+/// little-endian. This is the value an exporting module stores in its symbol
+/// table, so hashing a name is how sceKernelDlsym finds it.
+Nid nid_from_name(std::string_view name) noexcept;
 
 /// The process-wide linker, so HLE handlers can reach module loading without
 /// threading a reference through every registry signature. main.cpp installs it
@@ -166,6 +182,9 @@ void set_active_linker(DynamicLinker* linker) noexcept;
 GuestAddr module_base_allocator(GuestSize need) noexcept;
 
 void dump_hle_histogram();
+/// PS4_HLE_HIST_EVERY: print the per-thread HLE calls made since the last
+/// window (needs PS4_HLE_HIST) and start a new one.
+void dump_hle_time_window(const char* label);
 void dump_prx_calls();
 void dump_export_tables();
 std::string describe_guest_addr(GuestAddr a);

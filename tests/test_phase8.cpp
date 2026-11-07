@@ -122,6 +122,19 @@ int main() {
         std::cout << "  ✓ Test 8: Native AppKit NSWindow + CAMetalLayer created, presented frame, and closed cleanly\n";
     }
 
+    // Test 9: DisplayWindow PadState and MouseState retrieval
+    {
+        ps4::DisplayWindow window;
+        ps4::WindowConfig cfg{.headless = true};
+        assert(window.initialize(metal, cfg));
+        ps4::PadState ps = window.input_pad_state();
+        assert(ps.lx == 128 && ps.ly == 128);
+        assert(ps.touch_x == 960 && ps.touch_y == 471);
+        ps4::MouseState ms = window.input_mouse_state();
+        assert(ms.delta_x == 0 && ms.delta_y == 0);
+        std::cout << "  ✓ Test 9: DisplayWindow input_pad_state and input_mouse_state verified\n";
+    }
+
     std::cout << "[PHASE 8] PASS: All DisplayWindow & Presentation tests passed!\n";
     return 0;
 }

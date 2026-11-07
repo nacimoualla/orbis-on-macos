@@ -67,10 +67,11 @@ bool ElfLoader::load_from_memory(std::span<const u8> buffer) {
 }
 
 bool ElfLoader::parse_internal(std::span<const u8> buffer) {
-    // A shipped PS4 module is a 352-byte SELF container wrapped around a
-    // plaintext ELF. Detect and peel it before anything reads program headers,
-    // otherwise the ELF magic check below rejects every .prx outright.
-    if (buffer.size() >= SELF_HEADER_SIZE) {
+    // A shipped PS4 module is a SELF container wrapped around a plaintext ELF.
+    // Detect and peel it before anything reads program headers, otherwise the
+    // ELF magic check below rejects every .prx outright. The header prefix
+    // (magic + entry count) must fit before we look at it.
+    if (buffer.size() >= SELF_ENTRY_TABLE_OFF) {
         u32 magic = 0;
         std::memcpy(&magic, buffer.data(), sizeof(magic));
         if (magic == SELF_MAGIC) {
@@ -159,8 +160,17 @@ bool ElfLoader::parse_self(std::span<const u8> raw) {
         return false;
     }
 
+    // The inner ELF starts after the entry table, so its offset depends on how
+    // many entries this particular container carries (8 or 10 in practice).
+    const usize elf_off = self_elf_offset(count);
+    if (elf_off >= raw.size()) {
+        std::fprintf(stderr, "[elf] SELF: %u entries leave no room for an ELF\n", count);
+        m_error = ElfError::FileTooSmall;
+        return false;
+    }
+
     m_is_self = true;
-    m_elf_file_offset = SELF_ELF_OFFSET;
+    m_elf_file_offset = elf_off;
     m_self_entries.clear();
     m_self_entries.reserve(count);
     for (u16 i = 0; i < count; ++i) {
@@ -179,18 +189,18 @@ bool ElfLoader::parse_self(std::span<const u8> raw) {
         // A truncated dump would otherwise hand out offsets past EOF.
         if (e.offset + e.filesz > raw.size()) {
             std::fprintf(stderr, "[elf] SELF entry %u out of file bounds "
-                                "(off=0x%llx filesz=0x%llx, file=0x%llzx) -- ignoring\n",
+                                "(off=0x%llx filesz=0x%llx, file=0x%zx) -- ignoring\n",
                          i, (unsigned long long)e.offset, (unsigned long long)e.filesz, raw.size());
             continue;
         }
         m_self_entries.push_back(e);
     }
 
-    // Re-enter the normal path on the ELF that starts at SELF_ELF_OFFSET.
+    // Re-enter the normal path on the ELF that starts at elf_off.
     // Its magic is \x7fELF, so this terminates instead of recursing.
     m_error = ElfError::None;
     m_loaded = false;
-    if (!parse_internal(raw.subspan(SELF_ELF_OFFSET))) {
+    if (!parse_internal(raw.subspan(elf_off))) {
         return false;
     }
 

@@ -55,6 +55,7 @@ public:
     [[nodiscard]] bool has_exited() const noexcept { return m_has_exited; }
     [[nodiscard]] i32 exit_code() const noexcept { return m_exit_code; }
     void reset_exit() noexcept { m_has_exited = false; m_exit_code = 0; }
+    void set_exited(bool exited = true) noexcept { m_has_exited = exited; }
 
     /// Control whether sys_exit calls std::exit() immediately or flags exit
     void set_terminate_on_exit(bool terminate) noexcept { m_terminate_on_exit = terminate; }

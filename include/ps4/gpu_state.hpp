@@ -5,6 +5,7 @@
 // it can be tested without Metal; gcn_pipeline.mm maps it onto Metal state.
 
 #include "ps4/common.hpp"
+#include <array>
 
 namespace ps4 {
 
@@ -22,6 +23,7 @@ inline constexpr u32 kDbDepthSize = 0x016;
 inline constexpr u32 kPaScWindowOffset = 0x080;
 inline constexpr u32 kPaScWindowScissorTl = 0x081;
 inline constexpr u32 kPaScWindowScissorBr = 0x082;
+inline constexpr u32 kCbTargetMask = 0x08E;
 inline constexpr u32 kPaScGenericScissorTl = 0x090;
 inline constexpr u32 kPaScGenericScissorBr = 0x091;
 inline constexpr u32 kPaScVportScissor0Tl = 0x094;
@@ -35,6 +37,7 @@ inline constexpr u32 kPaClVportXscale = 0x10F;   // XSCALE, XOFFSET, YSCALE, YOF
 inline constexpr u32 kSpiPsInputEna = 0x1B3;
 inline constexpr u32 kSpiPsInputAddr = 0x1B4;
 inline constexpr u32 kDbDepthControl = 0x200;
+inline constexpr u32 kCbColorControl = 0x202;
 inline constexpr u32 kDbShaderControl = 0x203;
 inline constexpr u32 kPaClClipCntl = 0x204;
 inline constexpr u32 kPaSuScModeCntl = 0x205;
@@ -42,7 +45,11 @@ inline constexpr u32 kPaClVteCntl = 0x206;
 inline constexpr u32 kPaScModeCntl0 = 0x292;
 inline constexpr u32 kPaSuPolyOffsetClamp = 0x2DF;
 inline constexpr u32 kPaSuPolyOffsetFrontScale = 0x2E0;   // FRONT_SCALE, FRONT_OFFSET, BACK_SCALE, BACK_OFFSET
-inline constexpr u32 kCount = 0x300;   // registers decode_render_state may read
+inline constexpr u32 kCbBlend0Control = 0x1E0;  // + slot
+inline constexpr u32 kCbColor0BaseGfx7 = 0x318;   // CB_COLOR0_BASE; 15 registers per slot
+inline constexpr u32 kCbColorStrideGfx7 = 15;
+inline constexpr u32 kMaxColorTargets = 8;
+inline constexpr u32 kCount = 0x400;   // registers decode_render_state may read
 } // namespace ctx_reg
 
 // GCN compare function (DB_DEPTH_CONTROL ZFUNC / STENCILFUNC).
@@ -87,6 +94,18 @@ struct DepthTarget {
     u32 height{0};
 };
 
+struct ColorTarget {
+    bool enabled{false};  // base, format and a write mask are all set
+    GuestAddr base{0};    // CB_COLOR_BASE << 8
+    u32 width{0};         // rendered size: the tile-padded surface (pitch x
+    u32 height{0};        // slice / pitch) clipped by the screen scissor
+    u32 pitch{0};         // pixels per row
+    u32 format{0};        // CB_COLOR_INFO.FORMAT (bits 2-6): 10 = 8_8_8_8, 12 = 16_16_16_16, ...
+    u32 num_format{0};    // NUMBER_TYPE (bits 8-10): 0 UNORM, 1 SNORM, 4 UINT, 5 SINT, 6 SRGB, 7 FLOAT
+    u32 comp_swap{0};     // COMP_SWAP (bits 11-12): 0 STD (RGBA), 1 ALT (BGRA), 2 STD_REV, 3 ALT_REV
+    u8 write_mask{0};     // CB_TARGET_MASK nibble (R, G, B, A)
+};
+
 enum class CullMode : u8 { None, Front, Back, Both };
 
 struct RasterState {
@@ -109,6 +128,7 @@ struct RenderScissor {
 };
 
 struct GpuRenderState {
+    std::array<ColorTarget, ctx_reg::kMaxColorTargets> color{};
     DepthTarget depth{};
     DepthStencilState ds{};
     RasterState raster{};
@@ -116,7 +136,18 @@ struct GpuRenderState {
     RenderScissor scissor{};
     // Nothing would be rasterised (empty scissor or front+back culling).
     bool skip_draw{false};
+    // CB_COLOR_CONTROL.MODE: 0 disable, 1 normal, 2 eliminate fast clear,
+    // 3 resolve (CB0 -> CB1), 4 decompress, 5 FMASK decompress.
+    u8 cb_mode{1};
 };
+
+namespace cb_mode {
+inline constexpr u8 kNormal = 1;
+inline constexpr u8 kEliminateFastClear = 2;
+inline constexpr u8 kResolve = 3;
+inline constexpr u8 kDecompress = 4;
+inline constexpr u8 kFmaskDecompress = 5;
+} // namespace cb_mode
 
 /// Decode the draw state from the context-register shadow `ctx` (indexed by
 /// context offset; `count` registers valid). `fb_width`/`fb_height` bound the

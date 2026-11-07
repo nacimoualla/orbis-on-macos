@@ -18,7 +18,10 @@ namespace gui {
 
 struct GameEntry {
     std::string id;        // directory name, e.g. ED1633-NPXX51362_00-...
-    std::string name;      // from the SCE header when readable, else empty
+    std::string name;      // from param.sfo TITLE, e.g. "Thomas Was Alone"
+    std::string title_id;  // from param.sfo TITLE_ID, e.g. "CUSA00909"
+    std::string app_ver;   // from param.sfo APP_VER, e.g. "01.00"
+    std::string icon_path; // path to sce_sys/icon0.png if present
     std::string root;      // absolute path to the game directory
     std::string eboot;     // absolute path to the validated eboot (an ELF)
     u64 total_bytes{0};    // recursive size of the title directory

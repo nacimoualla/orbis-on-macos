@@ -105,14 +105,17 @@ bool load_program(const MemReader& read, u64 addr, const u32* user_sgprs,
 /// Decode an in-memory program (no fetch-shader inlining). For tests.
 bool decode_program(const u32* words, usize count, Program& out, std::string& error);
 
-enum class Stage : u8 { Vertex, Pixel };
+enum class Stage : u8 { Vertex, Pixel, Compute };
 
 /// Static description of the image (T#/S#) slots a program samples from.
 struct ImageSlot {
     u32 srsrc{0};   // first SGPR of the T#
     u32 ssamp{0};   // first SGPR of the S# (~0u for image_load)
     bool sampled{true};
+    bool storage{false};  // image_store target: bound as a writable texture
 };
+
+using ImageDesc = ImageSlot;
 
 struct TranslateOptions {
     /// How the VS is driven: vertex ids are remapped for RectList/QuadList
@@ -134,8 +137,10 @@ struct TranslatedPipeline {
     std::vector<ImageSlot> vs_images;
     u32 vs_param_count{0};
     u32 ps_attr_mask{0};
-    bool ps_writes_color{false};
+    bool ps_writes_color{false};     // exports mrt0
+    u8 ps_color_mask{0};             // exported colour targets (bit n = mrt<n>)
     bool ps_writes_depth{false};     // exp mrtz
+    bool has_ps{true};               // false: depth-only draw, no fragment function
 };
 
 /// Translate a VS/PS pair to MSL. `ps_input_cntl` holds SPI_PS_INPUT_CNTL_n
@@ -144,12 +149,41 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps,
                                       const u32* ps_input_cntl,
                                       const TranslateOptions& opts);
 
+struct ComputePipelineOptions {
+    u32 threads_x{64};
+    u32 threads_y{1};
+    u32 threads_z{1};
+    u32 rsrc1{0};
+    u32 rsrc2{0};
+};
+
+struct TranslatedComputePipeline {
+    bool ok{false};
+    std::string error;
+    std::string msl;
+    std::vector<ImageDesc> images;
+    u32 max_vgpr{0};
+    u32 max_sgpr{0};
+    bool uses_exec_write{false};
+};
+
+TranslatedComputePipeline translate_compute_pipeline(
+    const Program& cs,
+    const ComputePipelineOptions& opts = {});
+
 /// MSL binding contract shared with gcn_pipeline.mm.
 namespace binding {
 inline constexpr u32 kMemBuffer = 0;     // device const uchar* (resource arena)
 inline constexpr u32 kDrawConsts = 1;    // constant GcnDrawConsts&
+inline constexpr u32 kComputeConsts = 1; // constant GcnComputeConsts&
+inline constexpr u32 kUniformLoads = 2;  // constant uint*: scalar loads evaluated per draw
 inline constexpr u32 kMaxRanges = 16;
 } // namespace binding
+
+struct ComputeConsts {
+    u32 cs_user[16];
+    u32 pad[16];
+};
 
 /// Layout of the per-draw constant block (must match the MSL struct emitted
 /// by the translator).
@@ -187,6 +221,7 @@ struct ResourceScan {
     std::string error;
     std::vector<MemRange> ranges;
     std::vector<ImageDescriptors> images;   // parallel to ImageSlot list
+    std::vector<u32> uniform_loads;         // bound as binding::kUniformLoads
 };
 
 ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& slots,
@@ -215,18 +250,23 @@ struct SamplerDesc {
 
 SamplerDesc decode_ssharp(const u32* s);
 
-/// Bytes per element for a T#/V# data format, 0 if unsupported.
+/// Bytes per element for a T#/V# data format, 0 if unsupported. For BC1-BC7
+/// this is the size of one 4x4 block (see ps4/bc_decode.hpp).
 u32 data_format_bytes(u32 dfmt);
 
 /// Convert texture memory to linear RGBA8 (R in byte 0). Supports linear and
-/// 1D/2D-thin micro tiled 32bpp/16bpp/8bpp layouts plus the common formats.
+/// 1D/2D-thin micro tiled 32bpp/16bpp/8bpp layouts plus the common formats and
+/// BC1-BC7 (decoded per 4x4 block; see ps4/bc_decode.hpp for the covered modes).
 /// Returns false (with `error`) when the layout or format is unsupported.
 bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size,
                       std::vector<u8>& out, std::string& error);
 
 /// Byte size of the guest memory backing a texture's mip 0.
 usize texture_guest_size(const TextureDesc& td);
+bool is_linear_tiling(u32 tiling_index);
 
 u64 hash_words(const u32* data, usize count, u64 seed = 0xcbf29ce484222325ull);
+/// Fast content hash for whole guest surfaces, checked on every draw.
+u64 hash_memory(const u8* data, usize size);
 
 } // namespace ps4::gcn

@@ -9,6 +9,8 @@
 #include "ps4/gpu_state.hpp"
 #include "ps4/memory.hpp"
 #include "ps4/metal_backend.hpp"
+#include "ps4/pm4.hpp"
+#include "ps4/pm4_translator.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -291,6 +293,7 @@ void test_render(MemoryManager& mem) {
     clear.vs_user = clear_vs; clear.ps_user = clear_ps;
     clear.ctx_regs = ctx.data(); clear.ctx_reg_count = ctx.size();
     clear.prim = PrimitiveType::RectList; clear.count = 3;
+    clear.depth_format = metal.depth_stencil_format();
     std::string why;
     const bool c_ok = cache.encode_draw(enc, MTLPixelFormatBGRA8Unorm, clear, &why);
     if (!c_ok) std::fprintf(stderr, "clear draw fallback: %s\n", why.c_str());
@@ -303,6 +306,7 @@ void test_render(MemoryManager& mem) {
     sprite.vs_user = vs_user; sprite.ps_user = ps_user;
     sprite.ctx_regs = ctx.data(); sprite.ctx_reg_count = ctx.size();
     sprite.prim = PrimitiveType::QuadList; sprite.count = 4;
+    sprite.depth_format = metal.depth_stencil_format();
     const bool s_ok = cache.encode_draw(enc, MTLPixelFormatBGRA8Unorm, sprite, &why);
     if (!s_ok) std::fprintf(stderr, "sprite draw fallback: %s\n", why.c_str());
     CHECK(s_ok);
@@ -510,6 +514,283 @@ void test_texture_detile() {
     CHECK(!gcn::texture_to_rgba8(td, src.data(), src.size(), out, err));
 }
 
+// Phase 20: render-to-texture (offscreen render target) and sampling the rendered target.
+void test_render_to_texture(MemoryManager& mem) {
+    MetalBackend metal;
+    CHECK(metal.initialize());
+    CHECK(metal.create_framebuffer(64, 64));
+
+    u32 vs_user[16], ps_user[16];
+    setup_sprite_scene(mem, vs_user, ps_user);
+
+    const u32 clear_vs[16] = {};
+    const u32 clear_ps[16] = {static_cast<u32>(kClearColor), 0x00100000, 1, 0x20077fac};
+    write_words(mem, kClearVsAddr, kClearVs, std::size(kClearVs));
+    write_words(mem, kClearPsAddr, kClearPs, std::size(kClearPs));
+
+    // Clear color for offscreen target: bright yellow (R=1.0, G=1.0, B=0.0, A=1.0)
+    const float yellow[4] = {1.0f, 1.0f, 0.0f, 1.0f};
+    CHECK(mem.write_bytes(kClearColor, yellow, 16));
+
+    GcnPipelineCache cache(metal.raw_device(), &mem);
+    cache.set_metal_backend(&metal);
+
+    // Pass 1: Render into offscreen target at 0x160bb0000
+    const u64 kOffscreenAddr = 0x160bb0000ull;
+    metal.set_color_target(0, kOffscreenAddr, 64, 64, MTLPixelFormatBGRA8Unorm);
+    CHECK(metal.begin_frame());
+    CHECK(metal.ensure_render_encoder(true, ColorRGBA{0, 0, 0, 1}));
+    void* enc1 = metal.active_render_encoder();
+
+    std::vector<u32> ctx(ctx_reg::kCount, 0);
+    ctx[0x8E] = 0xF;
+    for (u32 k = 0; k < 32; ++k) ctx[0x191 + k] = k;
+
+    GcnDrawRequest clear_req{};
+    clear_req.vs_addr = kClearVsAddr; clear_req.ps_addr = kClearPsAddr;
+    clear_req.vs_rsrc2 = 0x00; clear_req.ps_rsrc2 = 0x08;
+    clear_req.vs_user = clear_vs; clear_req.ps_user = clear_ps;
+    clear_req.ctx_regs = ctx.data(); clear_req.ctx_reg_count = ctx.size();
+    clear_req.prim = PrimitiveType::RectList; clear_req.count = 3;
+    clear_req.fb_width = 64; clear_req.fb_height = 64;
+    clear_req.depth_format = metal.depth_stencil_format();
+
+    std::string why;
+    CHECK(cache.encode_draw(enc1, MTLPixelFormatBGRA8Unorm, clear_req, &why));
+    CHECK(metal.submit_frame(true));
+
+    u8 r, g, b, a;
+    CHECK(metal.read_color_pixel(kOffscreenAddr, 32, 32, r, g, b, a));
+    std::printf("  offscreen RT center: %u %u %u %u\n", r, g, b, a);
+    CHECK(r == 255 && g == 255 && b == 0);
+
+    // Pass 2: Draw to main framebuffer, sampling from kOffscreenAddr
+    CHECK(metal.begin_frame());
+    metal.set_color_target(0, 0); // back to default framebuffer
+    CHECK(metal.ensure_render_encoder(true, ColorRGBA{0, 0, 0, 1}));
+    void* enc2 = metal.active_render_encoder();
+
+    // Update T# in ps_user to point to offscreen target kOffscreenAddr (64x64, dfmt 10, nfmt 0)
+    ps_user[0] = static_cast<u32>(kOffscreenAddr >> 8);
+    ps_user[1] = static_cast<u32>((kOffscreenAddr >> 40) | (10u << 20)); // dfmt 10 (COLOR_8_8_8_8)
+    ps_user[2] = (63u) | (63u << 14); // 64x64
+    ps_user[3] = 0x94800fac; // type 9 (2D)
+
+    // Setup sprite quad covering the screen with white color (half=1.0, z=0.5, color=0.5)
+    // so 2 * tex * 0.5 = tex
+    const float half_white[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+    write_quad(mem, 1.0f, 0.5f, half_white);
+
+    GcnDrawRequest sprite_req{};
+    sprite_req.vs_addr = kVsAddr; sprite_req.ps_addr = kPsAddr;
+    sprite_req.vs_rsrc2 = 0x20; sprite_req.ps_rsrc2 = 0x18;
+    sprite_req.vs_user = vs_user; sprite_req.ps_user = ps_user;
+    sprite_req.ctx_regs = ctx.data(); sprite_req.ctx_reg_count = ctx.size();
+    sprite_req.prim = PrimitiveType::QuadList; sprite_req.count = 4;
+    sprite_req.fb_width = 64; sprite_req.fb_height = 64;
+    sprite_req.depth_format = metal.depth_stencil_format();
+
+    CHECK(cache.encode_draw(enc2, MTLPixelFormatBGRA8Unorm, sprite_req, &why));
+    CHECK(metal.submit_frame(true));
+
+    CHECK(metal.read_pixel(32, 32, r, g, b, a));
+    std::printf("  framebuffer center after sampling offscreen RT: %u %u %u %u\n", r, g, b, a);
+    // Yellow from offscreen RT (255, 255, 0) should be sampled and rendered!
+    CHECK(std::abs(int(r) - 255) <= 2 && std::abs(int(g) - 255) <= 2 && b <= 2);
+}
+
+// Phase 20: offscreen colour targets keep their size and contents across
+// passes and frames; mrt0/mrt1 exports reach both attachments (RGBA8 and
+// RGBA16F); a shader exporting only mrt0 with a second target bound is valid
+// and leaves it alone; the depth buffer matches the target size. Run with
+// MTL_DEBUG_LAYER=1 to have Metal validate every pass and pipeline.
+void test_render_targets(MemoryManager& mem) {
+    MetalBackend metal;
+    CHECK(metal.initialize());
+    CHECK(metal.create_framebuffer(64, 64));
+    // Clear PS with an extra export: exp mrt0 (compr, not done), exp mrt1 done.
+    const u32 kMrtPs[] = {
+        0xbeeb03ff, 0x00000008, 0xc2800100, 0xbf8c007f, 0x7e020201, 0x7e000203, 0x5e020200, 0x5e000002,
+        0xf800140f, 0x00000001, 0xf8001c1f, 0x00000001, 0xbf810000,
+    };
+    constexpr GuestAddr kMrtPsAddr = 0x10000600;
+    write_words(mem, kClearVsAddr, kClearVs, std::size(kClearVs));
+    write_words(mem, kClearPsAddr, kClearPs, std::size(kClearPs));
+    write_words(mem, kMrtPsAddr, kMrtPs, std::size(kMrtPs));
+    const u32 clear_vs[16] = {};
+    const u32 clear_ps[16] = {static_cast<u32>(kClearColor), 0x00100000, 1, 0x20077fac};
+    const float colour[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    CHECK(mem.write_bytes(kClearColor, colour, 16));
+
+    const u64 kA = 0x160aa0000ull, kB = 0x160ab0000ull, kZ = 0x160ac0000ull;
+    metal.set_color_target(0, kA, 32, 16, MTLPixelFormatRGBA8Unorm);
+    metal.set_color_target(1, kB, 32, 16, MTLPixelFormatRGBA16Float);
+    metal.set_depth_target(kZ);
+    id<MTLTexture> ta = (__bridge id<MTLTexture>)metal.find_color_target(kA);
+    id<MTLTexture> tb = (__bridge id<MTLTexture>)metal.find_color_target(kB);
+    CHECK(ta && tb);
+
+    GcnPipelineCache cache(metal.raw_device(), &mem);
+    cache.set_metal_backend(&metal);
+    std::vector<u32> ctx(ctx_reg::kCount, 0);
+    ctx[ctx_reg::kCbTargetMask] = 0xFF;
+    for (u32 k = 0; k < 32; ++k) ctx[0x191 + k] = k;
+    auto draw = [&](GuestAddr ps) {
+        GcnDrawRequest r{};
+        r.vs_addr = kClearVsAddr; r.ps_addr = ps;
+        r.vs_rsrc2 = 0x00; r.ps_rsrc2 = 0x08;
+        r.vs_user = clear_vs; r.ps_user = clear_ps;
+        r.ctx_regs = ctx.data(); r.ctx_reg_count = ctx.size();
+        r.prim = PrimitiveType::RectList; r.count = 3;
+        r.depth_format = metal.depth_stencil_format();
+        r.color_formats[1] = static_cast<u32>(MTLPixelFormatRGBA16Float);
+        r.fb_width = 32; r.fb_height = 16;
+        std::string why;
+        const bool ok = cache.encode_draw(metal.active_render_encoder(), MTLPixelFormatRGBA8Unorm, r, &why);
+        if (!ok) std::fprintf(stderr, "render-target draw fallback: %s\n", why.c_str());
+        CHECK(ok);
+    };
+    auto pixel_b = [&](float out[4]) {
+        __fp16 h[4] = {};
+        [tb getBytes:h bytesPerRow:32 * 8 fromRegion:MTLRegionMake2D(5, 5, 1, 1) mipmapLevel:0];
+        for (int k = 0; k < 4; ++k) out[k] = static_cast<float>(h[k]);
+    };
+    auto near8 = [](u8 v, int want) { return std::abs(int(v) - want) <= 2; };
+
+    // Frame 1: both targets from one draw. Opening the pass must not replace
+    // the 32x16 target with a framebuffer-sized one.
+    CHECK(metal.begin_frame());
+    CHECK(metal.ensure_render_encoder(true, ColorRGBA{1, 0, 0, 1}));
+    CHECK((__bridge id<MTLTexture>)metal.find_color_target(kA) == ta && ta.width == 32 && ta.height == 16);
+    draw(kMrtPsAddr);
+    CHECK(metal.submit_frame(true));
+    u8 r, g, b, a;
+    CHECK(metal.read_color_pixel(kA, 5, 5, r, g, b, a));
+    std::printf("  MRT target 0: %u %u %u %u\n", r, g, b, a);
+    CHECK(near8(r, 64) && near8(g, 128) && near8(b, 191) && a == 255);
+    float fb_[4];
+    pixel_b(fb_);
+    std::printf("  MRT target 1 (RGBA16F): %.3f %.3f %.3f %.3f\n", fb_[0], fb_[1], fb_[2], fb_[3]);
+    CHECK(fb_[0] == 0.25f && fb_[1] == 0.5f && fb_[2] == 0.75f && fb_[3] == 1.0f);
+
+    // Frame 2: an mrt0-only shader with target 1 still bound; the frame's
+    // clear applies to the screen only, so target 1 keeps frame 1's colour.
+    const float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    CHECK(mem.write_bytes(kClearColor, red, 16));
+    CHECK(metal.begin_frame());
+    CHECK(metal.ensure_render_encoder(true, ColorRGBA{0, 1, 0, 1}));
+    draw(kClearPsAddr);
+    CHECK(metal.submit_frame(true));
+    CHECK(metal.read_color_pixel(kA, 5, 5, r, g, b, a));
+    CHECK(r == 255 && g == 0 && b == 0);
+    pixel_b(fb_);
+    CHECK(fb_[0] == 0.25f && fb_[1] == 0.5f && fb_[2] == 0.75f);
+    CHECK((__bridge id<MTLTexture>)metal.find_color_target(kB) == tb);
+}
+
+void test_compute_shader(MemoryManager& mem, id<MTLDevice> device) {
+    // 1. Transpile simple compute shader with s_barrier and s_endpgm
+    const u32 kCsBytecode[] = {
+        0xbf8a0000, // s_barrier
+        0x7e020200, // v_mov_b32_e32 v1, v0
+        0xbf810000, // s_endpgm
+    };
+    gcn::Program cs;
+    std::string err;
+    CHECK(gcn::decode_program(kCsBytecode, std::size(kCsBytecode), cs, err));
+    gcn::ComputePipelineOptions copts;
+    copts.threads_x = 64;
+    copts.threads_y = 1;
+    copts.threads_z = 1;
+    gcn::TranslatedComputePipeline tcp = gcn::translate_compute_pipeline(cs, copts);
+    if (!tcp.ok) std::fprintf(stderr, "CS translation error: %s\n", tcp.error.c_str());
+    CHECK(tcp.ok);
+    CHECK(tcp.msl.find("kernel void gcn_cs_main") != std::string::npos);
+    CHECK(tcp.msl.find("threadgroup_barrier") != std::string::npos);
+
+    NSError* compile_err = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:tcp.msl.c_str()]
+                                              options:nil
+                                                error:&compile_err];
+    if (!lib) std::fprintf(stderr, "CS Metal compile error: %s\n", [[compile_err localizedDescription] UTF8String]);
+    CHECK(lib != nil);
+    id<MTLFunction> fn = [lib newFunctionWithName:@"gcn_cs_main"];
+    CHECK(fn != nil);
+    id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:fn error:&compile_err];
+    CHECK(pso != nil);
+
+    // 2. Dispatch via GcnPipelineCache
+    MetalBackend metal;
+    CHECK(metal.initialize());
+    CHECK(metal.create_framebuffer(64, 64));
+    GcnPipelineCache cache(metal.raw_device(), &mem);
+
+    constexpr GuestAddr kCsAddr = 0x163000000ULL;
+    write_words(mem, kCsAddr, kCsBytecode, std::size(kCsBytecode));
+
+    CHECK(metal.begin_frame());
+    CHECK(metal.ensure_compute_encoder());
+    void* compute_enc = metal.active_compute_encoder();
+    CHECK(compute_enc != nullptr);
+
+    u32 user_sgprs[16] = {};
+    user_sgprs[0] = 0x12345678;
+    GcnComputeRequest req{};
+    req.cs_addr = kCsAddr;
+    req.threads_x = 64;
+    req.threads_y = 1;
+    req.threads_z = 1;
+    req.grid_x = 2;
+    req.grid_y = 1;
+    req.grid_z = 1;
+    req.cs_user = user_sgprs;
+
+    std::string why;
+    CHECK(cache.encode_dispatch(compute_enc, req, &why));
+    CHECK(metal.submit_frame(true));
+    std::printf("  compute shader dispatch: OK\n");
+
+    // 3. Dispatch via Pm4Translator
+    Pm4Translator pm4(&metal);
+    pm4.set_memory_manager(&mem);
+
+    // Write COMPUTE registers via IT_SET_SH_REG
+    // COMPUTE_PGM_LO/HI (0x020C)
+    const u32 pgm_lo = static_cast<u32>((kCsAddr >> 8) & 0xFFFFFFFF);
+    const u32 pgm_hi = static_cast<u32>((kCsAddr >> 40) & 0xFFFFFFFF);
+    std::vector<u32> set_pgm = {
+        0x020CU, pgm_lo, pgm_hi
+    };
+    Pm4Packet pkt_pgm{};
+    pkt_pgm.header.type = Pm4PacketType::Type3;
+    pkt_pgm.header.opcode = IT_SET_SH_REG;
+    pkt_pgm.header.count = static_cast<u16>(set_pgm.size());
+    pkt_pgm.payload = set_pgm;
+    CHECK(pm4.execute_packet(pkt_pgm));
+
+    // COMPUTE_NUM_THREAD_X/Y/Z (0x0204)
+    std::vector<u32> set_threads = {
+        0x0204U, 64U, 1U, 1U
+    };
+    Pm4Packet pkt_threads{};
+    pkt_threads.header.type = Pm4PacketType::Type3;
+    pkt_threads.header.opcode = IT_SET_SH_REG;
+    pkt_threads.header.count = static_cast<u16>(set_threads.size());
+    pkt_threads.payload = set_threads;
+    CHECK(pm4.execute_packet(pkt_threads));
+
+    // IT_DISPATCH_DIRECT (dim_x=4, dim_y=1, dim_z=1, initiator=1)
+    CHECK(metal.begin_frame());
+    Pm4Packet pkt_disp{};
+    pkt_disp.header.type = Pm4PacketType::Type3;
+    pkt_disp.header.opcode = IT_DISPATCH_DIRECT;
+    pkt_disp.header.count = 4;
+    pkt_disp.payload = {4U, 1U, 1U, 1U};
+    CHECK(pm4.execute_packet(pkt_disp));
+    CHECK(metal.submit_frame(true));
+    std::printf("  PM4 IT_DISPATCH_DIRECT dispatch: OK\n");
+}
+
 } // namespace
 
 int main() {
@@ -529,7 +810,10 @@ int main() {
         test_translate_and_compile(mem, device);
         test_render(mem);
         test_render_depth(mem);
+        test_render_to_texture(mem);
+        test_render_targets(mem);
         test_depth_export(device);
+        test_compute_shader(mem, device);
     }
     if (g_failures) {
         std::fprintf(stderr, "GCN shader test: %d failure(s)\n", g_failures);

@@ -12,6 +12,7 @@
 namespace ps4 {
 
 class MemoryManager;
+class MetalBackend;
 
 struct GcnDrawRequest {
     GuestAddr vs_addr{0};
@@ -32,8 +33,23 @@ struct GcnDrawRequest {
     u32 instances{1};
 
     u32 depth_format{0};              // MTLPixelFormat of the pass depth attachment, 0 = none
+    u32 color_formats[8]{};           // MTLPixelFormat of colour attachments 1-7 (0 = none);
+                                      // attachment 0 is encode_draw's color_format
     u32 fb_width{0};                  // render target size; 0 leaves viewport/scissor alone
     u32 fb_height{0};
+};
+
+struct GcnComputeRequest {
+    GuestAddr cs_addr{0};
+    u32 cs_rsrc1{0};
+    u32 cs_rsrc2{0};
+    u32 threads_x{64};
+    u32 threads_y{1};
+    u32 threads_z{1};
+    u32 grid_x{1};
+    u32 grid_y{1};
+    u32 grid_z{1};
+    const u32* cs_user{nullptr};      // 16 compute user SGPRs
 };
 
 struct GcnPipelineStats {
@@ -53,6 +69,7 @@ public:
     GcnPipelineCache& operator=(const GcnPipelineCache&) = delete;
 
     void set_memory(MemoryManager* memory) noexcept;
+    void set_metal_backend(MetalBackend* metal) noexcept;
 
     /// Encode a draw with the game's translated shaders. Returns false (and
     /// leaves the encoder state untouched apart from nothing) when anything
@@ -61,6 +78,11 @@ public:
     /// MTLPixelFormat.
     bool encode_draw(void* render_encoder, u32 color_format, const GcnDrawRequest& req,
                      std::string* why = nullptr);
+
+    /// Encode a compute dispatch with the game's translated compute shader.
+    /// `compute_encoder` is an id<MTLComputeCommandEncoder>.
+    bool encode_dispatch(void* compute_encoder, const GcnComputeRequest& req,
+                         std::string* why = nullptr);
 
     [[nodiscard]] const GcnPipelineStats& stats() const noexcept;
     [[nodiscard]] static bool enabled_by_env() noexcept;

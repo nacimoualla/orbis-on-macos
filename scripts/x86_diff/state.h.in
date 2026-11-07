@@ -10,8 +10,18 @@ static void fill(struct State* s, unsigned c, unsigned t){
   s->flags = (rnd() & 0x8D5) | 0x202;
   // Small shift/rotate counts in cl are more interesting than random ones.
   if (t & 1) s->rcx = (s->rcx & ~0xffull) | (rnd() % 70);
+  // setup 4: bextr control in rdx with short fields and edge cases.
+  if (kCases[c].setup == 4) {
+    static const uint16_t controls[8] = {0x0000, 0x0401, 0x0810, 0x201F, 0x2000, 0x4020, 0x083F, 0xFF40};
+    s->rdx = controls[t & 7];
+  }
+  // setup 3: shift/rotate edge counts in cl (0, 1, operand-size boundaries).
+  if (kCases[c].setup == 3) {
+    static const uint8_t kCl[8] = {0, 1, 8, 9, 16, 17, 31, 63};
+    s->rcx = (s->rcx & ~0xffull) | kCl[t];
+  }
   // Division inputs that cannot fault (#DE), per operand width.
-  if (kCases[c].setup) {
+  if (kCases[c].setup == 1 || kCases[c].setup == 2) {
     const char* n = kCases[c].name; int w = 64;
     if (strstr(n, "div8")) w = 8; else if (strstr(n, "div16")) w = 16; else if (strstr(n, "div32")) w = 32;
     uint64_t m = w == 64 ? ~0ull : ((1ull << w) - 1);

@@ -1,9 +1,15 @@
+#if defined(__APPLE__)
+#include "ps4/debug/page_watch.hpp"
+#endif
 #include "ps4/jit_compiler.hpp"
+#include "arm64_simd.hpp"
 
 #include <atomic>
 #include "ps4/jit_stats.hpp"
 #include "ps4/x86_decode.hpp"
 #include <algorithm>
+#include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <iostream>
@@ -371,101 +377,6 @@ void Arm64Emitter::str_x_idx(u8 rt, u8 rn, u8 rm) {
   emit(ldst_idx(0xf8000000, rt, rn, rm));
 }
 
-// --- Variable shifts, select, multiply, rotate -----------------------------------
-
-namespace {
-inline u32 rrr(u32 base, bool sf, u8 rd, u8 rn, u8 rm) {
-  return base | (sf ? 0x80000000u : 0u) | (static_cast<u32>(rm) << 16) |
-         (static_cast<u32>(rn) << 5) | rd;
-}
-} // namespace
-
-void Arm64Emitter::lslv(bool sf, u8 rd, u8 rn, u8 rm) { emit(rrr(0x1ac02000u, sf, rd, rn, rm)); }
-void Arm64Emitter::asrv(bool sf, u8 rd, u8 rn, u8 rm) { emit(rrr(0x1ac02800u, sf, rd, rn, rm)); }
-
-void Arm64Emitter::csel(bool sf, u8 rd, u8 rn, u8 rm, u8 cond) {
-  emit(rrr(0x1a800000u, sf, rd, rn, rm) | (static_cast<u32>(cond & 0xf) << 12));
-}
-
-void Arm64Emitter::cmp_imm(bool sf, u8 rn, u16 imm12) {
-  // SUBS zr, rn, #imm12
-  emit((sf ? 0xf1000000u : 0x71000000u) | (static_cast<u32>(imm12 & 0xfff) << 10) |
-       (static_cast<u32>(rn) << 5) | 31u);
-}
-
-void Arm64Emitter::mul(bool sf, u8 rd, u8 rn, u8 rm) {
-  emit(rrr(0x1b000000u, sf, rd, rn, rm) | (31u << 10)); // MADD rd, rn, rm, zr
-}
-void Arm64Emitter::smull(u8 rd, u8 rn, u8 rm) {
-  emit(rrr(0x9b200000u, false, rd, rn, rm) | (31u << 10)); // SMADDL xd, wn, wm, xzr
-}
-void Arm64Emitter::smulh(u8 rd, u8 rn, u8 rm) {
-  emit(rrr(0x9b400000u, false, rd, rn, rm) | (31u << 10));
-}
-
-void Arm64Emitter::ror_imm(bool sf, u8 rd, u8 rn, u8 shift) {
-  emit((sf ? 0x93c00000u : 0x13800000u) | (static_cast<u32>(rn) << 16) |
-       (static_cast<u32>(shift & (sf ? 63 : 31)) << 10) | (static_cast<u32>(rn) << 5) | rd);
-}
-
-void Arm64Emitter::cbz(bool sf, u8 rt, i32 offset_words) {
-  emit((sf ? 0xb4000000u : 0x34000000u) | ((static_cast<u32>(offset_words) & 0x7ffff) << 5) | rt);
-}
-
-// --- SIMD&FP -------------------------------------------------------------------------
-
-namespace {
-// LDR/STR (SIMD&FP, unsigned offset) and (register, LSL #0), indexed by
-// size_log2 - 2 (S, D, Q).
-constexpr u32 kFpLdrImm[3] = {0xbd400000u, 0xfd400000u, 0x3dc00000u};
-constexpr u32 kFpStrImm[3] = {0xbd000000u, 0xfd000000u, 0x3d800000u};
-constexpr u32 kFpLdrIdx[3] = {0xbc606800u, 0xfc606800u, 0x3ce06800u};
-constexpr u32 kFpStrIdx[3] = {0xbc206800u, 0xfc206800u, 0x3ca06800u};
-} // namespace
-
-void Arm64Emitter::fp_ldr(u8 size_log2, u8 vt, u8 rn, u32 offset_bytes) {
-  emit(kFpLdrImm[size_log2 - 2] | (((offset_bytes >> size_log2) & 0xfff) << 10) |
-       (static_cast<u32>(rn) << 5) | vt);
-}
-void Arm64Emitter::fp_str(u8 size_log2, u8 vt, u8 rn, u32 offset_bytes) {
-  emit(kFpStrImm[size_log2 - 2] | (((offset_bytes >> size_log2) & 0xfff) << 10) |
-       (static_cast<u32>(rn) << 5) | vt);
-}
-void Arm64Emitter::fp_ldr_idx(u8 size_log2, u8 vt, u8 rn, u8 rm) {
-  emit(kFpLdrIdx[size_log2 - 2] | (static_cast<u32>(rm) << 16) | (static_cast<u32>(rn) << 5) | vt);
-}
-void Arm64Emitter::fp_str_idx(u8 size_log2, u8 vt, u8 rn, u8 rm) {
-  emit(kFpStrIdx[size_log2 - 2] | (static_cast<u32>(rm) << 16) | (static_cast<u32>(rn) << 5) | vt);
-}
-
-void Arm64Emitter::fp_arith(bool dbl, u8 op, u8 vd, u8 vn, u8 vm) {
-  emit(0x1e200800u | (dbl ? 0x400000u : 0u) | (static_cast<u32>(op & 3) << 12) |
-       (static_cast<u32>(vm) << 16) | (static_cast<u32>(vn) << 5) | vd);
-}
-void Arm64Emitter::fcmp(bool dbl, u8 vn, u8 vm) {
-  emit(0x1e202000u | (dbl ? 0x400000u : 0u) | (static_cast<u32>(vm) << 16) | (static_cast<u32>(vn) << 5));
-}
-void Arm64Emitter::fcsel(bool dbl, u8 vd, u8 vn, u8 vm, u8 cond) {
-  emit(0x1e200c00u | (dbl ? 0x400000u : 0u) | (static_cast<u32>(vm) << 16) |
-       (static_cast<u32>(cond & 0xf) << 12) | (static_cast<u32>(vn) << 5) | vd);
-}
-void Arm64Emitter::scvtf(bool dbl, bool src64, u8 vd, u8 rn) {
-  emit(0x1e220000u | (src64 ? 0x80000000u : 0u) | (dbl ? 0x400000u : 0u) |
-       (static_cast<u32>(rn) << 5) | vd);
-}
-void Arm64Emitter::ins_lane0(bool dbl, u8 vd, u8 vn) {
-  emit((dbl ? 0x6e080400u : 0x6e040400u) | (static_cast<u32>(vn) << 5) | vd);
-}
-void Arm64Emitter::eor_v16(u8 vd, u8 vn, u8 vm) {
-  emit(0x6e201c00u | (static_cast<u32>(vm) << 16) | (static_cast<u32>(vn) << 5) | vd);
-}
-void Arm64Emitter::fmov_to_gpr(bool dbl, u8 rd, u8 vn) {
-  emit((dbl ? 0x9e660000u : 0x1e260000u) | (static_cast<u32>(vn) << 5) | rd);
-}
-void Arm64Emitter::fmov_from_gpr(bool dbl, u8 vd, u8 rn) {
-  emit((dbl ? 0x9e670000u : 0x1e270000u) | (static_cast<u32>(rn) << 5) | vd);
-}
-
 void Arm64Emitter::patch_b_cond(usize at, usize target) {
   const i32 offset_words = static_cast<i32>(static_cast<isize>(target) -
                                             static_cast<isize>(at));
@@ -473,35 +384,38 @@ void Arm64Emitter::patch_b_cond(usize at, usize target) {
                ((static_cast<u32>(offset_words) & 0x7ffff) << 5);
 }
 
-namespace {
-// STP/LDP (64-bit): pre-index, signed offset, post-index. imm in bytes.
-inline u32 ldst_pair(u32 base, u8 rt, u8 rt2, u8 rn, i32 imm) {
-  return base | ((static_cast<u32>(imm / 8) & 0x7f) << 15) | (static_cast<u32>(rt2) << 10) |
-         (static_cast<u32>(rn) << 5) | rt;
-}
-} // namespace
-
 void Arm64Emitter::emit_prologue() {
-  emit(ldst_pair(0xa9800000u, 19, 30, 31, -64)); // stp x19, x30, [sp, #-64]!
-  emit(ldst_pair(0xa9000000u, 20, 21, 31, 16));  // stp x20, x21, [sp, #16]
-  emit(ldst_pair(0xa9000000u, 22, 23, 31, 32));  // stp x22, x23, [sp, #32]
-  emit(ldst_pair(0xa9000000u, 24, 25, 31, 48));  // stp x24, x25, [sp, #48]
+  // stp x19, x30, [sp, #-64]!
+  emit(0xa9bc7bf3);
+  // stp x20, x21, [sp, #16]
+  emit(0xa90157f4);
+  // stp x22, x23, [sp, #32]
+  emit(0xa9025ff6);
+  // str x24, [sp, #48]
+  emit(0xf9001bf8);
   // mov x19, x0 (guest CpuContext*)
   emit(0xaa0003f3);
   // mov x20, x1 (host base of guest memory)
   emit(0xaa0103f4);
   // sub x21, x2, #8 (highest valid start address of an 8-byte access)
   emit(0xd1002055);
-  // x22 = 0 (instructions retired by chained blocks), x23 = x3 (chain budget)
-  movz(true, 22, 0);
-  mov_reg(23, 3);
+  // mov x22, x3 (this thread's chain table)
+  emit(0xaa0303f6);
+  // mov x23, x4 (chained jumps left)
+  emit(0xaa0403f7);
+  // mov x24, xzr (instructions retired by earlier blocks of the chain)
+  emit(0xaa1f03f8);
 }
 
 void Arm64Emitter::emit_epilogue() {
-  emit(ldst_pair(0xa9400000u, 24, 25, 31, 48)); // ldp x24, x25, [sp, #48]
-  emit(ldst_pair(0xa9400000u, 22, 23, 31, 32)); // ldp x22, x23, [sp, #32]
-  emit(ldst_pair(0xa9400000u, 20, 21, 31, 16)); // ldp x20, x21, [sp, #16]
-  emit(ldst_pair(0xa8c00000u, 19, 30, 31, 64)); // ldp x19, x30, [sp], #64
+  // ldr x24, [sp, #48]
+  emit(0xf9401bf8);
+  // ldp x22, x23, [sp, #32]
+  emit(0xa9425ff6);
+  // ldp x20, x21, [sp, #16]
+  emit(0xa94157f4);
+  // ldp x19, x30, [sp], #64
+  emit(0xa8c47bf3);
   // ret
   emit(0xd65f03c0);
 }
@@ -586,8 +500,11 @@ constexpr u8 R_GBASE = 20;
 constexpr u8 R_GLIMIT = 21;
 constexpr u8 R_EA = 9;
 
+// Bytes of Arm64Emitter::emit_prologue: where a chained jump enters a block.
+constexpr usize kChainEntryOffset = 10 * sizeof(u32);
 constexpr u8 COND_CS = 2; // C set   (x86 CF after ADD)
 constexpr u8 COND_CC = 3; // C clear (x86 CF after SUB/CMP: borrow)
+constexpr u8 COND_NE = 1;
 constexpr u8 COND_HI = 8;
 
 // The arithmetic flags the interpreter computes. AF is never written by the
@@ -626,22 +543,87 @@ enum class Kind : u8 {
   Jcc,       // 70-7F rel8, 0F 80-8F rel32 (block end; reg = condition code)
   Cmov,      // 0F 40-4F (reg = condition code)
   Setcc,     // 0F 90-9F (reg = condition code)
-  ShiftCl,   // D3 /4 /5 /6 /7, 32/64-bit (count = CL)
-  RotImm,    // C0/C1/D0/D1 /0 /1 (ROL/ROR by a constant)
-  Imul,      // 0F AF, 69, 6B, 32/64-bit
-  Neg,       // F6/F7 /3
+  Vec,       // SSE / AVX (vop selects the operation)
+  SignExt,   // 98 CBW/CWDE/CDQE (reg = 0), 99 CWD/CDQ/CQO (reg = 1)
   Not,       // F6/F7 /2
-  SignExt,   // 98 CWDE/CDQE, 99 CDQ/CQO (32/64-bit)
-  Bextr,     // VEX.LZ.0F38 F7, pp=0
-  ShiftX,    // VEX.LZ.0F38 F7, pp=1/2/3 (SHLX/SARX/SHRX; alu_op = pp)
-  Andn,      // VEX.LZ.0F38 F2
-  Sse,       // VEX.0F scalar float / xor subset (vex_op + vex_pp select it)
-  CallRel,   // E8 (block end; target known)
-  CallInd,   // FF /2 (block end; target in x12)
-  JmpInd,    // FF /4 (block end; target in x12)
-  Ret,       // C3 (block end; target in x12)
-  Div,       // F7 /6 /7, 32/64-bit (alu_op = 6 DIV / 7 IDIV); #DE cases side-exit
-  Vec,       // VEX.128 packed-integer / move subset (vex_op, vex_pp, reg = map)
+  Neg,       // F6/F7 /3
+  Imul,      // 0F AF r, r/m ; 69/6B r, r/m, imm (imm_form)
+  ShiftCl,   // D2/D3 /0 /1 /4 /5 /7: count in CL (alu_op = ModRM.reg); also
+             // ROL/ROR by imm8 / 1 (imm_form, count in imm)
+  BitTest,   // 0F A3/AB/B3/BB r, 0F BA /4-/7 imm8 (alu_op: 0 BT 1 BTS 2 BTR 3 BTC)
+  CallRel,   // E8 rel32
+  Ret,       // C3 / C2 imm16 (imm = extra bytes popped)
+  CallInd,   // FF /2
+  JmpInd,    // FF /4
+  Bextr,     // VEX.0F38 F7: reg = rm[start + len - 1 : start], control in vvvv
+  Andn,      // VEX.0F38 F2: reg = ~vvvv & rm
+};
+
+/// Control transfers that end the block and store the next RIP themselves.
+bool writes_rip(Kind k) {
+  return k == Kind::CallRel || k == Kind::Ret || k == Kind::CallInd || k == Kind::JmpInd;
+}
+
+/// CALL/RET/indirect JMP are translated unless PS4_JIT_NO_CALLS is set; the
+/// interpreter then executes them and keeps its control-transfer history
+/// (dump_control_xfers) complete for crash reports.
+bool jit_translates_calls() {
+  static const bool on = std::getenv("PS4_JIT_NO_CALLS") == nullptr;
+  return on;
+}
+
+// SSE/AVX operations. Operands: dest = ModRM.reg, src1 = VEX.vvvv (legacy
+// SSE: dest), src2 / rm = ModRM.rm or memory. VEX.128 writes zero bits
+// 255:128 of the destination; legacy SSE writes leave them alone.
+enum class VecOp : u8 {
+  Load,        // dest = rm: movups/movaps/movupd/movapd/movdqu/movdqa
+  Store,       // rm = dest register: the 11/29/7F store forms
+  LoadScalar,  // movss/movsd xmm, xmm/m (F3/F2 10)
+  StoreScalar, // movss/movsd xmm/m, xmm (F3/F2 11)
+  Movq,        // movq xmm, xmm/m64 (F3 7E): zero-extended low qword
+  MovqStore,   // movq xmm/m64, xmm (66 D6)
+  MovdToVec,   // movd/movq xmm, r/m (66 6E)
+  MovdFromVec, // movd/movq r/m, xmm (66 7E)
+  LoadLow,     // movlps/movlpd xmm, m64 (12 mem)
+  LoadHigh,    // movhps/movhpd xmm, m64 (16 mem)
+  Movhlps,     // 0F 12 reg
+  Movlhps,     // 0F 16 reg
+  StoreLow,    // movlps/movlpd m64, xmm (13)
+  StoreHigh,   // movhps/movhpd m64, xmm (17)
+  Moveldup,    // movsldup (F3 12)
+  Movehdup,    // movshdup (F3 16)
+  Movddup,     // movddup (F2 12)
+  Packed,      // vbin on every lane, per 128-bit half
+  Scalar,      // vbin on lane 0; the other lanes come from src1
+  Ucomi,       // (u)comiss / (u)comisd -> ZF, PF, CF
+  Shuf,        // shufps / shufpd imm8
+  Pshufd,      // pshufd / vpermilps imm8 (one source)
+  Blend,       // blendps / blendpd imm8
+  Blendv,      // vblendvps / vblendvpd (mask register in imm8[7:4])
+  Insertps,
+  Broadcast,   // vbroadcastss
+  Pextr,       // pextrd / pextrq
+  Pinsr,       // pinsrd / pinsrq
+  CvtF2F,      // cvtss2sd / cvtsd2ss
+  CvtI2F,      // cvtsi2ss / cvtsi2sd
+  CvttF2I,     // cvttss2si / cvttsd2si
+  ShiftImm,    // groups 71/72/73: dest = vvvv (legacy: rm), source rm, count imm8
+  Pshuflw,     // pshuflw (dbl) / pshufhw imm8
+  Pmovx,       // pmovsx / pmovzx: vlane = source bits, vsteps = doublings
+  Permilpd,    // vpermilpd imm8
+  Vinsert128,  // vinsertf128
+  Vextract128, // vextractf128
+};
+
+enum class VecBin : u8 {
+  Add, Sub, Mul, Div, Min, Max, Sqrt, And, Andn, Or, Xor,
+  UnpckLo, UnpckHi, AddSub, IAdd, ISub, ICmpEq, Cmp,
+  Neon,    // v2 = v0 OP v1 with the encoding in JitInsn::neon
+  Narrow,  // packss/packus: saturate v0 and v1 to the low and high half
+  Pmulh,   // pmulhw (neon != 0: pmulhuw)
+  Pmaddwd,
+  Pmuludq,
+  Pshufb,
 };
 
 struct JitInsn {
@@ -661,11 +643,19 @@ struct JitInsn {
   GuestAddr target{0};
   u64 flags_written{0};
   u64 flags_read{0}; // must be in ctx->rflags before this instruction
-  // VEX fields (Bextr/ShiftX/Andn/Sse)
-  u8 vex_op{0};
-  u8 vex_pp{0};
-  u8 vex_vvvv{0};
-  bool vex_l{false};
+
+  // Kind::Vec
+  VecOp vop{VecOp::Load};
+  VecBin vbin{VecBin::Add};
+  bool vex{false};
+  bool l256{false}; // VEX.L: 256-bit operands
+  bool dbl{false};  // double / 64-bit lanes (pd, sd; integer qword forms)
+  bool w64{false};  // REX.W / VEX.W: 64-bit general register operand
+  u8 vvvv{0};       // VEX.vvvv
+  bool imm_form{false}; // Imul / BitTest: the second operand is d.imm
+  u32 neon{0};          // VecBin::Neon / Narrow: instruction base
+  u8 vlane{0};          // VecOp::ShiftImm / Pmovx: lane bits
+  u8 vsteps{0};         // VecOp::Pmovx: lane doublings
 
   [[nodiscard]] bool has_mem() const noexcept {
     switch (kind) {
@@ -680,19 +670,15 @@ struct JitInsn {
     case Kind::PushRm:
     case Kind::Cmov:
     case Kind::Setcc:
-    case Kind::ShiftCl:
-    case Kind::RotImm:
-    case Kind::Imul:
-    case Kind::Neg:
-    case Kind::Not:
-    case Kind::Bextr:
-    case Kind::ShiftX:
-    case Kind::Andn:
-    case Kind::Sse:
     case Kind::CallInd:
     case Kind::JmpInd:
-    case Kind::Div:
-    case Kind::Vec:
+    case Kind::Not:
+    case Kind::Neg:
+    case Kind::Imul:
+    case Kind::ShiftCl:
+    case Kind::BitTest:
+    case Kind::Bextr:
+    case Kind::Andn:
       return !m.is_reg;
     default:
       return false;
@@ -747,65 +733,312 @@ bool is_block_terminator(const u8 *code, usize avail, const x86::Prefixes &p) {
   const usize c = p.length;
   const u8 op0 = code[c];
   const u8 op1 = (c + 1 < avail) ? code[c + 1] : 0;
-  if (op0 == 0xF4 || op0 == 0xCC || op0 == 0xC2)
+  if (op0 == 0xF4 || op0 == 0xCC)
     return true;
-  if (op0 == 0x0F && (op1 == 0x05 || op1 == 0x0B))
+  if ((op0 == 0xC3 || op0 == 0xC2 || op0 == 0xE8) && !jit_translates_calls())
+    return true;
+  if (op0 == 0x0F && (op1 == 0x05 || op1 == 0x0B || op1 == 0x01 || op1 == 0x31 || op1 == 0xA2))
     return true;
   return false;
 }
 
-/// The VEX packed-integer / move forms emit_vec() translates (128-bit unless
-/// noted). Everything else stays with the interpreter.
-bool vec_supported(u8 map, u8 op, u8 pp, bool l, const x86::ModRM &m) {
-  if (map == 2) {
-    if (pp != 1)
-      return false;
-    if ((op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35)) // VPMOVSX / VPMOVZX
-      return !(l == false && (op & 0x0F) == 2); // BQ from 2 bytes stays interpreted
-    return !l && (op == 0x00 || op == 0x40 || op == 0x2B); // VPSHUFB, VPMULLD, VPACKUSDW
-  }
-  if (map == 3) {
-    if (pp != 1)
-      return false;
-    if (op == 0x18 || op == 0x19) // VINSERTF128 / VEXTRACTF128
-      return l;
-    if (op == 0x0E) // VPBLENDW
-      return !l;
-    if (op == 0x4A || op == 0x4B) // VBLENDVPS / VBLENDVPD
+/// Opcodes routed to decode_vec (map 1 = 0F, 2 = 0F 38, 3 = 0F 3A). None of
+/// them is handled by the integer decoder.
+bool is_vec_opcode(u8 map, u8 op) {
+  if (map == 1) {
+    switch (op) {
+    case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17:
+    case 0x28: case 0x29: case 0x2A: case 0x2C: case 0x2E: case 0x2F:
+    case 0x51: case 0x54: case 0x55: case 0x56: case 0x57: case 0x58: case 0x59: case 0x5A:
+    case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+    case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67:
+    case 0x68: case 0x69: case 0x6A: case 0x6B: case 0x6C: case 0x6D: case 0x6E: case 0x6F:
+    case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76:
+    case 0x7E: case 0x7F:
+    case 0xC2: case 0xC6: case 0xD0: case 0xD4: case 0xD5: case 0xD6: case 0xD8: case 0xD9:
+    case 0xDA: case 0xDB: case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+    case 0xE0: case 0xE3: case 0xE4: case 0xE5: case 0xE8: case 0xE9: case 0xEA: case 0xEB:
+    case 0xEC: case 0xED: case 0xEE: case 0xEF:
+    case 0xF4: case 0xF5: case 0xF8: case 0xF9: case 0xFA: case 0xFB: case 0xFC: case 0xFD:
+    case 0xFE:
       return true;
-    return false;
+    default:
+      return false;
+    }
   }
-  if (map != 1)
-    return false;
-  switch (op) {
-  case 0x6F: case 0x7F: // VMOVDQA (66) / VMOVDQU (F3), 128 or 256-bit
-    return pp == 1 || pp == 2;
-  case 0x10: case 0x11: case 0x28: case 0x29: // VMOVUPS/UPD/APS/APD
-    return pp <= 1;
-  case 0x6E: // VMOVD/Q xmm, r/m
-    return pp == 1 && !l;
-  case 0x7E: // VMOVD/Q r/m, xmm (66) ; VMOVQ xmm, xmm/m64 (F3)
-    return (pp == 1 || pp == 2) && !l;
-  case 0xD6: // VMOVQ xmm/m64, xmm
-    return pp == 1 && !l;
-  case 0x70: // VPSHUFD (66), VPSHUFHW (F3), VPSHUFLW (F2)
-    return pp >= 1 && !l;
-  case 0x63: case 0x67: case 0x6B: // VPACKSSWB, VPACKUSWB, VPACKSSDW
-    return pp == 1 && !l;
-  case 0x71: case 0x72: case 0x73: // shifts by immediate (/2 /4 /6; no /4 for q)
-    return pp == 1 && !l && m.is_reg && ((m.reg & 7) == 2 || (m.reg & 7) == 6 || ((m.reg & 7) == 4 && op != 0x73));
-  case 0xFC: case 0xFD: case 0xFE: case 0xD4: // VPADDB/W/D/Q
-  case 0xF8: case 0xF9: case 0xFA: case 0xFB: // VPSUBB/W/D/Q
-  case 0xDB: case 0xDF: case 0xEB:            // VPAND / VPANDN / VPOR
-  case 0xD5:                                  // VPMULLW
-  case 0x60: case 0x61: case 0x62: case 0x6C: // VPUNPCKL BW/WD/DQ/QDQ
-  case 0x68: case 0x69: case 0x6A: case 0x6D: // VPUNPCKH BW/WD/DQ/QDQ
-    return pp == 1 && !l;
-  case 0x54: case 0x55: case 0x56: // VANDPS/PD, VANDNPS/PD, VORPS/PD (also 256-bit)
-    return pp <= 1;
-  default:
-    return false;
+  if (map == 2) {
+    switch (op) {
+    case 0x00: case 0x18:
+    case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25:
+    case 0x29: case 0x2B:
+    case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35:
+    case 0x37: case 0x38: case 0x39: case 0x3A: case 0x3B: case 0x3C: case 0x3D: case 0x3E:
+    case 0x3F: case 0x40:
+      return true;
+    default:
+      return false;
+    }
   }
+  return op == 0x04 || op == 0x05 || op == 0x0C || op == 0x0D || op == 0x16 || op == 0x18 ||
+         op == 0x19 || op == 0x21 || op == 0x22 || op == 0x4A || op == 0x4B;
+}
+
+/// The packed-integer operations that are a single NEON instruction, with x86
+/// and NEON agreeing on operand order and on the 128-bit behaviour. 0: not one
+/// of them.
+u32 neon_int_op(u8 map, u8 op) {
+  using namespace a64;
+  if (map == 1) {
+    switch (op) {
+    case 0x60: return lanes(ZIP1_V, 0);   // punpcklbw
+    case 0x61: return lanes(ZIP1_V, 1);   // punpcklwd
+    case 0x68: return lanes(ZIP2_V, 0);   // punpckhbw
+    case 0x69: return lanes(ZIP2_V, 1);   // punpckhwd
+    case 0x64: return lanes(CMGT_V, 0);   // pcmpgtb
+    case 0x65: return lanes(CMGT_V, 1);   // pcmpgtw
+    case 0x66: return lanes(CMGT_V, 2);   // pcmpgtd
+    case 0x74: return lanes(CMEQ_V, 0);   // pcmpeqb
+    case 0x75: return lanes(CMEQ_V, 1);   // pcmpeqw
+    case 0xD5: return lanes(MUL_V, 1);    // pmullw
+    case 0xD8: return lanes(UQSUB_V, 0);  // psubusb
+    case 0xD9: return lanes(UQSUB_V, 1);  // psubusw
+    case 0xDA: return lanes(UMIN_V, 0);   // pminub
+    case 0xDC: return lanes(UQADD_V, 0);  // paddusb
+    case 0xDD: return lanes(UQADD_V, 1);  // paddusw
+    case 0xDE: return lanes(UMAX_V, 0);   // pmaxub
+    case 0xE0: return lanes(URHADD_V, 0); // pavgb
+    case 0xE3: return lanes(URHADD_V, 1); // pavgw
+    case 0xE8: return lanes(SQSUB_V, 0);  // psubsb
+    case 0xE9: return lanes(SQSUB_V, 1);  // psubsw
+    case 0xEA: return lanes(SMIN_V, 1);   // pminsw
+    case 0xEC: return lanes(SQADD_V, 0);  // paddsb
+    case 0xED: return lanes(SQADD_V, 1);  // paddsw
+    case 0xEE: return lanes(SMAX_V, 1);   // pmaxsw
+    case 0xF8: return lanes(SUB_V, 0);    // psubb
+    case 0xF9: return lanes(SUB_V, 1);    // psubw
+    case 0xFC: return lanes(ADD_V, 0);    // paddb
+    case 0xFD: return lanes(ADD_V, 1);    // paddw
+    default: return 0;
+    }
+  }
+  if (map == 2) {
+    switch (op) {
+    case 0x29: return lanes(CMEQ_V, 3);  // pcmpeqq
+    case 0x37: return lanes(CMGT_V, 3);  // pcmpgtq
+    case 0x38: return lanes(SMIN_V, 0);  // pminsb
+    case 0x39: return lanes(SMIN_V, 2);  // pminsd
+    case 0x3A: return lanes(UMIN_V, 1);  // pminuw
+    case 0x3B: return lanes(UMIN_V, 2);  // pminud
+    case 0x3C: return lanes(SMAX_V, 0);  // pmaxsb
+    case 0x3D: return lanes(SMAX_V, 2);  // pmaxsd
+    case 0x3E: return lanes(UMAX_V, 1);  // pmaxuw
+    case 0x3F: return lanes(UMAX_V, 2);  // pmaxud
+    case 0x40: return lanes(MUL_V, 2);   // pmulld
+    default: return 0;
+    }
+  }
+  return 0;
+}
+
+/// Decode an SSE/AVX instruction whose opcode byte is at code[pos] (after
+/// 0F [38|3A] or the VEX prefix). pp: 0 = none, 1 = 66, 2 = F3, 3 = F2.
+/// The forms not listed are left to the interpreter.
+bool decode_vec(const u8 *code, usize avail, usize pos, GuestAddr rip, u8 map,
+                u8 pp, JitInsn &d) {
+  if (pos >= avail)
+    return false;
+  const u8 op = code[pos++];
+  if (!x86::decode_modrm(code + pos, avail - pos, d.p, d.m))
+    return false;
+  pos += d.m.length;
+  const bool mem = !d.m.is_reg;
+  const bool vex = d.vex;
+  d.kind = Kind::Vec;
+  d.w64 = d.p.rex_w;
+  d.dbl = pp == 1 || pp == 3; // pd / sd
+  bool imm8 = false;
+  bool wide_ok = false; // VEX.L = 1 accepted
+  auto set = [&](VecOp v) { d.vop = v; return true; };
+  auto packed = [&](VecBin b) { d.vbin = b; wide_ok = true; return set(VecOp::Packed); };
+  auto scalar = [&](VecBin b) { d.vbin = b; return set(VecOp::Scalar); };
+  auto arith = [&](VecBin b) { return pp <= 1 ? packed(b) : scalar(b); };
+
+  bool ok = false;
+  if (map == 1) {
+    switch (op) {
+    case 0x10: case 0x11:
+      if (pp <= 1) { wide_ok = true; ok = set(op == 0x10 ? VecOp::Load : VecOp::Store); }
+      else ok = set(op == 0x10 ? VecOp::LoadScalar : VecOp::StoreScalar);
+      break;
+    case 0x12:
+      if (pp == 0) ok = set(mem ? VecOp::LoadLow : VecOp::Movhlps);
+      else if (pp == 1 && mem) ok = set(VecOp::LoadLow);
+      else if (pp == 2) { wide_ok = true; ok = set(VecOp::Moveldup); }
+      else if (pp == 3) { wide_ok = true; ok = set(VecOp::Movddup); }
+      break;
+    case 0x16:
+      if (pp == 0) ok = set(mem ? VecOp::LoadHigh : VecOp::Movlhps);
+      else if (pp == 1 && mem) ok = set(VecOp::LoadHigh);
+      else if (pp == 2) { wide_ok = true; ok = set(VecOp::Movehdup); }
+      break;
+    case 0x13: case 0x17:
+      if (pp <= 1 && mem) ok = set(op == 0x13 ? VecOp::StoreLow : VecOp::StoreHigh);
+      break;
+    case 0x14: case 0x15:
+      if (pp <= 1) ok = packed(op == 0x14 ? VecBin::UnpckLo : VecBin::UnpckHi);
+      break;
+    case 0x28: case 0x29:
+      if (pp <= 1) { wide_ok = true; ok = set(op == 0x28 ? VecOp::Load : VecOp::Store); }
+      break;
+    case 0x2A:
+      if (pp >= 2) { d.dbl = pp == 3; ok = set(VecOp::CvtI2F); }
+      break;
+    case 0x2C:
+      if (pp >= 2) { d.dbl = pp == 3; ok = set(VecOp::CvttF2I); }
+      break;
+    case 0x2E: case 0x2F:
+      if (pp <= 1) { d.flags_written = FLAGS_ARITH; ok = set(VecOp::Ucomi); }
+      break;
+    case 0x51: ok = arith(VecBin::Sqrt); break;
+    case 0x54: case 0x55: case 0x56: case 0x57:
+      if (pp <= 1) {
+        static constexpr VecBin kLogic[4] = {VecBin::And, VecBin::Andn, VecBin::Or, VecBin::Xor};
+        ok = packed(kLogic[op - 0x54]);
+      }
+      break;
+    case 0x58: ok = arith(VecBin::Add); break;
+    case 0x59: ok = arith(VecBin::Mul); break;
+    case 0x5C: ok = arith(VecBin::Sub); break;
+    case 0x5D: ok = arith(VecBin::Min); break;
+    case 0x5E: ok = arith(VecBin::Div); break;
+    case 0x5F: ok = arith(VecBin::Max); break;
+    case 0x5A:
+      if (pp >= 2) ok = set(VecOp::CvtF2F); // dbl: source is double
+      break;
+    case 0x62: case 0x6A: case 0x6C: case 0x6D: // punpck{l,h}{dq,qdq}
+      if (pp == 1) {
+        d.dbl = op >= 0x6C;
+        ok = packed((op & 0x0F) == 0x02 || op == 0x6C ? VecBin::UnpckLo : VecBin::UnpckHi);
+      }
+      break;
+    case 0x6E: if (pp == 1) ok = set(VecOp::MovdToVec); break;
+    case 0x7E:
+      if (pp == 1) ok = set(VecOp::MovdFromVec);
+      else if (pp == 2) ok = set(VecOp::Movq);
+      break;
+    case 0x6F: case 0x7F:
+      if (pp == 1 || pp == 2) { wide_ok = true; ok = set(op == 0x6F ? VecOp::Load : VecOp::Store); }
+      break;
+    case 0x70:
+      if (pp == 1) { imm8 = wide_ok = true; ok = set(VecOp::Pshufd); }
+      else if (pp >= 2) { imm8 = true; ok = set(VecOp::Pshuflw); } // dbl: low words
+      break;
+    case 0x63: case 0x67: case 0x6B: // packsswb, packuswb, packssdw
+      if (pp == 1) {
+        d.neon = a64::lanes(op == 0x67 ? a64::SQXTUN_V : a64::SQXTN_V, op == 0x6B ? 1 : 0);
+        d.vbin = VecBin::Narrow;
+        ok = set(VecOp::Packed);
+      }
+      break;
+    case 0x71: case 0x72: case 0x73: {
+      const u8 ext = d.m.reg & 7;
+      const bool bytes = op == 0x73 && (ext == 3 || ext == 7); // psrldq, pslldq
+      const bool word_or_dword = op != 0x73 && (ext == 2 || ext == 4 || ext == 6);
+      const bool qword = op == 0x73 && (ext == 2 || ext == 6);
+      if (pp == 1 && !mem && (bytes || word_or_dword || qword)) {
+        imm8 = true;
+        d.vlane = op == 0x71 ? 16 : op == 0x72 ? 32 : 64;
+        ok = set(VecOp::ShiftImm);
+      }
+      break;
+    }
+    case 0xE4: case 0xE5: // pmulhuw, pmulhw
+      if (pp == 1) { d.neon = op == 0xE4; d.vbin = VecBin::Pmulh; ok = set(VecOp::Packed); }
+      break;
+    case 0xF4: if (pp == 1) { d.vbin = VecBin::Pmuludq; ok = set(VecOp::Packed); } break;
+    case 0xF5: if (pp == 1) { d.vbin = VecBin::Pmaddwd; ok = set(VecOp::Packed); } break;
+    case 0x76: if (pp == 1) { d.dbl = false; ok = packed(VecBin::ICmpEq); } break;
+    case 0xC2: imm8 = true; ok = arith(VecBin::Cmp); break;
+    case 0xC6:
+      if (pp <= 1) { imm8 = wide_ok = true; ok = set(VecOp::Shuf); }
+      break;
+    case 0xD0: // addsubpd (66) / addsubps (F2)
+      if (pp == 1 || pp == 3) { d.dbl = pp == 1; ok = packed(VecBin::AddSub); }
+      break;
+    case 0xD4: case 0xFE: case 0xFA: case 0xFB:
+      if (pp == 1) {
+        d.dbl = op == 0xD4 || op == 0xFB;
+        ok = packed(op == 0xD4 || op == 0xFE ? VecBin::IAdd : VecBin::ISub);
+      }
+      break;
+    case 0xD6: if (pp == 1) ok = set(VecOp::MovqStore); break;
+    case 0xDB: case 0xDF: case 0xEB: case 0xEF:
+      if (pp == 1) {
+        ok = packed(op == 0xDB ? VecBin::And : op == 0xDF ? VecBin::Andn
+                    : op == 0xEB ? VecBin::Or : VecBin::Xor);
+      }
+      break;
+    default:
+      if (pp == 1 && neon_int_op(map, op)) {
+        d.neon = neon_int_op(map, op);
+        d.vbin = VecBin::Neon;
+        ok = set(VecOp::Packed);
+      }
+      break;
+    }
+  } else if (map == 2) {
+    if (op == 0x18 && vex && pp == 1 && !d.w64) { wide_ok = true; ok = set(VecOp::Broadcast); }
+    else if (pp == 1 && op == 0x00) { d.vbin = VecBin::Pshufb; ok = set(VecOp::Packed); }
+    else if (pp == 1 && op == 0x2B) { // packusdw
+      d.neon = a64::lanes(a64::SQXTUN_V, 1);
+      d.vbin = VecBin::Narrow;
+      ok = set(VecOp::Packed);
+    } else if (pp == 1 && ((op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35))) {
+      // pmovsx (2x) / pmovzx (3x): bw, bd, bq, wd, wq, dq
+      static constexpr u8 kSrc[6] = {8, 8, 8, 16, 16, 32};
+      static constexpr u8 kSteps[6] = {1, 2, 3, 1, 2, 1};
+      d.vlane = kSrc[op & 7];
+      d.vsteps = kSteps[op & 7];
+      d.dbl = op < 0x30; // sign extend
+      ok = set(VecOp::Pmovx);
+    } else if (pp == 1 && neon_int_op(map, op)) {
+      d.neon = neon_int_op(map, op);
+      d.vbin = VecBin::Neon;
+      ok = set(VecOp::Packed);
+    }
+  } else {
+    imm8 = true;
+    if (pp == 1) {
+      switch (op) {
+      case 0x04: if (vex && !d.w64) { wide_ok = true; ok = set(VecOp::Pshufd); } break;
+      case 0x05: if (vex && !d.w64) { wide_ok = true; ok = set(VecOp::Permilpd); } break;
+      case 0x18: if (vex && !d.w64 && d.l256) { wide_ok = true; ok = set(VecOp::Vinsert128); } break;
+      case 0x19: if (vex && !d.w64 && d.l256) { wide_ok = true; ok = set(VecOp::Vextract128); } break;
+      case 0x0C: case 0x0D: d.dbl = op == 0x0D; wide_ok = true; ok = set(VecOp::Blend); break;
+      case 0x16: d.dbl = d.w64; ok = set(VecOp::Pextr); break;
+      case 0x21: ok = set(VecOp::Insertps); break;
+      case 0x22: d.dbl = d.w64; ok = set(VecOp::Pinsr); break;
+      case 0x4A: case 0x4B:
+        if (vex && !d.w64) { d.dbl = op == 0x4B; wide_ok = true; ok = set(VecOp::Blendv); }
+        break;
+      default: break;
+      }
+    }
+  }
+  if (!ok || (d.l256 && !wide_ok))
+    return false;
+  if (imm8) {
+    if (pos >= avail)
+      return false;
+    d.imm = code[pos++];
+  }
+  // Compare predicates beyond the eight SSE ones (VEX imm 8-31) stay in the
+  // interpreter.
+  if ((d.vop == VecOp::Packed || d.vop == VecOp::Scalar) && d.vbin == VecBin::Cmp && d.imm >= 8)
+    return false;
+  d.rip = rip;
+  d.len = static_cast<u8>(pos);
+  return true;
 }
 
 /// Decode one instruction into a JitInsn. Returns false when the JIT does not
@@ -822,6 +1055,65 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
   usize pos = p.length;
   const u8 op0 = code[pos++];
   const u8 op_bits = p.op_bits();
+
+  // VEX prefix (C4/C5 are never LES/LDS in 64-bit mode). A 66/F2/F3/REX
+  // prefix in front of it is #UD: leave that to the interpreter.
+  if (op0 == 0xC4 || op0 == 0xC5) {
+    if (p.opsize16 || p.rep || p.has_rex)
+      return false;
+    const usize vex_len = op0 == 0xC5 ? 1 : 2;
+    if (pos + vex_len >= avail)
+      return false;
+    const u8 b1 = code[pos];
+    const u8 last = code[pos + vex_len - 1];
+    u8 map = 1;
+    p.rex_r = !(b1 & 0x80);
+    if (op0 == 0xC4) {
+      p.rex_x = !(b1 & 0x40);
+      p.rex_b = !(b1 & 0x20);
+      map = b1 & 0x1F;
+      p.rex_w = (last & 0x80) != 0;
+    }
+    pos += vex_len;
+    d.vex = true;
+    d.vvvv = static_cast<u8>((~last >> 3) & 0x0F);
+    d.l256 = (last & 4) != 0;
+    if (map < 1 || map > 3)
+      return false;
+    if (map == 2 && pos < avail && (code[pos] == 0xF2 || code[pos] == 0xF7)) {
+      // ANDN / BEXTR. (The other F7 forms, SHLX/SARX/SHRX, are BMI2, which
+      // the PS4's CPU does not have.)
+      if ((last & 3) != 0 || d.l256)
+        return false;
+      const bool andn = code[pos++] == 0xF2;
+      if (!x86::decode_modrm(code + pos, avail - pos, p, d.m))
+        return false;
+      pos += d.m.length;
+      d.kind = andn ? Kind::Andn : Kind::Bextr;
+      d.width = p.rex_w ? 64 : 32;
+      d.flags_written = CpuContext::FLAG_ZF | CpuContext::FLAG_CF | CpuContext::FLAG_OF |
+                        (andn ? u64{CpuContext::FLAG_SF} : u64{0});
+      d.rip = rip;
+      d.len = static_cast<u8>(pos);
+      return true;
+    }
+    return decode_vec(code, avail, pos, rip, map, last & 3, d);
+  }
+  // Legacy SSE: 0F xx, 0F 38 xx, 0F 3A xx with a 66/F3/F2 mandatory prefix.
+  if (op0 == 0x0F && pos < avail) {
+    u8 map = 1;
+    usize q = pos;
+    if (code[q] == 0x38 || code[q] == 0x3A) {
+      map = code[q] == 0x38 ? 2 : 3;
+      if (++q >= avail)
+        return false;
+    }
+    if (is_vec_opcode(map, code[q])) {
+      const u8 pp = p.rep == 0xF3 ? 2 : p.rep == 0xF2 ? 3 : p.opsize16 ? 1 : 0;
+      return decode_vec(code, avail, q, rip, map, pp, d);
+    }
+  }
+
   if (p.rep && op0 != 0x90) // F3 90 = PAUSE
     return false;
 
@@ -848,123 +1140,43 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return true;
   };
 
-  // VEX (C4 / C5): BMI1/BMI2 GPR ops and the scalar SSE subset. Legacy
-  // 66/F2/F3/REX prefixes before VEX are #UD; leave those to the interpreter.
-  if ((op0 == 0xC4 || op0 == 0xC5) && !p.opsize16 && !p.rep && !p.has_rex && !p.lock) {
-    if (pos + 2 > avail)
-      return false;
-    u8 map = 1;
-    bool w = false;
-    const u8 b1 = code[pos++];
-    p.rex_r = !(b1 & 0x80);
-    u8 b2 = b1;
-    if (op0 == 0xC4) {
-      p.rex_x = !(b1 & 0x40);
-      p.rex_b = !(b1 & 0x20);
-      map = b1 & 0x1F;
-      if (pos >= avail)
+  // CALL rel32, RET [imm16], CALL r/m64, JMP r/m64: block-ending transfers.
+  // 66-prefixed (16-bit) forms stay in the interpreter.
+  if (jit_translates_calls() && !p.opsize16) {
+    if (op0 == 0xE8) {
+      if (!imm(4))
         return false;
-      b2 = code[pos++];
-      w = (b2 & 0x80) != 0;
+      d.kind = Kind::CallRel;
+      finish();
+      d.target = rip + d.len + d.imm;
+      return true;
     }
-    p.rex_w = w;
-    d.vex_vvvv = static_cast<u8>((~b2 >> 3) & 15);
-    d.vex_l = (b2 & 4) != 0;
-    d.vex_pp = b2 & 3;
-    if (pos >= avail)
-      return false;
-    d.vex_op = code[pos++];
-    if (!modrm())
-      return false;
-    const u8 op = d.vex_op, pp = d.vex_pp;
-    if (map == 2 && op == 0xF7 && !d.vex_l) {
-      d.width = w ? 64 : 32;
-      if (pp == 0) {
-        d.kind = Kind::Bextr;
-        d.flags_written = CpuContext::FLAG_ZF | CpuContext::FLAG_CF | CpuContext::FLAG_OF;
-      } else {
-        d.kind = Kind::ShiftX;
-        d.alu_op = pp;
-      }
-      return finish();
-    }
-    if (map == 2 && op == 0xF2 && pp == 0 && !d.vex_l) {
-      d.kind = Kind::Andn;
-      d.width = w ? 64 : 32;
-      d.flags_written = CpuContext::FLAG_SF | CpuContext::FLAG_ZF | CpuContext::FLAG_CF |
-                        CpuContext::FLAG_OF;
-      return finish();
-    }
-    if (vec_supported(map, op, pp, d.vex_l, d.m)) {
-      d.kind = Kind::Vec;
-      d.reg = map;
-      d.width = w ? 64 : 32; // VMOVD/VMOVQ GPR width
-      if (map == 3 || (map == 1 && (op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73))) {
-        if (pos >= avail)
+    if (op0 == 0xC3 || op0 == 0xC2) {
+      if (op0 == 0xC2) {
+        if (!imm(2))
           return false;
-        d.imm = code[pos++];
+        d.imm &= 0xFFFF;
+      } else {
+        d.imm = 0;
       }
+      d.kind = Kind::Ret;
       return finish();
     }
-    if (map != 1)
-      return false;
-    const bool scalar = pp == 2 || pp == 3;
-    bool ok = false;
-    if ((op == 0x10 || op == 0x11 || op == 0x2A) && scalar)
-      ok = true;
-    else if ((op == 0x58 || op == 0x59 || (op >= 0x5C && op <= 0x5F)) && scalar)
-      ok = true;
-    else if ((op == 0x57 && pp <= 1) || (op == 0xEF && pp == 1))
-      ok = !d.vex_l || d.m.is_reg; // 256-bit only from registers
-    else if ((op == 0x2E || op == 0x2F) && pp <= 1) {
-      ok = true;
-      d.flags_written = FLAGS_ARITH | CpuContext::FLAG_AF;
+    if (op0 == 0xFF && pos < avail) {
+      x86::ModRM peek;
+      if (x86::decode_modrm(code + pos, avail - pos, p, peek) &&
+          ((peek.reg & 7) == 2 || (peek.reg & 7) == 4)) {
+        modrm();
+        d.kind = (d.m.reg & 7) == 2 ? Kind::CallInd : Kind::JmpInd;
+        d.width = 64;
+        return finish();
+      }
     }
-    if (!ok)
-      return false;
-    d.kind = Kind::Sse;
-    d.width = w ? 64 : 32; // VCVTSI2SS/SD source width
-    return finish();
   }
 
   // NOP / PAUSE (REX.B 90 is XCHG r8, rAX)
   if (op0 == 0x90 && !p.rex_b) {
     d.kind = Kind::Nop;
-    return finish();
-  }
-
-  // CWDE/CDQE (98), CDQ/CQO (99). 16-bit forms are left to the interpreter.
-  if ((op0 == 0x98 || op0 == 0x99) && op_bits != 16) {
-    d.kind = Kind::SignExt;
-    d.width = op_bits;
-    d.reg = op0 & 1;
-    return finish();
-  }
-
-  // IMUL r, r/m, imm32 / imm8 (32/64-bit)
-  if ((op0 == 0x69 || op0 == 0x6B) && op_bits != 16) {
-    if (!modrm() || !imm(op0 == 0x6B ? 1 : 4))
-      return false;
-    d.kind = Kind::Imul;
-    d.width = op_bits;
-    d.rm_is_dst = true; // marks the immediate form
-    d.flags_written = CpuContext::FLAG_CF | CpuContext::FLAG_OF;
-    return finish();
-  }
-
-  // SHL/SHR/SAR r/m32/64, CL. The count is only known at run time: a zero
-  // count leaves every flag alone, so the previous flags must be in rflags.
-  if (op0 == 0xD3 && op_bits != 16) {
-    if (!modrm())
-      return false;
-    const u8 sub = d.m.reg & 7;
-    if (sub < 4)
-      return false;
-    d.kind = Kind::ShiftCl;
-    d.width = op_bits;
-    d.alu_op = (sub == 6) ? 4 : sub;
-    d.flags_written = FLAGS_ARITH;
-    d.flags_read = FLAGS_ARITH;
     return finish();
   }
 
@@ -1030,15 +1242,11 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return finish();
   }
 
-  // ALU r/m, r and r, r/m: ADD/OR/AND/SUB/XOR/CMP; ADC/SBB at 32/64 bits
+  // ALU r/m, r and r, r/m: ADD/OR/AND/SUB/XOR/CMP (ADC/SBB not translated)
   if (op0 <= 0x3B && (op0 & 7) <= 3) {
     const u8 major = (op0 >> 3) & 7;
-    if ((major == 2 || major == 3) && ((op0 & 1) == 0 || op_bits == 16))
+    if (major == 2 || major == 3 || !modrm())
       return false;
-    if (!modrm())
-      return false;
-    if (major == 2 || major == 3)
-      d.flags_read = CpuContext::FLAG_CF;
     d.kind = Kind::Alu;
     d.alu_op = major;
     d.width = (op0 & 1) ? op_bits : 8;
@@ -1070,10 +1278,8 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     if (!modrm())
       return false;
     const u8 sub = d.m.reg & 7;
-    if ((sub == 2 || sub == 3) && (op0 == 0x80 || op_bits == 16))
-      return false;
     if (sub == 2 || sub == 3)
-      d.flags_read = CpuContext::FLAG_CF;
+      return false;
     d.width = (op0 == 0x80) ? 8 : op_bits;
     if (!imm(op0 == 0x81 ? imm_for(op_bits) : 1))
       return false;
@@ -1111,18 +1317,17 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return finish();
   }
 
-  // DIV / IDIV r/m32/64 (F7 /6 /7). Flags are left alone, as in the interpreter.
-  if (op0 == 0xF7 && op_bits != 16 && pos < avail && ((code[pos] >> 3) & 7) >= 6) {
-    if (!modrm())
-      return false;
-    d.kind = Kind::Div;
+  // CBW/CWDE/CDQE, CWD/CDQ/CQO
+  if (op0 == 0x98 || op0 == 0x99) {
+    d.kind = Kind::SignExt;
     d.width = op_bits;
-    d.alu_op = d.m.reg & 7;
+    d.reg = op0 & 1;
     return finish();
   }
 
-  // NOT / NEG r/m (F6/F7 /2 /3)
-  if ((op0 == 0xF6 || op0 == 0xF7) && pos < avail && (((code[pos] >> 3) & 7) == 2 || ((code[pos] >> 3) & 7) == 3)) {
+  // NOT / NEG r/m (F6/F7 /2 /3). LOCK forms were rejected above.
+  if ((op0 == 0xF6 || op0 == 0xF7) && pos < avail && ((code[pos] >> 3) & 7) >= 2 &&
+      ((code[pos] >> 3) & 7) <= 3) {
     if (!modrm())
       return false;
     d.width = (op0 == 0xF6) ? 8 : op_bits;
@@ -1132,6 +1337,34 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
       d.kind = Kind::Neg;
       d.flags_written = FLAGS_ARITH;
     }
+    return finish();
+  }
+
+  // IMUL r, r/m, imm8 / imm16/32 (sign-extended). Only CF and OF are written.
+  if (op0 == 0x69 || op0 == 0x6B) {
+    if (!modrm())
+      return false;
+    d.width = op_bits;
+    if (!imm(op0 == 0x6B ? 1 : imm_for(op_bits)))
+      return false;
+    d.kind = Kind::Imul;
+    d.imm_form = true;
+    d.flags_written = CpuContext::FLAG_CF | CpuContext::FLAG_OF;
+    return finish();
+  }
+
+  // Shifts and rotates by CL. The count is only known at run time and a
+  // count of 0 changes no flag, so the liveness pass may not treat these as
+  // flag writers (flags_written = 0); the code writes the flags itself.
+  if (op0 == 0xD2 || op0 == 0xD3) {
+    if (!modrm())
+      return false;
+    const u8 sub = d.m.reg & 7;
+    if (sub == 2 || sub == 3 || sub == 6) // RCL/RCR, and the SAL alias
+      return false;
+    d.kind = Kind::ShiftCl;
+    d.width = (op0 == 0xD3) ? op_bits : 8;
+    d.alu_op = sub;
     return finish();
   }
 
@@ -1153,10 +1386,10 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     return finish();
   }
 
-  // SHL/SAL/SHR/SAR r/m, imm8 / 1. The count is known at compile time, so
-  // the interpreter's semantics (incl. count 0 = no-op and counts >= the
-  // operand size for 8/16-bit) are reproduced exactly. Rotates and shifts by
-  // CL are not translated.
+  // SHL/SAL/SHR/SAR/ROL/ROR r/m, imm8 / 1. The count is known at compile
+  // time, so the interpreter's semantics (incl. count 0 = no-op and counts >=
+  // the operand size for 8/16-bit) are reproduced exactly. RCL/RCR are not
+  // translated.
   if (op0 == 0xC0 || op0 == 0xC1 || op0 == 0xD0 || op0 == 0xD1) {
     if (!modrm())
       return false;
@@ -1171,11 +1404,10 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
       d.imm = 1;
     }
     d.imm &= (d.width == 64) ? 0x3F : 0x1F;
-    if (sub < 2) {
-      // ROL / ROR: CF always (once the count is non-zero), OF for count 1.
-      d.kind = Kind::RotImm;
+    if (sub < 2) { // ROL / ROR imm: the CL path with a constant count
+      d.kind = Kind::ShiftCl;
       d.alu_op = sub;
-      d.flags_written = d.imm ? (CpuContext::FLAG_CF | (d.imm == 1 ? CpuContext::FLAG_OF : 0)) : 0;
+      d.imm_form = true;
       return finish();
     }
     d.kind = Kind::ShiftImm;
@@ -1189,13 +1421,6 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     if (!modrm())
       return false;
     const u8 sub = d.m.reg & 7;
-    if (op0 == 0xFF && (sub == 2 || sub == 4)) { // CALL / JMP r/m64
-      if (p.opsize16)
-        return false;
-      d.kind = sub == 2 ? Kind::CallInd : Kind::JmpInd;
-      d.width = 64;
-      return finish();
-    }
     if (op0 == 0xFF && sub == 6) {
       if (p.opsize16) // the interpreter always pushes 8 bytes
         return false;
@@ -1230,20 +1455,6 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     if (p.opsize16 || !imm(op0 == 0x6A ? 1 : 4))
       return false;
     d.kind = Kind::PushImm;
-    return finish();
-  }
-
-  // CALL rel32 / RET (66-prefixed forms are left to the interpreter)
-  if (op0 == 0xE8 && !p.opsize16) {
-    if (!imm(4))
-      return false;
-    d.kind = Kind::CallRel;
-    finish();
-    d.target = rip + d.len + d.imm;
-    return true;
-  }
-  if (op0 == 0xC3 && !p.opsize16) {
-    d.kind = Kind::Ret;
     return finish();
   }
 
@@ -1306,16 +1517,6 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
       return finish();
     }
 
-    // IMUL r, r/m (32/64-bit)
-    if (op1 == 0xAF && op_bits != 16) {
-      if (!modrm())
-        return false;
-      d.kind = Kind::Imul;
-      d.width = op_bits;
-      d.flags_written = CpuContext::FLAG_CF | CpuContext::FLAG_OF;
-      return finish();
-    }
-
     // Multi-byte NOP: 0F 1F /0
     if (op1 == 0x1F) {
       if (!modrm())
@@ -1336,6 +1537,38 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
       d.width = op_bits;
       d.src_width = word_src ? 16 : 8;
       d.sign_extend = op1 >= 0xBE;
+      return finish();
+    }
+
+    // IMUL r, r/m
+    if (op1 == 0xAF) {
+      if (!modrm())
+        return false;
+      d.kind = Kind::Imul;
+      d.width = op_bits;
+      d.flags_written = CpuContext::FLAG_CF | CpuContext::FLAG_OF;
+      return finish();
+    }
+
+    // BT/BTS/BTR/BTC r/m, r and r/m, imm8. The memory form with a register
+    // bit offset addresses a bit string beyond the operand; it stays in the
+    // interpreter.
+    if (op1 == 0xA3 || op1 == 0xAB || op1 == 0xB3 || op1 == 0xBB || op1 == 0xBA) {
+      if (!modrm())
+        return false;
+      if (op1 == 0xBA) {
+        if ((d.m.reg & 7) < 4 || !imm(1))
+          return false;
+        d.alu_op = (d.m.reg & 7) - 4;
+        d.imm_form = true;
+      } else {
+        if (!d.m.is_reg)
+          return false;
+        d.alu_op = op1 == 0xA3 ? 0 : op1 == 0xAB ? 1 : op1 == 0xB3 ? 2 : 3;
+      }
+      d.kind = Kind::BitTest;
+      d.width = op_bits;
+      d.flags_written = CpuContext::FLAG_CF;
       return finish();
     }
   }
@@ -1431,6 +1664,42 @@ public:
       if (d.writes_result)
         store_rm(0, w);
       break;
+    case Kind::Bextr: {
+      // Shifting or masking by 64 or more needs the explicit selects; ARM
+      // takes the amount modulo 64. A 32-bit source is zero-extended, so 64-bit
+      // arithmetic gives the 32-bit answer as well.
+      load_rm(0, w);
+      load_gpr(1, d.vvvv, w);
+      m_e.ubfx(false, 2, 1, 0, 8); // start
+      m_e.ubfx(false, 3, 1, 8, 8); // length
+      m_e.movz(true, 6, 64);
+      m_e.lsrv(true, 0, 0, 2);
+      m_e.cmp_reg(true, 2, 6);
+      m_e.emit(a64::csel(true, 0, 0, 31, COND_CC));
+      m_e.movz(true, 5, 1);
+      m_e.emit(a64::lslv(true, 5, 5, 3));
+      m_e.sub_imm(5, 5, 1);
+      m_e.cmp_reg(true, 3, 6);
+      m_e.mov_imm64(4, ~u64{0});
+      m_e.emit(a64::csel(true, 5, 5, 4, COND_CC));
+      m_e.and_reg(0, 0, 5);
+      store_gpr(d.m.reg, w, 0);
+      if (flags_needed) {
+        m_e.ands_shifted(true, 31, 0, 0); // Z from the result, C = V = 0
+        emit_flags(false, d.flags_written, 0);
+      }
+      break;
+    }
+    case Kind::Andn:
+      load_rm(0, w);
+      load_gpr(1, d.vvvv, w);
+      m_e.bic_shifted(w == 64, 0, 0, 1);
+      store_gpr(d.m.reg, w, 0);
+      if (flags_needed) {
+        m_e.ands_shifted(w == 64, 31, 0, 0); // N/Z from the result, C = V = 0
+        emit_flags(false, d.flags_written, 0);
+      }
+      break;
     case Kind::IncDec:
       load_rm(0, w);
       m_e.movz(false, 1, 1);
@@ -1455,28 +1724,21 @@ public:
       m_e.str_x_idx(0, R_GBASE, R_EA);
       m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
       break;
-    case Kind::Pop:
-      m_e.ldr_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
-      emit_bounds_check();
-      m_e.ldr_x_idx(0, R_GBASE, R_EA);
-      m_e.add_imm(R_EA, R_EA, 8);
-      m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
-      store_gpr(d.reg, 64, 0); // after RSP, so POP RSP keeps the popped value
+    case Kind::Vec:
+      emit_vec(d);
       break;
-    case Kind::ShiftCl:
-      emit_shift_cl(d, flags_needed);
-      break;
-    case Kind::RotImm:
-      emit_rotate(d, flags_needed);
-      break;
-    case Kind::Imul:
-      emit_imul(d, flags_needed);
-      break;
-    case Kind::Neg:
-      m_e.movz(true, 0, 0);
-      load_rm(1, w);
-      emit_alu(ALU_SUB, w, d.flags_written, flags_needed);
-      store_rm(0, w);
+    case Kind::SignExt:
+      if (d.reg == 0) { // CBW / CWDE / CDQE
+        load_gpr(0, 0, w / 2);
+        m_e.sxt(true, 0, 0, w / 2);
+        store_gpr(0, w, 0);
+      } else {          // CWD / CDQ / CQO: rDX = sign of rAX
+        load_gpr(0, 0, w);
+        if (w < 64)
+          m_e.sxt(true, 0, 0, w);
+        m_e.asr_imm(true, 0, 0, 63);
+        store_gpr(2, w, 0);
+      }
       break;
     case Kind::Not:
       load_rm(0, w);
@@ -1484,76 +1746,57 @@ public:
       m_e.eor_reg(0, 0, 1);
       store_rm(0, w);
       break;
-    case Kind::SignExt:
-      if (d.reg == 0) { // CWDE / CDQE
-        load_gpr(0, 0, w / 2);
-        m_e.sxt(true, 0, 0, static_cast<u8>(w / 2));
-        store_gpr(0, w, 0);
-      } else {          // CDQ / CQO
-        load_gpr(0, 0, w);
-        if (w == 32)
-          m_e.sxt(true, 0, 0, 32);
-        m_e.asr_imm(true, 0, 0, 63);
-        store_gpr(2, w, 0);
-      }
+    case Kind::Neg: // 0 - x: CF = (x != 0), as SUB computes it
+      load_rm(1, w);
+      m_e.movz(true, 0, 0);
+      emit_alu(ALU_SUB, w, d.flags_written, flags_needed);
+      store_rm(0, w);
       break;
-    case Kind::Bextr:
-      emit_bextr(d, flags_needed);
+    case Kind::Imul:
+      emit_imul(d, flags_needed);
       break;
-    case Kind::ShiftX: {
-      const bool sf = w == 64;
-      load_rm(0, w);
-      load_gpr(1, d.vex_vvvv, w); // the count is masked by the shift itself
-      if (d.alu_op == 1)
-        m_e.lslv(sf, 0, 0, 1);
-      else if (d.alu_op == 2)
-        m_e.asrv(sf, 0, 0, 1);
-      else
-        m_e.lsrv(sf, 0, 0, 1);
-      store_gpr(d.m.reg, w, 0);
+    case Kind::ShiftCl:
+      emit_shift_cl(d);
       break;
-    }
-    case Kind::Andn: {
-      const bool sf = w == 64;
-      load_rm(0, w);
-      load_gpr(1, d.vex_vvvv, w);
-      m_e.bic_shifted(sf, 0, 0, 1); // rm & ~src1
-      if (flags_needed) {
-        m_e.ands_shifted(sf, 31, 0, 0);
-        emit_flags(false, d.flags_written, 0);
-      }
-      store_gpr(d.m.reg, w, 0);
-      break;
-    }
-    case Kind::Sse:
-      emit_sse(d, flags_needed);
+    case Kind::BitTest:
+      emit_bit_test(d);
       break;
     case Kind::CallRel:
     case Kind::CallInd:
+      // The indirect target is read first (with the old RSP, as on hardware).
       if (d.kind == Kind::CallInd)
-        load_rm(12, 64); // target, read before RSP moves
+        load_rm(0, 64);
+      else
+        m_e.mov_imm64(0, d.target);
       m_e.ldr_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
       m_e.sub_imm(R_EA, R_EA, 8);
       emit_bounds_check();
-      m_e.mov_imm64(0, d.rip + d.len);
-      m_e.str_x_idx(0, R_GBASE, R_EA);
+      m_e.mov_imm64(1, d.rip + d.len);
+      m_e.str_x_idx(1, R_GBASE, R_EA);
       m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      m_e.str_reg(0, R_CTX, offsetof(CpuContext, rip));
       break;
     case Kind::JmpInd:
-      load_rm(12, 64);
-      break;
-    case Kind::Div:
-      emit_div(d);
-      break;
-    case Kind::Vec:
-      emit_vec(d);
+      load_rm(0, 64);
+      m_e.str_reg(0, R_CTX, offsetof(CpuContext, rip));
       break;
     case Kind::Ret:
       m_e.ldr_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
       emit_bounds_check();
-      m_e.ldr_x_idx(12, R_GBASE, R_EA);
+      m_e.ldr_x_idx(0, R_GBASE, R_EA);
+      m_e.add_imm(R_EA, R_EA, 8);
+      if (d.imm)
+        m_e.add_imm64(R_EA, R_EA, static_cast<i64>(d.imm), 11);
+      m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      m_e.str_reg(0, R_CTX, offsetof(CpuContext, rip));
+      break;
+    case Kind::Pop:
+      m_e.ldr_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      emit_bounds_check();
+      m_e.ldr_x_idx(0, R_GBASE, R_EA);
       m_e.add_imm(R_EA, R_EA, 8);
       m_e.str_reg(R_EA, R_CTX, offsetof(CpuContext, rsp));
+      store_gpr(d.reg, 64, 0); // after RSP, so POP RSP keeps the popped value
       break;
     }
   }
@@ -1565,7 +1808,7 @@ public:
       m_e.mov_imm64(0, x.rip);
       m_e.str_reg(0, R_CTX, offsetof(CpuContext, rip));
       m_e.mov_imm64(0, x.retired);
-      m_e.add_reg(0, 0, 22); // plus what chained blocks before this one retired
+      m_e.add_reg(0, 0, 24); // plus the earlier blocks of the chain
       m_e.emit_epilogue();
     }
     m_exits.clear();
@@ -1717,10 +1960,573 @@ private:
   /// if (x9 > guest_size - 8) side-exit with RIP at the current instruction.
   /// Accesses starting in the last 8 bytes of guest memory also take the
   /// exit; the interpreter then performs them with its own bounds checks.
-  void emit_bounds_check() {
-    m_e.cmp_reg(true, R_EA, R_GLIMIT);
+  /// Wider accesses (`bytes` > 8) check their last 8 bytes the same way.
+  void emit_bounds_check(u32 bytes = 8) {
+    if (bytes > 8) {
+      m_e.add_imm(10, R_EA, bytes - 8);
+      m_e.cmp_reg(true, 10, R_GLIMIT);
+    } else {
+      m_e.cmp_reg(true, R_EA, R_GLIMIT);
+    }
     m_exits.push_back({m_e.pos(), m_cur->rip, m_retired});
     m_e.b_cond(COND_HI, 0); // patched in emit_side_exits()
+  }
+
+  // ---- SSE / AVX ---------------------------------------------------------
+  // Guest XMM/YMM registers live in ctx->ymm; v0-v3 and v31 are scratch
+  // (caller-saved, so the block needs no NEON save/restore).
+
+  static u32 xmm_off(u8 r, u32 byte = 0) {
+    return static_cast<u32>(offsetof(CpuContext, ymm)) + 32u * r + byte;
+  }
+  void vld(u8 vt, u8 r, u32 half) { m_e.emit(a64::ldr_q(vt, R_CTX, xmm_off(r, 16 * half))); }
+  void vst(u8 vt, u8 r, u32 half) { m_e.emit(a64::str_q(vt, R_CTX, xmm_off(r, 16 * half))); }
+  void zero_upper(u8 r) {
+    m_e.emit(a64::movi_zero(31));
+    vst(31, r, 1);
+  }
+  // Register holding EA + off (x9 itself, or x10).
+  u8 ea_plus(u32 off) {
+    if (off == 0)
+      return R_EA;
+    m_e.add_imm(10, R_EA, off);
+    return 10;
+  }
+  void mld_q(u8 vt, u32 off = 0) { m_e.emit(a64::ldr_q_x(vt, R_GBASE, ea_plus(off))); }
+  void mst_q(u8 vt, u32 off = 0) { m_e.emit(a64::str_q_x(vt, R_GBASE, ea_plus(off))); }
+  // Scalar load/store of lane 0 (4 or 8 bytes); a load zeroes the rest of vt.
+  void mld_lane(bool dbl, u8 vt) {
+    m_e.emit(dbl ? a64::ldr_d_x(vt, R_GBASE, R_EA) : a64::ldr_s_x(vt, R_GBASE, R_EA));
+  }
+  void mst_lane(bool dbl, u8 vt) {
+    m_e.emit(dbl ? a64::str_d_x(vt, R_GBASE, R_EA) : a64::str_s_x(vt, R_GBASE, R_EA));
+  }
+  void ctx_ld_lane(bool dbl, u8 vt, u8 r, u32 byte = 0) {
+    m_e.emit(dbl ? a64::ldr_d(vt, R_CTX, xmm_off(r, byte)) : a64::ldr_s(vt, R_CTX, xmm_off(r, byte)));
+  }
+  void ins(bool dbl, u8 d, u32 i, u8 n, u32 j) { m_e.emit(a64::ins_elem(dbl, d, i, n, j)); }
+  // vt = half `half` of the rm operand (register or memory).
+  void ld_rm_q(u8 vt, u32 half) {
+    if (m_cur->m.is_reg)
+      vld(vt, m_cur->m.rm, half);
+    else
+      mld_q(vt, 16 * half);
+  }
+  // vt lane 0 = the scalar rm operand.
+  void ld_rm_lane(bool dbl, u8 vt) {
+    if (m_cur->m.is_reg)
+      ctx_ld_lane(dbl, vt, m_cur->m.rm);
+    else
+      mld_lane(dbl, vt);
+  }
+
+  static u32 vec_mem_bytes(const JitInsn &d) {
+    switch (d.vop) {
+    case VecOp::Load: case VecOp::Store: case VecOp::Packed: case VecOp::Shuf:
+    case VecOp::Pshufd: case VecOp::Blend: case VecOp::Blendv: case VecOp::Moveldup:
+    case VecOp::Movehdup: case VecOp::Pshuflw: case VecOp::Permilpd:
+      return d.l256 ? 32 : 16;
+    case VecOp::Vinsert128: case VecOp::Vextract128:
+      return 16;
+    case VecOp::Pmovx:
+      return 16u >> d.vsteps;
+    case VecOp::Movddup:
+      return d.l256 ? 32 : 8;
+    case VecOp::LoadScalar: case VecOp::StoreScalar: case VecOp::Scalar: case VecOp::Ucomi:
+    case VecOp::CvtF2F: case VecOp::CvttF2I:
+      return d.dbl ? 8 : 4;
+    case VecOp::Insertps: case VecOp::Broadcast:
+      return 4;
+    case VecOp::MovdToVec: case VecOp::MovdFromVec: case VecOp::CvtI2F: case VecOp::Pextr:
+    case VecOp::Pinsr:
+      return d.w64 ? 8 : 4;
+    default: // Movq, MovqStore, LoadLow/High, StoreLow/High
+      return 8;
+    }
+  }
+
+  /// x86 returns the negative "QNaN indefinite" where an operation creates a
+  /// NaN from non-NaN inputs (0/0, sqrt(-1), inf - inf); ARM's default NaN is
+  /// positive. Set the sign of such lanes of v2 (inputs v0, v1; `unary`: v1
+  /// only). Clobbers v3-v5.
+  void emit_x86_nan(bool dbl, bool unary) {
+    m_e.emit(a64::fcmeq_v(dbl, 3, 2, 2));            // result is a number
+    m_e.emit(a64::fcmeq_v(dbl, 4, unary ? 1 : 0, unary ? 1 : 0));
+    m_e.emit(a64::fcmeq_v(dbl, 5, 1, 1));
+    m_e.emit(a64::and_v(4, 4, 5));                   // inputs are numbers
+    m_e.emit(a64::bic_v(4, 4, 3));                   // ... but the result is not
+    m_e.emit(a64::shl_sign(dbl, 4, 4));
+    m_e.emit(a64::orr_v(2, 2, 4));
+  }
+
+  /// v2 = v0 OP v1 (all lanes; scalar callers use lane 0). Clobbers v3-v5.
+  void emit_vbin(const JitInsn &d) {
+    const bool dbl = d.dbl;
+    switch (d.vbin) {
+    case VecBin::Add: m_e.emit(a64::fadd_v(dbl, 2, 0, 1)); emit_x86_nan(dbl, false); break;
+    case VecBin::Sub: m_e.emit(a64::fsub_v(dbl, 2, 0, 1)); emit_x86_nan(dbl, false); break;
+    case VecBin::Mul: m_e.emit(a64::fmul_v(dbl, 2, 0, 1)); emit_x86_nan(dbl, false); break;
+    case VecBin::Div: m_e.emit(a64::fdiv_v(dbl, 2, 0, 1)); emit_x86_nan(dbl, false); break;
+    // x86 MIN/MAX return the second operand unless the comparison holds
+    // (NaNs and equal zeros included): a < b ? a : b, a > b ? a : b.
+    case VecBin::Min:
+      m_e.emit(a64::fcmgt_v(dbl, 2, 1, 0));
+      m_e.emit(a64::bsl_v(2, 0, 1));
+      break;
+    case VecBin::Max:
+      m_e.emit(a64::fcmgt_v(dbl, 2, 0, 1));
+      m_e.emit(a64::bsl_v(2, 0, 1));
+      break;
+    case VecBin::Sqrt: m_e.emit(a64::fsqrt_v(dbl, 2, 1)); emit_x86_nan(dbl, true); break;
+    case VecBin::And: m_e.emit(a64::and_v(2, 0, 1)); break;
+    case VecBin::Andn: m_e.emit(a64::bic_v(2, 1, 0)); break; // ~a & b
+    case VecBin::Or: m_e.emit(a64::orr_v(2, 0, 1)); break;
+    case VecBin::Xor: m_e.emit(a64::eor_v(2, 0, 1)); break;
+    case VecBin::UnpckLo: m_e.emit(a64::zip1(dbl, 2, 0, 1)); break;
+    case VecBin::UnpckHi: m_e.emit(a64::zip2(dbl, 2, 0, 1)); break;
+    case VecBin::AddSub: // even lanes a - b, odd lanes a + b
+      m_e.emit(a64::fsub_v(dbl, 2, 0, 1));
+      m_e.emit(a64::fadd_v(dbl, 3, 0, 1));
+      ins(dbl, 2, 1, 3, 1);
+      if (!dbl)
+        ins(false, 2, 3, 3, 3);
+      emit_x86_nan(dbl, false);
+      break;
+    case VecBin::IAdd: m_e.emit(a64::add_v(dbl, 2, 0, 1)); break;
+    case VecBin::ISub: m_e.emit(a64::sub_v(dbl, 2, 0, 1)); break;
+    case VecBin::ICmpEq: m_e.emit(a64::cmeq_v(2, 0, 1)); break;
+    case VecBin::Neon: m_e.emit(a64::rd_rn_rm(d.neon, 2, 0, 1)); break;
+    case VecBin::Narrow:
+      m_e.emit(a64::rd_rn(d.neon, 2, 0));
+      m_e.emit(a64::rd_rn(d.neon | a64::NARROW_HIGH, 2, 1));
+      break;
+    case VecBin::Pmulh:
+      m_e.emit(d.neon ? a64::umull_h(3, 0, 1) : a64::smull_h(3, 0, 1));
+      m_e.emit(d.neon ? a64::umull2_h(4, 0, 1) : a64::smull2_h(4, 0, 1));
+      m_e.emit(a64::uzp2_h(2, 3, 4));
+      break;
+    case VecBin::Pmaddwd:
+      m_e.emit(a64::smull_h(3, 0, 1));
+      m_e.emit(a64::smull2_h(4, 0, 1));
+      m_e.emit(a64::addp_s(2, 3, 4));
+      break;
+    case VecBin::Pmuludq:
+      m_e.emit(a64::xtn_s(3, 0));
+      m_e.emit(a64::xtn_s(4, 1));
+      m_e.emit(a64::umull_s(2, 3, 4));
+      break;
+    case VecBin::Pshufb: // an index with bit 7 set selects 0, as TBL's out-of-range does
+      m_e.emit(a64::movi_16b(3, 0x8F));
+      m_e.emit(a64::and_v(3, 1, 3));
+      m_e.emit(a64::tbl_16b(2, 0, 3));
+      break;
+    case VecBin::Cmp: {
+      const u32 pred = d.imm & 7;
+      switch (pred & 3) {
+      case 0: m_e.emit(a64::fcmeq_v(dbl, 2, 0, 1)); break; // EQ / NEQ
+      case 1: m_e.emit(a64::fcmgt_v(dbl, 2, 1, 0)); break; // LT / NLT
+      case 2: m_e.emit(a64::fcmge_v(dbl, 2, 1, 0)); break; // LE / NLE
+      default:                                            // ORD / UNORD
+        m_e.emit(a64::fcmeq_v(dbl, 2, 0, 0));
+        m_e.emit(a64::fcmeq_v(dbl, 3, 1, 1));
+        m_e.emit(a64::and_v(2, 2, 3));
+        break;
+      }
+      // Predicates 3-6 are the negations of 7, 0, 1, 2.
+      if (pred >= 3 && pred <= 6)
+        m_e.emit(a64::not_v(2, 2));
+      break;
+    }
+    }
+  }
+
+  void emit_vec(const JitInsn &d) {
+    const bool mem = !d.m.is_reg;
+    if (mem) {
+      emit_ea(d.m, d.rip + d.len, d.p.seg);
+      emit_bounds_check(vec_mem_bytes(d));
+    }
+    const u8 dst = d.m.reg, rm = d.m.rm;
+    const u8 src1 = d.vex ? d.vvvv : dst;
+    const u32 halves = d.l256 ? 2 : 1;
+    const bool dbl = d.dbl;
+    const u32 imm = static_cast<u32>(d.imm & 0xFF);
+    // A VEX.128 write zeroes bits 255:128; VEX.256 wrote both halves.
+    auto done = [&](u8 r) {
+      if (d.vex && !d.l256)
+        zero_upper(r);
+    };
+    switch (d.vop) {
+    case VecOp::Load:
+      for (u32 h = 0; h < halves; ++h) {
+        ld_rm_q(0, h);
+        vst(0, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Store:
+      for (u32 h = 0; h < halves; ++h) {
+        vld(0, dst, h);
+        if (mem)
+          mst_q(0, 16 * h);
+        else
+          vst(0, rm, h);
+      }
+      if (!mem)
+        done(rm);
+      break;
+    case VecOp::LoadScalar:
+      if (mem) {
+        mld_lane(dbl, 0); // zero-extended to 128 bits
+      } else {
+        vld(0, src1, 0);
+        vld(1, rm, 0);
+        ins(dbl, 0, 0, 1, 0);
+      }
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::StoreScalar:
+      if (mem) {
+        ctx_ld_lane(dbl, 0, dst);
+        mst_lane(dbl, 0);
+      } else {
+        vld(0, d.vex ? d.vvvv : rm, 0);
+        vld(1, dst, 0);
+        ins(dbl, 0, 0, 1, 0);
+        vst(0, rm, 0);
+        done(rm);
+      }
+      break;
+    case VecOp::Movq:
+      if (mem)
+        mld_lane(true, 0);
+      else
+        ctx_ld_lane(true, 0, rm);
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::MovqStore:
+      ctx_ld_lane(true, 0, dst);
+      if (mem) {
+        mst_lane(true, 0);
+      } else {
+        vst(0, rm, 0);
+        done(rm);
+      }
+      break;
+    case VecOp::MovdToVec:
+      load_rm(0, d.w64 ? 64 : 32);
+      m_e.emit(d.w64 ? a64::fmov_d_x(0, 0) : a64::fmov_s_w(0, 0)); // zero-extends
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::MovdFromVec:
+      if (d.w64)
+        m_e.ldr_reg(0, R_CTX, xmm_off(dst));
+      else
+        m_e.ldr_w(0, R_CTX, xmm_off(dst));
+      store_rm(0, d.w64 ? 64 : 32);
+      break;
+    case VecOp::LoadLow:
+    case VecOp::LoadHigh:
+      vld(0, src1, 0);
+      mld_lane(true, 1);
+      ins(true, 0, d.vop == VecOp::LoadHigh ? 1 : 0, 1, 0);
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::Movhlps:
+    case VecOp::Movlhps:
+      vld(0, src1, 0);
+      vld(1, rm, 0);
+      if (d.vop == VecOp::Movhlps)
+        ins(true, 0, 0, 1, 1);
+      else
+        ins(true, 0, 1, 1, 0);
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::StoreLow:
+    case VecOp::StoreHigh:
+      ctx_ld_lane(true, 0, dst, d.vop == VecOp::StoreHigh ? 8 : 0);
+      mst_lane(true, 0);
+      break;
+    case VecOp::Moveldup:
+    case VecOp::Movehdup:
+      for (u32 h = 0; h < halves; ++h) {
+        ld_rm_q(1, h);
+        m_e.emit(d.vop == VecOp::Moveldup ? a64::trn1(2, 1, 1) : a64::trn2(2, 1, 1));
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Movddup:
+      for (u32 h = 0; h < halves; ++h) {
+        if (mem && !d.l256)
+          mld_lane(true, 1);
+        else
+          ld_rm_q(1, h);
+        m_e.emit(a64::dup_elem(true, 2, 1, 0));
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Packed:
+      for (u32 h = 0; h < halves; ++h) {
+        if (d.vbin != VecBin::Sqrt)
+          vld(0, src1, h);
+        ld_rm_q(1, h);
+        emit_vbin(d);
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Scalar:
+      vld(0, src1, 0);
+      ld_rm_lane(dbl, 1);
+      emit_vbin(d);
+      ins(dbl, 0, 0, 2, 0);
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::Ucomi: {
+      // ZF, PF, CF = 111 unordered, 000 greater, 001 less, 100 equal;
+      // OF, SF and AF are cleared. After FCMP: less or unordered = LT,
+      // unordered = VS, equal = EQ.
+      ctx_ld_lane(dbl, 0, dst);
+      ld_rm_lane(dbl, 1);
+      m_e.emit(a64::fcmp_s(dbl, 0, 1));
+      m_e.cset(true, 3, 11); // LT -> CF
+      m_e.cset(true, 4, 6);  // VS -> PF
+      m_e.cset(true, 5, 0);  // EQ
+      m_e.orr_reg(5, 5, 4);  // ZF = equal or unordered
+      m_e.bfi(true, 3, 4, 2, 1);
+      m_e.bfi(true, 3, 5, 6, 1);
+      m_e.ldr_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      m_e.mov_imm64(5, FLAGS_ARITH | CpuContext::FLAG_AF);
+      m_e.bic_shifted(true, 4, 4, 5);
+      m_e.orr_shifted(true, 4, 4, 3);
+      m_e.str_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      break;
+    }
+    case VecOp::Shuf:
+      for (u32 h = 0; h < halves; ++h) {
+        vld(0, src1, h);
+        ld_rm_q(1, h);
+        if (!dbl) {
+          ins(false, 2, 0, 0, imm & 3);
+          ins(false, 2, 1, 0, (imm >> 2) & 3);
+          ins(false, 2, 2, 1, (imm >> 4) & 3);
+          ins(false, 2, 3, 1, (imm >> 6) & 3);
+        } else {
+          ins(true, 2, 0, 0, (imm >> (2 * h)) & 1);
+          ins(true, 2, 1, 1, (imm >> (2 * h + 1)) & 1);
+        }
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Pshufd:
+      for (u32 h = 0; h < halves; ++h) {
+        ld_rm_q(1, h);
+        for (u32 i = 0; i < 4; ++i)
+          ins(false, 2, i, 1, (imm >> (2 * i)) & 3);
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Blend: {
+      const u32 lanes = dbl ? 2 : 4;
+      for (u32 h = 0; h < halves; ++h) {
+        vld(0, src1, h);
+        ld_rm_q(1, h);
+        m_e.emit(a64::mov_v(2, 0));
+        for (u32 i = 0; i < lanes; ++i)
+          if ((imm >> (i + lanes * h)) & 1)
+            ins(dbl, 2, i, 1, i);
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    }
+    case VecOp::Blendv: {
+      const u8 mask = static_cast<u8>((imm >> 4) & 15);
+      for (u32 h = 0; h < halves; ++h) {
+        vld(0, src1, h);
+        ld_rm_q(1, h);
+        vld(3, mask, h);
+        m_e.emit(a64::sshr_sign(dbl, 3, 3));
+        m_e.emit(a64::bsl_v(3, 1, 0)); // sign set ? src2 : src1
+        vst(3, dst, h);
+      }
+      done(dst);
+      break;
+    }
+    case VecOp::Insertps: {
+      vld(0, src1, 0);
+      u32 from = 0;
+      if (mem) {
+        mld_lane(false, 1);
+      } else {
+        vld(1, rm, 0);
+        from = (imm >> 6) & 3;
+      }
+      ins(false, 0, (imm >> 4) & 3, 1, from);
+      if (imm & 15) {
+        m_e.emit(a64::movi_zero(31));
+        for (u32 k = 0; k < 4; ++k)
+          if ((imm >> k) & 1)
+            ins(false, 0, k, 31, 0);
+      }
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    }
+    case VecOp::Broadcast:
+      ld_rm_lane(false, 1);
+      m_e.emit(a64::dup_elem(false, 2, 1, 0));
+      for (u32 h = 0; h < halves; ++h)
+        vst(2, dst, h);
+      done(dst);
+      break;
+    case VecOp::Pextr: // ModRM.reg is the XMM source, rm the destination
+      if (d.w64)
+        m_e.ldr_reg(0, R_CTX, xmm_off(dst, 8 * (imm & 1)));
+      else
+        m_e.ldr_w(0, R_CTX, xmm_off(dst, 4 * (imm & 3)));
+      store_rm(0, d.w64 ? 64 : 32);
+      break;
+    case VecOp::ShiftImm: {
+      const u8 to = d.vex ? d.vvvv : rm;
+      const u32 ext = dst & 7, esize = d.vlane;
+      vld(1, rm, 0);
+      if (esize == 64 && (ext == 3 || ext == 7)) { // psrldq, pslldq: whole bytes
+        m_e.emit(a64::movi_zero(31));
+        if (imm == 0)
+          m_e.emit(a64::mov_v(2, 1));
+        else if (imm >= 16)
+          m_e.emit(a64::movi_zero(2));
+        else if (ext == 3)
+          m_e.emit(a64::ext_16b(2, 1, 31, imm));
+        else
+          m_e.emit(a64::ext_16b(2, 31, 1, 16 - imm));
+      } else if (imm == 0) {
+        m_e.emit(a64::mov_v(2, 1));
+      } else if (ext == 4) { // arithmetic: counts past the width fill with the sign
+        m_e.emit(a64::sshr_imm(esize, 2, 1, imm < esize ? imm : esize));
+      } else if (imm >= esize) {
+        m_e.emit(a64::movi_zero(2));
+      } else if (ext == 2) {
+        m_e.emit(a64::ushr_imm(esize, 2, 1, imm));
+      } else {
+        m_e.emit(a64::shl_imm(esize, 2, 1, imm));
+      }
+      vst(2, to, 0);
+      done(to);
+      break;
+    }
+    case VecOp::Pshuflw: {
+      const u32 base = dbl ? 0 : 4;
+      ld_rm_q(1, 0);
+      m_e.emit(a64::mov_v(2, 1));
+      for (u32 i = 0; i < 4; ++i)
+        m_e.emit(a64::ins_h(2, base + i, 1, base + ((imm >> (2 * i)) & 3)));
+      vst(2, dst, 0);
+      done(dst);
+      break;
+    }
+    case VecOp::Pmovx: {
+      if (!mem)
+        vld(1, rm, 0);
+      else if (d.vsteps == 1)
+        mld_lane(true, 1);
+      else if (d.vsteps == 2)
+        mld_lane(false, 1);
+      else
+        m_e.emit(a64::ldr_h_x(1, R_GBASE, R_EA));
+      for (u32 k = 0, esize = d.vlane; k < d.vsteps; ++k, esize *= 2)
+        m_e.emit(dbl ? a64::sxtl(esize, 1, 1) : a64::uxtl(esize, 1, 1));
+      vst(1, dst, 0);
+      done(dst);
+      break;
+    }
+    case VecOp::Permilpd:
+      for (u32 h = 0; h < halves; ++h) {
+        ld_rm_q(1, h);
+        ins(true, 2, 0, 1, (imm >> (2 * h)) & 1);
+        ins(true, 2, 1, 1, (imm >> (2 * h + 1)) & 1);
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Vinsert128:
+      ld_rm_q(1, 0);
+      vld(0, src1, (imm & 1) ^ 1);
+      vst(0, dst, (imm & 1) ^ 1);
+      vst(1, dst, imm & 1);
+      break;
+    case VecOp::Vextract128:
+      vld(0, dst, imm & 1);
+      if (mem) {
+        mst_q(0);
+      } else {
+        vst(0, rm, 0);
+        zero_upper(rm);
+      }
+      break;
+    case VecOp::Pinsr:
+      vld(0, src1, 0);
+      load_rm(0, d.w64 ? 64 : 32);
+      m_e.emit(a64::ins_gpr(d.w64, 0, d.w64 ? (imm & 1) : (imm & 3), 0));
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::CvtF2F: // dbl: cvtsd2ss, else cvtss2sd
+      vld(0, src1, 0);
+      ld_rm_lane(dbl, 1);
+      if (dbl) {
+        m_e.emit(a64::fcvt_s_d(2, 1));
+        ins(false, 0, 0, 2, 0);
+      } else {
+        m_e.emit(a64::fcvt_d_s(2, 1));
+        ins(true, 0, 0, 2, 0);
+      }
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::CvtI2F:
+      vld(0, src1, 0);
+      load_rm(0, d.w64 ? 64 : 32);
+      m_e.emit(a64::scvtf(dbl, d.w64, 2, 0));
+      ins(dbl, 0, 0, 2, 0);
+      vst(0, dst, 0);
+      done(dst);
+      break;
+    case VecOp::CvttF2I: {
+      // x86 returns the "integer indefinite" (only the sign bit set) for NaN
+      // and out-of-range inputs; FCVTZS saturates and maps NaN to 0.
+      ld_rm_lane(dbl, 1);
+      m_e.emit(a64::fcvtzs(dbl, true, 0, 1));
+      m_e.emit(a64::fcmp_s(dbl, 1, 1));
+      if (d.w64) {
+        m_e.mov_imm64(2, 0x8000000000000000ull);
+        m_e.emit(a64::csel(true, 0, 2, 0, 6)); // NaN (VS)
+        m_e.mov_imm64(3, 0x7FFFFFFFFFFFFFFFull);
+        m_e.cmp_reg(true, 0, 3);
+        m_e.emit(a64::csel(true, 0, 2, 0, 0)); // saturated high (EQ)
+        store_gpr(dst, 64, 0);
+      } else {
+        m_e.mov_imm64(2, 0x80000000ull);
+        m_e.emit(a64::csel(true, 0, 2, 0, 6)); // NaN (VS)
+        m_e.sxt(true, 3, 0, 32);
+        m_e.cmp_reg(true, 3, 0);
+        m_e.emit(a64::csel(true, 0, 2, 0, 1)); // not an int32 (NE)
+        store_gpr(dst, 32, 0);
+      }
+      break;
+    }
+    }
   }
 
   /// x0 = x0 OP x1 at `width` bits (result zero-extended); if any flag it
@@ -1737,17 +2543,6 @@ private:
     case ALU_ADD:
       m_e.adds_shifted(sf, 0, 0, 1, Arm64Emitter::SHIFT_LSL, sh);
       break;
-    case 2:   // ADC (32/64-bit only): ARM C = x86 CF, then ADCS
-    case 3: { // SBB: ARM C = !CF (ARM borrows on C clear), then SBCS
-      m_e.ldr_reg(2, R_CTX, offsetof(CpuContext, rflags));
-      m_e.ubfx(true, 2, 2, 0, 1);
-      if (op == 3)
-        m_e.emit(0xd2400042u); // eor x2, x2, #1
-      m_e.cmp_imm(true, 2, 1); // C = (x2 >= 1)
-      m_e.emit((op == 2 ? 0x3a000000u : 0x7a000000u) | (sf ? 0x80000000u : 0u) | (1u << 16) | (0u << 5) | 0u);
-      borrow = op == 3;
-      break;
-    }
     case ALU_SUB:
     case ALU_CMP:
       m_e.subs_shifted(sf, 0, 0, 1, Arm64Emitter::SHIFT_LSL, sh);
@@ -1858,655 +2653,170 @@ private:
     store_rm(0, w);
   }
 
-  /// SHL/SHR/SAR r32/64, CL with the interpreter's semantics: count masked to
-  /// 5/6 bits; a zero count writes nothing but still zero-extends a 32-bit
-  /// register; otherwise ZF/SF/PF from the result, CF = last bit out, OF =
-  /// (count 1 only) SHL: MSB(result) ^ CF, SHR: MSB(source), SAR: 0.
-  void emit_shift_cl(const JitInsn &d, u64 flags_needed) {
+  /// IMUL r, r/m[, imm]: truncated product to ModRM.reg; CF = OF = the
+  /// signed result did not fit. Other flags are left alone (undefined).
+  void emit_imul(const JitInsn &d, u64 flags_needed) {
     const u8 w = d.width;
-    const bool sf = w == 64;
     load_rm(0, w);
-    m_e.ldrb_imm(7, R_CTX, get_gpr_offset(1));
-    m_e.ubfx(true, 7, 7, 0, sf ? 6 : 5); // count
-    switch (d.alu_op) {
-    case 4: m_e.lslv(sf, 1, 0, 7); break;
-    case 5: m_e.lsrv(sf, 1, 0, 7); break;
-    default: m_e.asrv(sf, 1, 0, 7); break;
+    if (d.imm_form)
+      m_e.mov_imm64(1, d.imm);
+    else
+      load_gpr(1, d.m.reg, w);
+    if (w == 64) {
+      m_e.emit(a64::mul(2, 0, 1));
+      m_e.emit(a64::smulh(3, 0, 1));
+      m_e.asr_imm(true, 4, 2, 63);
+      m_e.cmp_reg(true, 3, 4); // high half != sign of the low half
+    } else {
+      m_e.sxt(true, 0, 0, w);
+      m_e.sxt(true, 1, 1, w);
+      m_e.emit(a64::mul(2, 0, 1)); // exact: |product| < 2^62
+      m_e.sxt(true, 4, 2, w);
+      m_e.cmp_reg(true, 4, 2);     // product != its own w-bit sign extension
     }
-    store_rm(1, w);
-    if (!flags_needed)
-      return;
+    if (flags_needed) {
+      m_e.cset(true, 3, 1); // NE
+      m_e.ldr_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      m_e.mov_imm64(5, CpuContext::FLAG_CF | CpuContext::FLAG_OF);
+      m_e.bic_shifted(true, 4, 4, 5);
+      m_e.orr_shifted(true, 4, 4, 3);                            // CF
+      m_e.orr_shifted(true, 4, 4, 3, Arm64Emitter::SHIFT_LSL, 11); // OF
+      m_e.str_reg(4, R_CTX, offsetof(CpuContext, rflags));
+    }
+    store_gpr(d.m.reg, w, 2);
+  }
+
+  /// SHL/SHR/SAR/ROL/ROR r/m, CL with the interpreter's semantics: the count
+  /// is CL masked to 5 bits (6 for 64-bit operands); a zero count changes
+  /// nothing (a 32-bit register destination is still zero-extended).
+  /// Shifts: ZF/SF/PF from the result, CF = last bit out, OF = (count 1)
+  /// ? defined value : 0. Rotates: CF, and OF only for count 1.
+  void emit_shift_cl(const JitInsn &d) {
+    const u8 w = d.width;
+    const bool x64 = w == 64;
+    load_rm(0, w); // zero-extended
+    if (d.imm_form) {
+      m_e.mov_imm64(1, d.imm); // already masked
+    } else {
+      load_gpr(1, 1, 8);
+      m_e.ubfx(true, 1, 1, 0, x64 ? 6 : 5);
+    }
+    if (w == 32 && d.m.is_reg)
+      store_rm(0, 32);
+    m_e.cmp_reg(true, 1, 31);
     const usize skip = m_e.pos();
-    m_e.cbz(true, 7, 0); // count 0: flags unchanged
-    // CF: SHL -> bit (w - count) of the source, SHR/SAR -> bit (count - 1).
-    if (d.alu_op == 4) {
-      m_e.movz(true, 8, w);
-      m_e.sub_reg(8, 8, 7);
+    m_e.b_cond(0, 0); // EQ: count 0, patched below
+    const u8 op = d.alu_op;
+    if (op == 0 || op == 1) {
+      // Rotate. 8/16-bit values are replicated to 32 bits so that a 32-bit
+      // rotate by any amount rotates them modulo their width.
+      m_e.mov_reg(7, 0);
+      if (w == 8)
+        m_e.orr_shifted(false, 7, 7, 7, Arm64Emitter::SHIFT_LSL, 8);
+      if (w <= 16)
+        m_e.orr_shifted(false, 7, 7, 7, Arm64Emitter::SHIFT_LSL, 16);
+      if (op == 0)
+        m_e.sub_reg(2, 31, 1); // ROL c == ROR -c
+      m_e.emit(a64::rorv(x64, 7, 7, op == 0 ? 2 : 1));
+      if (w < 32)
+        m_e.ubfx(false, 7, 7, 0, w);
+      // CF: ROL -> bit 0, ROR -> MSB. OF (count 1): MSB ^ CF / MSB ^ MSB-1.
+      m_e.ubfx(true, 6, 7, op == 0 ? 0 : static_cast<u8>(w - 1), 1);
+      m_e.ubfx(true, 10, 7, static_cast<u8>(w - 1), 1);
+      if (op == 0) {
+        m_e.eor_reg(10, 10, 6);
+      } else {
+        m_e.ubfx(true, 11, 7, static_cast<u8>(w - 2), 1);
+        m_e.eor_reg(10, 10, 11);
+      }
+      m_e.ldr_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      m_e.bfi(true, 4, 6, 0, 1);
+      m_e.mov_imm64(5, 1);
+      m_e.cmp_reg(true, 1, 5);
+      m_e.ubfx(true, 11, 4, 11, 1);
+      m_e.emit(a64::csel(true, 10, 10, 11, 0)); // count 1 ? new OF : old OF
+      m_e.bfi(true, 4, 10, 11, 1);
+      m_e.str_reg(4, R_CTX, offsetof(CpuContext, rflags));
+      m_e.mov_reg(0, 7);
     } else {
-      m_e.sub_imm(8, 7, 1);
+      if (op == 4) { // SHL
+        if (x64) {
+          m_e.mov_imm64(2, 64);
+          m_e.sub_reg(2, 2, 1);
+          m_e.lsrv(true, 6, 0, 2); // CF = bit (64 - c)
+          m_e.ubfx(true, 6, 6, 0, 1);
+          m_e.emit(a64::lslv(true, 0, 0, 1));
+        } else {
+          m_e.emit(a64::lslv(true, 0, 0, 1)); // value < 2^32, c <= 31: no overflow
+          m_e.ubfx(true, 6, 0, w, 1);          // CF = bit w of the shifted value
+          m_e.ubfx(true, 0, 0, 0, w);
+        }
+        // OF (count 1) = MSB(result) ^ CF
+        m_e.ubfx(true, 10, 0, static_cast<u8>(w - 1), 1);
+        m_e.eor_reg(10, 10, 6);
+      } else if (op == 5) { // SHR
+        m_e.ubfx(true, 10, 0, static_cast<u8>(w - 1), 1); // OF (count 1) = MSB(source)
+        m_e.sub_imm(2, 1, 1);
+        m_e.lsrv(true, 6, 0, 2); // CF = bit (c - 1)
+        m_e.ubfx(true, 6, 6, 0, 1);
+        m_e.lsrv(true, 0, 0, 1);
+      } else { // 7: SAR, on the sign-extended value
+        if (w < 64)
+          m_e.sxt(true, 0, 0, w);
+        m_e.sub_imm(2, 1, 1);
+        m_e.emit(a64::asrv(true, 6, 0, 2)); // CF = bit (c - 1), the sign beyond
+        m_e.ubfx(true, 6, 6, 0, 1);
+        m_e.emit(a64::asrv(true, 0, 0, 1));
+        if (w < 64)
+          m_e.ubfx(true, 0, 0, 0, w);
+        m_e.movz(true, 10, 0);
+      }
+      // ZF/SF/PF from the result, CF from x6, OF = count 1 ? x10 : 0.
+      if (w < 32) {
+        m_e.lsl_imm(false, 7, 0, static_cast<u8>(32 - w));
+        m_e.ands_shifted(false, 31, 7, 7);
+      } else {
+        m_e.ands_shifted(x64, 31, 0, 0);
+      }
+      emit_flags(false, FLAGS_ARITH, 0, 6);
+      m_e.mov_imm64(5, 1);
+      m_e.cmp_reg(true, 1, 5);
+      m_e.emit(a64::csel(true, 10, 10, 31, 0)); // EQ ? x10 : 0
+      m_e.ldr_reg(11, R_CTX, offsetof(CpuContext, rflags));
+      m_e.bfi(true, 11, 10, 11, 1);
+      m_e.str_reg(11, R_CTX, offsetof(CpuContext, rflags));
     }
-    m_e.lsrv(true, 6, 0, 8);
-    m_e.ubfx(true, 6, 6, 0, 1);
-    // OF candidate (x10), applied only when count == 1.
-    if (d.alu_op == 4) {
-      m_e.ubfx(true, 10, 1, static_cast<u8>(w - 1), 1);
-      m_e.eor_reg(10, 10, 6);
-    } else if (d.alu_op == 5) {
-      m_e.ubfx(true, 10, 0, static_cast<u8>(w - 1), 1);
-    } else {
-      m_e.movz(true, 10, 0);
-    }
-    m_e.ands_shifted(sf, 31, 1, 1); // N/Z of the result, C = V = 0
-    emit_flags(false, FLAGS_ARITH, 1, 6);
-    m_e.cmp_imm(true, 7, 1);
-    m_e.csel(true, 10, 10, 31, 0 /* EQ */);
-    m_e.ldr_reg(11, R_CTX, offsetof(CpuContext, rflags));
-    m_e.bfi(true, 11, 10, 11, 1); // OF -> bit 11
-    m_e.str_reg(11, R_CTX, offsetof(CpuContext, rflags));
+    store_rm(0, w);
     m_e.patch_b_cond(skip, m_e.pos());
   }
 
-  /// ROL/ROR by a constant: CF = LSB (ROL) / MSB (ROR) of the result; for a
-  /// count of 1, OF = MSB ^ CF (ROL) / MSB ^ next bit (ROR). Other flags kept.
-  void emit_rotate(const JitInsn &d, u64 flags_needed) {
+  /// BT/BTS/BTR/BTC: CF = the selected bit (offset modulo the operand size);
+  /// BTS/BTR/BTC then set/clear/flip it. Other flags are left alone.
+  void emit_bit_test(const JitInsn &d) {
     const u8 w = d.width;
-    const u8 c = static_cast<u8>(d.imm);
-    if (c == 0) {
-      if (w == 32 && d.m.is_reg) {
-        load_rm(0, 32);
-        store_rm(0, 32);
-      }
-      return;
-    }
-    const u8 n = c % w;
-    const bool rol = d.alu_op == 0;
     load_rm(0, w);
-    if (n != 0) {
-      if (w >= 32) {
-        m_e.ror_imm(w == 64, 0, 0, rol ? static_cast<u8>(w - n) : n);
-      } else {
-        const u8 left = rol ? n : static_cast<u8>(w - n);
-        m_e.lsl_imm(false, 1, 0, left);
-        m_e.lsr_imm(false, 0, 0, static_cast<u8>(w - left));
-        m_e.orr_reg(0, 0, 1);
-        m_e.ubfx(false, 0, 0, 0, w);
-      }
+    if (d.imm_form)
+      m_e.mov_imm64(1, d.imm & (w - 1));
+    else {
+      load_gpr(1, d.m.reg, w);
+      m_e.ubfx(true, 1, 1, 0, w == 64 ? 6 : w == 32 ? 5 : 4);
     }
-    store_rm(0, w);
-    if (!flags_needed)
-      return;
-    m_e.ldr_reg(11, R_CTX, offsetof(CpuContext, rflags));
-    m_e.ubfx(true, 6, 0, rol ? 0 : static_cast<u8>(w - 1), 1); // CF
-    m_e.bfi(true, 11, 6, 0, 1);
-    if (c == 1) {
-      m_e.ubfx(true, 10, 0, static_cast<u8>(w - 1), 1);
-      if (rol)
-        m_e.eor_reg(10, 10, 6);
-      else {
-        m_e.ubfx(true, 8, 0, static_cast<u8>(w - 2), 1);
-        m_e.eor_reg(10, 10, 8);
-      }
-      m_e.bfi(true, 11, 10, 11, 1);
-    }
-    m_e.str_reg(11, R_CTX, offsetof(CpuContext, rflags));
-  }
-
-  /// IMUL r, r/m [, imm]: the low half of the signed product; CF = OF = the
-  /// product does not fit the destination. Other flags are left alone.
-  void emit_imul(const JitInsn &d, u64 flags_needed) {
-    const u8 w = d.width;
-    load_rm(1, w);
-    if (d.rm_is_dst)
-      m_e.mov_imm64(0, d.imm);
-    else
-      load_gpr(0, d.m.reg, w);
-    if (w == 32) {
-      m_e.smull(2, 0, 1);
-      m_e.sxt(true, 3, 2, 32);
-      m_e.cmp_reg(true, 3, 2);
-    } else {
-      m_e.mul(true, 2, 0, 1);
-      m_e.smulh(3, 0, 1);
-      m_e.asr_imm(true, 4, 2, 63);
-      m_e.cmp_reg(true, 3, 4);
-    }
-    store_gpr(d.m.reg, w, 2);
-    if (!flags_needed)
-      return;
-    m_e.cset(true, 5, 1 /* NE */);
-    m_e.ldr_reg(11, R_CTX, offsetof(CpuContext, rflags));
-    m_e.bfi(true, 11, 5, 0, 1);  // CF
-    m_e.bfi(true, 11, 5, 11, 1); // OF
-    m_e.str_reg(11, R_CTX, offsetof(CpuContext, rflags));
-  }
-
-  /// BEXTR dst, src, ctrl: start = ctrl[7:0], len = ctrl[15:8]; ZF from the
-  /// result, CF = OF = 0 (the interpreter leaves SF/PF alone).
-  void emit_bextr(const JitInsn &d, u64 flags_needed) {
-    const u8 w = d.width;
-    const bool sf = w == 64;
-    load_rm(0, w);
-    load_gpr(1, d.vex_vvvv, w);
-    m_e.ubfx(true, 2, 1, 0, 8);    // start
-    m_e.ubfx(true, 3, 1, 8, 8);    // len
-    m_e.lsrv(true, 4, 0, 2);       // src >> (start & 63)
-    m_e.cmp_imm(true, 2, w);
-    m_e.csel(true, 4, 31, 4, 2 /* HS */); // start >= w -> 0
-    m_e.movz(true, 5, 1);
-    m_e.lslv(true, 5, 5, 3);
-    m_e.sub_imm(5, 5, 1);          // (1 << len) - 1
-    m_e.mov_imm64(6, ~0ULL);
-    m_e.cmp_imm(true, 3, 64);
-    m_e.csel(true, 5, 6, 5, 2 /* HS */); // len >= 64 -> all ones
-    m_e.and_reg(0, 4, 5);
-    store_gpr(d.m.reg, w, 0);
-    if (flags_needed) {
-      m_e.ands_shifted(sf, 31, 0, 0);
-      emit_flags(false, d.flags_written, 0);
-    }
-  }
-
-  /// DIV / IDIV r/m32/64 with the interpreter's results; divide by zero and a
-  /// quotient that does not fit side-exit, and the interpreter raises #DE.
-  void emit_div(const JitInsn &d) {
-    const u8 w = d.width;
-    const bool sgn = d.alu_op == 7;
-    auto exit_if = [&](u8 cond) {
-      m_exits.push_back({m_e.pos(), m_cur->rip, m_retired});
-      m_e.b_cond(cond, 0);
-    };
-    auto exit_if_zero = [&](u8 reg) {
-      m_exits.push_back({m_e.pos(), m_cur->rip, m_retired});
-      m_e.cbz(true, reg, 0);
-    };
-    load_rm(1, w); // divisor (zero-extended)
-    exit_if_zero(1);
-    if (w == 32) {
-      // x0 = EDX:EAX
-      m_e.ldr_w(0, R_CTX, get_gpr_offset(0));
-      m_e.ldr_w(2, R_CTX, get_gpr_offset(2));
-      m_e.orr_shifted(true, 0, 0, 2, Arm64Emitter::SHIFT_LSL, 32);
-      if (sgn) {
-        m_e.sxt(true, 1, 1, 32);
-        m_e.emit(0x9ac00c00u | (1u << 16) | (0u << 5) | 3u); // sdiv x3, x0, x1
-        m_e.sxt(true, 4, 3, 32);
-      } else {
-        m_e.emit(0x9ac00800u | (1u << 16) | (0u << 5) | 3u); // udiv x3, x0, x1
-        m_e.mov_w(4, 3);
-      }
-      m_e.cmp_reg(true, 4, 3);
-      exit_if(1 /* NE: quotient overflows 32 bits */);
-    } else {
-      m_e.ldr_reg(0, R_CTX, get_gpr_offset(0));
-      m_e.ldr_reg(2, R_CTX, get_gpr_offset(2));
-      // Only RDX = sign/zero extension of RAX (CQO / xor edx,edx) is handled
-      // here; a real 128-bit dividend goes to the interpreter.
-      if (sgn) {
-        m_e.asr_imm(true, 4, 0, 63);
-        m_e.cmp_reg(true, 2, 4);
-        exit_if(1);
-        // INT64_MIN / -1 overflows
-        m_e.mov_imm64(5, 0x8000000000000000ULL);
-        m_e.cmp_reg(true, 0, 5);
-        m_e.cset(true, 6, 0 /* EQ */);
-        m_e.mov_imm64(5, ~0ULL);
-        m_e.cmp_reg(true, 1, 5);
-        m_e.cset(true, 7, 0);
-        m_e.and_reg(6, 6, 7);
-        exit_if_zero(6); // placeholder: patched below to exit when x6 != 0
-        m_e.invert_last_cbz(); // cbnz: exit when non-zero
-        m_e.emit(0x9ac00c00u | (1u << 16) | (0u << 5) | 3u); // sdiv x3, x0, x1
-      } else {
-        exit_if_zero(2);
-        m_e.invert_last_cbz(); // cbnz: exit when non-zero
-        m_e.emit(0x9ac00800u | (1u << 16) | (0u << 5) | 3u); // udiv x3, x0, x1
-      }
-    }
-    // remainder = dividend - quotient * divisor
-    m_e.emit(0x9b008000u | (1u << 16) | (0u << 10) | (3u << 5) | 5u); // msub x5, x3, x1, x0
-    store_gpr(0, w, 3);
-    store_gpr(2, w, 5);
-  }
-
-  /// The VEX packed-integer / move subset (see vec_supported), with NEON.
-  /// v0 = src1 (vvvv), v1 = r/m; the result is written to the destination
-  /// and bits 255:128 are cleared, as every VEX.128 write does.
-  void emit_vec(const JitInsn &d) {
-    const u8 op = d.vex_op, pp = d.vex_pp, map = d.reg;
-    const u8 dst = d.m.reg & 15, src1 = d.vex_vvvv & 15;
-    auto v3 = [&](u32 base, u8 vd, u8 vn, u8 vm) {
-      m_e.emit(base | (static_cast<u32>(vm) << 16) | (static_cast<u32>(vn) << 5) | vd);
-    };
-    auto load_rm_q = [&](u8 v, u32 half) {
-      if (d.m.is_reg) {
-        m_e.fp_ldr(4, v, R_CTX, ymm_off(d.m.rm) + half);
-      } else if (half == 0) {
-        m_e.fp_ldr_idx(4, v, R_GBASE, R_EA);
-      } else {
-        m_e.add_imm(10, R_EA, half);
-        m_e.fp_ldr_idx(4, v, R_GBASE, 10);
-      }
-    };
-    auto store_dst = [&](u8 v) {
-      m_e.fp_str(4, v, R_CTX, ymm_off(dst));
-      zero_upper(dst);
-    };
-
-    if (map == 1) {
-      const bool load = op == 0x6F || op == 0x10 || op == 0x28;
-      const bool store = op == 0x7F || op == 0x11 || op == 0x29;
-      if (load || store) { // full-register moves, 128 or 256-bit
-        const u32 bytes = d.vex_l ? 32 : 16;
-        if (!d.m.is_reg)
-          emit_bounds_check_wide(bytes);
-        for (u32 half = 0; half < bytes; half += 16) {
-          if (load) {
-            load_rm_q(0, half);
-            m_e.fp_str(4, 0, R_CTX, ymm_off(dst) + half);
-          } else {
-            m_e.fp_ldr(4, 0, R_CTX, ymm_off(dst) + half);
-            if (d.m.is_reg) {
-              m_e.fp_str(4, 0, R_CTX, ymm_off(d.m.rm) + half);
-            } else if (half == 0) {
-              m_e.fp_str_idx(4, 0, R_GBASE, R_EA);
-            } else {
-              m_e.add_imm(10, R_EA, half);
-              m_e.fp_str_idx(4, 0, R_GBASE, 10);
-            }
-          }
-        }
-        if (!d.vex_l) {
-          if (load)
-            zero_upper(dst);
-          else if (d.m.is_reg)
-            zero_upper(d.m.rm);
-        }
-        return;
-      }
-      const bool q64 = d.width == 64;
-      switch (op) {
-      case 0x6E: // VMOVD/VMOVQ xmm, r/m
-        load_rm(0, q64 ? 64 : 32);
-        m_e.fmov_from_gpr(q64, 0, 0); // zeroes the rest of v0
-        store_dst(0);
-        return;
-      case 0x7E:
-        if (pp == 1) { // VMOVD/VMOVQ r/m, xmm
-          m_e.fp_ldr(q64 ? 3 : 2, 0, R_CTX, ymm_off(dst));
-          m_e.fmov_to_gpr(q64, 0, 0);
-          store_rm(0, q64 ? 64 : 32);
-        } else {       // VMOVQ xmm, xmm/m64
-          if (d.m.is_reg)
-            m_e.fp_ldr(3, 0, R_CTX, ymm_off(d.m.rm));
-          else
-            m_e.fp_ldr_idx(3, 0, R_GBASE, R_EA);
-          store_dst(0);
-        }
-        return;
-      case 0xD6: // VMOVQ xmm/m64, xmm
-        m_e.fp_ldr(3, 0, R_CTX, ymm_off(dst));
-        if (d.m.is_reg) {
-          m_e.fp_str(4, 0, R_CTX, ymm_off(d.m.rm));
-          zero_upper(d.m.rm);
-        } else {
-          m_e.fp_str_idx(3, 0, R_GBASE, R_EA);
-        }
-        return;
-      case 0x70: { // VPSHUFD (66) / VPSHUFHW (F3) / VPSHUFLW (F2)
-        if (!d.m.is_reg)
-          emit_bounds_check_wide(16);
-        load_rm_q(1, 0);
-        if (pp == 1) {
-          for (u32 i = 0; i < 4; ++i) {
-            const u32 j = (d.imm >> (2 * i)) & 3;
-            m_e.emit(0x6e000400u | (((i << 3) | 4u) << 16) | ((j << 2) << 11) | (1u << 5) | 0u);
-          }
-        } else {
-          // INS Vd.H[i], Vn.H[j]: imm5 = i:010, imm4 = j:0
-          const u32 base = pp == 2 ? 4 : 0; // the shuffled half
-          v3(0x4ea01c00u, 0, 1, 1);         // mov v0, v1 (keeps the other half)
-          for (u32 i = 0; i < 4; ++i) {
-            const u32 j = base + ((d.imm >> (2 * i)) & 3);
-            m_e.emit(0x6e000400u | ((((base + i) << 2) | 2u) << 16) | ((j << 1) << 11) | (1u << 5) | 0u);
-          }
-        }
-        store_dst(0);
-        return;
-      }
-      case 0x71: case 0x72: case 0x73: { // shifts by immediate (dest = vvvv)
-        const u32 esize = op == 0x71 ? 16 : op == 0x72 ? 32 : 64;
-        const u32 sub = d.m.reg & 7;
-        const u32 sh = static_cast<u32>(d.imm);
-        m_e.fp_ldr(4, 0, R_CTX, ymm_off(d.m.rm));
-        if (sh == 0) {
-          // unchanged
-        } else if (sub == 6) { // left
-          if (sh >= esize)
-            m_e.eor_v16(0, 0, 0);
-          else
-            m_e.emit(0x4f005400u | ((esize + sh) << 16) | (0u << 5) | 0u);
-        } else {               // 2: logical right, 4: arithmetic right
-          if (sub == 2 && sh >= esize) {
-            m_e.eor_v16(0, 0, 0);
-          } else {
-            const u32 s = std::min(sh, esize);
-            m_e.emit((sub == 2 ? 0x6f000400u : 0x4f000400u) | ((2 * esize - s) << 16) | (0u << 5) | 0u);
-          }
-        }
-        m_e.fp_str(4, 0, R_CTX, ymm_off(src1));
-        zero_upper(src1);
-        return;
-      }
-      default:
-        break;
-      }
-    }
-
-    if (map == 2 && ((op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35))) {
-      // VPMOVSX / VPMOVZX: widen the low elements of r/m. kind: 0 BW, 1 BD,
-      // 2 BQ, 3 WD, 4 WQ, 5 DQ; each step doubles the element size.
-      static constexpr u8 kFrom[6] = {8, 8, 8, 16, 16, 32};
-      static constexpr u8 kSteps[6] = {1, 2, 3, 1, 2, 1};
-      const u8 kind = op & 0x0F;
-      const u32 out = d.vex_l ? 32 : 16, in = out >> kSteps[kind];
-      const bool sgn = op < 0x30;
-      auto widen = [&](u8 vd, u8 vn, u32 esize, bool upper) {
-        m_e.emit((sgn ? 0x0f00a400u : 0x2f00a400u) | (upper ? 0x40000000u : 0u) | ((esize / 8) << 19) |
-                 (static_cast<u32>(vn) << 5) | vd);
-      };
-      const u8 lg = in == 16 ? 4 : in == 8 ? 3 : 2;
-      if (d.m.is_reg) {
-        m_e.fp_ldr(lg, 1, R_CTX, ymm_off(d.m.rm));
-      } else {
-        if (in > 8)
-          emit_bounds_check_wide(in);
-        m_e.fp_ldr_idx(lg, 1, R_GBASE, R_EA);
-      }
-      u32 esize = kFrom[kind];
-      for (u8 st = 1; st < kSteps[kind]; ++st, esize *= 2)
-        widen(1, 1, esize, false);
-      widen(0, 1, esize, false);
-      if (d.vex_l) {
-        widen(2, 1, esize, true);
-        m_e.fp_str(4, 0, R_CTX, ymm_off(dst));
-        m_e.fp_str(4, 2, R_CTX, ymm_off(dst) + 16);
-      } else {
-        store_dst(0);
-      }
-      return;
-    }
-
-    if (map == 3 && (op == 0x18 || op == 0x19)) { // VINSERTF128 / VEXTRACTF128
-      const u32 lane = (d.imm & 1) * 16;
-      if (!d.m.is_reg)
-        emit_bounds_check_wide(16);
-      if (op == 0x18) {
-        m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1));
-        m_e.fp_ldr(4, 1, R_CTX, ymm_off(src1) + 16);
-        load_rm_q(2, 0);
-        m_e.fp_str(4, lane ? 0 : 2, R_CTX, ymm_off(dst));
-        m_e.fp_str(4, lane ? 2 : 1, R_CTX, ymm_off(dst) + 16);
-      } else {
-        m_e.fp_ldr(4, 0, R_CTX, ymm_off(dst) + lane);
-        if (d.m.is_reg) {
-          m_e.fp_str(4, 0, R_CTX, ymm_off(d.m.rm));
-          zero_upper(d.m.rm);
-        } else {
-          m_e.fp_str_idx(4, 0, R_GBASE, R_EA);
-        }
-      }
-      return;
-    }
-
-    if (map == 3 && (op == 0x4A || op == 0x4B)) { // VBLENDVPS / VBLENDVPD
-      // dest = src2 where the mask element's sign bit is set, else src1.
-      const u8 mask = static_cast<u8>((d.imm >> 4) & 15);
-      const u32 halves = d.vex_l ? 2 : 1;
-      if (!d.m.is_reg)
-        emit_bounds_check_wide(16 * halves);
-      for (u32 h = 0; h < halves; ++h) {
-        m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1) + 16 * h);
-        load_rm_q(1, 16 * h);
-        m_e.fp_ldr(4, 2, R_CTX, ymm_off(mask) + 16 * h);
-        // sshr v2, v2, #esize-1: all ones where the sign bit is set
-        m_e.emit(op == 0x4A ? 0x4f210442u : 0x4f410442u);
-        v3(0x6ea01c00u, 0, 1, 2); // bit v0, v1, v2
-        m_e.fp_str(4, 0, R_CTX, ymm_off(dst) + 16 * h);
-      }
-      if (!d.vex_l)
-        zero_upper(dst);
-      return;
-    }
-
-    if (map == 1 && d.vex_l) { // 256-bit VANDPS / VANDNPS / VORPS (and PD)
-      if (!d.m.is_reg)
-        emit_bounds_check_wide(32);
-      for (u32 h = 0; h < 2; ++h) {
-        m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1) + 16 * h);
-        load_rm_q(1, 16 * h);
-        if (op == 0x54)
-          v3(0x4e201c00u, 0, 0, 1);
-        else if (op == 0x56)
-          v3(0x4ea01c00u, 0, 0, 1);
-        else
-          v3(0x4e601c00u, 0, 1, 0);
-        m_e.fp_str(4, 0, R_CTX, ymm_off(dst) + 16 * h);
-      }
-      return;
-    }
-
-    // Two-source ops: dest = src1 OP r/m (128-bit).
-    if (!d.m.is_reg)
-      emit_bounds_check_wide(16);
-    m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1));
-    load_rm_q(1, 0);
-    if (map == 3) { // VPBLENDW: word i from r/m when imm bit i is set
-      u64 lo = 0, hi = 0;
-      for (u32 i = 0; i < 8; ++i)
-        if (d.imm & (1u << i))
-          (i < 4 ? lo : hi) |= 0xFFFFULL << ((i & 3) * 16);
-      m_e.mov_imm64(2, lo);
-      m_e.mov_imm64(3, hi);
-      m_e.fmov_from_gpr(true, 2, 2);
-      m_e.emit(0x4e181c62u); // ins v2.d[1], x3
-      v3(0x6ea01c00u, 0, 1, 2); // bit v0, v1, v2
-      store_dst(0);
-      return;
-    }
-    if (map == 1 && (op == 0x63 || op == 0x67 || op == 0x6B)) {
-      // Saturating packs: low half from src1, high half from r/m.
-      const u32 narrow = op == 0x67 ? 0x2e212800u   // sqxtun .8b, .8h
-                       : op == 0x63 ? 0x0e214800u   // sqxtn  .8b, .8h
-                                    : 0x0e614800u;  // sqxtn  .4h, .4s
-      m_e.emit(narrow | (0u << 5) | 2u);
-      m_e.emit(narrow | 0x40000000u | (1u << 5) | 2u);
-      store_dst(2);
-      return;
-    }
-    if (map == 2 && op == 0x2B) { // VPACKUSDW: sqxtun .4h / sqxtun2 .8h from .4s
-      m_e.emit(0x2e612800u | (0u << 5) | 2u);
-      m_e.emit(0x6e612800u | (1u << 5) | 2u);
-      store_dst(2);
-      return;
-    }
-    if (map == 2) {
-      if (op == 0x00) { // VPSHUFB: index bit 7 -> 0, else src1[idx & 15]
-        m_e.emit(0x4f00e400u | (4u << 16) | (0x0fu << 5) | 2u); // movi v2.16b, #0x8f
-        v3(0x4e201c00u, 1, 1, 2);                              // and v1, v1, v2
-        v3(0x4e000000u, 0, 0, 1);                              // tbl v0, {v0}, v1
-      } else {          // VPMULLD
-        v3(0x4ea09c00u, 0, 0, 1);
-      }
-      store_dst(0);
-      return;
-    }
-    u32 base = 0;
-    bool swap = false; // operands as (r/m, src1)
-    switch (op) {
-    case 0xFC: base = 0x4e208400u; break; // add .16b
-    case 0xFD: base = 0x4e608400u; break; // add .8h
-    case 0xFE: base = 0x4ea08400u; break; // add .4s
-    case 0xD4: base = 0x4ee08400u; break; // add .2d
-    case 0xF8: base = 0x6e208400u; break; // sub .16b
-    case 0xF9: base = 0x6e608400u; break; // sub .8h
-    case 0xFA: base = 0x6ea08400u; break; // sub .4s
-    case 0xFB: base = 0x6ee08400u; break; // sub .2d
-    case 0xDB: case 0x54: base = 0x4e201c00u; break; // and
-    case 0xEB: case 0x56: base = 0x4ea01c00u; break; // orr
-    case 0xDF: case 0x55: base = 0x4e601c00u; swap = true; break; // ~src1 & rm = bic(rm, src1)
-    case 0xD5: base = 0x4e609c00u; break; // mul .8h
-    case 0x60: base = 0x4e003800u; break; // zip1 .16b
-    case 0x61: base = 0x4e403800u; break; // zip1 .8h
-    case 0x62: base = 0x4e803800u; break; // zip1 .4s
-    case 0x6C: base = 0x4ec03800u; break; // zip1 .2d
-    case 0x68: base = 0x4e007800u; break; // zip2 .16b
-    case 0x69: base = 0x4e407800u; break; // zip2 .8h
-    case 0x6A: base = 0x4e807800u; break; // zip2 .4s
-    case 0x6D: base = 0x4ec07800u; break; // zip2 .2d
-    default: break;
-    }
-    if (swap)
-      v3(base, 0, 1, 0);
-    else
-      v3(base, 0, 0, 1);
-    store_dst(0);
-  }
-
-  static u32 ymm_off(u8 reg) {
-    return static_cast<u32>(offsetof(CpuContext, ymm) + (reg & 15) * sizeof(CpuContext::YmmReg));
-  }
-
-  /// Zero bits 255:128 of ymm[reg] (every VEX.128 / scalar write does).
-  void zero_upper(u8 reg) {
-    m_e.str_zero(R_CTX, ymm_off(reg) + 16);
-    m_e.str_zero(R_CTX, ymm_off(reg) + 24);
-  }
-
-  /// Side exit unless [x9, x9 + bytes) lies inside guest memory (the generic
-  /// check covers 8 bytes).
-  void emit_bounds_check_wide(u32 bytes) {
-    m_e.add_imm(10, R_EA, bytes - 8);
-    m_e.cmp_reg(true, 10, R_GLIMIT);
-    m_exits.push_back({m_e.pos(), m_cur->rip, m_retired});
-    m_e.b_cond(COND_HI, 0);
-  }
-
-  /// The VEX scalar float / xor subset, with the interpreter's semantics:
-  /// scalar ops take bits 127:N from src1 (vvvv) and zero 255:128; created
-  /// NaNs are x86's negative "indefinite"; MIN/MAX return src2 unless src1
-  /// compares strictly less/greater; UCOMISS/COMISS set ZF/PF/CF and clear
-  /// OF/SF/AF.
-  void emit_sse(const JitInsn &d, u64 flags_needed) {
-    const u8 op = d.vex_op, pp = d.vex_pp;
-    const u8 dst = d.m.reg & 15, src1 = d.vex_vvvv & 15;
-    const bool dbl = pp == 3 || ((op == 0x2E || op == 0x2F) && pp == 1);
-    const u8 lg = dbl ? 3 : 2; // element size log2
-    auto load_src2 = [&](u8 v, u8 size_log2) {
-      if (d.m.is_reg)
-        m_e.fp_ldr(size_log2, v, R_CTX, ymm_off(d.m.rm));
+    m_e.lsrv(true, 6, 0, 1);
+    m_e.ubfx(true, 6, 6, 0, 1);
+    m_e.ldr_reg(4, R_CTX, offsetof(CpuContext, rflags));
+    m_e.bfi(true, 4, 6, 0, 1);
+    m_e.str_reg(4, R_CTX, offsetof(CpuContext, rflags));
+    if (d.alu_op != 0) {
+      m_e.mov_imm64(2, 1);
+      m_e.emit(a64::lslv(true, 2, 2, 1));
+      if (d.alu_op == 1)
+        m_e.orr_reg(0, 0, 2);
+      else if (d.alu_op == 2)
+        m_e.bic_shifted(true, 0, 0, 2);
       else
-        m_e.fp_ldr_idx(size_log2, v, R_GBASE, R_EA);
-    };
-
-    if (op == 0x10 || op == 0x11) { // VMOVSS / VMOVSD
-      const bool load = op == 0x10;
-      if (!d.m.is_reg) {
-        if (load) {
-          m_e.fp_ldr_idx(lg, 0, R_GBASE, R_EA); // zeroes the rest of v0
-          m_e.fp_str(4, 0, R_CTX, ymm_off(dst));
-          zero_upper(dst);
-        } else {
-          m_e.fp_ldr(lg, 0, R_CTX, ymm_off(dst));
-          m_e.fp_str_idx(lg, 0, R_GBASE, R_EA);
-        }
-        return;
-      }
-      // Register form: dest = src1[127:N] : other[N-1:0].
-      const u8 to = load ? dst : static_cast<u8>(d.m.rm & 15);
-      const u8 from = load ? static_cast<u8>(d.m.rm & 15) : dst;
-      m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1));
-      m_e.fp_ldr(lg, 1, R_CTX, ymm_off(from));
-      m_e.ins_lane0(dbl, 0, 1);
-      m_e.fp_str(4, 0, R_CTX, ymm_off(to));
-      zero_upper(to);
-      return;
+        m_e.eor_reg(0, 0, 2);
+      store_rm(0, w);
     }
-
-    if (op == 0x57 || op == 0xEF) { // VXORPS / VXORPD / VPXOR
-      if (!d.m.is_reg)
-        emit_bounds_check_wide(16);
-      for (u8 half = 0; half < (d.vex_l ? 2 : 1); ++half) {
-        m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1) + half * 16);
-        if (d.m.is_reg)
-          m_e.fp_ldr(4, 1, R_CTX, ymm_off(d.m.rm) + half * 16);
-        else
-          m_e.fp_ldr_idx(4, 1, R_GBASE, R_EA);
-        m_e.eor_v16(0, 0, 1);
-        m_e.fp_str(4, 0, R_CTX, ymm_off(dst) + half * 16);
-      }
-      if (!d.vex_l)
-        zero_upper(dst);
-      return;
-    }
-
-    if (op == 0x2E || op == 0x2F) { // (V)UCOMISS/SD, (V)COMISS/SD
-      if (!flags_needed)
-        return;
-      m_e.fp_ldr(lg, 0, R_CTX, ymm_off(dst));
-      load_src2(1, lg);
-      m_e.fcmp(dbl, 0, 1);
-      m_e.cset(true, 3, 11 /* LT: less or unordered */);
-      m_e.cset(true, 4, 0 /* EQ */);
-      m_e.cset(true, 5, 6 /* VS: unordered */);
-      m_e.orr_reg(4, 4, 5);
-      m_e.bfi(true, 3, 5, 2, 1); // PF
-      m_e.bfi(true, 3, 4, 6, 1); // ZF
-      m_e.ldr_reg(4, R_CTX, offsetof(CpuContext, rflags));
-      m_e.mov_imm64(5, FLAGS_ARITH | CpuContext::FLAG_AF);
-      m_e.bic_shifted(true, 4, 4, 5);
-      m_e.orr_reg(4, 4, 3);
-      m_e.str_reg(4, R_CTX, offsetof(CpuContext, rflags));
-      return;
-    }
-
-    m_e.fp_ldr(4, 0, R_CTX, ymm_off(src1)); // v0 = src1
-    if (op == 0x2A) {                         // VCVTSI2SS / VCVTSI2SD
-      load_rm(1, d.width);
-      m_e.scvtf(dbl, d.width == 64, 2, 1);
-    } else {
-      load_src2(1, lg);
-      switch (op) {
-      case 0x5D: // MIN: src1 < src2 ? src1 : src2
-        m_e.fcmp(dbl, 0, 1);
-        m_e.fcsel(dbl, 2, 0, 1, 4 /* MI */);
-        break;
-      case 0x5F: // MAX: src1 > src2 ? src1 : src2
-        m_e.fcmp(dbl, 0, 1);
-        m_e.fcsel(dbl, 2, 0, 1, 12 /* GT */);
-        break;
-      default: {
-        const u8 fop = op == 0x58 ? Arm64Emitter::FP_ADD
-                     : op == 0x59 ? Arm64Emitter::FP_MUL
-                     : op == 0x5C ? Arm64Emitter::FP_SUB : Arm64Emitter::FP_DIV;
-        m_e.fp_arith(dbl, fop, 2, 0, 1);
-        // A NaN created from two non-NaN inputs is x86's negative QNaN.
-        m_e.fcmp(dbl, 0, 1);
-        m_e.cset(true, 3, 7 /* VC: inputs ordered */);
-        m_e.fcmp(dbl, 2, 2);
-        m_e.cset(true, 4, 6 /* VS: result NaN */);
-        m_e.and_reg(3, 3, 4);
-        m_e.fmov_to_gpr(dbl, 5, 2);
-        m_e.mov_imm64(6, dbl ? 0xFFF8000000000000ULL : 0xFFC00000ULL);
-        m_e.cmp_imm(true, 3, 0);
-        m_e.csel(true, 5, 6, 5, 1 /* NE */);
-        m_e.fmov_from_gpr(dbl, 2, 5);
-        break;
-      }
-      }
-    }
-    m_e.ins_lane0(dbl, 0, 2);
-    m_e.fp_str(4, 0, R_CTX, ymm_off(dst));
-    zero_upper(dst);
   }
 
   /// Convert NZCV (plus the parity of the low byte of `res`) to x86 flags and
@@ -2555,32 +2865,6 @@ JitCompiler::JitCompiler(usize code_cache_size)
   if (m_code_buffer == MAP_FAILED) {
     m_code_buffer = nullptr;
   }
-  m_chain.resize(kChainSlots);
-  chain_clear();
-}
-
-void JitCompiler::add_chain_barrier(GuestAddr rip) {
-  std::unique_lock lock(m_cache_mutex);
-  m_barriers.insert(rip);
-}
-
-void JitCompiler::chain_clear() {
-  for (ChainSlot &s : m_chain) {
-    __atomic_store_n(&s.rip, ~0ULL, __ATOMIC_RELAXED);
-    __atomic_store_n(&s.entry, 0ULL, __ATOMIC_RELAXED);
-  }
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
-}
-
-// Readers load {rip, entry} with one atomic LDP; invalidate the slot before
-// changing its entry so no reader can pair a new entry with an old rip.
-void JitCompiler::chain_insert(GuestAddr rip, const void *entry) {
-  ChainSlot &s = m_chain[(rip ^ (rip >> 16)) & (kChainSlots - 1)];
-  __atomic_store_n(&s.rip, ~0ULL, __ATOMIC_RELEASE);
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
-  __atomic_store_n(&s.entry, reinterpret_cast<u64>(entry), __ATOMIC_RELEASE);
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
-  __atomic_store_n(&s.rip, rip, __ATOMIC_RELEASE);
 }
 
 JitCompiler::~JitCompiler() {
@@ -2597,8 +2881,7 @@ JitCompiler::JitCompiler(JitCompiler &&other) noexcept
       m_total_invocations(other.m_total_invocations),
       m_blocks(std::move(other.m_blocks)),
       m_metrics(std::move(other.m_metrics)),
-      m_failed(std::move(other.m_failed)),
-      m_chain(std::move(other.m_chain)) {
+      m_failed(std::move(other.m_failed)) {
   other.m_code_buffer = nullptr;
   other.m_code_buffer_size = 0;
   other.m_code_buffer_offset = 0;
@@ -2618,7 +2901,6 @@ JitCompiler &JitCompiler::operator=(JitCompiler &&other) noexcept {
     m_blocks = std::move(other.m_blocks);
     m_metrics = std::move(other.m_metrics);
     m_failed = std::move(other.m_failed);
-    m_chain = std::move(other.m_chain);
 
     other.m_code_buffer = nullptr;
     other.m_code_buffer_size = 0;
@@ -2677,7 +2959,6 @@ void JitCompiler::clear_cache() {
   m_blocks.clear();
   m_metrics.clear();
   m_failed.clear();
-  chain_clear();
   m_code_buffer_offset = 0;
   m_epoch.store(g_jit_epoch.fetch_add(1, std::memory_order_relaxed), std::memory_order_release);
 }
@@ -2725,7 +3006,6 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
   }
 
   // Pass 1: decode the block.
-  constexpr usize MAX_BLOCK_INSNS = 128;
   std::vector<JitInsn> insns;
   GuestAddr current_rip = guest_rip;
   bool block_ended = false;
@@ -2733,8 +3013,6 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
 
   while (!block_ended && insns.size() < MAX_BLOCK_INSNS) {
     insn_rip = current_rip;
-    if (current_rip != guest_rip && m_barriers.count(current_rip) != 0)
-      break; // a barrier starts its own block
     if (!memory.is_valid_address(current_rip, 1)) {
       break;
     }
@@ -2760,16 +3038,12 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
     }
 
     insns.push_back(insn);
-    if (insn.kind == Kind::Jcc) {
+    if (insn.kind == Kind::Jcc || writes_rip(insn.kind)) {
       block_ended = true;
       break;
     }
-    if (insn.kind == Kind::Jmp || insn.kind == Kind::CallRel) {
+    if (insn.kind == Kind::Jmp) {
       current_rip = insn.target;
-      block_ended = true;
-      break;
-    }
-    if (insn.kind == Kind::Ret || insn.kind == Kind::JmpInd || insn.kind == Kind::CallInd) {
       block_ended = true;
       break;
     }
@@ -2804,42 +3078,49 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
   // Pass 3: emit.
   m_emitter.clear();
   m_emitter.emit_prologue();
-  m_emitter.mov_imm64(24, reinterpret_cast<u64>(m_chain.data()));
-  const usize chain_entry_pos = m_emitter.pos(); // chained blocks enter here
+  assert(m_emitter.size_bytes() == kChainEntryOffset);
   BlockTranslator translator(m_emitter);
   for (usize i = 0; i < insns.size(); ++i) {
+    // Debug-only publication: preserve the precise store RIP with JIT chaining.
+    static const bool page_watch = std::getenv("PS4_PAGE_WATCH") != nullptr;
+    if (page_watch) {
+      m_emitter.mov_imm64(0, insns[i].rip);
+      m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
+    }
     translator.emit(insns[i], flags_needed[i], i);
   }
 
   const usize instructions = insns.size();
 
-  // Always update RIP at end of block.
-  const Kind last = insns.back().kind;
-  if (last == Kind::Jcc) {
+  // Update RIP at the end of the block (CALL/RET/indirect JMP stored it
+  // already); return the retired-instruction count.
+  if (insns.back().kind == Kind::Jcc) {
     emit_jcc_rip(m_emitter, insns.back());
-  } else if (last == Kind::Ret || last == Kind::JmpInd || last == Kind::CallInd) {
-    m_emitter.mov_reg(0, 12);
-  } else {
+    m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
+  } else if (!writes_rip(insns.back().kind)) {
     m_emitter.mov_imm64(0, current_rip);
+    m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
   }
-  m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
-  // x22 += retired; while under the chain budget (x23), continue straight
-  // into the next block if it is compiled: chain[(rip ^ rip >> 16) & 0xffff].
-  m_emitter.add_imm(22, 22, static_cast<u32>(instructions));
-  m_emitter.cmp_reg(true, 22, 23);
-  const usize to_return = m_emitter.pos();
-  m_emitter.b_cond(2 /* HS */, 0);
-  m_emitter.eor_shifted(true, 1, 0, 0, Arm64Emitter::SHIFT_LSR, 16);
-  m_emitter.ubfx(true, 1, 1, 0, 16);
-  m_emitter.add_shifted(true, 1, 24, 1, Arm64Emitter::SHIFT_LSL, 4);
-  m_emitter.emit(0xa9400c22); // ldp x2, x3, [x1]
-  m_emitter.cmp_reg(true, 2, 0);
-  const usize miss = m_emitter.pos();
-  m_emitter.b_cond(1 /* NE */, 0);
-  m_emitter.emit(0xd61f0060); // br x3
-  m_emitter.patch_b_cond(to_return, m_emitter.pos());
-  m_emitter.patch_b_cond(miss, m_emitter.pos());
-  m_emitter.mov_reg(0, 22);
+  // Next block: while the budget lasts, jump to it if this thread's table
+  // knows it (the same slot function as ThreadBlockCache). It is inline so that
+  // each block's BR has its own branch-predictor history. x0 = the next RIP.
+  if (writes_rip(insns.back().kind))
+    m_emitter.ldr_reg(0, 19, offsetof(CpuContext, rip));
+  m_emitter.add_imm(24, 24, static_cast<u32>(instructions));
+  m_emitter.emit(0xf10006f7); // subs x23, x23, #1
+  const usize out_of_budget = m_emitter.pos();
+  m_emitter.b_cond(COND_CC, 0);
+  m_emitter.eor_shifted(true, 2, 0, 0, Arm64Emitter::SHIFT_LSR, 16);
+  m_emitter.ubfx(true, 2, 2, 0, 16);
+  m_emitter.emit(0x8b0212c2); // add x2, x22, x2, lsl #4
+  m_emitter.emit(0xa9401043); // ldp x3, x4, [x2]
+  m_emitter.cmp_reg(true, 3, 0);
+  const usize not_cached = m_emitter.pos();
+  m_emitter.b_cond(COND_NE, 0);
+  m_emitter.emit(0xd61f0080); // br x4
+  m_emitter.patch_b_cond(out_of_budget, m_emitter.pos());
+  m_emitter.patch_b_cond(not_cached, m_emitter.pos());
+  m_emitter.mov_reg(0, 24);
   m_emitter.emit_epilogue();
 
   translator.emit_side_exits();
@@ -2854,8 +3135,6 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
 
   auto fn = reinterpret_cast<JittedBlockFunc>(code_ptr);
   m_blocks[guest_rip] = fn;
-  if (m_barriers.count(guest_rip) == 0)
-    chain_insert(guest_rip, static_cast<const u8 *>(code_ptr) + chain_entry_pos * sizeof(u32));
   m_metrics[guest_rip] = JitBlockMetrics{
       .instructions_compiled = instructions,
       .bytes_emitted = code_size,
@@ -2881,6 +3160,13 @@ struct ThreadBlockCache {
   };
   u64 epoch = 0;
   std::unique_ptr<Slot[]> fast;
+  // What compiled code reads to chain to the next block: same slot function as
+  // `fast`, `body` being the block's code just past its prologue.
+  struct ChainSlot {
+    GuestAddr rip;
+    const void *body;
+  };
+  std::unique_ptr<ChainSlot[]> chain;
   std::unordered_map<GuestAddr, Entry> map;
   static usize slot_of(GuestAddr rip) { return static_cast<usize>((rip ^ (rip >> 16)) & (kFastSlots - 1)); }
 };
@@ -2888,22 +3174,34 @@ thread_local ThreadBlockCache t_block_cache;
 } // namespace
 
 bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
-                                usize *retired, usize chain_budget) {
+                                usize *retired, u64 chain_budget) {
   if (retired)
     *retired = 0;
+  // RIP 0 (a guest thread returning from its entry point) and the other
+  // invalid low targets are the interpreter's to report.
+  if (ctx.rip < 0x20)
+    return false;
   JittedBlockFunc fn = nullptr;
   usize *exec_count = nullptr;
   ThreadBlockCache &tc = t_block_cache;
   const u64 epoch = m_epoch.load(std::memory_order_acquire);
   if (tc.epoch != epoch || !tc.fast) {
     tc.map.clear();
-    if (!tc.fast)
+    if (!tc.fast) {
       tc.fast = std::make_unique<ThreadBlockCache::Slot[]>(ThreadBlockCache::kFastSlots);
-    for (usize i = 0; i < ThreadBlockCache::kFastSlots; ++i)
+      tc.chain = std::make_unique<ThreadBlockCache::ChainSlot[]>(ThreadBlockCache::kFastSlots);
+    }
+    for (usize i = 0; i < ThreadBlockCache::kFastSlots; ++i) {
       tc.fast[i].rip = ~GuestAddr{0};
+      tc.chain[i].rip = ~GuestAddr{0};
+    }
     tc.epoch = epoch;
   }
-  ThreadBlockCache::Slot &slot = tc.fast[ThreadBlockCache::slot_of(ctx.rip)];
+  const usize slot_index = ThreadBlockCache::slot_of(ctx.rip);
+  ThreadBlockCache::Slot &slot = tc.fast[slot_index];
+  auto chain_to = [&](JittedBlockFunc block) {
+    tc.chain[slot_index] = {ctx.rip, reinterpret_cast<const u8 *>(block) + kChainEntryOffset};
+  };
   if (slot.rip == ctx.rip) {
     if (!slot.entry.fn)
       return false;
@@ -2916,6 +3214,7 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
       return false;
     fn = it->second.fn;
     exec_count = it->second.execution_count;
+    chain_to(fn);
   } else {
     {
       // Another thread may have compiled it: look it up under the shared lock.
@@ -2942,6 +3241,7 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
     }
     tc.map.emplace(ctx.rip, ThreadBlockCache::Entry{fn, exec_count});
     slot = {ctx.rip, ThreadBlockCache::Entry{fn, exec_count}};
+    chain_to(fn);
   }
   if (m_collect_metrics) {
     // __atomic builtins: the macos-14 CI runner's libc++ has no C++20
@@ -2959,7 +3259,18 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
   // Compiled code stores to guest memory: the MemoryManager is only const
   // because compilation does not modify it.
   u8 *guest_base = const_cast<u8 *>(memory.base_address());
-  const u64 n = fn(&ctx, guest_base, memory.total_size(), chain_budget);
+#if defined(__APPLE__)
+  static const bool page_watch = std::getenv("PS4_PAGE_WATCH") != nullptr;
+  const CpuContext* previous_watch_context = nullptr;
+  if (page_watch) {
+    previous_watch_context = debug::watch_context;
+    debug::watch_context = &ctx;
+  }
+#endif
+  const u64 n = fn(&ctx, guest_base, memory.total_size(), tc.chain.get(), chain_budget);
+#if defined(__APPLE__)
+  if (page_watch) debug::watch_context = previous_watch_context;
+#endif
   if (retired)
     *retired = static_cast<usize>(n);
   // A block that side-exited on its first instruction made no progress: the

@@ -59,6 +59,7 @@ int main() {
     {
         auto games = ps4::gui::scan_folder("games");
         bool found_flappy = false;
+        bool found_thomas = false;
         for (const auto& g : games) {
             if (g.id.find("ED1633-NPXX51362") != std::string::npos) {
                 found_flappy = true;
@@ -68,11 +69,24 @@ int main() {
                       "flappy eboot chosen by the scanner is a real ELF");
                 check(g.total_bytes > 0, "flappy size is non-zero");
                 check(g.file_count > 0, "flappy file count is non-zero");
+                check(!g.name.empty(), "flappy title name populated from param.sfo");
+                check(g.title_id == "NPXX51362", "flappy title_id extracted from param.sfo");
+                check(g.app_ver == "01.00", "flappy app_ver extracted from param.sfo");
+                check(!g.icon_path.empty(), "flappy icon_path populated");
+            }
+            if (g.id.find("CUSA00909") != std::string::npos) {
+                found_thomas = true;
+                check(g.name == "Thomas Was Alone", "thomas title name populated from param.sfo");
+                check(g.title_id == "CUSA00909", "thomas title_id extracted from param.sfo");
+                check(g.app_ver == "01.00", "thomas app_ver extracted from param.sfo");
+                check(!g.icon_path.empty(), "thomas icon_path populated");
             }
             // The publisher directory must NOT be reported as its own title.
             check(g.id != "flappy_bird", "publisher dir is not listed as a title");
+            check(g.id != "thomas_was_alone", "thomas publisher dir is not listed as a title");
         }
         check(found_flappy, "found the real content-id title directory");
+        check(found_thomas, "found the real thomas title directory");
     }
 
     // --- Test 2: synthetic nested layout ---

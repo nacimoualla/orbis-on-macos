@@ -98,7 +98,7 @@ int main() {
     registry.thread_manager(memory).set_main_context(&cpu.context());
     if (!cpu.setup_default_stack()) return fail("guest stack initialization failed");
     cpu.set_entry_point(loader.entry_point());
-    ps4::t_guest_tid = 1;
+    registry.thread_manager(memory).bind_current_host_thread(1);
 
     // PS4_TRACE_AFTER=addr: once that RIP executes, trace every instruction.
     const ps4::GuestAddr trace_after =

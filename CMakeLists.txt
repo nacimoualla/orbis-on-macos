@@ -21,6 +21,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # a stack canary indirectly (a bad length field driving an oversized memcpy), so
 # the assert is the best-supported lead and must stay live while we chase it.
 set(CMAKE_CXX_FLAGS_INVESTIGATE "-O2 -g" CACHE STRING "" FORCE)
+# The GPU and window code is Objective-C++ (.mm), which has its own flag set.
+set(CMAKE_OBJCXX_FLAGS_INVESTIGATE "-O2 -g" CACHE STRING "" FORCE)
 set(CMAKE_EXE_LINKER_FLAGS_INVESTIGATE "-O2 -g" CACHE STRING "" FORCE)
 
 # Only sets a default, so -DCMAKE_BUILD_TYPE=Debug/Release still work.
@@ -42,6 +44,8 @@ find_library(GAMECONTROLLER_FRAMEWORK GameController REQUIRED)
 
 # Core library
 add_library(ps4_core
+    src/debug/capture.mm
+    src/debug/page_watch.cpp
     src/core/elf_loader.cpp
     src/core/memory.cpp
     src/core/syscall_table.cpp
@@ -56,6 +60,7 @@ add_library(ps4_core
     src/gpu/pm4_translator.mm
     src/gpu/gcn_decoder.cpp
     src/gpu/gcn_to_msl.cpp
+    src/gpu/bc_decode.cpp
     src/gpu/gcn_pipeline.mm
     src/gpu/gpu_state.cpp
     src/audio/audio_manager.cpp
@@ -63,6 +68,7 @@ add_library(ps4_core
     src/hle/nid_registry.cpp
     src/hle/thread.cpp
     src/gui/game_import.cpp
+    src/core/sfo.cpp
 )
 target_include_directories(ps4_core PUBLIC include)
 target_link_libraries(ps4_core PUBLIC
@@ -169,11 +175,28 @@ add_test(NAME Phase19_GcnShader COMMAND test_gcn_shader)
 add_executable(test_gpu_state tests/test_gpu_state.cpp)
 target_link_libraries(test_gpu_state PRIVATE ps4_core)
 add_test(NAME Phase20_GpuState COMMAND test_gpu_state)
-set_tests_properties(Flappy_GpuSmoke PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(Flappy_GpuSmoke PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} RUN_SERIAL TRUE)
+
+add_executable(test_bc_decode tests/test_bc_decode.cpp)
+target_link_libraries(test_bc_decode PRIVATE ps4_core)
+add_test(NAME BcDecode COMMAND test_bc_decode)
 
 add_executable(test_jit_stats tests/test_jit_stats.cpp)
 target_link_libraries(test_jit_stats PRIVATE ps4_core)
 add_test(NAME JitStats COMMAND test_jit_stats)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_EXECUTABLE)
+    add_test(NAME GoldenFrameRegression
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/golden_frame_test.py"
+            --runner "$<TARGET_FILE:ps4-runner>"
+            --games-dir "${CMAKE_SOURCE_DIR}/games"
+            --csv "${CMAKE_BINARY_DIR}/fps_metrics.csv")
+    set_tests_properties(GoldenFrameRegression PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        TIMEOUT 180
+        RUN_SERIAL TRUE)
+endif()
 
 
 
@@ -188,7 +211,7 @@ target_link_libraries(ps4-gui PRIVATE ps4_core)
 set_source_files_properties(src/gui/game_library_gui.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 # Scanner test for the game-import GUI: finds the real dump layout on disk.
-add_executable(test_phase16 tests/test_phase16.cpp src/gui/game_import.cpp)
+add_executable(test_phase16 tests/test_phase16.cpp src/gui/game_import.cpp src/core/sfo.cpp)
 target_include_directories(test_phase16 PRIVATE include)
 add_test(NAME Phase16_GameImport COMMAND test_phase16)
 # The scanner test inspects the real games/ layout, so it must run from the
@@ -214,15 +237,33 @@ set(GUI_BUNDLE "${CMAKE_BINARY_DIR}/ps4-gui.app")
 set(GUI_BUNDLE_MACOS "${GUI_BUNDLE}/Contents/MacOS")
 set(GUI_BUNDLE_RESOURCES "${GUI_BUNDLE}/Contents/Resources")
 
+# Keep an existing Desktop shortcut current even after a targeted binary build.
+# The application stays at one stable path; only its executable is replaced.
+foreach(GUI_COMPONENT ps4-gui ps4-runner)
+    add_custom_command(TARGET ${GUI_COMPONENT} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_MACOS}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:${GUI_COMPONENT}>" "${GUI_BUNDLE_MACOS}/${GUI_COMPONENT}.next"
+        COMMAND ${CMAKE_COMMAND} -E rename
+                "${GUI_BUNDLE_MACOS}/${GUI_COMPONENT}.next" "${GUI_BUNDLE_MACOS}/${GUI_COMPONENT}"
+        VERBATIM)
+endforeach()
+
 add_custom_target(ps4-gui-app ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_MACOS}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_RESOURCES}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:ps4-gui>" "${GUI_BUNDLE_MACOS}/ps4-gui"
+            "$<TARGET_FILE:ps4-gui>" "${GUI_BUNDLE_MACOS}/ps4-gui.next"
+    COMMAND ${CMAKE_COMMAND} -E rename
+            "${GUI_BUNDLE_MACOS}/ps4-gui.next" "${GUI_BUNDLE_MACOS}/ps4-gui"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:ps4-runner>" "${GUI_BUNDLE_MACOS}/ps4-runner"
+            "$<TARGET_FILE:ps4-runner>" "${GUI_BUNDLE_MACOS}/ps4-runner.next"
+    COMMAND ${CMAKE_COMMAND} -E rename
+            "${GUI_BUNDLE_MACOS}/ps4-runner.next" "${GUI_BUNDLE_MACOS}/ps4-runner"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/cmake/Info.plist.in" "${GUI_BUNDLE}/Contents/Info.plist"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/resources/AppIcon.icns" "${GUI_BUNDLE_RESOURCES}/AppIcon.icns"
     COMMAND ${CMAKE_COMMAND} -E echo "APPL????" > "${GUI_BUNDLE}/Contents/PkgInfo"
     DEPENDS ps4-gui ps4-runner
     COMMENT "Assembling ps4-gui.app"
@@ -252,6 +293,17 @@ add_test(NAME JitMemOperands COMMAND test_jit_mem)
 add_executable(test_jit_diff tests/test_jit_diff.cpp)
 target_link_libraries(test_jit_diff PRIVATE ps4_core)
 add_test(NAME JitDifferentialFuzz COMMAND test_jit_diff)
+
+add_executable(test_sfo tests/test_sfo.cpp)
+target_link_libraries(test_sfo PRIVATE ps4_core)
+add_test(NAME SfoParser COMMAND test_sfo)
+set_tests_properties(SfoParser PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_input tests/test_input.cpp)
+target_link_libraries(test_input PRIVATE ps4_core)
+add_test(NAME InputState COMMAND test_input)
+
+set_source_files_properties(src/debug/capture.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 # libSceSaveData (host-folder saves, search, save-data memory) and
 # libSceNpTrophy HLE round trips.

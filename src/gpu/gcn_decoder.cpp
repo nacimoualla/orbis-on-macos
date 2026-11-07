@@ -554,6 +554,30 @@ u64 hash_words(const u32* data, usize count, u64 seed) {
     return h;
 }
 
+u64 hash_memory(const u8* data, usize size) {
+    // Four independent lanes, so the CPU can run them in parallel. Each step
+    // is a bijection of its lane, so one changed word always changes the lane.
+    constexpr u64 K = 0x9E3779B97F4A7C15ull;
+    u64 lane[4] = {K, K ^ 1, K ^ 2, K ^ 3};
+    usize i = 0;
+    for (; i + 32 <= size; i += 32) {
+        u64 w[4];
+        std::memcpy(w, data + i, 32);
+        for (int k = 0; k < 4; ++k) {
+            const u64 v = lane[k] ^ w[k];
+            lane[k] = ((v << 23) | (v >> 41)) * K;
+        }
+    }
+    u64 h = size;
+    for (; i < size; ++i) h = (h ^ data[i]) * K;
+    for (u64 v : lane) {
+        h ^= v;
+        h *= K;
+        h ^= h >> 29;
+    }
+    return h;
+}
+
 namespace {
 
 bool decode_words(const std::vector<u32>& words, u32 pc_base, std::vector<Instruction>& out,

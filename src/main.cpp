@@ -1,4 +1,7 @@
+#include "ps4/debug/page_watch.hpp"
+#include "ps4/debug/capture.hpp"
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
@@ -215,7 +218,8 @@ int main(int argc, char* argv[]) {
     // never be ambiguous about whether Mono actually executed.
     {
         const char* prx = std::getenv("PS4_LOAD_PRX");
-        std::fprintf(stderr, "[prx] mode=%s\n", (prx && prx[0] && std::strcmp(prx, "0") != 0) ? "real" : "hle");
+        const bool force_hle = (prx && std::strcmp(prx, "0") == 0);
+        std::fprintf(stderr, "[prx] mode=%s\n", force_hle ? "hle" : "auto");
     }
     // Hand the linker to HLE handlers: sceKernelLoadStartModule needs it to map
     // PRX modules for real, and the trampoline dispatcher it owns is what makes
@@ -247,6 +251,9 @@ int main(int argc, char* argv[]) {
                 std::cout << "[Metal] GPU command buffer executed clear pass.\n";
             }
             nid_registry.set_metal_backend(&metal);
+            if (auto* gpu = nid_registry.gpu_translator()) {
+                gpu->begin_frame();
+            }
         }
 
         if (enable_window) {
@@ -307,6 +314,12 @@ int main(int argc, char* argv[]) {
         std::cerr << "[Error] Failed to allocate stack.\n";
         return 1;
     }
+    ps4::debug::set_frame_dump([&] {
+        memory.dump_mappings();
+        nid_registry.thread_manager(memory).dump_thread_states();
+    });
+    ps4::debug::start_page_watch(memory);
+    struct PageWatchLifetime { ~PageWatchLifetime() { ps4::debug::stop_page_watch(); ps4::debug::set_frame_dump({}); } } page_watch_lifetime;
     cpu.set_entry_point(loader.entry_point());
     std::cout << "[CPU] RIP set to entry point: 0x" << std::hex << loader.entry_point() << std::dec << "\n";
     std::cout << "[CPU] RSP initialized to:     0x" << std::hex << cpu.context().rsp << std::dec << "\n";
@@ -348,7 +361,7 @@ int main(int argc, char* argv[]) {
             // frames. Each guest flip now ends the GPU frame and marks a new
             // frame to present (set_flip_hook).
             ps4::Pm4Translator* gpu = nid_registry.gpu_translator();
-            if (gpu && !gpu->begin_frame()) {
+            if (gpu && !gpu->frame_in_progress() && !gpu->begin_frame()) {
                 std::cerr << "[GPU] Failed to begin translator frame; stopping guest execution.\n";
                 run_res.status = ps4::StepResult::MemoryFault;
             } else {
@@ -365,7 +378,7 @@ int main(int argc, char* argv[]) {
                 std::atomic<ps4::usize> guest_instructions{0};
                 ps4::RunResult guest_res{};
                 std::thread guest([&] {
-                    ps4::t_guest_tid = 1; // main is guest TID 1
+                    nid_registry.thread_manager(memory).bind_current_host_thread(1);
                     // It used to run on the AppKit thread; keep that thread's
                     // priority so it is not scheduled onto efficiency cores.
                     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -392,14 +405,63 @@ int main(int argc, char* argv[]) {
                 double worst_gap_ms = 0;
                 auto t_prev_present = t_window;
                 static const bool s_flip_stats = std::getenv("PS4_FLIP_STATS") != nullptr;
+                // PS4_AUTO_PRESS=N: pulse Cross (plus touch pad) for 100 ms every
+                // N seconds, to walk menus in unattended test runs.
+                static const double s_auto_press = [] {
+                    const char* v = std::getenv("PS4_AUTO_PRESS");
+                    return v ? std::atof(v) : 0.0;
+                }();
+                const auto t_start = std::chrono::steady_clock::now();
+                // PS4_RUN_SECONDS=N: close the window loop after N seconds so an
+                // unattended run reaches the normal shutdown (and its stats).
+                static const double s_run_seconds = [] {
+                    const char* v = std::getenv("PS4_RUN_SECONDS");
+                    return v ? std::atof(v) : 0.0;
+                }();
                 // Scripted input replaces the keyboard/gamepad; pokes land
                 // while the guest thread runs (aligned 32-bit stores).
                 ScriptedRun script = ScriptedRun::from_env();
                 while (window->is_open() && !guest_done.load()) {
+                    if (s_run_seconds > 0 &&
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() > s_run_seconds)
+                        break;
                     window->poll_events();
+                    ps4::PadState pad_state = window->input_pad_state();
+                    if (s_auto_press > 0) {
+                        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                        if (t > s_auto_press && std::fmod(t, s_auto_press) < 0.1) pad_state.buttons |= 0x4000 | 0x100000;
+                    }
+                    // PS4_AUTO_MOVE=1: hold d-pad right for 2 s, then left for 1 s, repeating.
+                    static const bool s_auto_move = std::getenv("PS4_AUTO_MOVE") != nullptr;
+                    if (s_auto_move) {
+                        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                        pad_state.buttons |= std::fmod(t, 3.0) < 2.0 ? 0x20 : 0x80;
+                    }
+                    nid_registry.set_pad_state(pad_state);
+                    // PS4_HLE_HIST_EVERY=N (with PS4_HLE_HIST): per-thread HLE
+                    // calls of each N-second window, to see what a running but
+                    // stuck game polls.
+                    static const double s_hist_every = [] {
+                        const char* v = std::getenv("PS4_HLE_HIST_EVERY");
+                        return v ? std::atof(v) : 0.0;
+                    }();
+                    if (s_hist_every > 0) {
+                        static auto s_next = t_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                           std::chrono::duration<double>(s_hist_every));
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now >= s_next) {
+                            char label[64];
+                            std::snprintf(label, sizeof(label), "t=%.0fs",
+                                          std::chrono::duration<double>(now - t_start).count());
+                            ps4::dump_hle_time_window(label);
+                            s_next = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                               std::chrono::duration<double>(s_hist_every));
+                        }
+                    }
+                    nid_registry.set_mouse_state(window->input_mouse_state());
                     const ps4::u64 ready = frames_ready.load(std::memory_order_acquire);
                     if (script.done(ready)) break;
-                    if (script.input.empty()) nid_registry.set_pad_buttons(window->input_buttons());
+                    // (the window's pad state was set above; a script overrides it)
                     script.apply(ready, nid_registry, memory);
                     if (ready != presented) {
                         presented = ready;
@@ -427,6 +489,7 @@ int main(int argc, char* argv[]) {
                 // a blocking HLE wait, so give it a moment to finish its slice and
                 // otherwise leave it: shutdown hard-exits parked threads anyway.
                 stop_guest.store(true);
+                syscalls.set_exited(true);
                 for (int i = 0; i < 50 && !guest_done.load(); ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 if (guest_done.load()) {
@@ -474,7 +537,23 @@ int main(int argc, char* argv[]) {
             auto t_start = std::chrono::steady_clock::now();
             auto t_last = t_start;
             ps4::usize instrs_last = 0;
+            static const double s_auto_press = [] {
+                const char* v = std::getenv("PS4_AUTO_PRESS");
+                return v ? std::atof(v) : 0.0;
+            }();
+            static const bool s_auto_move = std::getenv("PS4_AUTO_MOVE") != nullptr;
             while ((max_total == 0 || total_instructions < max_total) && !syscalls.has_exited()) {
+                if (s_auto_press > 0.0 || s_auto_move) {
+                    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                    ps4::u32 buttons = 0;
+                    if (s_auto_press > 0.0 && t > s_auto_press && std::fmod(t, s_auto_press) < 0.1) {
+                        buttons |= 0x4000 | 0x100000;
+                    }
+                    if (s_auto_move) {
+                        buttons |= std::fmod(t, 3.0) < 2.0 ? 0x20 : 0x80;
+                    }
+                    nid_registry.set_pad_buttons(buttons);
+                }
                 run_res = cpu.run(batch);
                 total_instructions += run_res.instructions_executed;
                 if (run_res.status != ps4::StepResult::Ok) break;
@@ -534,6 +613,7 @@ int main(int argc, char* argv[]) {
     }
     memory.dump_mappings();
     ps4::dump_rip_histogram();
+    ps4::write_jit_stats(); // before the thread teardown, which can hard-exit
     ps4::dump_hle_histogram();
     ps4::dump_export_tables();
     ps4::dump_prx_calls();
@@ -551,6 +631,17 @@ int main(int argc, char* argv[]) {
     }
 
     cpu.context().dump();
+
+    std::fprintf(stderr, "=== Main Thread Callstack ===\n");
+    ps4::GuestAddr fp = cpu.context().rbp;
+    for (int d = 0; d < 24 && fp != 0; ++d) {
+        ps4::u64 saved = 0, ret = 0;
+        if (!memory.read_bytes(fp, &saved, 8) || !memory.read_bytes(fp + 8, &ret, 8)) break;
+        std::fprintf(stderr, "  #%02d fp=0x%016llx ret=0x%016llx\n",
+                     d, (unsigned long long)fp, (unsigned long long)ret);
+        if (saved <= fp) break;
+        fp = saved;
+    }
 
     // End-of-run per-thread snapshot: state, wake deadline, last RIP, instrs.
     // Answers "what is each thread blocked in" without a live debugger.
