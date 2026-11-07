@@ -233,15 +233,33 @@ set(GUI_BUNDLE "${CMAKE_BINARY_DIR}/ps4-gui.app")
 set(GUI_BUNDLE_MACOS "${GUI_BUNDLE}/Contents/MacOS")
 set(GUI_BUNDLE_RESOURCES "${GUI_BUNDLE}/Contents/Resources")
 
+# Keep an existing Desktop shortcut current even after a targeted binary build.
+# The application stays at one stable path; only its executable is replaced.
+foreach(GUI_COMPONENT ps4-gui ps4-runner)
+    add_custom_command(TARGET ${GUI_COMPONENT} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_MACOS}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:${GUI_COMPONENT}>" "${GUI_BUNDLE_MACOS}/${GUI_COMPONENT}.next"
+        COMMAND ${CMAKE_COMMAND} -E rename
+                "${GUI_BUNDLE_MACOS}/${GUI_COMPONENT}.next" "${GUI_BUNDLE_MACOS}/${GUI_COMPONENT}"
+        VERBATIM)
+endforeach()
+
 add_custom_target(ps4-gui-app ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_MACOS}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${GUI_BUNDLE_RESOURCES}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:ps4-gui>" "${GUI_BUNDLE_MACOS}/ps4-gui"
+            "$<TARGET_FILE:ps4-gui>" "${GUI_BUNDLE_MACOS}/ps4-gui.next"
+    COMMAND ${CMAKE_COMMAND} -E rename
+            "${GUI_BUNDLE_MACOS}/ps4-gui.next" "${GUI_BUNDLE_MACOS}/ps4-gui"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:ps4-runner>" "${GUI_BUNDLE_MACOS}/ps4-runner"
+            "$<TARGET_FILE:ps4-runner>" "${GUI_BUNDLE_MACOS}/ps4-runner.next"
+    COMMAND ${CMAKE_COMMAND} -E rename
+            "${GUI_BUNDLE_MACOS}/ps4-runner.next" "${GUI_BUNDLE_MACOS}/ps4-runner"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/cmake/Info.plist.in" "${GUI_BUNDLE}/Contents/Info.plist"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/resources/AppIcon.icns" "${GUI_BUNDLE_RESOURCES}/AppIcon.icns"
     COMMAND ${CMAKE_COMMAND} -E echo "APPL????" > "${GUI_BUNDLE}/Contents/PkgInfo"
     DEPENDS ps4-gui ps4-runner
     COMMENT "Assembling ps4-gui.app"

@@ -29,6 +29,13 @@ import glob
 import re
 import time
 import shutil
+import json
+import contextlib
+import shlex
+import signal
+import selectors
+from pathlib import Path
+from game_library import Library
 from typing import List, Dict, Optional, Tuple
 
 try:
@@ -130,12 +137,14 @@ class CommandRunner:
 
         output_lines = []
         process = None
+        selector = None
         try:
             # Guest code prints arbitrary bytes (Unity logs, printf of binary
             # data), so decode leniently: one stray byte must not kill the session.
             process = subprocess.Popen(
-                cmd,
-                shell=True,
+                shlex.split(cmd) if isinstance(cmd, str) else cmd,
+                shell=False,
+                start_new_session=True,
                 cwd=cwd,
                 env=env,
                 stdout=subprocess.PIPE,
@@ -146,9 +155,20 @@ class CommandRunner:
                 bufsize=1,
             )
 
-            start_time = time.time()
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ)
+            start_time = time.monotonic()
             while True:
-                line = process.stdout.readline()
+                if timeout and time.monotonic() - start_time > timeout:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                    ui.warn(f"Process timed out after {timeout} seconds!")
+                    return False, -signal.SIGKILL, "".join(output_lines)
+                if not selector.select(0.1):
+                    if process.poll() is not None:
+                        break
+                    continue
+                line = os.read(process.stdout.fileno(), 65536).decode("utf-8", errors="replace")
                 if not line and process.poll() is not None:
                     break
                 if line:
@@ -160,8 +180,8 @@ class CommandRunner:
                         log_handle.write(line)
                         log_handle.flush()
 
-                if timeout and (time.time() - start_time) > timeout:
-                    process.kill()
+                if timeout and (time.monotonic() - start_time) > timeout:
+                    os.killpg(process.pid, signal.SIGKILL)
                     ui.warn(f"Process timed out after {timeout} seconds!")
                     if log_handle:
                         log_handle.write(f"\n[TIMEOUT after {timeout}s]\n")
@@ -179,9 +199,16 @@ class CommandRunner:
         except Exception as e:
             ui.fail(f"Execution error: {e}")
             if process is not None and process.poll() is None:
-                process.kill()  # don't leave the runner going without a reader
+                os.killpg(process.pid, signal.SIGKILL)  # don't leave the runner going without a reader
             return False, -1, str(e)
         finally:
+            if process is not None and process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            if selector is not None:
+                selector.close()
+            if process is not None and process.stdout is not None:
+                process.stdout.close()
             if log_handle:
                 log_handle.close()
 
@@ -213,9 +240,9 @@ class BuildManager:
         # Check if ninja exists
         if generator == "Ninja" and not shutil.which("ninja"):
             ui.warn("Ninja not found in PATH, falling back to default generator.")
-            cmd = f"cmake -B {self.build_dir} -DCMAKE_BUILD_TYPE={build_type}"
+            cmd = f"cmake -B {shlex.quote(self.build_dir)} -DCMAKE_BUILD_TYPE={build_type}"
         else:
-            cmd = f"cmake -B {self.build_dir} -G {generator} -DCMAKE_BUILD_TYPE={build_type}"
+            cmd = f"cmake -B {shlex.quote(self.build_dir)} -G {generator} -DCMAKE_BUILD_TYPE={build_type}"
         
         success, _, _ = CommandRunner.run(cmd, "CMake Configure", cwd=self.root_dir)
         return success
@@ -226,7 +253,7 @@ class BuildManager:
         if not self.is_configured():
             ui.warn("Build directory not configured; nothing to clean.")
             return True
-        cmd = f"cmake --build {self.build_dir} --target clean"
+        cmd = f"cmake --build {shlex.quote(self.build_dir)} --target clean"
         success, _, _ = CommandRunner.run(cmd, "Clean Build", cwd=self.root_dir)
         return success
 
@@ -248,9 +275,9 @@ class BuildManager:
                 ui.fail("Failed to configure CMake.")
                 return False
 
-        cmd_parts = [f"cmake --build {self.build_dir}"]
+        cmd_parts = [f"cmake --build {shlex.quote(self.build_dir)}"]
         if target:
-            cmd_parts.append(f"--target {target}")
+            cmd_parts.append(f"--target {shlex.quote(target)}")
         if jobs:
             cmd_parts.append(f"-j {jobs}")
 
@@ -309,12 +336,12 @@ class TestManager:
             ui.fail(f"Build directory not found at {self.build_dir}. Please build first.")
             return False
 
-        cmd_parts = [f"ctest --test-dir {self.build_dir}", "--output-on-failure"]
+        cmd_parts = [f"ctest --test-dir {shlex.quote(self.build_dir)}", "--output-on-failure"]
 
         if phase:
             phase_lower = phase.strip().lower()
             regex = self.PHASE_MAP.get(phase_lower, phase)
-            cmd_parts.append(f"-R '{regex}'")
+            cmd_parts.append(f"-R {shlex.quote(regex)}")
             ui.info(f"Targeting test filter: {regex}")
 
         if verbose:
@@ -406,48 +433,8 @@ class GameRunner:
 
     def discover_games(self) -> List[Dict[str, str]]:
         """Search for runnable eboot.elf or eboot.bin titles under games/ and root."""
-        candidates = []
-        games_dir = os.path.join(self.root_dir, "games")
-
-        # 1. Search games/ for title directories containing an eboot
-        if os.path.isdir(games_dir):
-            seen_dirs = set()
-            for root, _, files in os.walk(games_dir):
-                eboot_elf = os.path.join(root, "eboot.elf")
-                eboot_bin = os.path.join(root, "eboot.bin")
-                chosen_eboot = None
-                if os.path.isfile(eboot_elf):
-                    chosen_eboot = eboot_elf
-                elif os.path.isfile(eboot_bin):
-                    chosen_eboot = eboot_bin
-
-                if chosen_eboot and root not in seen_dirs:
-                    seen_dirs.add(root)
-                    rel_path = os.path.relpath(chosen_eboot, self.root_dir)
-                    parent_name = os.path.basename(root)
-                    grandparent = os.path.basename(os.path.dirname(root))
-                    if grandparent != "games":
-                        title = f"{grandparent} ({parent_name})"
-                    else:
-                        title = parent_name
-                    candidates.append({
-                        "title": title,
-                        "path": rel_path,
-                        "filename": os.path.basename(chosen_eboot),
-                    })
-
-        # 2. Check root directory
-        for f in ["eboot.elf", "eboot.bin"]:
-            root_f = os.path.join(self.root_dir, f)
-            if os.path.isfile(root_f):
-                candidates.append({
-                    "title": "Root Game",
-                    "path": f,
-                    "filename": f,
-                })
-                break
-
-        return candidates
+        return [dict(title=g['title'], path=g['eboot'], filename=os.path.basename(g['eboot']))
+                for g in Library(self.root_dir).snapshot()['games'] if g['status'] == 'ready']
 
     def find_executable(self, use_gui: bool = False) -> Optional[str]:
         """Find the path to ps4-runner or ps4-gui."""
@@ -467,14 +454,14 @@ class GameRunner:
         game_path: Optional[str] = None,
         use_gui: bool = False,
         headless: bool = False,
-        window: bool = False,
+        window: Optional[bool] = None,
         budget: Optional[int] = None,
         timeout: Optional[int] = None,
         lldb: bool = False,
         trace: bool = False,
         strict_hle: bool = False,
-        no_jit: bool = False,
-        hle_mono: bool = False,
+        no_jit: Optional[bool] = None,
+        hle_mono: Optional[bool] = None,
     ) -> bool:
         """Launch game with runner. Unity titles run their own Mono PRX modules
         (PS4_LOAD_PRX=1) unless hle_mono asks for the HLE Mono shim."""
@@ -486,14 +473,16 @@ class GameRunner:
             ui.info("Please build the target first: python3 scripts/run_workflow.py build")
             return False
 
+        if use_gui:
+            return CommandRunner.run([runner_exe], "Open game library", cwd=self.root_dir)[0]
+
         if not game_path:
             # Auto-detect
             games = self.discover_games()
             if not games:
                 ui.fail("No game assets (eboot.bin/pkg) found under games/ or root directory.")
                 return False
-            # Default to Flappy Bird if available
-            flappy = next((g for g in games if "flappy" in g["path"].lower()), games[0])
+            flappy = games[0]
             game_path = flappy["path"]
             ui.info(f"Auto-selected game: {flappy['title']} ({game_path})")
 
@@ -501,8 +490,21 @@ class GameRunner:
             ui.fail(f"Game file does not exist: {game_path}")
             return False
 
+        # If game_path is a directory, resolve to eboot.elf or eboot.bin inside it
+        abs_target = os.path.abspath(os.path.join(self.root_dir, game_path)) if not os.path.isabs(game_path) else game_path
+        if os.path.isdir(abs_target):
+            resolved_eboot = None
+            for root, _, files in os.walk(abs_target):
+                if "eboot.elf" in files:
+                    resolved_eboot = os.path.join(root, "eboot.elf")
+                    break
+                elif "eboot.bin" in files and not resolved_eboot:
+                    resolved_eboot = os.path.join(root, "eboot.bin")
+            if resolved_eboot:
+                game_path = os.path.relpath(resolved_eboot, self.root_dir)
+                ui.info(f"Target directory resolved to binary: {game_path}")
+
         if game_path.lower().endswith(".pkg"):
-            from pathlib import Path
             abs_pkg = os.path.abspath(os.path.join(self.root_dir, game_path)) if not os.path.isabs(game_path) else game_path
             pkg_name = os.path.basename(game_path)
             extracted = None
@@ -546,12 +548,20 @@ class GameRunner:
                 ui.fail(f"Could not extract or resolve package container: {game_path}")
                 return False
 
+        saved = Library(self.root_dir).profile(str(Path(self.root_dir, game_path).resolve().parent), {})
+        window = saved['window'] if window is None else window
+        if headless:
+            window = False
+        budget = saved['budget'] if budget is None else budget
+        no_jit = not saved['jit'] if no_jit is None else no_jit
+        hle_mono = saved['hle_mono'] if hle_mono is None else hle_mono
+
         # Build runner flags
         cmd_parts = []
         if lldb:
             cmd_parts.extend(["lldb", "--"])
 
-        cmd_parts.append(os.path.relpath(runner_exe, self.root_dir))
+        cmd_parts.append(shlex.quote(runner_exe))
 
         if not use_gui:
             if window:
@@ -571,7 +581,7 @@ class GameRunner:
             if no_jit:
                 cmd_parts.append("--no-jit")
 
-        cmd_parts.append(f'"{game_path}"')
+        cmd_parts.append(shlex.quote(game_path))
         cmd = " ".join(cmd_parts)
 
         env = os.environ.copy()
@@ -696,7 +706,7 @@ class DiagnosticsManager:
 
         cmd = f"python3 scripts/collect_logs.py"
         if log_file:
-            cmd += f" --log {log_file}"
+            cmd += f" --log {shlex.quote(log_file)}"
 
         CommandRunner.run(cmd, "Run PM4 Log Collector", cwd=self.root_dir)
 
@@ -772,13 +782,14 @@ class InteractiveMenu:
         """Display the interactive loop."""
         while True:
             ui.header("PS4-to-macOS Developer Workflow")
-            print(f"  {ui.BOLD}[1]{ui.RESET} Quick Run: Build & Launch Flappy Bird (Budget: 10M)")
+            print(f"  {ui.BOLD}[1]{ui.RESET} Open Game Library")
             print(f"  {ui.BOLD}[2]{ui.RESET} Build Targets (ps4-runner, ps4-gui, tests, clean)")
             print(f"  {ui.BOLD}[3]{ui.RESET} Run CTest Suite (All or choose Phase 1-17 / Flappy)")
-            print(f"  {ui.BOLD}[4]{ui.RESET} Launch Game / App (Flappy Bird or custom eboot)")
+            print(f"  {ui.BOLD}[4]{ui.RESET} Launch Game / App from Library")
             print(f"  {ui.BOLD}[5]{ui.RESET} Inspect / Collect Diagnostics & Logs")
             print(f"  {ui.BOLD}[6]{ui.RESET} Clean Build Artifacts")
-            print(f"  {ui.BOLD}[7]{ui.RESET} Extract Games (Unpack PKGs / Archives, password: SuperPSX)")
+            print(f"  {ui.BOLD}[7]{ui.RESET} Import PKGs / Archives / Folders into Library")
+            print(f"  {ui.BOLD}[8]{ui.RESET} List Game Library")
             print(f"  {ui.BOLD}[q]{ui.RESET} Exit")
             print(f"{ui.CYAN}{'─' * 64}{ui.RESET}")
 
@@ -804,16 +815,22 @@ class InteractiveMenu:
             elif choice == "6":
                 self.builder.clean()
             elif choice == "7":
-                self._menu_extract()
+                target = input("Import path [Enter=scan games/]: ").strip()
+                result = Library(self.root_dir).import_sources(Path(self.root_dir, target) if target else None)
+                for job in result['jobs']:
+                    print(f"{job['status']}: {job['source']} — {job['message']}")
+            elif choice == "8":
+                for game in Library(self.root_dir).snapshot()['games']:
+                    print(f"{game['title']} [{game['title_id']}] — {game['status']}")
             else:
                 ui.warn("Invalid choice, please select 1-7 or q.")
 
             input(f"\n{ui.DIM}Press Enter to return to the menu...{ui.RESET}")
 
     def _quick_run(self):
-        ui.section("Quick Run: Build & Launch Flappy Bird")
-        if self.builder.build(target="ps4-runner"):
-            self.runner.launch(budget=10000000)
+        ui.section("Open Game Library")
+        if self.builder.build(target="ps4-gui"):
+            self.runner.launch(use_gui=True)
 
     def _menu_build(self):
         ui.section("Build Targets")
@@ -821,11 +838,14 @@ class InteractiveMenu:
         print("  [2] Build ps4-runner")
         print("  [3] Build ps4-gui")
         print("  [4] Rebuild (Clean + Build All)")
+        print("  [5] Build macOS App Bundle")
         sub = input("Select build option [1-4, Enter=1]: ").strip()
         if sub == "2":
             self.builder.build(target="ps4-runner")
         elif sub == "3":
             self.builder.build(target="ps4-gui")
+        elif sub == "5":
+            self.builder.build(target="ps4-gui-app")
         elif sub == "4":
             self.builder.build(clean_first=True)
         else:
@@ -950,6 +970,21 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command", help="Workflow command to run")
 
+    for name in ('library', 'import', 'profile'):
+        command = subparsers.add_parser(name)
+        command.add_argument('--json', action='store_true')
+        if name == 'library':
+            command.add_argument('--refresh', action='store_true')
+        elif name == 'import':
+            command.add_argument('target', nargs='?')
+            command.add_argument('--retry', action='store_true')
+            command.add_argument('--background', action='store_true')
+        else:
+            command.add_argument('root')
+            for flag in ('jit', 'window', 'hle-mono'):
+                command.add_argument('--' + flag, choices=('on', 'off'))
+            command.add_argument('--budget', type=int)
+
     # --- Build subcommand ---
     p_build = subparsers.add_parser("build", help="Build targets via CMake & Ninja")
     p_build.add_argument("--target", "-t", type=str, default=None, help="Target name (e.g. ps4-runner, ps4-gui)")
@@ -969,15 +1004,15 @@ def main():
     p_run = subparsers.add_parser("run", aliases=["game"], help="Launch PS4 game / app")
     p_run.add_argument("game_path", nargs="?", default=None, help="Path to eboot.bin, elf, or pkg")
     p_run.add_argument("--gui", action="store_true", help="Launch with ps4-gui instead of ps4-runner")
-    p_run.add_argument("--window", "-w", action="store_true", help="Open macOS interactive display window")
+    p_run.add_argument("--window", "-w", action="store_true", default=None, help="Open macOS interactive display window")
     p_run.add_argument("--headless", action="store_true", help="Run in headless console mode")
     p_run.add_argument("--budget", "-b", type=int, default=None, help="Headless instruction budget (0=unlimited)")
     p_run.add_argument("--timeout", type=int, default=None, help="Execution timeout in seconds")
     p_run.add_argument("--lldb", action="store_true", help="Wrap runner in LLDB debugger")
     p_run.add_argument("--trace", "-t", action="store_true", help="Trace guest instruction execution")
     p_run.add_argument("--strict-hle", action="store_true", help="Fail-loud strict HLE mode")
-    p_run.add_argument("--no-jit", action="store_true", help="Disable ARM64 JIT recompiler")
-    p_run.add_argument("--hle-mono", action="store_true",
+    p_run.add_argument("--no-jit", action="store_true", default=None, help="Disable ARM64 JIT recompiler")
+    p_run.add_argument("--hle-mono", action="store_true", default=None,
                        help="Use the HLE Mono shim instead of the game's own Mono PRX modules")
 
     # --- Logs subcommand ---
@@ -1002,6 +1037,44 @@ def main():
     p_all.add_argument("--game", type=str, default=None, help="Game path for pipeline")
 
     args = parser.parse_args()
+
+    if args.command in ('library', 'import', 'profile'):
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                library = Library(root_dir)
+                if args.command == 'profile':
+                    changes = {key: getattr(args, key) == 'on' for key in ('jit', 'window', 'hle_mono') if getattr(args, key) is not None}
+                    if args.budget is not None:
+                        if args.budget < 0:
+                            parser.error('budget must be nonnegative')
+                        changes['budget'] = args.budget
+                    result = library.profile(Path(root_dir, args.root), changes)
+                elif args.command == 'import' or args.refresh:
+                    target = Path(root_dir, args.target) if args.command == 'import' and args.target else None
+                    result = library.background_import(target, args.retry) if getattr(args, 'background', False) else library.import_sources(target, getattr(args, 'retry', False))
+                else:
+                    result = library.snapshot()
+            if args.json:
+                print(json.dumps(result))
+            elif args.command == 'profile':
+                for key, value in result.items():
+                    print(f"{key}: {value}")
+            else:
+                for game in result['games']:
+                    print(f"{game['title']} [{game['title_id'] or 'unknown'}] — {game['status']}")
+                if not result['games']:
+                    print('No games in the library.')
+                for job in result['jobs']:
+                    print(f"{job['status']}: {job['source']} — {job['message']}")
+                worker = result.get('worker', {})
+                if worker.get('pid'):
+                    print(f"Import worker: {'running' if worker.get('running') else 'idle'} (PID {worker['pid']}, queued {worker.get('queued', 0)})")
+                if worker.get('log_path'):
+                    print(f"Import log: {worker['log_path']}")
+        except Exception as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        return
 
     # Determine execution flow
     if args.menu or (not args.command and sys.stdin.isatty()):

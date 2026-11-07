@@ -9,10 +9,12 @@ extracted SELF eboot.bin files into runnable eboot.elf binaries using unpack_sel
 
 import os
 import sys
+import time
 import shutil
 import struct
 import tarfile
 import zipfile
+import threading
 import argparse
 import subprocess
 from pathlib import Path
@@ -52,6 +54,132 @@ def log_warn(msg: str):
 
 def log_fail(msg: str):
     log(msg, prefix="✗", color="\033[91m")
+
+
+class ExtractionProgressTracker:
+    """
+    Real-time progress tracker for game and archive extractions.
+    Monitors output directory size, write speed (MB/s), ETA, and tool stdout.
+    Supports animated terminal progress bar and periodic non-interactive log updates.
+    """
+
+    def __init__(self, target_dir: Path, expected_bytes: int, label: str = "Extracting"):
+        self.target_dir = target_dir
+        self.expected_bytes = max(1, expected_bytes)
+        self.label = label
+        self.start_time = time.time()
+        self.last_log_time = 0.0
+        self.last_pct_milestone = -1
+        self.is_tty = sys.stdout.isatty()
+        self.stop_event = threading.Event()
+        self.current_status = ""
+        self.file_info = ""
+        self.error_lines: List[str] = []
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        """Start the background monitor thread."""
+        self.stop_event.clear()
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread.start()
+
+    def set_status(self, status: str):
+        """Update current active file or status text."""
+        self.current_status = status.strip()
+
+    def set_file_info(self, file_info: str):
+        """Update file counter info, e.g. [5/26]."""
+        self.file_info = file_info.strip()
+
+    def _get_dir_size(self) -> int:
+        """Efficient non-recursive directory size calculation using stack."""
+        if not self.target_dir.exists():
+            return 0
+        total = 0
+        stack = [str(self.target_dir)]
+        while stack:
+            cur = stack.pop()
+            try:
+                with os.scandir(cur) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                total += entry.stat().st_size
+                            elif entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+        return total
+
+    def _render(self, written: int, force_log: bool = False):
+        """Render animated progress bar or output log milestone."""
+        now = time.time()
+        elapsed = max(0.001, now - self.start_time)
+        speed = written / elapsed
+        pct = (written / self.expected_bytes) * 100.0 if self.expected_bytes > 0 else 0.0
+        if pct > 99.5 and not self.stop_event.is_set():
+            pct = 99.5
+
+        cols = shutil.get_terminal_size((80, 24)).columns
+        bar_len = 15 if cols < 95 else 20
+        filled = int(round(bar_len * (min(100.0, pct) / 100.0)))
+        bar = "█" * filled + "░" * (bar_len - filled)
+
+        cur_gb = written / (1024**3)
+        tot_gb = self.expected_bytes / (1024**3)
+        speed_mb = speed / (1024 * 1024)
+        rem_bytes = max(0, self.expected_bytes - written)
+        eta_sec = (rem_bytes / speed) if speed > 1024 else 0
+        eta_str = f"{int(eta_sec)}s" if eta_sec < 60 else f"{int(eta_sec//60)}m{int(eta_sec%60):02d}s"
+
+        status_part = f"{self.file_info} {self.current_status}".strip()
+
+        if self.is_tty:
+            prefix = f"\r\033[96m[{bar}]\033[0m {pct:5.1f}% | {cur_gb:.2f}/{tot_gb:.2f} GB | {speed_mb:5.1f} MB/s | ETA: {eta_str}"
+            rem_cols = max(0, cols - len(prefix) - 4)
+            if status_part and rem_cols > 8:
+                if len(status_part) > rem_cols:
+                    status_part = "..." + status_part[-(rem_cols - 3):]
+                line = f"{prefix} | {status_part}"
+            else:
+                line = prefix
+            sys.stdout.write(line.ljust(cols - 1) + "\r")
+            sys.stdout.flush()
+        else:
+            milestone = int(pct // 10) * 10
+            if force_log or (now - self.last_log_time >= 5.0) or (milestone > self.last_pct_milestone):
+                tag = f"[{status_part}]" if status_part else ""
+                print(f"ℹ Progress: {pct:5.1f}% ({cur_gb:.2f}/{tot_gb:.2f} GB) | {speed_mb:5.1f} MB/s | ETA: {eta_str} {tag}")
+                self.last_log_time = now
+                self.last_pct_milestone = milestone
+
+    def _monitor_loop(self):
+        while not self.stop_event.is_set():
+            written = self._get_dir_size()
+            self._render(written)
+            time.sleep(0.25)
+
+    def finish(self, success: bool = True):
+        """Stop tracking and print final execution summary."""
+        self.stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        final_written = self._get_dir_size()
+        elapsed = max(0.001, time.time() - self.start_time)
+        speed_mb = (final_written / elapsed) / (1024 * 1024)
+        tot_gb = final_written / (1024**3)
+        time_str = f"{int(elapsed)}s" if elapsed < 60 else f"{int(elapsed//60)}m{int(elapsed%60):02d}s"
+
+        if self.is_tty:
+            sys.stdout.write("\r" + " " * (shutil.get_terminal_size((80, 24)).columns - 1) + "\r")
+            sys.stdout.flush()
+
+        if success:
+            log_success(f"{self.label} completed: {tot_gb:.2f} GB in {time_str} ({speed_mb:.1f} MB/s)")
+        else:
+            log_fail(f"{self.label} failed after {time_str}")
 
 
 def find_pkg_tool() -> Optional[Path]:
@@ -213,22 +341,27 @@ def is_already_extracted(games_dir: Path, content_id: str, title_id: str) -> Opt
     """Check if a game with the given content_id or title_id is already extracted."""
     if not games_dir.is_dir():
         return None
-    for item in games_dir.rglob("eboot.bin"):
-        p = item.parent
-        # Check if parent matches content_id or title_id
-        if content_id and p.name == content_id:
-            return p
-        if title_id and p.name == title_id:
-            return p
-        # Check param.sfo in parent
-        sfo_path = p / "sce_sys" / "param.sfo"
-        if sfo_path.is_file():
-            try:
-                sfo = parse_sfo(sfo_path.read_bytes())
-                if title_id and sfo.get("TITLE_ID") == title_id:
-                    return p
-            except Exception:
-                pass
+    seen_dirs = set()
+    for pattern in ["eboot.elf", "eboot.bin"]:
+        for item in games_dir.rglob(pattern):
+            p = item.parent
+            if p in seen_dirs:
+                continue
+            seen_dirs.add(p)
+            # Check if parent matches content_id or title_id
+            if content_id and p.name == content_id:
+                return p
+            if title_id and p.name == title_id:
+                return p
+            # Check param.sfo in parent
+            sfo_path = p / "sce_sys" / "param.sfo"
+            if sfo_path.is_file():
+                try:
+                    sfo = parse_sfo(sfo_path.read_bytes())
+                    if title_id and sfo.get("TITLE_ID") == title_id:
+                        return p
+                except Exception:
+                    pass
     return None
 
 
@@ -237,10 +370,11 @@ def extract_archive(
     output_dir: Path,
     password: str = "SuperPSX",
 ) -> List[Path]:
-    """Extract compressed archive (.zip, .7z, .rar) using password if protected."""
+    """Extract compressed archive (.zip, .7z, .rar) with real-time progress."""
     output_dir.mkdir(parents=True, exist_ok=True)
     ext = archive_path.suffix.lower()
     extracted_files = []
+    arch_size = archive_path.stat().st_size if archive_path.is_file() else 0
 
     log(f"Extracting archive: {archive_path.name} (password: {password})...")
 
@@ -249,39 +383,120 @@ def extract_archive(
     tool_unar = shutil.which("unar")
 
     if tool_7z:
-        cmd = [tool_7z, "x", f"-p{password}", "-y", f"-o{output_dir}", str(archive_path)]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode == 0:
+        tracker = ExtractionProgressTracker(
+            target_dir=output_dir,
+            expected_bytes=arch_size,
+            label=f"Unpacking {archive_path.name}",
+        )
+        tracker.start()
+        cmd = [tool_7z, "x", f"-p{password}", "-y", "-bsp1", f"-o{output_dir}", str(archive_path)]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        try:
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, ''):
+                    l_str = line.strip()
+                    if not l_str:
+                        continue
+                    if l_str.endswith("%"):
+                        tracker.set_file_info(f"[{l_str}]")
+                    elif "+" in l_str:
+                        parts = l_str.split("+", 1)
+                        if len(parts) == 2:
+                            tracker.set_status(parts[1].strip())
+                    elif "error" in l_str.lower():
+                        tracker.error_lines.append(l_str)
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            res = proc.wait()
+            tracker.finish(success=(res == 0))
+
+        if res == 0:
             log_success(f"Extracted {archive_path.name} via 7z")
         else:
             # Try without password
-            cmd_nopass = [tool_7z, "x", "-y", f"-o{output_dir}", str(archive_path)]
-            res2 = subprocess.run(cmd_nopass, capture_output=True, text=True)
-            if res2.returncode == 0:
+            tracker = ExtractionProgressTracker(
+                target_dir=output_dir,
+                expected_bytes=arch_size,
+                label=f"Unpacking {archive_path.name} (unencrypted)",
+            )
+            tracker.start()
+            cmd_nopass = [tool_7z, "x", "-y", "-bsp1", f"-o{output_dir}", str(archive_path)]
+            proc2 = subprocess.Popen(cmd_nopass, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            try:
+                if proc2.stdout:
+                    for line in iter(proc2.stdout.readline, ''):
+                        l_str = line.strip()
+                        if not l_str:
+                            continue
+                        if l_str.endswith("%"):
+                            tracker.set_file_info(f"[{l_str}]")
+                        elif "+" in l_str:
+                            parts = l_str.split("+", 1)
+                            if len(parts) == 2:
+                                tracker.set_status(parts[1].strip())
+            finally:
+                if proc2.stdout:
+                    proc2.stdout.close()
+                res2 = proc2.wait()
+                tracker.finish(success=(res2 == 0))
+
+            if res2 == 0:
                 log_success(f"Extracted {archive_path.name} via 7z (unencrypted)")
             else:
-                log_fail(f"7z extraction failed: {res.stderr or res.stdout}")
+                log_fail(f"7z extraction failed: {res2}")
 
     elif tool_unar:
+        tracker = ExtractionProgressTracker(
+            target_dir=output_dir,
+            expected_bytes=arch_size,
+            label=f"Unpacking {archive_path.name}",
+        )
+        tracker.start()
         cmd = [tool_unar, "-p", password, "-o", str(output_dir), str(archive_path)]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode == 0:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        try:
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, ''):
+                    l_str = line.strip()
+                    if l_str:
+                        tracker.set_status(l_str)
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            res = proc.wait()
+            tracker.finish(success=(res == 0))
+        if res == 0:
             log_success(f"Extracted {archive_path.name} via unar")
         else:
-            log_fail(f"unar extraction failed: {res.stderr or res.stdout}")
+            log_fail(f"unar extraction failed with code {res}")
 
     elif ext == ".zip":
         try:
             with zipfile.ZipFile(archive_path, "r") as zf:
+                members = zf.infolist()
+                total_bytes = sum(m.file_size for m in members)
+                tracker = ExtractionProgressTracker(
+                    target_dir=output_dir,
+                    expected_bytes=total_bytes,
+                    label=f"Extracting {archive_path.name}",
+                )
+                tracker.start()
                 try:
-                    zf.extractall(path=output_dir, pwd=password.encode("utf-8"))
+                    for idx, member in enumerate(members):
+                        tracker.set_file_info(f"[{idx+1}/{len(members)}]")
+                        tracker.set_status(member.filename)
+                        try:
+                            zf.extract(member, path=output_dir, pwd=password.encode("utf-8"))
+                        except RuntimeError:
+                            zf.extract(member, path=output_dir)
+                    tracker.finish(success=True)
                     log_success(f"Extracted {archive_path.name} via zipfile")
-                except RuntimeError:
-                    # Retry without password
-                    zf.extractall(path=output_dir)
-                    log_success(f"Extracted {archive_path.name} via zipfile (unencrypted)")
+                except Exception as e:
+                    tracker.finish(success=False)
+                    log_fail(f"zipfile extraction failed: {e}")
         except Exception as e:
-            log_fail(f"zipfile extraction failed: {e}")
+            log_fail(f"zipfile open failed: {e}")
     else:
         log_fail(f"No suitable decompression tool found to unpack {archive_path.name}. Please install 7zz or unar.")
 
@@ -300,7 +515,8 @@ def extract_pkg(
 ) -> Optional[Path]:
     """
     Extract a single PS4 PKG into games/<slug>/<content_id>.
-    Converts eboot.bin to eboot.elf and sets up environment.
+    Converts eboot.bin to eboot.elf, configures VFS environment,
+    and displays a real-time progress indicator during unpacking.
     """
     info = inspect_pkg(pkg_path)
     if not info["is_pkg"]:
@@ -324,6 +540,8 @@ def extract_pkg(
         eboot_bin = existing / "eboot.bin"
         if not eboot_elf.is_file() and eboot_bin.is_file():
             convert_eboot_bin_to_elf(eboot_bin, eboot_elf)
+        (existing / "debug.log").touch(exist_ok=True)
+        (existing / "vfs_root").mkdir(parents=True, exist_ok=True)
         return existing
 
     pkg_tool = ensure_pkg_tool()
@@ -333,18 +551,57 @@ def extract_pkg(
     log(f"  Destination: {final_dir}")
 
     target_parent.mkdir(parents=True, exist_ok=True)
+    extracted_title_dir = target_parent / title_id
+    extracted_title_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-create internal directories so unpatched ps4-pkg-tool will not fail fopen
+    (extracted_title_dir / "sce_module").mkdir(parents=True, exist_ok=True)
+    (extracted_title_dir / "sce_sys").mkdir(parents=True, exist_ok=True)
 
     # ps4-pkg-tool extracts to <output_dir>/<title_id>
     cmd = [str(pkg_tool), str(pkg_path), str(target_parent)]
     log(f"Running: {' '.join(cmd)}")
 
-    proc = subprocess.run(cmd, text=True, capture_output=True)
-    if proc.returncode != 0:
-        log_fail(f"ps4-pkg-tool failed with return code {proc.returncode}:\n{proc.stderr or proc.stdout}")
+    pkg_size = pkg_path.stat().st_size if pkg_path.is_file() else 0
+    tracker = ExtractionProgressTracker(
+        target_dir=target_parent,
+        expected_bytes=pkg_size,
+        label=f"Extracting {pkg_path.name}",
+    )
+    tracker.start()
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    try:
+        if proc.stdout:
+            for line in iter(proc.stdout.readline, ''):
+                line_clean = line.strip()
+                if not line_clean:
+                    continue
+                if line_clean.startswith("Extracting: "):
+                    tracker.set_status(line_clean[12:])
+                elif line_clean.startswith("Progress: "):
+                    tracker.set_file_info(f"[{line_clean[10:]}]")
+                elif "failed" in line_clean.lower() or "error" in line_clean.lower():
+                    tracker.error_lines.append(line_clean)
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        ret = proc.wait()
+        tracker.finish(success=(ret == 0))
+
+    if ret != 0:
+        err_msg = "\n".join(tracker.error_lines) if tracker.error_lines else f"Process exited with return code {ret}"
+        log_fail(f"ps4-pkg-tool failed with return code {ret}:\n{err_msg}")
         return None
 
     # ps4-pkg-tool creates <target_parent>/<title_id>
-    extracted_title_dir = target_parent / title_id
     if extracted_title_dir.is_dir() and extracted_title_dir != final_dir:
         if final_dir.exists():
             shutil.rmtree(final_dir)

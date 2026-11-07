@@ -25,6 +25,7 @@ from extract_games import (
     extract_pkg,
     extract_game_target,
     find_pkg_tool,
+    ExtractionProgressTracker,
 )
 
 
@@ -113,6 +114,33 @@ class TestExtractGames(unittest.TestCase):
                 self.assertTrue(len(extracted) > 0)
                 # Verify extracted content exists
                 self.assertTrue((out_extracted / "test.zip").is_file())
+
+    def test_progress_tracker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            out_dir = tmppath / "progress_test"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            tracker = ExtractionProgressTracker(
+                target_dir=out_dir,
+                expected_bytes=1024 * 1024,
+                label="Unit Test Tracker",
+            )
+            tracker.start()
+            tracker.set_status("test_file.cpk")
+            tracker.set_file_info("[1/10]")
+
+            # Write some dummy bytes
+            test_file = out_dir / "test_file.cpk"
+            test_file.write_bytes(b"\x00" * (512 * 1024))
+
+            # Allow monitor loop to sample
+            tracker._render(tracker._get_dir_size())
+            self.assertEqual(tracker._get_dir_size(), 512 * 1024)
+
+            # Test finish
+            tracker.finish(success=True)
+            self.assertTrue(tracker.stop_event.is_set())
 
     def test_run_workflow_extract_subcommand(self):
         cmd = [sys.executable, str(SCRIPTS_DIR / "run_workflow.py"), "extract"]
