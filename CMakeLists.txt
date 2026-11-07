@@ -177,6 +177,19 @@ add_executable(test_jit_stats tests/test_jit_stats.cpp)
 target_link_libraries(test_jit_stats PRIVATE ps4_core)
 add_test(NAME JitStats COMMAND test_jit_stats)
 
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_EXECUTABLE)
+    add_test(NAME GoldenFrameRegression
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/golden_frame_test.py"
+            --runner "$<TARGET_FILE:ps4-runner>"
+            --games-dir "${CMAKE_SOURCE_DIR}/games"
+            --csv "${CMAKE_BINARY_DIR}/fps_metrics.csv")
+    set_tests_properties(GoldenFrameRegression PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        TIMEOUT 180
+        RUN_SERIAL TRUE)
+endif()
+
 
 
 
