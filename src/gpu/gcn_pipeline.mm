@@ -97,6 +97,24 @@ MTLSamplerAddressMode address_mode(u32 c) {
 struct GcnPipelineCache::Impl {
     id<MTLDevice> device{nil};
     MemoryManager* memory{nullptr};
+    // All of guest memory as one no-copy buffer, for compute shaders (they
+    // read and write it in place). Made once: wrapping the 8 GB range again
+    // for every dispatch made each command buffer wait for that range to be
+    // made resident, so a game dispatching every frame (Sonic Mania) ran at
+    // 4-17 fps with the GPU nearly idle.
+    id<MTLBuffer> guest_buffer{nil};
+    const void* guest_buffer_base{nullptr};
+    id<MTLBuffer> guest_memory_buffer() {
+        if (!memory || !memory->base_address()) return nil;
+        if (guest_buffer && guest_buffer_base == memory->base_address()) return guest_buffer;
+        const NSUInteger len = std::min<NSUInteger>(memory->total_size(), [device maxBufferLength]) & ~16383UL;
+        guest_buffer = [device newBufferWithBytesNoCopy:memory->base_address()
+                                                 length:len
+                                                options:MTLResourceStorageModeShared
+                                            deallocator:nil];
+        guest_buffer_base = guest_buffer ? memory->base_address() : nullptr;
+        return guest_buffer;
+    }
     MetalBackend* metal{nullptr};
     GcnPipelineStats stats{};
 
@@ -932,19 +950,8 @@ bool GcnPipelineCache::encode_dispatch(void* compute_encoder, const GcnComputeRe
             }
         }
 
-        id<MTLBuffer> mem = nil;
-        if (im.memory && im.memory->base_address()) {
-            NSUInteger max_len = [im.device maxBufferLength];
-            NSUInteger buf_len = std::min<NSUInteger>(im.memory->total_size(), max_len);
-            buf_len = buf_len & ~16383UL;
-            mem = [im.device newBufferWithBytesNoCopy:im.memory->base_address()
-                                               length:buf_len
-                                              options:MTLResourceStorageModeShared
-                                          deallocator:nil];
-        }
-        if (!mem) {
-            mem = [im.device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
-        }
+        id<MTLBuffer> mem = im.guest_memory_buffer();
+        if (!mem) mem = [im.device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
         [enc setBuffer:mem offset:0 atIndex:gcn::binding::kMemBuffer];
 
         gcn::ComputeConsts cc{};
