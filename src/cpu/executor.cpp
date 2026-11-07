@@ -2514,7 +2514,7 @@ StepResult CpuExecutor::step() {
         }
 
         // VMOVAPS / VMOVAPD (0x28 load, 0x29 store)
-        if (vex_op == 0x28) {
+        if (vex_map == 1 && vex_op == 0x28) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 dest = m.reg_id & 15;
@@ -2526,7 +2526,7 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        if (vex_op == 0x29) {
+        if (vex_map == 1 && vex_op == 0x29) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 src = m.reg_id & 15;
@@ -2684,8 +2684,8 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // VPCMPGTQ (map 2, op 0x37, pp=1): compare packed qwords for greater than (signed)
-        if (vex_map == 2 && vex_op == 0x37 && vex_pp == 1) {
+        // VPCMPEQQ (0x29) / VPCMPGTQ (0x37) (map 2, pp=1): compare packed qwords
+        if (vex_map == 2 && (vex_op == 0x29 || vex_op == 0x37) && vex_pp == 1) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 dest = m.reg_id & 15;
@@ -2697,9 +2697,13 @@ StepResult CpuExecutor::step() {
             CpuContext::YmmReg res{};
             const usize count = vex_l ? 4 : 2;
             for (usize i = 0; i < count; ++i) {
-                const i64 a = static_cast<i64>(m_context.ymm[src1].q[i]);
-                const i64 b = static_cast<i64>(src2.q[i]);
-                res.q[i] = (a > b) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                if (vex_op == 0x29) {
+                    res.q[i] = (m_context.ymm[src1].q[i] == src2.q[i]) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                } else {
+                    const i64 a = static_cast<i64>(m_context.ymm[src1].q[i]);
+                    const i64 b = static_cast<i64>(src2.q[i]);
+                    res.q[i] = (a > b) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                }
             }
             m_context.ymm[dest] = res;
             if (!vex_l) {
@@ -2874,7 +2878,7 @@ StepResult CpuExecutor::step() {
             for (usize lane = 0; lane < lanes; ++lane) {
                 const usize base = lane * 2;
                 for (usize i = 0; i < 2; ++i) {
-                    const u8 sel = (imm8 >> i) & 1;
+                    const u8 sel = (imm8 >> (base + i)) & 1;
                     res.q[base + i] = src.q[base + sel];
                 }
             }
@@ -4041,7 +4045,11 @@ StepResult CpuExecutor::step() {
                 case 0x70: mine = pp >= 1; has_imm = true; break;   // PSHUFD / PSHUFHW / PSHUFLW
                 case 0xD0: mine = pp == 1 || pp == 3; break;
                 case 0xD4: case 0xFA: case 0xFB: case 0xFE:
-                case 0x62: case 0x6A: case 0x6C: case 0x6D: mine = pp == 1; break;
+                case 0x60: case 0x61: case 0x62: case 0x63: case 0x67: case 0x68: case 0x69: case 0x6A: case 0x6B: case 0x6C: case 0x6D:
+                case 0xD5: case 0xD8: case 0xD9: case 0xDA: case 0xDC: case 0xDD: case 0xDE:
+                case 0xE0: case 0xE3: case 0xE4: case 0xE5: case 0xE8: case 0xE9: case 0xEA:
+                case 0xEC: case 0xED: case 0xEE: case 0xF4: case 0xF5:
+                case 0xF8: case 0xF9: case 0xFC: case 0xFD: mine = pp == 1; break;
                 case 0x14: case 0x15: case 0x54: case 0x55: case 0x56: mine = pp <= 1; break;
                 default: break;
                 }
@@ -4059,6 +4067,8 @@ StepResult CpuExecutor::step() {
                     return m_memory.read_bytes(m.mem_addr, &b, n);
                 };
                 CpuContext::YmmReg r = a;
+                auto sat8 = [](int v) { return static_cast<u8>(static_cast<i8>(std::clamp(v, -128, 127))); };
+                auto sat16 = [](int v) { return static_cast<u16>(static_cast<i16>(std::clamp(v, -32768, 32767))); };
                 const bool dbl = pp == 1 || pp == 3;
                 auto cmp = [](auto x, auto y, u8 pred) {
                     const bool unord = std::isnan(x) || std::isnan(y);
@@ -4186,9 +4196,63 @@ StepResult CpuExecutor::step() {
                     case 0xFB: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = a.q[i] - b.q[i]; break; // PSUBQ
                     case 0xFE: ok = load_b(16); for (int i = 0; i < 4; ++i) r.d[i] = a.d[i] + b.d[i]; break; // PADDD
                     case 0xFA: ok = load_b(16); for (int i = 0; i < 4; ++i) r.d[i] = a.d[i] - b.d[i]; break; // PSUBD
+                    case 0x60: ok = load_b(16); for (int i = 0; i < 8; ++i) { r.b[2 * i] = a.b[i]; r.b[2 * i + 1] = b.b[i]; } break; // PUNPCKLBW
+                    case 0x61: ok = load_b(16); for (int i = 0; i < 4; ++i) { r.w[2 * i] = a.w[i]; r.w[2 * i + 1] = b.w[i]; } break; // PUNPCKLWD
                     case 0x62: ok = load_b(16); r.d[0] = a.d[0]; r.d[1] = b.d[0]; r.d[2] = a.d[1]; r.d[3] = b.d[1]; break;
+                    case 0x63: // PACKSSWB
+                        ok = load_b(16);
+                        for (int i = 0; i < 8; ++i) {
+                            r.b[i] = sat8(static_cast<i16>(a.w[i]));
+                            r.b[8 + i] = sat8(static_cast<i16>(b.w[i]));
+                        }
+                        break;
+                    case 0x67: // PACKUSWB
+                        ok = load_b(16);
+                        for (int i = 0; i < 8; ++i) {
+                            r.b[i] = static_cast<u8>(std::clamp<int>(static_cast<i16>(a.w[i]), 0, 255));
+                            r.b[8 + i] = static_cast<u8>(std::clamp<int>(static_cast<i16>(b.w[i]), 0, 255));
+                        }
+                        break;
+                    case 0x68: ok = load_b(16); for (int i = 0; i < 8; ++i) { r.b[2 * i] = a.b[8 + i]; r.b[2 * i + 1] = b.b[8 + i]; } break; // PUNPCKHBW
+                    case 0x69: ok = load_b(16); for (int i = 0; i < 4; ++i) { r.w[2 * i] = a.w[4 + i]; r.w[2 * i + 1] = b.w[4 + i]; } break; // PUNPCKHWD
                     case 0x6A: ok = load_b(16); r.d[0] = a.d[2]; r.d[1] = b.d[2]; r.d[2] = a.d[3]; r.d[3] = b.d[3]; break;
+                    case 0x6B: // PACKSSDW
+                        ok = load_b(16);
+                        for (int i = 0; i < 4; ++i) {
+                            r.w[i] = sat16(static_cast<i32>(a.d[i]));
+                            r.w[4 + i] = sat16(static_cast<i32>(b.d[i]));
+                        }
+                        break;
                     case 0x6C: ok = load_b(16); r.q[0] = a.q[0]; r.q[1] = b.q[0]; break;
+                    case 0x6D: ok = load_b(16); r.q[0] = a.q[1]; r.q[1] = b.q[1]; break;
+                    case 0xD5: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>(u32{a.w[i]} * b.w[i]); break; // PMULLW
+                    case 0xD8: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] > b.b[i] ? a.b[i] - b.b[i] : 0; break; // PSUBSB unsigned (PSUBUSB)
+                    case 0xD9: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = a.w[i] > b.w[i] ? a.w[i] - b.w[i] : 0; break; // PSUBUSW
+                    case 0xDA: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = std::min(a.b[i], b.b[i]); break; // PMINUB
+                    case 0xDC: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = static_cast<u8>(std::min(a.b[i] + b.b[i], 0xFF)); break; // PADDUSB
+                    case 0xDD: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>(std::min(a.w[i] + b.w[i], 0xFFFF)); break; // PADDUSW
+                    case 0xDE: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = std::max(a.b[i], b.b[i]); break; // PMAXUB
+                    case 0xE0: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = static_cast<u8>((static_cast<u32>(a.b[i]) + static_cast<u32>(b.b[i]) + 1) >> 1); break; // PAVGB
+                    case 0xE3: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>((static_cast<u32>(a.w[i]) + static_cast<u32>(b.w[i]) + 1) >> 1); break; // PAVGW
+                    case 0xE4: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>((u32{a.w[i]} * b.w[i]) >> 16); break; // PMULHUW
+                    case 0xE5: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>((static_cast<i32>(static_cast<i16>(a.w[i])) * static_cast<i32>(static_cast<i16>(b.w[i]))) >> 16); break; // PMULHW
+                    case 0xE8: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = sat8(static_cast<i32>(static_cast<i8>(a.b[i])) - static_cast<i32>(static_cast<i8>(b.b[i]))); break; // PSUBSB
+                    case 0xE9: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = sat16(static_cast<i32>(static_cast<i16>(a.w[i])) - static_cast<i32>(static_cast<i16>(b.w[i]))); break; // PSUBSW
+                    case 0xEA: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>(std::min(static_cast<i16>(a.w[i]), static_cast<i16>(b.w[i]))); break; // PMINSW
+                    case 0xEC: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = sat8(static_cast<i32>(static_cast<i8>(a.b[i])) + static_cast<i32>(static_cast<i8>(b.b[i]))); break; // PADDSB
+                    case 0xED: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = sat16(static_cast<i32>(static_cast<i16>(a.w[i])) + static_cast<i32>(static_cast<i16>(b.w[i]))); break; // PADDSW
+                    case 0xEE: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = static_cast<u16>(std::max(static_cast<i16>(a.w[i]), static_cast<i16>(b.w[i]))); break; // PMAXSW
+                    case 0xF4: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = static_cast<u64>(a.d[2 * i]) * static_cast<u64>(b.d[2 * i]); break; // PMULUDQ
+                    case 0xF5: // PMADDWD
+                        ok = load_b(16);
+                        for (int i = 0; i < 4; ++i)
+                            r.d[i] = static_cast<u32>(static_cast<i32>(static_cast<i16>(a.w[2 * i])) * static_cast<i32>(static_cast<i16>(b.w[2 * i])) +
+                                                      static_cast<i32>(static_cast<i16>(a.w[2 * i + 1])) * static_cast<i32>(static_cast<i16>(b.w[2 * i + 1])));
+                        break;
+                    case 0xF8: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] - b.b[i]; break; // PSUBB
+                    case 0xF9: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = a.w[i] - b.w[i]; break; // PSUBW
+                    case 0xFC: ok = load_b(16); for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] + b.b[i]; break; // PADDB
+                    case 0xFD: ok = load_b(16); for (int i = 0; i < 8; ++i) r.w[i] = a.w[i] + b.w[i]; break; // PADDW
                     case 0x14: case 0x15: { // UNPCKLPS/PD, UNPCKHPS/PD
                         ok = load_b(16);
                         const int hi = op == 0x15;
@@ -4199,7 +4263,7 @@ StepResult CpuExecutor::step() {
                     case 0x54: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = a.q[i] & b.q[i]; break;  // ANDPS/PD
                     case 0x55: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = ~a.q[i] & b.q[i]; break; // ANDNPS/PD
                     case 0x56: ok = load_b(16); for (int i = 0; i < 2; ++i) r.q[i] = a.q[i] | b.q[i]; break;  // ORPS/PD
-                    default:   ok = load_b(16); r.q[0] = a.q[1]; r.q[1] = b.q[1]; break; // 0x6D
+                    default:   break;
                     }
                 }
                 if (!ok) return StepResult::MemoryFault;
@@ -4207,6 +4271,57 @@ StepResult CpuExecutor::step() {
                 m_context.rip = start_rip + c + m.bytes_consumed + (has_imm ? 1 : 0);
                 return StepResult::Ok;
             }
+        }
+
+        // 66 0F 71 / 72 / 73: Shift packed integers by immediate
+        if (operand_size_16 && (op1 == 0x71 || op1 == 0x72 || op1 == 0x73)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context, 1);
+            if (!m.valid || !m.is_reg) return StepResult::IllegalInstruction;
+            const u8 imm8 = raw_code[cursor + m.bytes_consumed];
+            const u8 sub_op = m.reg_id & 7;
+            const u8 target = m.rm_id & 15;
+            CpuContext::YmmReg src = m_context.ymm[target];
+            CpuContext::YmmReg res = src;
+            if (op1 == 0x73) {
+                if (sub_op == 7) { // PSLLDQ (shift left bytes)
+                    for (usize i = 0; i < 16; ++i) {
+                        res.b[i] = (i >= imm8) ? src.b[i - imm8] : 0;
+                    }
+                } else if (sub_op == 3) { // PSRLDQ (shift right bytes)
+                    for (usize i = 0; i < 16; ++i) {
+                        res.b[i] = (i + imm8 < 16) ? src.b[i + imm8] : 0;
+                    }
+                } else if (sub_op == 6) { // PSLLQ (shift left qwords by bits)
+                    for (usize q = 0; q < 2; ++q) {
+                        const u64 v = src.q[q];
+                        res.q[q] = (imm8 < 64) ? (v << imm8) : 0;
+                    }
+                } else if (sub_op == 2) { // PSRLQ (shift right qwords by bits)
+                    for (usize q = 0; q < 2; ++q) {
+                        const u64 v = src.q[q];
+                        res.q[q] = (imm8 < 64) ? (v >> imm8) : 0;
+                    }
+                }
+            } else if (op1 == 0x72) {
+                // PSRLD (2), PSRAD (4), PSLLD (6)
+                for (usize d = 0; d < 4; ++d) {
+                    const u32 v = src.d[d];
+                    if (sub_op == 6) res.d[d] = (imm8 < 32) ? (v << imm8) : 0;
+                    else if (sub_op == 2) res.d[d] = (imm8 < 32) ? (v >> imm8) : 0;
+                    else if (sub_op == 4) res.d[d] = (imm8 < 32) ? (static_cast<u32>(static_cast<i32>(v) >> imm8)) : (static_cast<i32>(v) < 0 ? 0xFFFFFFFFU : 0U);
+                }
+            } else if (op1 == 0x71) {
+                // PSRLW (2), PSRAW (4), PSLLW (6)
+                for (usize w = 0; w < 8; ++w) {
+                    const u16 v = src.w[w];
+                    if (sub_op == 6) res.w[w] = (imm8 < 16) ? static_cast<u16>(v << imm8) : 0;
+                    else if (sub_op == 2) res.w[w] = (imm8 < 16) ? static_cast<u16>(v >> imm8) : 0;
+                    else if (sub_op == 4) res.w[w] = (imm8 < 16) ? (static_cast<u16>(static_cast<i16>(v) >> imm8)) : (static_cast<i16>(v) < 0 ? 0xFFFFU : 0U);
+                }
+            }
+            m_context.ymm[target] = res;
+            m_context.rip = start_rip + cursor + m.bytes_consumed + 1;
+            return StepResult::Ok;
         }
 
         // 0x0F 0x38: 3-byte escape prefix
@@ -4330,6 +4445,71 @@ StepResult CpuExecutor::step() {
                 }
                 m_context.ymm[dest] = res;
                 m_context.ymm[dest].q[2] = 0; m_context.ymm[dest].q[3] = 0;
+                m_context.rip = start_rip + cursor + m.bytes_consumed;
+                return StepResult::Ok;
+            }
+
+            // SSE4.1 packed integer instructions (66 0F 38):
+            // PCMPEQQ (0x29), PACKUSDW (0x2B), PCMPGTQ (0x37),
+            // PMINSB/SD/UW/UD (0x38..0x3B), PMAXSB/SD/UW/UD (0x3C..0x3F), PMULLD (0x40)
+            if (operand_size_16 && (op2 == 0x29 || op2 == 0x2B || op2 == 0x37 ||
+                                    (op2 >= 0x38 && op2 <= 0x40))) {
+                auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f38, rex_r, rex_x, rex_b, seg_override, m_context);
+                if (!m.valid) return StepResult::IllegalInstruction;
+                const u8 dest = m.reg_id & 15;
+                CpuContext::YmmReg b{};
+                if (m.is_reg) b = m_context.ymm[m.rm_id & 15];
+                else if (!m_memory.read_bytes(m.mem_addr, &b, 16)) return StepResult::MemoryFault;
+                CpuContext::YmmReg a = m_context.ymm[dest];
+                CpuContext::YmmReg res = a;
+                switch (op2) {
+                case 0x29: // PCMPEQQ
+                    for (int i = 0; i < 2; ++i) res.q[i] = (a.q[i] == b.q[i]) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                    break;
+                case 0x2B: // PACKUSDW
+                    for (int i = 0; i < 4; ++i) {
+                        res.w[i] = static_cast<u16>(std::clamp<i64>(static_cast<i64>(static_cast<i32>(a.d[i])), 0, 65535));
+                        res.w[4 + i] = static_cast<u16>(std::clamp<i64>(static_cast<i64>(static_cast<i32>(b.d[i])), 0, 65535));
+                    }
+                    break;
+                case 0x37: // PCMPGTQ
+                    for (int i = 0; i < 2; ++i)
+                        res.q[i] = (static_cast<i64>(a.q[i]) > static_cast<i64>(b.q[i])) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                    break;
+                case 0x38: // PMINSB
+                    for (int i = 0; i < 16; ++i)
+                        res.b[i] = static_cast<u8>(std::min(static_cast<i8>(a.b[i]), static_cast<i8>(b.b[i])));
+                    break;
+                case 0x39: // PMINSD
+                    for (int i = 0; i < 4; ++i)
+                        res.d[i] = static_cast<u32>(std::min(static_cast<i32>(a.d[i]), static_cast<i32>(b.d[i])));
+                    break;
+                case 0x3A: // PMINUW
+                    for (int i = 0; i < 8; ++i) res.w[i] = std::min(a.w[i], b.w[i]);
+                    break;
+                case 0x3B: // PMINUD
+                    for (int i = 0; i < 4; ++i) res.d[i] = std::min(a.d[i], b.d[i]);
+                    break;
+                case 0x3C: // PMAXSB
+                    for (int i = 0; i < 16; ++i)
+                        res.b[i] = static_cast<u8>(std::max(static_cast<i8>(a.b[i]), static_cast<i8>(b.b[i])));
+                    break;
+                case 0x3D: // PMAXSD
+                    for (int i = 0; i < 4; ++i)
+                        res.d[i] = static_cast<u32>(std::max(static_cast<i32>(a.d[i]), static_cast<i32>(b.d[i])));
+                    break;
+                case 0x3E: // PMAXUW
+                    for (int i = 0; i < 8; ++i) res.w[i] = std::max(a.w[i], b.w[i]);
+                    break;
+                case 0x3F: // PMAXUD
+                    for (int i = 0; i < 4; ++i) res.d[i] = std::max(a.d[i], b.d[i]);
+                    break;
+                case 0x40: // PMULLD
+                    for (int i = 0; i < 4; ++i)
+                        res.d[i] = static_cast<u32>(static_cast<i64>(static_cast<i32>(a.d[i])) * static_cast<i64>(static_cast<i32>(b.d[i])));
+                    break;
+                }
+                m_context.ymm[dest] = res;
                 m_context.rip = start_rip + cursor + m.bytes_consumed;
                 return StepResult::Ok;
             }
