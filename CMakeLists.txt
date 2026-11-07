@@ -280,3 +280,9 @@ target_link_libraries(test_input PRIVATE ps4_core)
 add_test(NAME InputState COMMAND test_input)
 
 set_source_files_properties(src/debug/capture.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+# libSceSaveData (host-folder saves, search, save-data memory) and
+# libSceNpTrophy HLE round trips.
+add_executable(test_save_data_trophy tests/test_save_data_trophy.cpp)
+target_link_libraries(test_save_data_trophy PRIVATE ps4_core)
+add_test(NAME SaveDataTrophy COMMAND test_save_data_trophy)
