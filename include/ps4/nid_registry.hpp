@@ -40,6 +40,17 @@ public:
     /// Find an HLE symbol by name
     [[nodiscard]] const HleSymbol* find_by_name(std::string_view name) const;
 
+    /// Register an imported data object (a vtable, `_Stderr`, a `locale::id`).
+    /// Imports of `nid` bind to the address `make` returns, called once with
+    /// guest memory the first time a module imports it, instead of to a code
+    /// trampoline.
+    using DataFactory = std::function<GuestAddr(MemoryManager&)>;
+    void register_data_symbol(Nid nid, std::string_view name, DataFactory make);
+
+    /// Guest address of a registered data import (created on first use), or 0
+    /// when `nid` is not a registered data symbol.
+    [[nodiscard]] GuestAddr resolve_data_symbol(Nid nid, MemoryManager& mem);
+
     /// HLE dispatch accounting for the stall watchdog. Const: touches only
     /// globals and thread entries, never the registry itself.
     void note_hle_dispatch(Nid nid, GuestAddr caller_rip = 0) const;
@@ -87,6 +98,12 @@ public:
 private:
     std::unordered_map<Nid, HleSymbol> m_symbols_by_nid;
     std::unordered_map<std::string, Nid> m_nids_by_name;
+    struct DataSymbol {
+        std::string name;
+        DataFactory make;
+        GuestAddr addr{0};
+    };
+    std::unordered_map<Nid, DataSymbol> m_data_by_nid;
 };
 
 } // namespace ps4

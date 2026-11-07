@@ -57,3 +57,7 @@ Logs/
 *.log
 *.log
 dump_code_*.bin
+
+# Save data the runtime writes for games (user data, never committed)
+vfs_root/savedata/*
+!vfs_root/savedata/.gitkeep

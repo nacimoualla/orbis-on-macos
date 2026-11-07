@@ -471,8 +471,8 @@ int main() {
             0xC5, 0xF1, 0x6B, 0xC1,
             // VPACKUSWB xmm2, xmm0, xmm0: unsigned saturation of those words
             0xC5, 0xF9, 0x67, 0xD0,
-            // VPSADBW is still unimplemented and must fail explicitly.
-            0xC5, 0xF9, 0xF6, 0xC0
+            // VPCLMULQDQ is unimplemented and must fail explicitly.
+            0xC4, 0xE3, 0x79, 0x44, 0xC0, 0x00
         };
         assert(memory.write_bytes(code_addr, code, sizeof(code)));
         cpu.context().ymm[1].d[0] = 0x00010000U;

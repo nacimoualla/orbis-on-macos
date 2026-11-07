@@ -1438,6 +1438,116 @@ StepResult CpuExecutor::step() {
         g_vex_op = vex_op;
         const GuestAddr next_ip_base_vex = start_rip + cursor;
 
+        // VMASKMOVPS/PD (map 2 2C/2D load, 2E/2F store; map-1 2C/2E are
+        // VCVTTSS2SI/VUCOMISS). The mask is vvvv; an element moves only when its
+        // mask sign bit is set. Loads zero the rest; stores leave memory alone.
+        if (vex_map == 2 && vex_pp == 1 && vex_op >= 0x2C && vex_op <= 0x2F) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override,
+                                  m_context);
+            if (!m.valid || m.is_reg) return StepResult::IllegalInstruction;
+            const bool pd = vex_op & 1;
+            const bool store = vex_op >= 0x2E;
+            const unsigned esz = pd ? 8 : 4;
+            const unsigned count = (vex_l ? 32u : 16u) / esz;
+            const CpuContext::YmmReg mask = m_context.ymm[vex_vvvv & 15];
+            const u8 reg = m.reg_id & 15;
+            if (store) {
+                const CpuContext::YmmReg src = m_context.ymm[reg];
+                for (unsigned i = 0; i < count; ++i) {
+                    const bool on = pd ? (mask.q[i] >> 63) : (mask.d[i] >> 31);
+                    if (on) m_memory.write_bytes(m.mem_addr + i * esz, src.b + i * esz, esz);
+                }
+            } else {
+                CpuContext::YmmReg res{};
+                for (unsigned i = 0; i < count; ++i) {
+                    const bool on = pd ? (mask.q[i] >> 63) : (mask.d[i] >> 31);
+                    if (on) m_memory.read_bytes(m.mem_addr + i * esz, res.b + i * esz, esz);
+                }
+                m_context.ymm[reg] = res;
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
+        // Packed-integer ops whose opcode bytes other (map- or prefix-blind)
+        // handlers below also match: VPSHUFLW/VPSHUFHW (map 1 70, F2/F3),
+        // VPSADBW (map 1 F6), and map 2 VPHADDSW 03, VPMADDUBSW 04, VPHSUBW
+        // 05, VPHSUBD 06, VPMULHRSW 0B, VPCMPEQQ 29. 128 or 256-bit, per lane.
+        if (vex_pp >= 1 && ((vex_map == 1 && vex_op == 0x70 && vex_pp >= 2) ||
+                            (vex_map == 1 && vex_op == 0xF6 && vex_pp == 1) ||
+                            (vex_map == 2 && vex_pp == 1 &&
+                             (vex_op == 0x03 || vex_op == 0x04 || vex_op == 0x05 || vex_op == 0x06 ||
+                              vex_op == 0x0B || vex_op == 0x29)))) {
+            const bool has_imm = vex_map == 1 && vex_op == 0x70;
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override,
+                                  m_context, has_imm ? 1 : 0);
+            if (!m.valid) return StepResult::IllegalInstruction;
+            const u8 imm8 = has_imm ? raw_code[cursor + m.bytes_consumed] : 0;
+            const CpuContext::YmmReg a = m_context.ymm[vex_vvvv & 15];
+            CpuContext::YmmReg b{};
+            if (m.is_reg) b = m_context.ymm[m.rm_id & 15];
+            else if (!m_memory.read_bytes(m.mem_addr, &b, vex_l ? 32 : 16)) return StepResult::MemoryFault;
+            auto sat16 = [](i32 v) { return static_cast<u16>(static_cast<i16>(std::clamp(v, -32768, 32767))); };
+            CpuContext::YmmReg r{};
+            for (usize lane = 0; lane < (vex_l ? 2u : 1u); ++lane) {
+                const usize w0 = lane * 8, d0 = lane * 4, q0 = lane * 2, b0 = lane * 16;
+                if (vex_map == 1 && vex_op == 0x70) {
+                    const bool high = vex_pp == 2; // F3: PSHUFHW, F2: PSHUFLW
+                    const usize keep = high ? 0 : 4, shuf = high ? 4 : 0;
+                    for (usize i = 0; i < 4; ++i) {
+                        r.w[w0 + keep + i] = b.w[w0 + keep + i];
+                        r.w[w0 + shuf + i] = b.w[w0 + shuf + ((imm8 >> (2 * i)) & 3)];
+                    }
+                } else if (vex_map == 1) { // VPSADBW
+                    for (usize q = 0; q < 2; ++q) {
+                        u32 sum = 0;
+                        for (usize i = 0; i < 8; ++i) {
+                            const int x = a.b[b0 + q * 8 + i], y = b.b[b0 + q * 8 + i];
+                            sum += static_cast<u32>(x > y ? x - y : y - x);
+                        }
+                        r.q[q0 + q] = sum;
+                    }
+                } else {
+                    switch (vex_op) {
+                    case 0x03: case 0x05: // VPHADDSW / VPHSUBW
+                        for (usize i = 0; i < 4; ++i) {
+                            const i32 x0 = static_cast<i16>(a.w[w0 + 2 * i]), x1 = static_cast<i16>(a.w[w0 + 2 * i + 1]);
+                            const i32 y0 = static_cast<i16>(b.w[w0 + 2 * i]), y1 = static_cast<i16>(b.w[w0 + 2 * i + 1]);
+                            r.w[w0 + i] = vex_op == 0x03 ? sat16(x0 + x1) : static_cast<u16>(x0 - x1);
+                            r.w[w0 + 4 + i] = vex_op == 0x03 ? sat16(y0 + y1) : static_cast<u16>(y0 - y1);
+                        }
+                        break;
+                    case 0x06: // VPHSUBD
+                        for (usize i = 0; i < 2; ++i) {
+                            r.d[d0 + i] = a.d[d0 + 2 * i] - a.d[d0 + 2 * i + 1];
+                            r.d[d0 + 2 + i] = b.d[d0 + 2 * i] - b.d[d0 + 2 * i + 1];
+                        }
+                        break;
+                    case 0x04: // VPMADDUBSW: unsigned a bytes x signed b bytes
+                        for (usize i = 0; i < 8; ++i) {
+                            const i32 p0 = static_cast<i32>(a.b[b0 + 2 * i]) * static_cast<i8>(b.b[b0 + 2 * i]);
+                            const i32 p1 = static_cast<i32>(a.b[b0 + 2 * i + 1]) * static_cast<i8>(b.b[b0 + 2 * i + 1]);
+                            r.w[w0 + i] = sat16(p0 + p1);
+                        }
+                        break;
+                    case 0x0B: // VPMULHRSW
+                        for (usize i = 0; i < 8; ++i) {
+                            const i32 p = static_cast<i16>(a.w[w0 + i]) * static_cast<i16>(b.w[w0 + i]);
+                            r.w[w0 + i] = static_cast<u16>(((p >> 14) + 1) >> 1);
+                        }
+                        break;
+                    default: // 0x29 VPCMPEQQ
+                        for (usize i = 0; i < 2; ++i)
+                            r.q[q0 + i] = a.q[q0 + i] == b.q[q0 + i] ? ~0ULL : 0ULL;
+                        break;
+                    }
+                }
+            }
+            m_context.ymm[m.reg_id & 15] = r; // VEX.128 leaves 255:128 zero
+            m_context.rip = start_rip + cursor + m.bytes_consumed + (has_imm ? 1 : 0);
+            return StepResult::Ok;
+        }
+
         // VMOVLPS store (VEX.128.0F 13 /r, pp=0): copy the low 64 bits of the
         // ModR/M.reg XMM register to memory.
         // VMOVLPD store (VEX.128.0F 13 /r, pp=1): copy the low 64 bits of the
@@ -1524,6 +1634,7 @@ StepResult CpuExecutor::step() {
                 const usize bytes = vex_l ? 32 : 16;
                 if (m.is_reg) {
                     std::memcpy(&m_context.ymm[m.rm_id & 15], &m_context.ymm[src], bytes);
+                    if (!vex_l) m_context.ymm[m.rm_id & 15].q[2] = m_context.ymm[m.rm_id & 15].q[3] = 0;
                 } else {
                     m_memory.write_bytes(m.mem_addr, &m_context.ymm[src], bytes);
                 }
@@ -1582,6 +1693,7 @@ StepResult CpuExecutor::step() {
             const usize bytes = vex_l ? 32 : 16;
             if (m.is_reg) {
                 std::memcpy(&m_context.ymm[m.rm_id & 15], &m_context.ymm[src], bytes);
+                if (!vex_l) m_context.ymm[m.rm_id & 15].q[2] = m_context.ymm[m.rm_id & 15].q[3] = 0;
             } else {
                 m_memory.write_bytes(m.mem_addr, &m_context.ymm[src], bytes);
             }
@@ -1909,7 +2021,7 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
-        // VPMOVZX (map 2, op 0x20..0x25) / VPMOVSX (map 2, op 0x30..0x35)
+        // VPMOVSX (map 2, op 0x20..0x25) / VPMOVZX (map 2, op 0x30..0x35)
         // 0x20/0x30: BW (byte to word)
         // 0x21/0x31: BD (byte to dword)
         // 0x22/0x32: BQ (byte to qword)
@@ -2531,8 +2643,12 @@ StepResult CpuExecutor::step() {
             if (!m.valid) return StepResult::IllegalInstruction;
             const u8 src = m.reg_id & 15;
             const usize bytes = vex_l ? 32 : 16;
-            if (m.is_reg) std::memcpy(&m_context.ymm[m.rm_id & 15], &m_context.ymm[src], bytes);
-            else m_memory.write_bytes(m.mem_addr, &m_context.ymm[src], bytes);
+            if (m.is_reg) {
+                std::memcpy(&m_context.ymm[m.rm_id & 15], &m_context.ymm[src], bytes);
+                if (!vex_l) m_context.ymm[m.rm_id & 15].q[2] = m_context.ymm[m.rm_id & 15].q[3] = 0;
+            } else {
+                m_memory.write_bytes(m.mem_addr, &m_context.ymm[src], bytes);
+            }
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
         }
@@ -2902,7 +3018,8 @@ StepResult CpuExecutor::step() {
             if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
             else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
 
-            const u8 mode = (imm8 & 8) ? 0 : static_cast<u8>(imm8 & 3);
+            const u8 mode = (imm8 & 4) ? static_cast<u8>((m_context.mxcsr >> 13) & 3) // RS: MXCSR.RC
+                                         : static_cast<u8>(imm8 & 3);            // bit 3 only masks #P
             CpuContext::YmmReg res{};
             const usize count = vex_l ? 8 : 4;
             for (usize i = 0; i < count; ++i) {
@@ -2933,7 +3050,8 @@ StepResult CpuExecutor::step() {
             if (m.is_reg) src = m_context.ymm[m.rm_id & 15];
             else m_memory.read_bytes(m.mem_addr, &src, vex_l ? 32 : 16);
 
-            const u8 mode = (imm8 & 8) ? 0 : static_cast<u8>(imm8 & 3);
+            const u8 mode = (imm8 & 4) ? static_cast<u8>((m_context.mxcsr >> 13) & 3) // RS: MXCSR.RC
+                                         : static_cast<u8>(imm8 & 3);            // bit 3 only masks #P
             CpuContext::YmmReg res{};
             const usize count = vex_l ? 4 : 2;
             for (usize i = 0; i < count; ++i) {
@@ -2965,7 +3083,8 @@ StepResult CpuExecutor::step() {
             if (m.is_reg) in_val = m_context.ymm[m.rm_id & 15].f[0];
             else m_memory.read_bytes(m.mem_addr, &in_val, 4);
 
-            const u8 mode = (imm8 & 8) ? 0 : static_cast<u8>(imm8 & 3);
+            const u8 mode = (imm8 & 4) ? static_cast<u8>((m_context.mxcsr >> 13) & 3) // RS: MXCSR.RC
+                                         : static_cast<u8>(imm8 & 3);            // bit 3 only masks #P
             CpuContext::YmmReg res = m_context.ymm[src1];
             switch (mode) {
                 case 0: res.f[0] = std::nearbyint(in_val); break;
@@ -2992,7 +3111,8 @@ StepResult CpuExecutor::step() {
             if (m.is_reg) in_val = m_context.ymm[m.rm_id & 15].df[0];
             else m_memory.read_bytes(m.mem_addr, &in_val, 8);
 
-            const u8 mode = (imm8 & 8) ? 0 : static_cast<u8>(imm8 & 3);
+            const u8 mode = (imm8 & 4) ? static_cast<u8>((m_context.mxcsr >> 13) & 3) // RS: MXCSR.RC
+                                         : static_cast<u8>(imm8 & 3);            // bit 3 only masks #P
             CpuContext::YmmReg res = m_context.ymm[src1];
             switch (mode) {
                 case 0: res.df[0] = std::nearbyint(in_val); break;
@@ -3174,7 +3294,7 @@ StepResult CpuExecutor::step() {
                 }
             } else if (vex_pp == 2) { // VCVTTPS2DQ: float to dword (truncate)
                 for (usize i = 0; i < count; ++i) {
-                    res.d[i] = static_cast<u32>(static_cast<i32>(std::trunc(src.f[i])));
+                    res.d[i] = x86_cvt_i32(std::trunc(src.f[i])); // NaN / out of range -> 0x80000000
                 }
             }
             if (!vex_l) {
@@ -3272,40 +3392,41 @@ StepResult CpuExecutor::step() {
             const bool is_scalar = (vex_pp >= 2);
             const usize count = is_scalar ? 1 : (is_pd ? (vex_l ? 4 : 2) : (vex_l ? 8 : 4));
 
+            // The 32 AVX predicates; 16-31 repeat 0-15 with the other
+            // signalling behaviour, which does not change the result.
+            auto pred = [imm8](auto x, auto y) {
+                const bool uno = std::isnan(x) || std::isnan(y);
+                const bool lt = x < y, eq = x == y, gt = x > y;
+                switch (imm8 & 0x0F) {
+                    case 0: return eq;                 // EQ_OQ
+                    case 1: return lt;                 // LT_OS
+                    case 2: return lt || eq;           // LE_OS
+                    case 3: return uno;                // UNORD_Q
+                    case 4: return !eq;                // NEQ_UQ
+                    case 5: return !lt;                // NLT_US
+                    case 6: return !(lt || eq);        // NLE_US
+                    case 7: return !uno;               // ORD_Q
+                    case 8: return eq || uno;          // EQ_UQ
+                    case 9: return lt || uno;          // NGE_US
+                    case 10: return !gt;               // NGT_US
+                    case 11: return false;             // FALSE_OQ
+                    case 12: return !eq && !uno;       // NEQ_OQ
+                    case 13: return gt || eq;          // GE_OS
+                    case 14: return gt;                // GT_OS
+                    default: return true;              // TRUE_UQ
+                }
+            };
             for (usize i = 0; i < count; ++i) {
-                bool cmp_result = false;
                 if (is_pd) {
-                    double a = 0.0, b = 0.0;
-                    std::memcpy(&a, &m_context.ymm[src1].q[i], 8);
-                    std::memcpy(&b, &src2.q[i], 8);
-                    switch (imm8 & 0x1F) {
-                        case 0: cmp_result = (a == b); break;      // EQ
-                        case 1: cmp_result = (a < b); break;       // LT
-                        case 2: cmp_result = (a <= b); break;      // LE
-                        case 3: cmp_result = std::isnan(a) || std::isnan(b); break; // UNORD
-                        case 4: cmp_result = (a != b); break;      // NEQ
-                        case 5: cmp_result = !(a < b); break;     // NLT (true for NaN)
-                        case 6: cmp_result = !(a <= b); break;    // NLE (true for NaN)
-                        case 7: cmp_result = !(std::isnan(a) || std::isnan(b)); break; // ORD
-                        default: cmp_result = false;
-                    }
-                    res.q[i] = cmp_result ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+                    double x = 0.0, y = 0.0;
+                    std::memcpy(&x, &m_context.ymm[src1].q[i], 8);
+                    std::memcpy(&y, &src2.q[i], 8);
+                    res.q[i] = pred(x, y) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
                 } else {
-                    float a = 0.0f, b = 0.0f;
-                    std::memcpy(&a, &m_context.ymm[src1].d[i], 4);
-                    std::memcpy(&b, &src2.d[i], 4);
-                    switch (imm8 & 0x1F) {
-                        case 0: cmp_result = (a == b); break;      // EQ
-                        case 1: cmp_result = (a < b); break;       // LT
-                        case 2: cmp_result = (a <= b); break;      // LE
-                        case 3: cmp_result = std::isnan(a) || std::isnan(b); break; // UNORD
-                        case 4: cmp_result = (a != b); break;      // NEQ
-                        case 5: cmp_result = !(a < b); break;     // NLT (true for NaN)
-                        case 6: cmp_result = !(a <= b); break;    // NLE (true for NaN)
-                        case 7: cmp_result = !(std::isnan(a) || std::isnan(b)); break; // ORD
-                        default: cmp_result = false;
-                    }
-                    res.d[i] = cmp_result ? 0xFFFFFFFFU : 0U;
+                    float x = 0.0f, y = 0.0f;
+                    std::memcpy(&x, &m_context.ymm[src1].d[i], 4);
+                    std::memcpy(&y, &src2.d[i], 4);
+                    res.d[i] = pred(x, y) ? 0xFFFFFFFFU : 0U;
                 }
             }
             if (is_scalar) {

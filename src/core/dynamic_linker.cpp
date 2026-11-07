@@ -166,6 +166,22 @@ bool DynamicLinker::is_whitelisted(Nid nid) const noexcept {
 // zeroed and overwrote the game's own code there. Its next wild jump landed in
 // stub bytes and corrupted the stack canary. Slide the pool up past any mapping
 // that overlaps it.
+// Where to ask for the pool given the executable's segments (past an eboot
+// linked over the default base). initialize() still slides it past any
+// mapping it would overlap.
+GuestAddr DynamicLinker::trampoline_base_for(const ElfLoader& loader) {
+    constexpr GuestSize kPool = 0x10000;
+    GuestAddr end = 0;
+    bool overlaps = false;
+    for (const auto& seg : loader.load_segments()) {
+        const GuestAddr lo = seg.p_vaddr, hi = seg.p_vaddr + seg.p_memsz;
+        end = std::max(end, hi);
+        if (lo < HLE_TRAMPOLINE_BASE + kPool && HLE_TRAMPOLINE_BASE < hi) overlaps = true;
+    }
+    if (!overlaps) return HLE_TRAMPOLINE_BASE;
+    return (end + kPool - 1) & ~(kPool - 1);
+}
+
 static GuestAddr free_trampoline_base(const MemoryManager& memory, GuestAddr wanted, GuestSize size) {
     GuestAddr base = wanted;
     bool moved = true;
@@ -875,6 +891,11 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                     ++synthetic_imports;
                     nid = 0x8000000000000000ULL | static_cast<u64>(sym_idx);
                 }
+                if (const GuestAddr data = m_registry.resolve_data_symbol(nid, m_memory); data != 0) {
+                    if (!m_memory.write_value(patch_location, data + rela.r_addend))
+                        patch_failed(patch_location);
+                    continue;
+                }
                 if (!m_registry.find_by_nid(nid) && !m_module_exports.contains(nid))
                     m_unresolved_nids.push_back(nid);
                 if (handle_special_data_import(m_memory, patch_location, sym_str, nid)) {
@@ -901,6 +922,14 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
                         if (nid == 0) {
                             ++synthetic_imports;
                             nid = 0x8000000000000000ULL | static_cast<u64>(sym_idx);
+                        }
+                        // GLOB_DAT binds S itself; a JUMP_SLOT always wants code.
+                        if (type == R_X86_64_GLOB_DAT) {
+                            if (const GuestAddr data = m_registry.resolve_data_symbol(nid, m_memory); data != 0) {
+                                if (!m_memory.write_value(patch_location, data))
+                                    patch_failed(patch_location);
+                                continue;
+                            }
                         }
                         if (!m_registry.find_by_nid(nid) && !m_module_exports.contains(nid)) {
                             m_unresolved_nids.push_back(nid);

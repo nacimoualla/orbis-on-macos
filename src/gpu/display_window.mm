@@ -1,4 +1,5 @@
 #import <AppKit/AppKit.h>
+#import <GameController/GameController.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include "ps4/display_window.hpp"
@@ -78,6 +79,68 @@ struct DisplayWindow::Impl {
     // down and up arrive in the same event batch would otherwise never be seen.
     mutable u32 pressed_latch{0};
 };
+
+namespace {
+
+// Orbis pad button bits come from ps4/input.hpp; these are the names the
+// keyboard and controller maps below use.
+constexpr u32 kPadOptions = kPadStart, kPadTouchPad = kPadTouchPadClick;
+
+// Keyboard -> pad. Space and a left click press Cross and the touch pad
+// together: games that say "touch pad to start" read the pad, others Cross.
+u32 key_to_pad(unsigned short code) {
+    switch (code) {
+    case 123: return kPadLeft;                  // arrows
+    case 124: return kPadRight;
+    case 125: return kPadDown;
+    case 126: return kPadUp;
+    case 49: return kPadCross | kPadTouchPad;   // Space
+    case 6: return kPadCross;                   // Z
+    case 7: return kPadCircle;                  // X
+    case 8: return kPadSquare;                  // C
+    case 9: return kPadTriangle;                // V
+    case 36: return kPadOptions;                // Return
+    case 0: return kPadL1;                      // A
+    case 1: return kPadR1;                      // S
+    case 12: return kPadL2;                     // Q
+    case 14: return kPadR2;                     // E
+    case 48: return kPadTouchPad;               // Tab
+    default: return 0;
+    }
+}
+
+// Every connected game controller (DualShock 4, DualSense, Xbox, MFi): D-pad
+// or left stick, face buttons by position, shoulders, triggers, Menu.
+u32 gamepad_buttons() {
+    u32 b = 0;
+    for (GCController* c in [GCController controllers]) {
+        GCExtendedGamepad* g = c.extendedGamepad;
+        if (!g) continue;
+        const float x = g.leftThumbstick.xAxis.value, y = g.leftThumbstick.yAxis.value;
+        if (g.dpad.up.pressed || y > 0.5f) b |= kPadUp;
+        if (g.dpad.down.pressed || y < -0.5f) b |= kPadDown;
+        if (g.dpad.left.pressed || x < -0.5f) b |= kPadLeft;
+        if (g.dpad.right.pressed || x > 0.5f) b |= kPadRight;
+        if (g.buttonA.pressed) b |= kPadCross;
+        if (g.buttonB.pressed) b |= kPadCircle;
+        if (g.buttonX.pressed) b |= kPadSquare;
+        if (g.buttonY.pressed) b |= kPadTriangle;
+        if (g.leftShoulder.pressed) b |= kPadL1;
+        if (g.rightShoulder.pressed) b |= kPadR1;
+        if (g.leftTrigger.pressed) b |= kPadL2;
+        if (g.rightTrigger.pressed) b |= kPadR2;
+        if (g.buttonMenu.pressed) b |= kPadOptions;
+        if (g.leftThumbstickButton.pressed) b |= kPadL3;
+        if (g.rightThumbstickButton.pressed) b |= kPadR3;
+        if ([g isKindOfClass:[GCDualShockGamepad class]] &&
+            ((GCDualShockGamepad*)g).touchpadButton.pressed) b |= kPadTouchPad;
+        if ([g isKindOfClass:[GCDualSenseGamepad class]] &&
+            ((GCDualSenseGamepad*)g).touchpadButton.pressed) b |= kPadTouchPad;
+    }
+    return b;
+}
+
+} // namespace
 
 DisplayWindow::DisplayWindow() : m_impl(std::make_unique<Impl>()) {}
 
@@ -346,7 +409,7 @@ void DisplayWindow::poll_events() {
 
 u32 DisplayWindow::input_buttons() const noexcept {
     if (!m_impl) return 0;
-    const u32 b = m_impl->buttons | m_impl->pressed_latch;
+    const u32 b = m_impl->buttons | m_impl->pressed_latch | gamepad_buttons();
     m_impl->pressed_latch = 0;
     return b;
 }
@@ -354,7 +417,7 @@ u32 DisplayWindow::input_buttons() const noexcept {
 PadState DisplayWindow::input_pad_state() const noexcept {
     if (!m_impl) return PadState{};
     PadState st = m_impl->active_pad_state;
-    st.buttons |= m_impl->pressed_latch;
+    st.buttons |= m_impl->pressed_latch | gamepad_buttons();  // keyboard, mouse and any game controller
     m_impl->pressed_latch = 0;
     return st;
 }

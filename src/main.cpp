@@ -26,12 +26,78 @@
 #include "ps4/thread.hpp"
 #include "ps4/vfs.hpp"
 
+namespace {
+
+// Scripted test runs for --offscreen and --window:
+//   PS4_FRAMES=N           stop after N flips
+//   PS4_INPUT=f:b,f:b,...  from flip f hold pad buttons b (hex ok) until the
+//                          next entry
+//   PS4_POKE=f:addr:v,...  at flip f write the 32-bit value v to guest addr
+//                          (test set-ups: teleports, flags)
+struct ScriptedRun {
+    struct Poke { ps4::u64 flip; ps4::GuestAddr addr; ps4::u32 value; };
+    std::vector<std::pair<ps4::u64, ps4::u32>> input;
+    std::vector<Poke> pokes;
+    ps4::u64 max_flips = 0;
+    ps4::usize next_input = 0, next_poke = 0;
+
+    static ScriptedRun from_env() {
+        ScriptedRun s;
+        if (const char* in = std::getenv("PS4_INPUT")) {
+            for (const char* p = in; *p;) {
+                char* end = nullptr;
+                const ps4::u64 f = std::strtoull(p, &end, 0);
+                if (!end || *end != ':') break;
+                const ps4::u32 b = static_cast<ps4::u32>(std::strtoul(end + 1, &end, 0));
+                s.input.emplace_back(f, b);
+                p = (*end == ',') ? end + 1 : end;
+            }
+        }
+        if (const char* pk = std::getenv("PS4_POKE")) {
+            for (const char* p = pk; *p;) {
+                char* end = nullptr;
+                Poke k{};
+                k.flip = std::strtoull(p, &end, 0);
+                if (!end || *end != ':') break;
+                k.addr = std::strtoull(end + 1, &end, 0);
+                if (!end || *end != ':') break;
+                k.value = static_cast<ps4::u32>(std::strtoull(end + 1, &end, 0));
+                s.pokes.push_back(k);
+                p = (*end == ',') ? end + 1 : end;
+            }
+        }
+        if (const char* fr = std::getenv("PS4_FRAMES")) s.max_flips = std::strtoull(fr, nullptr, 0);
+        return s;
+    }
+
+    bool done(ps4::u64 flip) const { return max_flips != 0 && flip >= max_flips; }
+
+    // Applies every input change and poke due by `flip`.
+    void apply(ps4::u64 flip, ps4::NidRegistry& nids, ps4::MemoryManager& memory) {
+        while (next_input < input.size() && input[next_input].first <= flip) {
+            nids.set_pad_buttons(input[next_input].second);
+            std::fprintf(stderr, "[input] flip %llu: buttons=0x%x\n", (unsigned long long)flip,
+                         input[next_input].second);
+            ++next_input;
+        }
+        while (next_poke < pokes.size() && pokes[next_poke].flip <= flip) {
+            memory.write_value(pokes[next_poke].addr, pokes[next_poke].value);
+            std::fprintf(stderr, "[poke] flip %llu: [0x%llx] = 0x%x\n", (unsigned long long)flip,
+                         (unsigned long long)pokes[next_poke].addr, pokes[next_poke].value);
+            ++next_poke;
+        }
+    }
+};
+
+} // namespace
+
 int main(int argc, char* argv[]) {
     std::cout << "========================================================\n";
     std::cout << " ps4-to-macos: Orbis Compatibility Layer & Runtime\n";
     std::cout << "========================================================\n";
 
     bool enable_window = false;
+    bool enable_offscreen = false;
     bool enable_jit = true;
     bool enable_trace = false;
     bool enable_strict_hle = false;
@@ -48,6 +114,8 @@ int main(int argc, char* argv[]) {
             enable_window = true;
         } else if (arg == "--headless") {
             enable_window = false;
+        } else if (arg == "--offscreen") {
+            enable_offscreen = true;
         } else if (arg == "--no-jit") {
             enable_jit = false;
         } else if (arg == "--trace" || arg == "-t") {
@@ -62,6 +130,9 @@ int main(int argc, char* argv[]) {
             std::cout << "Options:\n";
             std::cout << "  --window, -w     Open interactive macOS display window (60 FPS)\n";
             std::cout << "  --headless       Run headlessly in console only (default)\n";
+            std::cout << "  --offscreen      Headless, but render and pace frames like --window (PS4_FRAMES,\n"
+                         "                   PS4_INPUT, PS4_POKE, PS4_GPU_READBACK + PS4_READBACK_EVERY;\n"
+                         "                   PS4_FRAMES/PS4_INPUT/PS4_POKE also script --window)\n";
             std::cout << "  --budget N       Headless instruction budget (default 100000000, 0 = unlimited)\n";
             std::cout << "  --no-jit         Disable ARM64 JIT dynamic recompiler (interpreter only)\n";
             std::cout << "  --trace, -t      Trace guest instruction execution step-by-step\n";
@@ -72,7 +143,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (enable_window && !budget_specified) {
+    if ((enable_window || enable_offscreen) && !budget_specified) {
         instruction_budget = 0; // Interactive windowed mode runs indefinitely until window is closed
     }
 
@@ -158,7 +229,7 @@ int main(int argc, char* argv[]) {
         linker.set_strict_hle(true);
         std::cout << "[Linker] Strict HLE mode ENABLED (fail-loud diagnostic crash on missing NIDs)\n";
     }
-    if (!linker.initialize()) {
+    if (!linker.initialize(ps4::DynamicLinker::trampoline_base_for(loader))) {
         std::cerr << "[Error] Failed to initialize dynamic linker trampoline pool.\n";
         return 1;
     }
@@ -347,6 +418,9 @@ int main(int argc, char* argv[]) {
                     const char* v = std::getenv("PS4_RUN_SECONDS");
                     return v ? std::atof(v) : 0.0;
                 }();
+                // Scripted input replaces the keyboard/gamepad; pokes land
+                // while the guest thread runs (aligned 32-bit stores).
+                ScriptedRun script = ScriptedRun::from_env();
                 while (window->is_open() && !guest_done.load()) {
                     if (s_run_seconds > 0 &&
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() > s_run_seconds)
@@ -386,6 +460,9 @@ int main(int argc, char* argv[]) {
                     }
                     nid_registry.set_mouse_state(window->input_mouse_state());
                     const ps4::u64 ready = frames_ready.load(std::memory_order_acquire);
+                    if (script.done(ready)) break;
+                    // (the window's pad state was set above; a script overrides it)
+                    script.apply(ready, nid_registry, memory);
                     if (ready != presented) {
                         presented = ready;
                         window->present_frame(); // waits for a drawable: paced by the display
@@ -424,6 +501,35 @@ int main(int argc, char* argv[]) {
                 nid_registry.set_flip_hook(nullptr);
                 total_instructions = guest_instructions.load();
             }
+        } else if (enable_offscreen) {
+            // The windowed runner's frame path without a window: every guest
+            // flip ends and submits the GPU frame and is paced to the 60 Hz
+            // vblank (perform_flip paces whenever a flip hook is set), so frame
+            // rate and pacing measured here match --window. Scripted with
+            // PS4_FRAMES / PS4_INPUT / PS4_POKE (ScriptedRun).
+            // Same scheduling class as the windowed runner's guest thread.
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+            ps4::Pm4Translator* gpu = nid_registry.gpu_translator();
+            if (gpu) gpu->begin_frame();
+            std::atomic<ps4::u64> flips{0};
+            nid_registry.set_flip_hook([gpu, &flips] {
+                if (gpu) {
+                    gpu->submit_frame(false);
+                    gpu->begin_frame();
+                }
+                flips.fetch_add(1, std::memory_order_release);
+            });
+            ScriptedRun script = ScriptedRun::from_env();
+            while ((instruction_budget == 0 || total_instructions < instruction_budget) && !syscalls.has_exited()) {
+                const ps4::u64 f = flips.load(std::memory_order_acquire);
+                if (script.done(f)) break;
+                script.apply(f, nid_registry, memory);
+                run_res = cpu.run(200000);
+                total_instructions += run_res.instructions_executed;
+                if (run_res.status != ps4::StepResult::Ok) break;
+            }
+            nid_registry.set_flip_hook(nullptr);
+            std::fprintf(stderr, "[offscreen] %llu flips\n", (unsigned long long)flips.load());
         } else {
             // Console / Headless Execution Loop
             const ps4::usize batch = 1000000;
@@ -488,7 +594,7 @@ int main(int argc, char* argv[]) {
     // the image the guest really executed.
     if (const char* dc = std::getenv("PS4_DUMP_CODE")) {
         unsigned long long base = 0, len = 0;
-        if (std::sscanf(dc, "%llx:%llx", &base, &len) == 2 && len > 0 && len < (1u << 22)) {
+        if (std::sscanf(dc, "%llx:%llx", &base, &len) == 2 && len > 0 && len < (1u << 25)) {
             std::vector<ps4::u8> buf(static_cast<size_t>(len));
             if (memory.read_bytes(static_cast<ps4::GuestAddr>(base), buf.data(), buf.size())) {
                 char path[256];

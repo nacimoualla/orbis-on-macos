@@ -1775,6 +1775,7 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
     // 6 MB) and wait for the GPU only on those, so frame pacing is unaffected.
     static const u64 dump_every = [] {
         const char* v = std::getenv("PS4_GPU_READBACK_EVERY");
+        if (!v) v = std::getenv("PS4_READBACK_EVERY");  // older name
         const u64 n = v ? std::strtoull(v, nullptr, 0) : 1;
         return n ? n : 1;
     }();
