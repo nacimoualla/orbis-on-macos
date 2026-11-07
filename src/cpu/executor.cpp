@@ -6738,7 +6738,14 @@ RunResult CpuExecutor::run(usize max_instructions) {
         // Try JIT block execution if compiler attached
         if (m_jit && !m_syscalls.has_exited()) {
             usize retired = 0;
-            if (m_jit->execute_block(m_context, m_memory, &retired)) {
+            // Blocks chain without returning here, so bound the chain: this
+            // loop has to see a budget that ran out, or a guest that exited.
+            constexpr u64 kMaxChain = 4096;
+            u64 chain = kMaxChain;
+            if (max_instructions > 0)
+                chain = std::min<u64>(kMaxChain, (max_instructions - result.instructions_executed) / JitCompiler::MAX_BLOCK_INSNS);
+            if (jit_stats_enabled()) chain = 0; // the stats count blocks
+            if (m_jit->execute_block(m_context, m_memory, &retired, chain)) {
                 // A block that side-exits retires fewer instructions than it
                 // compiled; count what actually ran.
                 result.instructions_executed += retired;

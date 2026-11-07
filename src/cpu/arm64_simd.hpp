@@ -78,6 +78,44 @@ constexpr u32 shl_sign(bool q, u32 d, u32 n) {    // shl vd, vn, #31 (4S) / #63 
     return rd_rn(q ? 0x4F7F5400 : 0x4F3F5400, d, n);
 }
 
+// Integer vector, any lane size: sz = 0 (16B), 1 (8H), 2 (4S), 3 (2D). The
+// JIT stores these bases per opcode and adds the registers when it emits.
+constexpr u32 lanes(u32 base, u32 sz) { return base | (sz << 22); }
+inline constexpr u32 ADD_V = 0x4E208400, SUB_V = 0x6E208400, MUL_V = 0x4E209C00;
+inline constexpr u32 SQADD_V = 0x4E200C00, UQADD_V = 0x6E200C00;
+inline constexpr u32 SQSUB_V = 0x4E202C00, UQSUB_V = 0x6E202C00;
+inline constexpr u32 CMEQ_V = 0x6E208C00, CMGT_V = 0x4E203400;
+inline constexpr u32 SMAX_V = 0x4E206400, UMAX_V = 0x6E206400;
+inline constexpr u32 SMIN_V = 0x4E206C00, UMIN_V = 0x6E206C00;
+inline constexpr u32 URHADD_V = 0x6E201400;
+inline constexpr u32 ZIP1_V = 0x4E003800, ZIP2_V = 0x4E007800;
+// Saturating narrow into the low half of vd (OR in NARROW_HIGH for the high half).
+inline constexpr u32 SQXTN_V = 0x0E214800, SQXTUN_V = 0x2E212800, NARROW_HIGH = 0x40000000;
+constexpr u32 smull_h(u32 d, u32 n, u32 m) { return rd_rn_rm(0x0E60C000, d, n, m); }    // 4S <- 4H * 4H
+constexpr u32 smull2_h(u32 d, u32 n, u32 m) { return rd_rn_rm(0x4E60C000, d, n, m); }   // 4S <- high 4H
+constexpr u32 umull_h(u32 d, u32 n, u32 m) { return rd_rn_rm(0x2E60C000, d, n, m); }
+constexpr u32 umull2_h(u32 d, u32 n, u32 m) { return rd_rn_rm(0x6E60C000, d, n, m); }
+constexpr u32 umull_s(u32 d, u32 n, u32 m) { return rd_rn_rm(0x2EA0C000, d, n, m); }    // 2D <- 2S * 2S
+constexpr u32 xtn_s(u32 d, u32 n) { return rd_rn(0x0EA12800, d, n); }                    // 2S <- 2D
+constexpr u32 uzp2_h(u32 d, u32 n, u32 m) { return rd_rn_rm(0x4E405800, d, n, m); }
+constexpr u32 addp_s(u32 d, u32 n, u32 m) { return rd_rn_rm(0x4EA0BC00, d, n, m); }
+constexpr u32 tbl_16b(u32 d, u32 n, u32 m) { return rd_rn_rm(0x4E000000, d, n, m); }
+constexpr u32 ext_16b(u32 d, u32 n, u32 m, u32 i) { return rd_rn_rm(0x6E000000 | (i << 11), d, n, m); }
+constexpr u32 movi_16b(u32 d, u32 imm) {   // all bytes = imm
+    return 0x4F00E400 | ((imm >> 5) << 16) | ((imm & 31) << 5) | d;
+}
+// Shift by immediate; esize = 16, 32 or 64. shl: sh < esize; shr: 1 <= sh <= esize.
+constexpr u32 shl_imm(u32 esize, u32 d, u32 n, u32 sh) { return rd_rn(0x4F005400 | ((esize + sh) << 16), d, n); }
+constexpr u32 sshr_imm(u32 esize, u32 d, u32 n, u32 sh) { return rd_rn(0x4F000400 | ((2 * esize - sh) << 16), d, n); }
+constexpr u32 ushr_imm(u32 esize, u32 d, u32 n, u32 sh) { return rd_rn(0x6F000400 | ((2 * esize - sh) << 16), d, n); }
+// Widen the low half of vn; esize = source lane bits (8, 16, 32).
+constexpr u32 sxtl(u32 esize, u32 d, u32 n) { return rd_rn(0x0F00A400 | (esize << 16), d, n); }
+constexpr u32 uxtl(u32 esize, u32 d, u32 n) { return rd_rn(0x2F00A400 | (esize << 16), d, n); }
+constexpr u32 ins_h(u32 d, u32 i, u32 n, u32 j) {   // vd.h[i] = vn.h[j]
+    return 0x6E000400 | (((i << 2) | 2) << 16) | ((j << 1) << 11) | (n << 5) | d;
+}
+constexpr u32 ldr_h_x(u32 vt, u32 xn, u32 xm) { return rd_rn_rm(0x7C606800, vt, xn, xm); }
+
 // Permutes: 4S (q = false) or 2D (q = true).
 constexpr u32 zip1(bool q, u32 d, u32 n, u32 m) { return rd_rn_rm(0x4E003800 | isz(q), d, n, m); }
 constexpr u32 zip2(bool q, u32 d, u32 n, u32 m) { return rd_rn_rm(0x4E007800 | isz(q), d, n, m); }

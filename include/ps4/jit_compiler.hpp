@@ -23,7 +23,11 @@ namespace ps4 {
 // its instructions unless a memory access fails the bounds check, in which
 // case it side-exits with ctx->rip at the faulting instruction (so the
 // interpreter executes it) and returns the count retired before it.
-using JittedBlockFunc = u64 (*)(CpuContext* ctx, u8* guest_base, u64 guest_size);
+/// A compiled block. `chain_table` is the calling thread's table of compiled
+/// blocks; while `chain_budget` lasts, a block jumps straight to the next one
+/// instead of returning. Returns the guest instructions retired by all of them.
+using JittedBlockFunc = u64 (*)(CpuContext* ctx, u8* guest_base, u64 guest_size,
+                                const void* chain_table, u64 chain_budget);
 
 struct JitBlockMetrics {
     usize instructions_compiled{0};
@@ -138,6 +142,7 @@ public:
     // 16 MB filled up during Unity gameplay, after which every new block
     // retried its compile under the exclusive lock and ran interpreted.
     static constexpr usize DEFAULT_CODE_CACHE_SIZE = 256 * 1024 * 1024;
+    static constexpr usize MAX_BLOCK_INSNS = 128;
 
     explicit JitCompiler(usize code_cache_size = DEFAULT_CODE_CACHE_SIZE);
     ~JitCompiler();
@@ -156,8 +161,10 @@ public:
     /// retiring any instruction). `retired` receives the number of guest
     /// instructions the block retired.
     /// The block reads and writes guest memory through memory.base_address().
+    /// Up to `chain_budget` further blocks may run before this returns; each
+    /// one retires at most MAX_BLOCK_INSNS instructions.
     bool execute_block(CpuContext& ctx, const MemoryManager& memory,
-                       usize* retired = nullptr);
+                       usize* retired = nullptr, u64 chain_budget = 0);
 
     /// Check if a guest address has a compiled block in cache
     [[nodiscard]] bool is_block_cached(GuestAddr guest_rip) const;

@@ -1,9 +1,14 @@
 #import <Metal/Metal.h>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #import <Foundation/Foundation.h>
 #include "ps4/metal_backend.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <set>
@@ -270,6 +275,23 @@ bool MetalBackend::submit_frame(bool wait_for_completion) {
         }
 
         id<MTLCommandBuffer> command_buffer = m_impl->active_command_buffer;
+        // PS4_FLIP_STATS: how busy the GPU is, once a second.
+        static const bool gpu_stats = std::getenv("PS4_FLIP_STATS") != nullptr;
+        if (gpu_stats) {
+            [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                static std::atomic<int> s_frames{0};
+                static std::atomic<double> s_busy{0}, s_since{0};
+                const double busy = cb.GPUEndTime - cb.GPUStartTime;
+                s_frames.fetch_add(1);
+                double total = s_busy.load();
+                while (!s_busy.compare_exchange_weak(total, total + busy)) {}
+                if (cb.GPUEndTime - s_since.load() >= 1.0) {
+                    std::fprintf(stderr, "[fps] gpu %d frames, %.0f ms busy\n", s_frames.exchange(0),
+                                 s_busy.exchange(0) * 1000.0);
+                    s_since.store(cb.GPUEndTime);
+                }
+            }];
+        }
         [command_buffer commit];
         if (wait_for_completion) {
             [command_buffer waitUntilCompleted];

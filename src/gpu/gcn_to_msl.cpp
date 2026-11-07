@@ -294,6 +294,7 @@ public:
 private:
     const Program& prog;
     Stage stage;
+    std::vector<u32> uniform_slots;     // parallel to prog.insts (see uniform_load_slots)
     const u32* input_cntl;
     [[maybe_unused]] u32 input_ena;
     const Instruction* cur{nullptr};
@@ -733,6 +734,38 @@ void Emitter::emit_salu(const Instruction& i) {
     }
 }
 
+constexpr u32 kNoUniformSlot = ~0u;
+constexpr u32 kMaxUniformLoads = 1000;  // Metal's setBytes takes up to 4 KB
+
+/// Where each scalar load of the shader's straight-line start goes in the
+/// draw's table of evaluated loads (kNoUniformSlot: the shader loads it itself).
+/// Up to the first branch or branch target those loads run once with values
+/// the draw fixes, so scan_resources can evaluate them. On every fragment they
+/// would otherwise search the range table and read memory for each dword,
+/// which dominates post-processing shaders.
+std::vector<u32> uniform_load_slots(const Program& prog) {
+    static const u32 kCount[] = {1, 2, 4, 8, 16};
+    std::set<u32> targets;
+    for (const Instruction& i : prog.insts)
+        if (i.enc == Encoding::SOPP && i.op >= 2 && i.op <= 9)
+            targets.insert(static_cast<u32>(static_cast<i64>(i.pc) + i.size + i.simm));
+    std::vector<u32> slots(prog.insts.size(), kNoUniformSlot);
+    u32 next = 0;
+    for (usize k = 0; k < prog.insts.size(); ++k) {
+        const Instruction& i = prog.insts[k];
+        if (targets.count(i.pc)) break;
+        if (i.enc == Encoding::SOPP && i.op >= 2 && i.op <= 9) break;
+        if (i.enc == Encoding::SOP1 && (i.op == 32 || i.op == 33)) break;  // s_setpc, s_swappc
+        if (i.enc != Encoding::SMRD || i.op == 29 || i.op == 30 || i.op == 31) continue;
+        if ((i.op & 7) > 4 || (i.op & ~7u) > 8 || !(i.imm || i.offset == 255)) continue;
+        const u32 n = kCount[i.op & 7];
+        if (next + n > kMaxUniformLoads) break;
+        slots[k] = next;
+        next += n;
+    }
+    return slots;
+}
+
 void Emitter::emit_smrd(const Instruction& i) {
     static const u32 kCount[] = {1, 2, 4, 8, 16};
     const u32 kind = i.op & 7;
@@ -745,6 +778,13 @@ void Emitter::emit_smrd(const Instruction& i) {
     if (kind > 4 || (i.op & ~7u) > 8) { fail("unsupported " + mnemonic(i)); return; }
     const u32 n = kCount[kind];
     for (u32 k = 0; k < n; ++k) track_s(i.dst + k);
+    // Evaluated once per draw on the CPU: read the answer from the draw's table.
+    const usize index = static_cast<usize>(&i - prog.insts.data());
+    if (index < uniform_slots.size() && uniform_slots[index] != kNoUniformSlot) {
+        for (u32 k = 0; k < n; ++k)
+            body << "    s[" << i.dst + k << "] = ul[" << uniform_slots[index] + k << "];\n";
+        return;
+    }
     track_s(i.sbase); track_s(i.sbase + 1);
     if (!i.imm && i.offset < 128) track_s(i.offset);
     std::string off;
@@ -1039,6 +1079,7 @@ bool Emitter::run() {
         if (i.enc == Encoding::VOP3 && i.op < 0x100 && (i.op & 0x10)) uses_exec_write = true;
         if (i.enc == Encoding::VOP3 && i.op < 0x100 && i.sdst == operand::kExecLo) uses_exec_write = true;
     }
+    if (stage != Stage::Compute) uniform_slots = uniform_load_slots(prog);
     const bool structured = prog.has_branches;
     std::set<u32> labels;
     if (structured) {
@@ -1175,7 +1216,7 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     m << "};\n\n";
 
     const u32 vs_vgprs = std::max<u32>(ev.max_vgpr, 4);
-    m << "static void gcn_vs_body(uint vid, uint iid, constant GcnDrawConsts& dc, device const uchar* mem"
+    m << "static void gcn_vs_body(uint vid, uint iid, constant GcnDrawConsts& dc, device const uchar* mem, constant uint* ul"
       << image_decl_args(ev.images) << ", thread GcnVsOut& out) {\n";
     m << "  uint s[128]; uint v[" << vs_vgprs << "]; uint scc = 0u;\n";
     m << "  for (uint k = 0; k < 128u; ++k) s[k] = 0u;\n";
@@ -1188,26 +1229,26 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
     m << ev.body.str() << "}\n\n";
 
     m << "vertex GcnVsOut gcn_vs_main(uint vid [[vertex_id]], uint iid [[instance_id]],\n"
-      << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]]"
+      << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]], constant uint* ul [[buffer(2)]]"
       << image_params(ev.images) << ") {\n";
     m << "  GcnVsOut out;\n";
     using VR = TranslateOptions::VertexRemap;
     if (opts.remap == VR::None) {
-        m << "  gcn_vs_body(vid, iid, dc, mem" << image_args(ev.images) << ", out);\n";
+        m << "  gcn_vs_body(vid, iid, dc, mem, ul" << image_args(ev.images) << ", out);\n";
     } else if (opts.remap == VR::QuadList) {
         m << "  uint q = vid / 6u, c = vid % 6u;\n";
         m << "  const uint map_[6] = {0u, 1u, 2u, 0u, 2u, 3u};\n";
-        m << "  gcn_vs_body(dc.base_vertex + q * 4u + map_[c], iid, dc, mem" << image_args(ev.images) << ", out);\n";
+        m << "  gcn_vs_body(dc.base_vertex + q * 4u + map_[c], iid, dc, mem, ul" << image_args(ev.images) << ", out);\n";
     } else {
         // RectList: corners 0,1,2 are given, corner 3 = v1 + v2 - v0.
         m << "  uint r = vid / 6u, c = vid % 6u;\n";
         m << "  const uint map_[6] = {0u, 1u, 2u, 2u, 1u, 3u};\n";
         m << "  uint k = map_[c]; uint b = dc.base_vertex + r * 3u;\n";
-        m << "  if (k < 3u) {\n    gcn_vs_body(b + k, iid, dc, mem" << image_args(ev.images) << ", out);\n  } else {\n";
+        m << "  if (k < 3u) {\n    gcn_vs_body(b + k, iid, dc, mem, ul" << image_args(ev.images) << ", out);\n  } else {\n";
         m << "    GcnVsOut o0, o1, o2;\n";
-        m << "    gcn_vs_body(b, iid, dc, mem" << image_args(ev.images) << ", o0);\n";
-        m << "    gcn_vs_body(b + 1u, iid, dc, mem" << image_args(ev.images) << ", o1);\n";
-        m << "    gcn_vs_body(b + 2u, iid, dc, mem" << image_args(ev.images) << ", o2);\n";
+        m << "    gcn_vs_body(b, iid, dc, mem, ul" << image_args(ev.images) << ", o0);\n";
+        m << "    gcn_vs_body(b + 1u, iid, dc, mem, ul" << image_args(ev.images) << ", o1);\n";
+        m << "    gcn_vs_body(b + 2u, iid, dc, mem, ul" << image_args(ev.images) << ", o2);\n";
         m << "    out.position = o1.position + o2.position - o0.position;\n";
         for (u32 p = 0; p < nparams; ++p) m << "    out.p" << p << " = o1.p" << p << " + o2.p" << p << " - o0.p" << p << ";\n";
         m << "  }\n";
@@ -1228,7 +1269,7 @@ TranslatedPipeline translate_pipeline(const Program& vs, const Program& ps, cons
             m << "};\n\n";
         }
         m << "fragment " << (ps_struct ? "GcnPsOut" : "float4") << " gcn_ps_main(GcnPsIn in [[stage_in]],\n"
-          << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]]"
+          << "    device const uchar* mem [[buffer(0)]], constant GcnDrawConsts& dc [[buffer(1)]], constant uint* ul [[buffer(2)]]"
           << (uses_front_face ? ", bool front_face [[front_facing]]" : "")
           << image_params(ep.images) << ") {\n";
         m << "  uint s[128]; uint v[" << ps_vgprs << "]; uint scc = 0u;\n";
@@ -1362,6 +1403,9 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
                             u32 user_count, const MemReader& read, u32 max_vertex_index) {
     ResourceScan rs;
     rs.images.resize(slots.size());
+    const std::vector<u32> uniform_slots = uniform_load_slots(prog);
+    for (u32 slot : uniform_slots)
+        if (slot != kNoUniformSlot) rs.uniform_loads.resize(slot + 16, 0);
     u32 val[128] = {};
     bool known[128] = {};
     for (u32 k = 0; k < user_count && k < 16; ++k) { val[k] = user_sgprs[k]; known[k] = true; }
@@ -1403,6 +1447,7 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
         switch (i.enc) {
         case Encoding::SMRD: {
             if (i.op == 29 || i.op == 31) break;
+            const usize index = static_cast<usize>(&i - prog.insts.data());
             static const u32 kCount[] = {1, 2, 4, 8, 16};
             const u32 kind = i.op & 7;
             if (kind > 4 || i.op == 30) {
@@ -1441,6 +1486,7 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
                 u32 w = 0;
                 const bool got = ok && read(base + offv + k * 4, &w, 4);
                 set(i.dst + k, w, got);
+                if (uniform_slots[index] != kNoUniformSlot) rs.uniform_loads[uniform_slots[index] + k] = w;
             }
             break;
         }
@@ -1622,12 +1668,8 @@ u32 data_format_bytes(u32 dfmt) {
     }
 }
 
-namespace {
-
 /// Tiling index 8 (and 31) is linear; the other supported index is 8x8 micro tiled.
 bool is_linear_tiling(u32 tiling_index) { return tiling_index == 8 || tiling_index == 31; }
-
-} // namespace
 
 usize texture_guest_size(const TextureDesc& td) {
     if (const u32 block = bc::block_bytes(td.dfmt)) {

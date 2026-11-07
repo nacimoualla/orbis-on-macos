@@ -246,12 +246,42 @@ struct GcnPipelineCache::Impl {
             return white_texture();
         }
         const u8* src = memory->to_host_ptr<u8>(td.base);
-        const u64 h = gcn::hash_words(reinterpret_cast<const u32*>(src), size / 4);
+        const u64 h = gcn::hash_memory(src, size);
         std::vector<u32> key(img.tsharp, img.tsharp + 8);
         auto it = textures.find(key);
         if (it != textures.end() && it->second.content_hash == h) {
             it->second.last_used = ++clock;
             return it->second.tex;
+        }
+        // Linear R8 (video planes change every frame) needs no conversion: the
+        // guest bytes upload as they are and the T#'s selector becomes a swizzle.
+        if (td.dfmt == 1 && td.nfmt == 0 && gcn::is_linear_tiling(td.tiling_index)) {
+            auto channel = [](u32 sel) {
+                switch (sel) {
+                case 1: return MTLTextureSwizzleOne;
+                case 4: return MTLTextureSwizzleRed;
+                case 5: return MTLTextureSwizzleGreen;
+                case 6: return MTLTextureSwizzleBlue;
+                case 7: return MTLTextureSwizzleAlpha;
+                default: return MTLTextureSwizzleZero;
+                }
+            };
+            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                                                         width:td.width
+                                                                                        height:td.height
+                                                                                     mipmapped:NO];
+            d.usage = MTLTextureUsageShaderRead;
+            d.allowGPUOptimizedContents = NO;
+            d.swizzle = MTLTextureSwizzleChannelsMake(channel(td.dst_sel[0]), channel(td.dst_sel[1]),
+                                                      channel(td.dst_sel[2]), channel(td.dst_sel[3]));
+            id<MTLTexture> tex = [device newTextureWithDescriptor:d];
+            if (!tex) return white_texture();
+            [tex replaceRegion:MTLRegionMake2D(0, 0, td.width, td.height) mipmapLevel:0 withBytes:src
+                   bytesPerRow:std::max(td.pitch, td.width)];
+            if (textures.size() > 256) textures.clear();
+            textures[key] = TexEntry{tex, h, ++clock};
+            ++stats.textures_uploaded;
+            return tex;
         }
         std::vector<u8> rgba;
         std::string err;
@@ -631,6 +661,16 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
         [enc setVertexBytes:&dc length:sizeof(dc) atIndex:gcn::binding::kDrawConsts];
         [enc setFragmentBuffer:mem offset:0 atIndex:gcn::binding::kMemBuffer];
         [enc setFragmentBytes:&dc length:sizeof(dc) atIndex:gcn::binding::kDrawConsts];
+        auto bind_uniform_loads = [](const std::vector<u32>& t, auto&& set) {
+            static const u32 kEmpty = 0;
+            set(t.empty() ? &kEmpty : t.data(), t.empty() ? sizeof(kEmpty) : t.size() * sizeof(u32));
+        };
+        bind_uniform_loads(vs_scan.uniform_loads, [&](const u32* p, usize n) {
+            [enc setVertexBytes:p length:n atIndex:gcn::binding::kUniformLoads];
+        });
+        bind_uniform_loads(ps_scan.uniform_loads, [&](const u32* p, usize n) {
+            [enc setFragmentBytes:p length:n atIndex:gcn::binding::kUniformLoads];
+        });
         for (usize k = 0; k < pe.tp.vs_images.size(); ++k) {
             [enc setVertexTexture:im.texture_for(vs_scan.images[k]) atIndex:k];
             if (pe.tp.vs_images[k].sampled) [enc setVertexSamplerState:im.sampler_for(vs_scan.images[k]) atIndex:k];

@@ -5,6 +5,7 @@
 #include "ps4/jit_stats.hpp"
 #include "ps4/x86_decode.hpp"
 #include <algorithm>
+#include <cassert>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -381,23 +382,37 @@ void Arm64Emitter::patch_b_cond(usize at, usize target) {
 }
 
 void Arm64Emitter::emit_prologue() {
-  // stp x19, x30, [sp, #-32]!
-  emit(0xa9be7bf3);
+  // stp x19, x30, [sp, #-64]!
+  emit(0xa9bc7bf3);
   // stp x20, x21, [sp, #16]
   emit(0xa90157f4);
+  // stp x22, x23, [sp, #32]
+  emit(0xa9025ff6);
+  // str x24, [sp, #48]
+  emit(0xf9001bf8);
   // mov x19, x0 (guest CpuContext*)
   emit(0xaa0003f3);
   // mov x20, x1 (host base of guest memory)
   emit(0xaa0103f4);
   // sub x21, x2, #8 (highest valid start address of an 8-byte access)
   emit(0xd1002055);
+  // mov x22, x3 (this thread's chain table)
+  emit(0xaa0303f6);
+  // mov x23, x4 (chained jumps left)
+  emit(0xaa0403f7);
+  // mov x24, xzr (instructions retired by earlier blocks of the chain)
+  emit(0xaa1f03f8);
 }
 
 void Arm64Emitter::emit_epilogue() {
+  // ldr x24, [sp, #48]
+  emit(0xf9401bf8);
+  // ldp x22, x23, [sp, #32]
+  emit(0xa9425ff6);
   // ldp x20, x21, [sp, #16]
   emit(0xa94157f4);
-  // ldp x19, x30, [sp], #32
-  emit(0xa8c27bf3);
+  // ldp x19, x30, [sp], #64
+  emit(0xa8c47bf3);
   // ret
   emit(0xd65f03c0);
 }
@@ -482,8 +497,11 @@ constexpr u8 R_GBASE = 20;
 constexpr u8 R_GLIMIT = 21;
 constexpr u8 R_EA = 9;
 
+// Bytes of Arm64Emitter::emit_prologue: where a chained jump enters a block.
+constexpr usize kChainEntryOffset = 10 * sizeof(u32);
 constexpr u8 COND_CS = 2; // C set   (x86 CF after ADD)
 constexpr u8 COND_CC = 3; // C clear (x86 CF after SUB/CMP: borrow)
+constexpr u8 COND_NE = 1;
 constexpr u8 COND_HI = 8;
 
 // The arithmetic flags the interpreter computes. AF is never written by the
@@ -534,6 +552,8 @@ enum class Kind : u8 {
   Ret,       // C3 / C2 imm16 (imm = extra bytes popped)
   CallInd,   // FF /2
   JmpInd,    // FF /4
+  Bextr,     // VEX.0F38 F7: reg = rm[start + len - 1 : start], control in vvvv
+  Andn,      // VEX.0F38 F2: reg = ~vvvv & rm
 };
 
 /// Control transfers that end the block and store the next RIP themselves.
@@ -584,11 +604,23 @@ enum class VecOp : u8 {
   CvtF2F,      // cvtss2sd / cvtsd2ss
   CvtI2F,      // cvtsi2ss / cvtsi2sd
   CvttF2I,     // cvttss2si / cvttsd2si
+  ShiftImm,    // groups 71/72/73: dest = vvvv (legacy: rm), source rm, count imm8
+  Pshuflw,     // pshuflw (dbl) / pshufhw imm8
+  Pmovx,       // pmovsx / pmovzx: vlane = source bits, vsteps = doublings
+  Permilpd,    // vpermilpd imm8
+  Vinsert128,  // vinsertf128
+  Vextract128, // vextractf128
 };
 
 enum class VecBin : u8 {
   Add, Sub, Mul, Div, Min, Max, Sqrt, And, Andn, Or, Xor,
   UnpckLo, UnpckHi, AddSub, IAdd, ISub, ICmpEq, Cmp,
+  Neon,    // v2 = v0 OP v1 with the encoding in JitInsn::neon
+  Narrow,  // packss/packus: saturate v0 and v1 to the low and high half
+  Pmulh,   // pmulhw (neon != 0: pmulhuw)
+  Pmaddwd,
+  Pmuludq,
+  Pshufb,
 };
 
 struct JitInsn {
@@ -618,6 +650,9 @@ struct JitInsn {
   bool w64{false};  // REX.W / VEX.W: 64-bit general register operand
   u8 vvvv{0};       // VEX.vvvv
   bool imm_form{false}; // Imul / BitTest: the second operand is d.imm
+  u32 neon{0};          // VecBin::Neon / Narrow: instruction base
+  u8 vlane{0};          // VecOp::ShiftImm / Pmovx: lane bits
+  u8 vsteps{0};         // VecOp::Pmovx: lane doublings
 
   [[nodiscard]] bool has_mem() const noexcept {
     switch (kind) {
@@ -639,6 +674,8 @@ struct JitInsn {
     case Kind::Imul:
     case Kind::ShiftCl:
     case Kind::BitTest:
+    case Kind::Bextr:
+    case Kind::Andn:
       return !m.is_reg;
     default:
       return false;
@@ -711,19 +748,93 @@ bool is_vec_opcode(u8 map, u8 op) {
     case 0x28: case 0x29: case 0x2A: case 0x2C: case 0x2E: case 0x2F:
     case 0x51: case 0x54: case 0x55: case 0x56: case 0x57: case 0x58: case 0x59: case 0x5A:
     case 0x5C: case 0x5D: case 0x5E: case 0x5F:
-    case 0x62: case 0x6A: case 0x6C: case 0x6D: case 0x6E: case 0x6F:
-    case 0x70: case 0x76: case 0x7E: case 0x7F:
-    case 0xC2: case 0xC6: case 0xD0: case 0xD4: case 0xD6: case 0xDB: case 0xDF:
-    case 0xEB: case 0xEF: case 0xFA: case 0xFB: case 0xFE:
+    case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67:
+    case 0x68: case 0x69: case 0x6A: case 0x6B: case 0x6C: case 0x6D: case 0x6E: case 0x6F:
+    case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76:
+    case 0x7E: case 0x7F:
+    case 0xC2: case 0xC6: case 0xD0: case 0xD4: case 0xD5: case 0xD6: case 0xD8: case 0xD9:
+    case 0xDA: case 0xDB: case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+    case 0xE0: case 0xE3: case 0xE4: case 0xE5: case 0xE8: case 0xE9: case 0xEA: case 0xEB:
+    case 0xEC: case 0xED: case 0xEE: case 0xEF:
+    case 0xF4: case 0xF5: case 0xF8: case 0xF9: case 0xFA: case 0xFB: case 0xFC: case 0xFD:
+    case 0xFE:
       return true;
     default:
       return false;
     }
   }
-  if (map == 2)
-    return op == 0x18;
-  return op == 0x04 || op == 0x0C || op == 0x0D || op == 0x16 || op == 0x21 ||
-         op == 0x22 || op == 0x4A || op == 0x4B;
+  if (map == 2) {
+    switch (op) {
+    case 0x00: case 0x18:
+    case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25:
+    case 0x29: case 0x2B:
+    case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35:
+    case 0x37: case 0x38: case 0x39: case 0x3A: case 0x3B: case 0x3C: case 0x3D: case 0x3E:
+    case 0x3F: case 0x40:
+      return true;
+    default:
+      return false;
+    }
+  }
+  return op == 0x04 || op == 0x05 || op == 0x0C || op == 0x0D || op == 0x16 || op == 0x18 ||
+         op == 0x19 || op == 0x21 || op == 0x22 || op == 0x4A || op == 0x4B;
+}
+
+/// The packed-integer operations that are a single NEON instruction, with x86
+/// and NEON agreeing on operand order and on the 128-bit behaviour. 0: not one
+/// of them.
+u32 neon_int_op(u8 map, u8 op) {
+  using namespace a64;
+  if (map == 1) {
+    switch (op) {
+    case 0x60: return lanes(ZIP1_V, 0);   // punpcklbw
+    case 0x61: return lanes(ZIP1_V, 1);   // punpcklwd
+    case 0x68: return lanes(ZIP2_V, 0);   // punpckhbw
+    case 0x69: return lanes(ZIP2_V, 1);   // punpckhwd
+    case 0x64: return lanes(CMGT_V, 0);   // pcmpgtb
+    case 0x65: return lanes(CMGT_V, 1);   // pcmpgtw
+    case 0x66: return lanes(CMGT_V, 2);   // pcmpgtd
+    case 0x74: return lanes(CMEQ_V, 0);   // pcmpeqb
+    case 0x75: return lanes(CMEQ_V, 1);   // pcmpeqw
+    case 0xD5: return lanes(MUL_V, 1);    // pmullw
+    case 0xD8: return lanes(UQSUB_V, 0);  // psubusb
+    case 0xD9: return lanes(UQSUB_V, 1);  // psubusw
+    case 0xDA: return lanes(UMIN_V, 0);   // pminub
+    case 0xDC: return lanes(UQADD_V, 0);  // paddusb
+    case 0xDD: return lanes(UQADD_V, 1);  // paddusw
+    case 0xDE: return lanes(UMAX_V, 0);   // pmaxub
+    case 0xE0: return lanes(URHADD_V, 0); // pavgb
+    case 0xE3: return lanes(URHADD_V, 1); // pavgw
+    case 0xE8: return lanes(SQSUB_V, 0);  // psubsb
+    case 0xE9: return lanes(SQSUB_V, 1);  // psubsw
+    case 0xEA: return lanes(SMIN_V, 1);   // pminsw
+    case 0xEC: return lanes(SQADD_V, 0);  // paddsb
+    case 0xED: return lanes(SQADD_V, 1);  // paddsw
+    case 0xEE: return lanes(SMAX_V, 1);   // pmaxsw
+    case 0xF8: return lanes(SUB_V, 0);    // psubb
+    case 0xF9: return lanes(SUB_V, 1);    // psubw
+    case 0xFC: return lanes(ADD_V, 0);    // paddb
+    case 0xFD: return lanes(ADD_V, 1);    // paddw
+    default: return 0;
+    }
+  }
+  if (map == 2) {
+    switch (op) {
+    case 0x29: return lanes(CMEQ_V, 3);  // pcmpeqq
+    case 0x37: return lanes(CMGT_V, 3);  // pcmpgtq
+    case 0x38: return lanes(SMIN_V, 0);  // pminsb
+    case 0x39: return lanes(SMIN_V, 2);  // pminsd
+    case 0x3A: return lanes(UMIN_V, 1);  // pminuw
+    case 0x3B: return lanes(UMIN_V, 2);  // pminud
+    case 0x3C: return lanes(SMAX_V, 0);  // pmaxsb
+    case 0x3D: return lanes(SMAX_V, 2);  // pmaxsd
+    case 0x3E: return lanes(UMAX_V, 1);  // pmaxuw
+    case 0x3F: return lanes(UMAX_V, 2);  // pmaxud
+    case 0x40: return lanes(MUL_V, 2);   // pmulld
+    default: return 0;
+    }
+  }
+  return 0;
 }
 
 /// Decode an SSE/AVX instruction whose opcode byte is at code[pos] (after
@@ -817,7 +928,32 @@ bool decode_vec(const u8 *code, usize avail, usize pos, GuestAddr rip, u8 map,
       break;
     case 0x70:
       if (pp == 1) { imm8 = wide_ok = true; ok = set(VecOp::Pshufd); }
+      else if (pp >= 2) { imm8 = true; ok = set(VecOp::Pshuflw); } // dbl: low words
       break;
+    case 0x63: case 0x67: case 0x6B: // packsswb, packuswb, packssdw
+      if (pp == 1) {
+        d.neon = a64::lanes(op == 0x67 ? a64::SQXTUN_V : a64::SQXTN_V, op == 0x6B ? 1 : 0);
+        d.vbin = VecBin::Narrow;
+        ok = set(VecOp::Packed);
+      }
+      break;
+    case 0x71: case 0x72: case 0x73: {
+      const u8 ext = d.m.reg & 7;
+      const bool bytes = op == 0x73 && (ext == 3 || ext == 7); // psrldq, pslldq
+      const bool word_or_dword = op != 0x73 && (ext == 2 || ext == 4 || ext == 6);
+      const bool qword = op == 0x73 && (ext == 2 || ext == 6);
+      if (pp == 1 && !mem && (bytes || word_or_dword || qword)) {
+        imm8 = true;
+        d.vlane = op == 0x71 ? 16 : op == 0x72 ? 32 : 64;
+        ok = set(VecOp::ShiftImm);
+      }
+      break;
+    }
+    case 0xE4: case 0xE5: // pmulhuw, pmulhw
+      if (pp == 1) { d.neon = op == 0xE4; d.vbin = VecBin::Pmulh; ok = set(VecOp::Packed); }
+      break;
+    case 0xF4: if (pp == 1) { d.vbin = VecBin::Pmuludq; ok = set(VecOp::Packed); } break;
+    case 0xF5: if (pp == 1) { d.vbin = VecBin::Pmaddwd; ok = set(VecOp::Packed); } break;
     case 0x76: if (pp == 1) { d.dbl = false; ok = packed(VecBin::ICmpEq); } break;
     case 0xC2: imm8 = true; ok = arith(VecBin::Cmp); break;
     case 0xC6:
@@ -839,15 +975,42 @@ bool decode_vec(const u8 *code, usize avail, usize pos, GuestAddr rip, u8 map,
                     : op == 0xEB ? VecBin::Or : VecBin::Xor);
       }
       break;
-    default: break;
+    default:
+      if (pp == 1 && neon_int_op(map, op)) {
+        d.neon = neon_int_op(map, op);
+        d.vbin = VecBin::Neon;
+        ok = set(VecOp::Packed);
+      }
+      break;
     }
   } else if (map == 2) {
     if (op == 0x18 && vex && pp == 1 && !d.w64) { wide_ok = true; ok = set(VecOp::Broadcast); }
+    else if (pp == 1 && op == 0x00) { d.vbin = VecBin::Pshufb; ok = set(VecOp::Packed); }
+    else if (pp == 1 && op == 0x2B) { // packusdw
+      d.neon = a64::lanes(a64::SQXTUN_V, 1);
+      d.vbin = VecBin::Narrow;
+      ok = set(VecOp::Packed);
+    } else if (pp == 1 && ((op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35))) {
+      // pmovsx (2x) / pmovzx (3x): bw, bd, bq, wd, wq, dq
+      static constexpr u8 kSrc[6] = {8, 8, 8, 16, 16, 32};
+      static constexpr u8 kSteps[6] = {1, 2, 3, 1, 2, 1};
+      d.vlane = kSrc[op & 7];
+      d.vsteps = kSteps[op & 7];
+      d.dbl = op < 0x30; // sign extend
+      ok = set(VecOp::Pmovx);
+    } else if (pp == 1 && neon_int_op(map, op)) {
+      d.neon = neon_int_op(map, op);
+      d.vbin = VecBin::Neon;
+      ok = set(VecOp::Packed);
+    }
   } else {
     imm8 = true;
     if (pp == 1) {
       switch (op) {
       case 0x04: if (vex && !d.w64) { wide_ok = true; ok = set(VecOp::Pshufd); } break;
+      case 0x05: if (vex && !d.w64) { wide_ok = true; ok = set(VecOp::Permilpd); } break;
+      case 0x18: if (vex && !d.w64 && d.l256) { wide_ok = true; ok = set(VecOp::Vinsert128); } break;
+      case 0x19: if (vex && !d.w64 && d.l256) { wide_ok = true; ok = set(VecOp::Vextract128); } break;
       case 0x0C: case 0x0D: d.dbl = op == 0x0D; wide_ok = true; ok = set(VecOp::Blend); break;
       case 0x16: d.dbl = d.w64; ok = set(VecOp::Pextr); break;
       case 0x21: ok = set(VecOp::Insertps); break;
@@ -914,6 +1077,23 @@ bool decode_insn(const u8 *code, usize avail, GuestAddr rip, JitInsn &d) {
     d.l256 = (last & 4) != 0;
     if (map < 1 || map > 3)
       return false;
+    if (map == 2 && pos < avail && (code[pos] == 0xF2 || code[pos] == 0xF7)) {
+      // ANDN / BEXTR. (The other F7 forms, SHLX/SARX/SHRX, are BMI2, which
+      // the PS4's CPU does not have.)
+      if ((last & 3) != 0 || d.l256)
+        return false;
+      const bool andn = code[pos++] == 0xF2;
+      if (!x86::decode_modrm(code + pos, avail - pos, p, d.m))
+        return false;
+      pos += d.m.length;
+      d.kind = andn ? Kind::Andn : Kind::Bextr;
+      d.width = p.rex_w ? 64 : 32;
+      d.flags_written = CpuContext::FLAG_ZF | CpuContext::FLAG_CF | CpuContext::FLAG_OF |
+                        (andn ? u64{CpuContext::FLAG_SF} : u64{0});
+      d.rip = rip;
+      d.len = static_cast<u8>(pos);
+      return true;
+    }
     return decode_vec(code, avail, pos, rip, map, last & 3, d);
   }
   // Legacy SSE: 0F xx, 0F 38 xx, 0F 3A xx with a 66/F3/F2 mandatory prefix.
@@ -1481,6 +1661,42 @@ public:
       if (d.writes_result)
         store_rm(0, w);
       break;
+    case Kind::Bextr: {
+      // Shifting or masking by 64 or more needs the explicit selects; ARM
+      // takes the amount modulo 64. A 32-bit source is zero-extended, so 64-bit
+      // arithmetic gives the 32-bit answer as well.
+      load_rm(0, w);
+      load_gpr(1, d.vvvv, w);
+      m_e.ubfx(false, 2, 1, 0, 8); // start
+      m_e.ubfx(false, 3, 1, 8, 8); // length
+      m_e.movz(true, 6, 64);
+      m_e.lsrv(true, 0, 0, 2);
+      m_e.cmp_reg(true, 2, 6);
+      m_e.emit(a64::csel(true, 0, 0, 31, COND_CC));
+      m_e.movz(true, 5, 1);
+      m_e.emit(a64::lslv(true, 5, 5, 3));
+      m_e.sub_imm(5, 5, 1);
+      m_e.cmp_reg(true, 3, 6);
+      m_e.mov_imm64(4, ~u64{0});
+      m_e.emit(a64::csel(true, 5, 5, 4, COND_CC));
+      m_e.and_reg(0, 0, 5);
+      store_gpr(d.m.reg, w, 0);
+      if (flags_needed) {
+        m_e.ands_shifted(true, 31, 0, 0); // Z from the result, C = V = 0
+        emit_flags(false, d.flags_written, 0);
+      }
+      break;
+    }
+    case Kind::Andn:
+      load_rm(0, w);
+      load_gpr(1, d.vvvv, w);
+      m_e.bic_shifted(w == 64, 0, 0, 1);
+      store_gpr(d.m.reg, w, 0);
+      if (flags_needed) {
+        m_e.ands_shifted(w == 64, 31, 0, 0); // N/Z from the result, C = V = 0
+        emit_flags(false, d.flags_written, 0);
+      }
+      break;
     case Kind::IncDec:
       load_rm(0, w);
       m_e.movz(false, 1, 1);
@@ -1589,6 +1805,7 @@ public:
       m_e.mov_imm64(0, x.rip);
       m_e.str_reg(0, R_CTX, offsetof(CpuContext, rip));
       m_e.mov_imm64(0, x.retired);
+      m_e.add_reg(0, 0, 24); // plus the earlier blocks of the chain
       m_e.emit_epilogue();
     }
     m_exits.clear();
@@ -1804,8 +2021,12 @@ private:
     switch (d.vop) {
     case VecOp::Load: case VecOp::Store: case VecOp::Packed: case VecOp::Shuf:
     case VecOp::Pshufd: case VecOp::Blend: case VecOp::Blendv: case VecOp::Moveldup:
-    case VecOp::Movehdup:
+    case VecOp::Movehdup: case VecOp::Pshuflw: case VecOp::Permilpd:
       return d.l256 ? 32 : 16;
+    case VecOp::Vinsert128: case VecOp::Vextract128:
+      return 16;
+    case VecOp::Pmovx:
+      return 16u >> d.vsteps;
     case VecOp::Movddup:
       return d.l256 ? 32 : 8;
     case VecOp::LoadScalar: case VecOp::StoreScalar: case VecOp::Scalar: case VecOp::Ucomi:
@@ -1871,6 +2092,31 @@ private:
     case VecBin::IAdd: m_e.emit(a64::add_v(dbl, 2, 0, 1)); break;
     case VecBin::ISub: m_e.emit(a64::sub_v(dbl, 2, 0, 1)); break;
     case VecBin::ICmpEq: m_e.emit(a64::cmeq_v(2, 0, 1)); break;
+    case VecBin::Neon: m_e.emit(a64::rd_rn_rm(d.neon, 2, 0, 1)); break;
+    case VecBin::Narrow:
+      m_e.emit(a64::rd_rn(d.neon, 2, 0));
+      m_e.emit(a64::rd_rn(d.neon | a64::NARROW_HIGH, 2, 1));
+      break;
+    case VecBin::Pmulh:
+      m_e.emit(d.neon ? a64::umull_h(3, 0, 1) : a64::smull_h(3, 0, 1));
+      m_e.emit(d.neon ? a64::umull2_h(4, 0, 1) : a64::smull2_h(4, 0, 1));
+      m_e.emit(a64::uzp2_h(2, 3, 4));
+      break;
+    case VecBin::Pmaddwd:
+      m_e.emit(a64::smull_h(3, 0, 1));
+      m_e.emit(a64::smull2_h(4, 0, 1));
+      m_e.emit(a64::addp_s(2, 3, 4));
+      break;
+    case VecBin::Pmuludq:
+      m_e.emit(a64::xtn_s(3, 0));
+      m_e.emit(a64::xtn_s(4, 1));
+      m_e.emit(a64::umull_s(2, 3, 4));
+      break;
+    case VecBin::Pshufb: // an index with bit 7 set selects 0, as TBL's out-of-range does
+      m_e.emit(a64::movi_16b(3, 0x8F));
+      m_e.emit(a64::and_v(3, 1, 3));
+      m_e.emit(a64::tbl_16b(2, 0, 3));
+      break;
     case VecBin::Cmp: {
       const u32 pred = d.imm & 7;
       switch (pred & 3) {
@@ -2147,6 +2393,84 @@ private:
       else
         m_e.ldr_w(0, R_CTX, xmm_off(dst, 4 * (imm & 3)));
       store_rm(0, d.w64 ? 64 : 32);
+      break;
+    case VecOp::ShiftImm: {
+      const u8 to = d.vex ? d.vvvv : rm;
+      const u32 ext = dst & 7, esize = d.vlane;
+      vld(1, rm, 0);
+      if (esize == 64 && (ext == 3 || ext == 7)) { // psrldq, pslldq: whole bytes
+        m_e.emit(a64::movi_zero(31));
+        if (imm == 0)
+          m_e.emit(a64::mov_v(2, 1));
+        else if (imm >= 16)
+          m_e.emit(a64::movi_zero(2));
+        else if (ext == 3)
+          m_e.emit(a64::ext_16b(2, 1, 31, imm));
+        else
+          m_e.emit(a64::ext_16b(2, 31, 1, 16 - imm));
+      } else if (imm == 0) {
+        m_e.emit(a64::mov_v(2, 1));
+      } else if (ext == 4) { // arithmetic: counts past the width fill with the sign
+        m_e.emit(a64::sshr_imm(esize, 2, 1, imm < esize ? imm : esize));
+      } else if (imm >= esize) {
+        m_e.emit(a64::movi_zero(2));
+      } else if (ext == 2) {
+        m_e.emit(a64::ushr_imm(esize, 2, 1, imm));
+      } else {
+        m_e.emit(a64::shl_imm(esize, 2, 1, imm));
+      }
+      vst(2, to, 0);
+      done(to);
+      break;
+    }
+    case VecOp::Pshuflw: {
+      const u32 base = dbl ? 0 : 4;
+      ld_rm_q(1, 0);
+      m_e.emit(a64::mov_v(2, 1));
+      for (u32 i = 0; i < 4; ++i)
+        m_e.emit(a64::ins_h(2, base + i, 1, base + ((imm >> (2 * i)) & 3)));
+      vst(2, dst, 0);
+      done(dst);
+      break;
+    }
+    case VecOp::Pmovx: {
+      if (!mem)
+        vld(1, rm, 0);
+      else if (d.vsteps == 1)
+        mld_lane(true, 1);
+      else if (d.vsteps == 2)
+        mld_lane(false, 1);
+      else
+        m_e.emit(a64::ldr_h_x(1, R_GBASE, R_EA));
+      for (u32 k = 0, esize = d.vlane; k < d.vsteps; ++k, esize *= 2)
+        m_e.emit(dbl ? a64::sxtl(esize, 1, 1) : a64::uxtl(esize, 1, 1));
+      vst(1, dst, 0);
+      done(dst);
+      break;
+    }
+    case VecOp::Permilpd:
+      for (u32 h = 0; h < halves; ++h) {
+        ld_rm_q(1, h);
+        ins(true, 2, 0, 1, (imm >> (2 * h)) & 1);
+        ins(true, 2, 1, 1, (imm >> (2 * h + 1)) & 1);
+        vst(2, dst, h);
+      }
+      done(dst);
+      break;
+    case VecOp::Vinsert128:
+      ld_rm_q(1, 0);
+      vld(0, src1, (imm & 1) ^ 1);
+      vst(0, dst, (imm & 1) ^ 1);
+      vst(1, dst, imm & 1);
+      break;
+    case VecOp::Vextract128:
+      vld(0, dst, imm & 1);
+      if (mem) {
+        mst_q(0);
+      } else {
+        vst(0, rm, 0);
+        zero_upper(rm);
+      }
       break;
     case VecOp::Pinsr:
       vld(0, src1, 0);
@@ -2680,7 +3004,6 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
   }
 
   // Pass 1: decode the block.
-  constexpr usize MAX_BLOCK_INSNS = 128;
   std::vector<JitInsn> insns;
   GuestAddr current_rip = guest_rip;
   bool block_ended = false;
@@ -2753,6 +3076,7 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
   // Pass 3: emit.
   m_emitter.clear();
   m_emitter.emit_prologue();
+  assert(m_emitter.size_bytes() == kChainEntryOffset);
   BlockTranslator translator(m_emitter);
   for (usize i = 0; i < insns.size(); ++i) {
     translator.emit(insns[i], flags_needed[i], i);
@@ -2769,7 +3093,26 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
     m_emitter.mov_imm64(0, current_rip);
     m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
   }
-  m_emitter.mov_imm64(0, instructions);
+  // Next block: while the budget lasts, jump to it if this thread's table
+  // knows it (the same slot function as ThreadBlockCache). It is inline so that
+  // each block's BR has its own branch-predictor history. x0 = the next RIP.
+  if (writes_rip(insns.back().kind))
+    m_emitter.ldr_reg(0, 19, offsetof(CpuContext, rip));
+  m_emitter.add_imm(24, 24, static_cast<u32>(instructions));
+  m_emitter.emit(0xf10006f7); // subs x23, x23, #1
+  const usize out_of_budget = m_emitter.pos();
+  m_emitter.b_cond(COND_CC, 0);
+  m_emitter.eor_shifted(true, 2, 0, 0, Arm64Emitter::SHIFT_LSR, 16);
+  m_emitter.ubfx(true, 2, 2, 0, 16);
+  m_emitter.emit(0x8b0212c2); // add x2, x22, x2, lsl #4
+  m_emitter.emit(0xa9401043); // ldp x3, x4, [x2]
+  m_emitter.cmp_reg(true, 3, 0);
+  const usize not_cached = m_emitter.pos();
+  m_emitter.b_cond(COND_NE, 0);
+  m_emitter.emit(0xd61f0080); // br x4
+  m_emitter.patch_b_cond(out_of_budget, m_emitter.pos());
+  m_emitter.patch_b_cond(not_cached, m_emitter.pos());
+  m_emitter.mov_reg(0, 24);
   m_emitter.emit_epilogue();
 
   translator.emit_side_exits();
@@ -2809,6 +3152,13 @@ struct ThreadBlockCache {
   };
   u64 epoch = 0;
   std::unique_ptr<Slot[]> fast;
+  // What compiled code reads to chain to the next block: same slot function as
+  // `fast`, `body` being the block's code just past its prologue.
+  struct ChainSlot {
+    GuestAddr rip;
+    const void *body;
+  };
+  std::unique_ptr<ChainSlot[]> chain;
   std::unordered_map<GuestAddr, Entry> map;
   static usize slot_of(GuestAddr rip) { return static_cast<usize>((rip ^ (rip >> 16)) & (kFastSlots - 1)); }
 };
@@ -2816,7 +3166,7 @@ thread_local ThreadBlockCache t_block_cache;
 } // namespace
 
 bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
-                                usize *retired) {
+                                usize *retired, u64 chain_budget) {
   if (retired)
     *retired = 0;
   // RIP 0 (a guest thread returning from its entry point) and the other
@@ -2829,13 +3179,21 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
   const u64 epoch = m_epoch.load(std::memory_order_acquire);
   if (tc.epoch != epoch || !tc.fast) {
     tc.map.clear();
-    if (!tc.fast)
+    if (!tc.fast) {
       tc.fast = std::make_unique<ThreadBlockCache::Slot[]>(ThreadBlockCache::kFastSlots);
-    for (usize i = 0; i < ThreadBlockCache::kFastSlots; ++i)
+      tc.chain = std::make_unique<ThreadBlockCache::ChainSlot[]>(ThreadBlockCache::kFastSlots);
+    }
+    for (usize i = 0; i < ThreadBlockCache::kFastSlots; ++i) {
       tc.fast[i].rip = ~GuestAddr{0};
+      tc.chain[i].rip = ~GuestAddr{0};
+    }
     tc.epoch = epoch;
   }
-  ThreadBlockCache::Slot &slot = tc.fast[ThreadBlockCache::slot_of(ctx.rip)];
+  const usize slot_index = ThreadBlockCache::slot_of(ctx.rip);
+  ThreadBlockCache::Slot &slot = tc.fast[slot_index];
+  auto chain_to = [&](JittedBlockFunc block) {
+    tc.chain[slot_index] = {ctx.rip, reinterpret_cast<const u8 *>(block) + kChainEntryOffset};
+  };
   if (slot.rip == ctx.rip) {
     if (!slot.entry.fn)
       return false;
@@ -2848,6 +3206,7 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
       return false;
     fn = it->second.fn;
     exec_count = it->second.execution_count;
+    chain_to(fn);
   } else {
     {
       // Another thread may have compiled it: look it up under the shared lock.
@@ -2874,8 +3233,10 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
     }
     tc.map.emplace(ctx.rip, ThreadBlockCache::Entry{fn, exec_count});
     slot = {ctx.rip, ThreadBlockCache::Entry{fn, exec_count}};
+    chain_to(fn);
   }
   if (m_collect_metrics) {
+    chain_budget = 0; // every block is counted here
     std::atomic_ref<usize>(*exec_count).fetch_add(1, std::memory_order_relaxed);
     std::atomic_ref<usize>(m_total_invocations).fetch_add(1, std::memory_order_relaxed);
   }
@@ -2889,7 +3250,7 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
   // Compiled code stores to guest memory: the MemoryManager is only const
   // because compilation does not modify it.
   u8 *guest_base = const_cast<u8 *>(memory.base_address());
-  const u64 n = fn(&ctx, guest_base, memory.total_size());
+  const u64 n = fn(&ctx, guest_base, memory.total_size(), tc.chain.get(), chain_budget);
   if (retired)
     *retired = static_cast<usize>(n);
   // A block that side-exited on its first instruction made no progress: the

@@ -176,6 +176,7 @@ namespace binding {
 inline constexpr u32 kMemBuffer = 0;     // device const uchar* (resource arena)
 inline constexpr u32 kDrawConsts = 1;    // constant GcnDrawConsts&
 inline constexpr u32 kComputeConsts = 1; // constant GcnComputeConsts&
+inline constexpr u32 kUniformLoads = 2;  // constant uint*: scalar loads evaluated per draw
 inline constexpr u32 kMaxRanges = 16;
 } // namespace binding
 
@@ -220,6 +221,7 @@ struct ResourceScan {
     std::string error;
     std::vector<MemRange> ranges;
     std::vector<ImageDescriptors> images;   // parallel to ImageSlot list
+    std::vector<u32> uniform_loads;         // bound as binding::kUniformLoads
 };
 
 ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& slots,
@@ -261,7 +263,10 @@ bool texture_to_rgba8(const TextureDesc& td, const u8* src, usize src_size,
 
 /// Byte size of the guest memory backing a texture's mip 0.
 usize texture_guest_size(const TextureDesc& td);
+bool is_linear_tiling(u32 tiling_index);
 
 u64 hash_words(const u32* data, usize count, u64 seed = 0xcbf29ce484222325ull);
+/// Fast content hash for whole guest surfaces, checked on every draw.
+u64 hash_memory(const u8* data, usize size);
 
 } // namespace ps4::gcn

@@ -8968,6 +8968,56 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
+    // libSceMsgDialog: there is no system UI to show it in, so it is logged and
+    // ends at once with OK / Yes. Dragon Ball Xenoverse 2 opens one after its
+    // opening movie and polls UpdateStatus for FINISHED; the fallback's 0
+    // left it on a black screen forever.
+    static DialogTracker s_dlg_msg;
+    register_symbol(0x943AB1698D546C4AULL, "sceMsgDialogInitialize", "libSceMsgDialog", dlg_ok);
+    // sceMsgDialogOpen(const SceMsgDialogParam*): mode at +0x38 (1 = user text),
+    // userMsgParam at +0x40 = { int buttonType; const char* msg at +8 }.
+    register_symbol(0x6F4E878740CF11A1ULL, "sceMsgDialogOpen", "libSceMsgDialog",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            i32 mode = 0;
+            GuestAddr user = 0, msg = 0;
+            std::string text;
+            mem.read_value(ctx.rdi + 0x38, mode);
+            if (mode == 1 && mem.read_value(ctx.rdi + 0x40, user) && user != 0 && mem.read_value(user + 8, msg))
+                read_guest_cstring(mem, msg, text);
+            std::fprintf(stderr, "[MsgDialog] mode %d: %s\n", mode, text.c_str());
+            s_dlg_msg.status.store(kDlgStatusFinished);
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x1D3ADC0CA9452AE3ULL, "sceMsgDialogClose", "libSceMsgDialog", dlg_open(s_dlg_msg));
+    register_symbol(0x78FC3F92A6667A5AULL, "sceMsgDialogTerminate", "libSceMsgDialog", dlg_terminate(s_dlg_msg));
+    register_symbol(0xE9F202DD72ADDA4DULL, "sceMsgDialogUpdateStatus", "libSceMsgDialog", dlg_status(s_dlg_msg));
+    register_symbol(0x096556EFC41CDDF2ULL, "sceMsgDialogGetStatus", "libSceMsgDialog", dlg_status(s_dlg_msg));
+    // GetResult(SceMsgDialogResult*): mode (left as is), result 0, buttonId OK/Yes (1).
+    register_symbol(0x2EBF28BC71FD97A0ULL, "sceMsgDialogGetResult", "libSceMsgDialog",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (mem.is_valid_address(ctx.rdi, 12)) {
+                mem.write_value<i32>(ctx.rdi + 4, 0);
+                mem.write_value<i32>(ctx.rdi + 8, 1);
+            }
+            ctx.rax = SCE_OK;
+        });
+    // libSceErrorDialog: logged, ends at once.
+    static DialogTracker s_dlg_error;
+    register_symbol(0x23CF0A0A19729D2BULL, "sceErrorDialogInitialize", "libSceErrorDialog", dlg_ok);
+    // sceErrorDialogOpen(const SceErrorDialogParam*): errorCode at +4.
+    register_symbol(0x336645FC294B8606ULL, "sceErrorDialogOpen", "libSceErrorDialog",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            u32 code = 0;
+            mem.read_value(ctx.rdi + 4, code);
+            std::fprintf(stderr, "[ErrorDialog] error 0x%08x\n", code);
+            s_dlg_error.status.store(kDlgStatusFinished);
+            ctx.rax = SCE_OK;
+        });
+    register_symbol(0x7A45C76F5903065DULL, "sceErrorDialogClose", "libSceErrorDialog", dlg_open(s_dlg_error));
+    register_symbol(0xF570312B63CCC24FULL, "sceErrorDialogTerminate", "libSceErrorDialog", dlg_terminate(s_dlg_error));
+    register_symbol(0x596886BA1F577E04ULL, "sceErrorDialogUpdateStatus", "libSceErrorDialog", dlg_status(s_dlg_error));
+    register_symbol(0xB7616F1D15F382A9ULL, "sceErrorDialogGetStatus", "libSceErrorDialog", dlg_status(s_dlg_error));
+
     // --- libc / libc++ gaps (real implementations) ---
     register_symbol(0x015EA2A4235AE11CULL, "strcasecmp", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {

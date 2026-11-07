@@ -21,6 +21,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # a stack canary indirectly (a bad length field driving an oversized memcpy), so
 # the assert is the best-supported lead and must stay live while we chase it.
 set(CMAKE_CXX_FLAGS_INVESTIGATE "-O2 -g" CACHE STRING "" FORCE)
+# The GPU and window code is Objective-C++ (.mm), which has its own flag set.
+set(CMAKE_OBJCXX_FLAGS_INVESTIGATE "-O2 -g" CACHE STRING "" FORCE)
 set(CMAKE_EXE_LINKER_FLAGS_INVESTIGATE "-O2 -g" CACHE STRING "" FORCE)
 
 # Only sets a default, so -DCMAKE_BUILD_TYPE=Debug/Release still work.
