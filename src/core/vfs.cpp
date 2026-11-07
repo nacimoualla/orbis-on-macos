@@ -95,7 +95,6 @@ VirtualFileSystem::VirtualFileSystem(VirtualFileSystem&& other) noexcept {
     m_mounts = std::move(other.m_mounts);
     m_fd_table = std::move(other.m_fd_table);
     m_next_fd = other.m_next_fd;
-    m_next_savedata_mount_idx = other.m_next_savedata_mount_idx;
 }
 
 VirtualFileSystem& VirtualFileSystem::operator=(VirtualFileSystem&& other) noexcept {
@@ -106,7 +105,6 @@ VirtualFileSystem& VirtualFileSystem::operator=(VirtualFileSystem&& other) noexc
         m_mounts = std::move(other.m_mounts);
         m_fd_table = std::move(other.m_fd_table);
         m_next_fd = other.m_next_fd;
-        m_next_savedata_mount_idx = other.m_next_savedata_mount_idx;
     }
     return *this;
 }
@@ -396,30 +394,6 @@ bool VirtualFileSystem::exists(std::string_view guest_path) const {
     }
     std::error_code ec;
     return std::filesystem::exists(*resolved, ec);
-}
-
-i32 VirtualFileSystem::mount_savedata(u32 user_id, const std::string& dir_name, u32 mount_mode, SceSaveDataMountResult& out_result) {
-    const std::filesystem::path save_dir = m_sandbox_root / "savedata" / std::to_string(user_id) / dir_name;
-
-    if (mount_mode & SCE_SAVE_DATA_MOUNT_MODE_CREATE) {
-        std::error_code ec;
-        std::filesystem::create_directories(save_dir, ec);
-    }
-
-    const std::string virt_mount = "/savedata" + std::to_string(m_next_savedata_mount_idx++);
-    const bool ro = (mount_mode == SCE_SAVE_DATA_MOUNT_MODE_RDONLY);
-
-    mount(virt_mount, save_dir, ro);
-
-    std::memset(&out_result, 0, sizeof(SceSaveDataMountResult));
-    std::strncpy(out_result.mount_path, virt_mount.c_str(), sizeof(out_result.mount_path) - 1);
-    out_result.required_blocks = 1024; // Standard 32MB simulated allocation quota
-
-    return SCE_OK;
-}
-
-i32 VirtualFileSystem::unmount_savedata(const std::string& mount_path) {
-    return unmount(mount_path) ? SCE_OK : -1;
 }
 
 void VirtualFileSystem::reset() {
