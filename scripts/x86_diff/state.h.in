@@ -1,12 +1,12 @@
 #include <string.h>
-struct State { uint8_t ymm[16][32]; uint64_t rax, rcx, rdx, rsi; uint8_t mem[16]; uint64_t flags; };
+struct State { uint8_t ymm[16][32]; uint64_t rax, rcx, rdx, rsi; uint8_t mem[32]; uint64_t flags; };
 static uint64_t rng_s;
 static uint64_t rnd(void){ rng_s ^= rng_s<<13; rng_s ^= rng_s>>7; rng_s ^= rng_s<<17; return rng_s; }
 static void fill(struct State* s, unsigned c, unsigned t){
   rng_s = 0x9E3779B97F4A7C15ull ^ (c*7919u + t*104729u + 1);
   for (int r=0;r<16;r++) for (int b=0;b<32;b+=8){ uint64_t v=rnd(); for(int k=0;k<8;k++) s->ymm[r][b+k]=(uint8_t)(v>>(8*k)); }
   s->rax=rnd(); s->rcx=rnd(); s->rdx=rnd(); s->rsi=rnd()&0xff;
-  for(int k=0;k<16;k++) s->mem[k]=(uint8_t)rnd();
+  for(int k=0;k<32;k++) s->mem[k]=(uint8_t)rnd();
   s->flags = (rnd() & 0x8D5) | 0x202;
   // Small shift/rotate counts in cl are more interesting than random ones.
   if (t & 1) s->rcx = (s->rcx & ~0xffull) | (rnd() % 70);
@@ -38,6 +38,6 @@ static void print_state(const struct State* s, unsigned c, unsigned t, int(*pr)(
   pr("%u.%u flags=%llx", c, t, (unsigned long long)(s->flags & kCases[c].fmask));
   for (int r=0;r<16;r++){ pr(" y%d=",r); for(int b=31;b>=0;b--) pr("%02x",s->ymm[r][b]); }
   pr(" rax=%llx rcx=%llx rdx=%llx rsi=%llx mem=", (unsigned long long)s->rax,(unsigned long long)s->rcx,(unsigned long long)s->rdx,(unsigned long long)s->rsi);
-  for(int k=0;k<16;k++) pr("%02x",s->mem[k]);
+  for(int k=0;k<32;k++) pr("%02x",s->mem[k]);
   pr("\n");
 }

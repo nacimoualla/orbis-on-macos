@@ -657,6 +657,17 @@ void NidRegistry::register_symbol(Nid nid, std::string_view name, std::string_vi
     m_nids_by_name[sym.name] = nid;
 }
 
+void NidRegistry::register_data_symbol(Nid nid, std::string_view name, DataFactory make) {
+    m_data_by_nid[nid] = DataSymbol{std::string(name), std::move(make), 0};
+}
+
+GuestAddr NidRegistry::resolve_data_symbol(Nid nid, MemoryManager& mem) {
+    auto it = m_data_by_nid.find(nid);
+    if (it == m_data_by_nid.end()) return 0;
+    if (it->second.addr == 0) it->second.addr = it->second.make(mem);
+    return it->second.addr;
+}
+
 const HleSymbol* NidRegistry::find_by_nid(Nid nid) const {
     auto it = m_symbols_by_nid.find(nid);
     if (it != m_symbols_by_nid.end()) {
@@ -1055,7 +1066,33 @@ static void deliver_gnm_eop_interrupt() {
 // The PM4 translator performs the label writes; the interrupts belong to the
 // HLE equeue path, raised after the stream has executed (the label is visible
 // before the waiter wakes, as on hardware).
-static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_bytes, bool log) {
+// The "prepare flip" marker Gnm leaves as the last packet of a flip's DCB: a
+// 64-dword NOP the driver rewrites into the work that runs once the flip has
+// happened. Tags: 0x68750777 plain, 0x68750778 + write label, 0x68750780 +
+// EOP interrupt, 0x68750781 + label and interrupt. Payload after the tag:
+// label lo, label hi, value (label forms); the game spins on that label to
+// know the display buffer is free again.
+struct PrepareFlip {
+    GuestAddr label{0};
+    u32 value{0};
+    bool interrupt{false};
+};
+
+static std::optional<PrepareFlip> decode_prepare_flip(const u32* p, u16 count) {
+    if (count < 1) return std::nullopt;
+    const u32 tag = p[0];
+    if (tag != 0x68750777 && tag != 0x68750778 && tag != 0x68750780 && tag != 0x68750781) return std::nullopt;
+    PrepareFlip f;
+    f.interrupt = tag == 0x68750780 || tag == 0x68750781;
+    if ((tag == 0x68750778 || tag == 0x68750781) && count >= 4) {
+        f.label = (static_cast<GuestAddr>(p[2]) << 32) | p[1];
+        f.value = p[3];
+    }
+    return f;
+}
+
+static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_bytes, bool log,
+                                    std::vector<PrepareFlip>* flips = nullptr) {
     if (!mem.is_valid_address(dcb, size_bytes)) return 0;
     const u32* dw = mem.to_host_ptr<u32>(dcb);
     const usize n = size_bytes / sizeof(u32);
@@ -1070,6 +1107,9 @@ static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_
         if (hdr.type == Pm4PacketType::Type3) {
             if (hdr.opcode == IT_EVENT_WRITE_EOP && hdr.count >= 3 && ((p[2] >> 24) & 0x3) != 0) ++interrupts;
             if (hdr.opcode == IT_RELEASE_MEM && hdr.count >= 2 && ((p[1] >> 24) & 0x7) != 0) ++interrupts;
+            if (flips && hdr.opcode == IT_NOP) {
+                if (auto f = decode_prepare_flip(p, hdr.count)) flips->push_back(*f);
+            }
             if (log) {
                 switch (hdr.opcode) {
                 case IT_WAIT_REG_MEM:
@@ -1096,7 +1136,7 @@ static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_
 // EOP interrupts they request. Shared by sceGnmSubmitCommandBuffers and
 // sceGnmSubmitAndFlipCommandBuffers.
 static void execute_submitted_dcbs(MemoryManager& mem, u32 count, GuestAddr dcb_addrs_ptr,
-                                   GuestAddr dcb_sizes_ptr) {
+                                   GuestAddr dcb_sizes_ptr, std::vector<PrepareFlip>* flips = nullptr) {
     if (dcb_addrs_ptr == 0 || dcb_sizes_ptr == 0 || count > 64) return;
     static std::atomic<u32> s_submits_logged{0};
     const bool log = s_submits_logged.fetch_add(1, std::memory_order_relaxed) < 4;
@@ -1115,7 +1155,7 @@ static void execute_submitted_dcbs(MemoryManager& mem, u32 count, GuestAddr dcb_
             !mem.is_valid_address(dcb_gpu_addr, dcb_size_bytes)) {
             continue;
         }
-        interrupts += count_dcb_eop_interrupts(mem, dcb_gpu_addr, dcb_size_bytes, log);
+        interrupts += count_dcb_eop_interrupts(mem, dcb_gpu_addr, dcb_size_bytes, log, flips);
         if (g_pm4_translator) {
             const usize pkts_in_dcb = g_pm4_translator->execute_command_buffer(dcb_gpu_addr, dcb_size_bytes);
             auto cc = g_pm4_translator->clear_color();
@@ -1126,6 +1166,14 @@ static void execute_submitted_dcbs(MemoryManager& mem, u32 count, GuestAddr dcb_
         }
     }
     for (u32 i = 0; i < interrupts; ++i) deliver_gnm_eop_interrupt();
+}
+
+// Run what the prepare-flip markers of a just-performed flip ask for.
+static void complete_prepare_flips(MemoryManager& mem, const std::vector<PrepareFlip>& flips) {
+    for (const PrepareFlip& f : flips) {
+        if (f.label != 0 && mem.is_valid_address(f.label, sizeof(u32))) mem.write_value(f.label, f.value);
+        if (f.interrupt) deliver_gnm_eop_interrupt();
+    }
 }
 
 // Sema-table snapshot for the stall watchdog (id, count/max per semaphore).
@@ -1201,6 +1249,8 @@ static void ensure_unity_screen_resolution(MemoryManager& mem) {
 }
 
 static void register_save_data_and_trophy(NidRegistry& reg);
+static void register_libc_cxx_runtime(NidRegistry& reg);
+static void register_np_offline(NidRegistry& reg);
 
 void NidRegistry::register_default_libraries() {
     // =========================================================================
@@ -4440,6 +4490,11 @@ void NidRegistry::register_default_libraries() {
     // libSceSaveData and libSceNpTrophy (see register_save_data_and_trophy).
     register_save_data_and_trophy(*this);
 
+    // libc / C++ runtime pieces Sonic Mania (RSDKv5) imports, and the NP
+    // services it polls, served as an offline console.
+    register_libc_cxx_runtime(*this);
+    register_np_offline(*this);
+
     // =========================================================================
     // libSceVideoOut / libSceSocialScreen entries that were falling through to
     // the generic unimplemented stub. Each of these is registered under the name
@@ -4985,6 +5040,7 @@ void NidRegistry::register_default_libraries() {
     static std::vector<FlipSubscription> s_flip_subscriptions;
 
     auto perform_flip = [](MemoryManager& mem, u32 buffer_index, i64 flip_arg) {
+        const auto t_flip_enter = std::chrono::steady_clock::now();
         // VBlank pacing. A PS4 flips at the next 60 Hz vblank and the game
         // paces itself on that; completing every flip at once let frame times
         // drift between 16 and 22 ms (judder). With a presenter attached
@@ -5000,11 +5056,19 @@ void NidRegistry::register_default_libraries() {
             if (s_next_vblank.time_since_epoch().count() == 0 || now > s_next_vblank + kVblank) {
                 s_next_vblank = now; // first flip, or more than a frame late: resync
             } else if (now < s_next_vblank) {
-                // sleep_until oversleeps by 1-2 ms on macOS; sleep to just short
-                // of the tick and spin the remainder so frames stay evenly spaced.
-                const auto coarse = s_next_vblank - std::chrono::microseconds(1500);
+                // sleep_until oversleeps by 1-2 ms on macOS, and by 3-4 ms while
+                // the audio and GPU threads are busy; sleep to well short of
+                // the tick and spin the remainder so frames stay evenly spaced.
+                // The spin must not yield: Darwin's sched_yield drops the thread
+                // to the lowest priority for a quantum, so with other threads
+                // busy the tick was missed by 2-8 ms.
+                const auto coarse = s_next_vblank - std::chrono::microseconds(4000);
                 if (now < coarse) std::this_thread::sleep_until(coarse);
-                while (clock::now() < s_next_vblank) std::this_thread::yield();
+                while (clock::now() < s_next_vblank) {
+#if defined(__aarch64__)
+                    __builtin_arm_isb(15);
+#endif
+                }
             }
             s_next_vblank += kVblank;
         }
@@ -5086,7 +5150,27 @@ void NidRegistry::register_default_libraries() {
                 g_thread_manager->equeue_signal(sub.eq_id, ev);
             }
         }
+        const auto t_hook = std::chrono::steady_clock::now();
         if (g_flip_hook) g_flip_hook();
+        // PS4_HITCH_MS=n: for every frame longer than n ms, where the time
+        // went -- guest work since the last flip returned (CPU + command
+        // buffer execution), the vblank wait, and the presenter's flip hook.
+        static const double s_hitch_ms = std::getenv("PS4_HITCH_MS") ? std::atof(std::getenv("PS4_HITCH_MS")) : 0.0;
+        if (s_hitch_ms > 0.0) {
+            using ms = std::chrono::duration<double, std::milli>;
+            static std::chrono::steady_clock::time_point s_last_exit{};
+            const auto t_exit = std::chrono::steady_clock::now();
+            if (s_last_exit.time_since_epoch().count() != 0) {
+                const double guest = ms(t_flip_enter - s_last_exit).count();
+                const double wait = ms(t_hook - t_flip_enter).count();
+                const double hook = ms(t_exit - t_hook).count();
+                if (guest + wait + hook > s_hitch_ms) {
+                    std::fprintf(stderr, "[hitch] flip %llu: %.1f ms = guest %.1f + vblank wait %.1f + flip hook %.1f\n",
+                                 (unsigned long long)count, guest + wait + hook, guest, wait, hook);
+                }
+            }
+            s_last_exit = t_exit;
+        }
     };
 
     // sceVideoOutRegisterBuffers(int handle, int startIndex, void* const* addresses, int bufferCount, ...)
@@ -6527,11 +6611,13 @@ void NidRegistry::register_default_libraries() {
 
             // The command processor runs the DCBs to completion here (labels
             // written, EOP interrupts raised), then the flip is performed.
-            execute_submitted_dcbs(mem, count, dcb_addrs_ptr, dcb_sizes_ptr);
+            std::vector<PrepareFlip> flips;
+            execute_submitted_dcbs(mem, count, dcb_addrs_ptr, dcb_sizes_ptr, &flips);
             g_gnm_completed_label.fetch_add(1);
             sync_gnm_label_slot(mem);
 
             perform_flip(mem, buffer_index, flip_arg);
+            complete_prepare_flips(mem, flips);
             ctx.rax = SCE_OK;
         });
 
@@ -8001,6 +8087,501 @@ static void register_save_data_and_trophy(NidRegistry& reg) {
         [sce_err](CpuContext& ctx, MemoryManager& mem) {
             const i32 r = get_vfs().unlink(guest_cstring(mem, ctx.rdi, 1024));
             ctx.rax = r < 0 ? sce_err(r) : 0;
+        });
+}
+
+
+// =============================================================================
+// libc / C++ runtime: the pieces of the game-bundled libc.prx (Dinkumware) that
+// Sonic Mania (RSDKv5) imports beyond what the Unity titles needed.
+//
+// Guest code reaches several of these objects without calling us -- a locale's
+// _Incref is a virtual call, an id is read straight from memory -- so the
+// objects live in guest memory, and the few member functions guest code calls
+// virtually are tiny x86 stubs written there too.
+// =============================================================================
+
+namespace {
+
+// Copy `code` into fresh guest heap memory and return its address.
+GuestAddr emit_guest_code(MemoryManager& mem, std::initializer_list<u8> code) {
+    const GuestAddr p = bump_alloc(code.size(), 16);
+    if (p != 0) mem.write_bytes(p, std::data(code), code.size());
+    return p;
+}
+
+// Zeroed guest object of `size` bytes.
+GuestAddr alloc_guest_zeroed(MemoryManager& mem, GuestSize size) {
+    const GuestAddr p = bump_alloc(size, 16);
+    if (p != 0) mem.zero_memory(p, size);
+    return p;
+}
+
+// ---- locale -----------------------------------------------------------------
+// locale::_Locimp is a facet (vptr, u32 refcount) followed by
+//   0x10 facet** _Facetvec, 0x18 size_t _Facetcount, 0x20 int _Catmask,
+//   0x24 bool _Xparent, 0x28 const char* _Name   (0x30 bytes, from the
+// game's own `new _Locimp` and its inlined use_facet). Facet vtables are
+// [dtor, deleting dtor, _Incref, _Decref]; _Decref returns the facet to delete
+// or null. Our locale objects are never freed, so their _Decref returns null.
+constexpr GuestSize kLocimpSize = 0x30;
+GuestAddr g_locimp_vtable = 0;
+GuestAddr g_global_locimp = 0;
+GuestAddr g_locale_name = 0;
+std::mutex g_locale_mtx;
+
+void ensure_global_locale(MemoryManager& mem) {
+    std::lock_guard lock(g_locale_mtx);
+    if (g_global_locimp != 0) return;
+    const GuestAddr ret = emit_guest_code(mem, {0xC3});                    // ret
+    const GuestAddr ret0 = emit_guest_code(mem, {0x31, 0xC0, 0xC3});      // xor eax,eax; ret
+    g_locimp_vtable = alloc_guest_zeroed(mem, 4 * 8);
+    mem.write_value(g_locimp_vtable + 0x00, ret);
+    mem.write_value(g_locimp_vtable + 0x08, ret);
+    mem.write_value(g_locimp_vtable + 0x10, ret);
+    mem.write_value(g_locimp_vtable + 0x18, ret0);
+    g_locale_name = alloc_guest_zeroed(mem, 16);
+    mem.write_bytes(g_locale_name, "C", 2);
+    g_global_locimp = alloc_guest_zeroed(mem, kLocimpSize);
+    mem.write_value(g_global_locimp + 0x00, g_locimp_vtable);
+    mem.write_value(g_global_locimp + 0x08, static_cast<u32>(1));
+    mem.write_value(g_global_locimp + 0x20, static_cast<i32>(0x3F)); // all categories
+    mem.write_value(g_global_locimp + 0x28, g_locale_name);
+}
+
+// ---- std::thread launch pad ---------------------------------------------------
+// _Pad::_Launch(_Thrd_t*) starts a thread running the derived object's _Go()
+// (vtable slot 0) and waits until _Go has copied what it needs and called
+// _Release() -- the pad lives on the launching thread's stack.
+struct PadState {
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool released{false};
+};
+std::mutex g_pads_mtx;
+std::unordered_map<GuestAddr, std::shared_ptr<PadState>> g_pads;
+GuestAddr g_pad_entry = 0;
+
+std::shared_ptr<PadState> pad_state(GuestAddr pad, bool create) {
+    std::lock_guard lock(g_pads_mtx);
+    auto it = g_pads.find(pad);
+    if (it != g_pads.end()) return it->second;
+    if (!create) return nullptr;
+    auto st = std::make_shared<PadState>();
+    g_pads.emplace(pad, st);
+    return st;
+}
+
+// _Locksyslock(kind) / _Unlocksyslock(kind): Dinkumware's _Lockit table.
+std::array<std::recursive_mutex, 8> g_syslocks;
+
+// The game-bundled libc's rand(): FreeBSD's Park-Miller generator, RAND_MAX
+// 0x7fffffff.
+std::atomic<u32> g_rand_state{1};
+
+// _Stderr / _Stdout as seen by the guest: a FILE-sized blob whose address the
+// stdio handlers below map back to the host stream.
+GuestAddr g_guest_stderr = 0;
+
+FILE* host_stream(GuestAddr fp) {
+    if (fp != 0 && fp == g_guest_stderr) return stderr;
+    return reinterpret_cast<FILE*>(fp);
+}
+
+} // namespace
+
+static void register_libc_cxx_runtime(NidRegistry& reg) {
+    // ---- data objects -------------------------------------------------------
+    reg.register_data_symbol(0x1FC029ACA799B4D8ULL, "_Stderr", [](MemoryManager& mem) {
+        g_guest_stderr = alloc_guest_zeroed(mem, 0x100);
+        return g_guest_stderr;
+    });
+    reg.register_data_symbol(0x3F7DF43F774517AFULL, "Need_sceLibc", [](MemoryManager& mem) {
+        return alloc_guest_zeroed(mem, 8);
+    });
+    // static int locale::id::_Id_cnt, and codecvt<char16_t, char, mbstate_t>::id
+    // (a size_t the game assigns from ++_Id_cnt on first use).
+    reg.register_data_symbol(0x1F87DCA503A9734FULL, "_ZNSt6locale2id7_Id_cntE", [](MemoryManager& mem) {
+        return alloc_guest_zeroed(mem, 8);
+    });
+    reg.register_data_symbol(0xC4CE6B7B9F26C63FULL, "_ZNSt7codecvtIDsc9_MbstatetE2idE", [](MemoryManager& mem) {
+        return alloc_guest_zeroed(mem, 8);
+    });
+    // runtime_error / range_error vtables, for objects the game constructs on
+    // a conversion error path: dtor, deleting dtor, what().
+    auto make_error_vtable = [](const char* what) {
+        return [what](MemoryManager& mem) -> GuestAddr {
+            const GuestAddr text = alloc_guest_zeroed(mem, std::strlen(what) + 1);
+            mem.write_bytes(text, what, std::strlen(what) + 1);
+            const GuestAddr ret = emit_guest_code(mem, {0xC3});
+            // movabs rax, text; ret
+            u8 code[11] = {0x48, 0xB8};
+            std::memcpy(code + 2, &text, 8);
+            code[10] = 0xC3;
+            const GuestAddr what_fn = bump_alloc(sizeof(code), 16);
+            mem.write_bytes(what_fn, code, sizeof(code));
+            // [offset-to-top, typeinfo] then the address point.
+            const GuestAddr vt = alloc_guest_zeroed(mem, 5 * 8);
+            mem.write_value(vt + 0x10, ret);
+            mem.write_value(vt + 0x18, ret);
+            mem.write_value(vt + 0x20, what_fn);
+            return vt;
+        };
+    };
+    reg.register_data_symbol(0xFCBFBFF05D3E8017ULL, "_ZTVSt13runtime_error", make_error_vtable("runtime_error"));
+    reg.register_data_symbol(0x45BCD637C5F6D616ULL, "_ZTVSt11range_error", make_error_vtable("range_error"));
+
+    // ---- operator new / delete ----------------------------------------------
+    auto op_new = [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr p = bump_alloc(ctx.rdi ? ctx.rdi : 1, 16);
+        if (p == 0) guest_abort("operator new: out of memory (std::bad_alloc)", ctx, mem);
+        ctx.rax = p;
+    };
+    auto op_delete = [](CpuContext& ctx, MemoryManager&) { heap_free(ctx.rdi); };
+    reg.register_symbol(0x7C99E9B955416CA9ULL, "_Znwm", "libc", op_new);
+    reg.register_symbol(0x85D9B461F31AED34ULL, "_Znam", "libc", op_new);
+    reg.register_symbol(0xCFE3FEC429D62C19ULL, "_ZdlPv", "libc", op_delete);
+    reg.register_symbol(0x30B5A5F7448558D1ULL, "_ZdaPv", "libc", op_delete);
+
+    // ---- C++ error throwers: the guest only reaches these when the real
+    // library would throw, and we have no unwinder, so stop with the reason.
+    static constexpr struct { Nid nid; const char* name; } kThrowers[] = {
+        {0x793D94B264DEC1B5ULL, "_ZSt11_Xbad_allocv"},
+        {0x6D1BA3221796941DULL, "_ZSt14_Throw_C_errori"},
+        {0xA33300AF6F01C126ULL, "_ZSt14_Xout_of_rangePKc"},
+        {0x5B48FABC2C61F4F7ULL, "_ZSt16_Throw_Cpp_errori"},
+        {0x3042E2FDC2AA5AADULL, "_ZSt19_Xbad_function_callv"},
+        {0x0EE5B966A66FFFBDULL, "_ZNKSt9exception6_RaiseEv"},
+    };
+    for (const auto& t : kThrowers) {
+        const std::string reason = std::string(t.name) + ": guest threw a C++ exception";
+        reg.register_symbol(t.nid, t.name, "libc", [reason](CpuContext& ctx, MemoryManager& mem) {
+            guest_abort(reason, ctx, mem);
+        });
+    }
+    reg.register_symbol(0x36735A59AD7A3AF1ULL, "_ZNSt11range_errorD1Ev", "libc",
+        [](CpuContext&, MemoryManager&) {});
+
+    // ---- process start-up -----------------------------------------------------
+    reg.register_symbol(0x6F3404C72D7CF592ULL, "_init_env", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+    // atexit(fn): handlers never run (the process is torn down from the host).
+    reg.register_symbol(0xF06D8B07E037AF38ULL, "atexit", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+    // catchReturnFromMain(int status): the CRT calls this when main returns.
+    reg.register_symbol(0x5CA45E82C1691299ULL, "catchReturnFromMain", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            std::fprintf(stderr, "[libc] main returned %d\n", static_cast<int>(ctx.rdi));
+            std::fflush(nullptr);
+            std::_Exit(static_cast<int>(ctx.rdi));
+        });
+
+    // ---- math ---------------------------------------------------------------
+    // Dinkumware kernels: _Sin(x, qoff) / _FSin is sin for qoff 0 and cos for
+    // qoff 1; _Log(x, baseflag) is ln for 0, log10 for >0 and log2 for <0.
+    reg.register_symbol(0x66D8ECA64250FAFCULL, "_FSin", "libc", [](CpuContext& ctx, MemoryManager&) {
+        const float x = ctx.ymm[0].f[0];
+        ctx.ymm[0].f[0] = (ctx.rdi & 1) ? std::cos(x) : std::sin(x);
+    });
+    reg.register_symbol(0x7025E353BD99D0ECULL, "_Sin", "libc", [](CpuContext& ctx, MemoryManager&) {
+        const double x = ctx.ymm[0].df[0];
+        ctx.ymm[0].df[0] = (ctx.rdi & 1) ? std::cos(x) : std::sin(x);
+    });
+    reg.register_symbol(0xCD70A2EFC6D8AC42ULL, "_Log", "libc", [](CpuContext& ctx, MemoryManager&) {
+        const double x = ctx.ymm[0].df[0];
+        const i32 base = static_cast<i32>(ctx.rdi);
+        ctx.ymm[0].df[0] = base == 0 ? std::log(x) : base > 0 ? std::log10(x) : std::log2(x);
+    });
+    reg.register_symbol(0x408FF1D122FC8E1CULL, "acosf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::acos(ctx.ymm[0].f[0]); });
+    reg.register_symbol(0x1995A317F6081459ULL, "asinf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::asin(ctx.ymm[0].f[0]); });
+    reg.register_symbol(0x644E9134BF9E2DB9ULL, "tanf", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].f[0] = std::tan(ctx.ymm[0].f[0]); });
+    reg.register_symbol(0x35569D7E7CD08474ULL, "exp", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::exp(ctx.ymm[0].df[0]); });
+    reg.register_symbol(0x76769E1976E33FA1ULL, "exp2", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.ymm[0].df[0] = std::exp2(ctx.ymm[0].df[0]); });
+    reg.register_symbol(0xF4B0A3A56C90E597ULL, "pow", "libc", [](CpuContext& ctx, MemoryManager&) {
+        ctx.ymm[0].df[0] = std::pow(ctx.ymm[0].df[0], ctx.ymm[1].df[0]);
+    });
+    reg.register_symbol(0x26BC0520CCCA36BDULL, "ldexp", "libc", [](CpuContext& ctx, MemoryManager&) {
+        ctx.ymm[0].df[0] = std::ldexp(ctx.ymm[0].df[0], static_cast<int>(ctx.rdi));
+    });
+    reg.register_symbol(0x72908E5D632085ADULL, "rand", "libc", [](CpuContext& ctx, MemoryManager&) {
+        u32 cur = g_rand_state.load(), next;
+        do {
+            // x = 16807 * x mod (2^31 - 1), Schrage's method as in FreeBSD.
+            i64 x = cur % 0x7FFFFFFE + 1;
+            const i64 hi = x / 127773, lo = x % 127773;
+            x = 16807 * lo - 2836 * hi;
+            if (x < 0) x += 0x7FFFFFFF;
+            next = static_cast<u32>(x - 1);
+        } while (!g_rand_state.compare_exchange_weak(cur, next));
+        ctx.rax = next;
+    });
+
+    // ---- atomics: _Atomic_fetch_{add,sub}_4(u32* p, u32 v, memory_order) ----
+    reg.register_symbol(0x88F06AB3E614505CULL, "_Atomic_fetch_add_4", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            auto* p = mem.to_host_ptr<u32>(ctx.rdi);
+            ctx.rax = p ? __atomic_fetch_add(p, static_cast<u32>(ctx.rsi), __ATOMIC_SEQ_CST) : 0;
+        });
+    reg.register_symbol(0xD879E62A22E657ABULL, "_Atomic_fetch_sub_4", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            auto* p = mem.to_host_ptr<u32>(ctx.rdi);
+            ctx.rax = p ? __atomic_fetch_sub(p, static_cast<u32>(ctx.rsi), __ATOMIC_SEQ_CST) : 0;
+        });
+    reg.register_symbol(0x9002EF76012FE4C1ULL, "_Locksyslock", "libc", [](CpuContext& ctx, MemoryManager&) {
+        g_syslocks[ctx.rdi % g_syslocks.size()].lock();
+    });
+    reg.register_symbol(0xF677FC8E851349A4ULL, "_Unlocksyslock", "libc", [](CpuContext& ctx, MemoryManager&) {
+        g_syslocks[ctx.rdi % g_syslocks.size()].unlock();
+    });
+
+    // ---- strings / stdio ------------------------------------------------------
+    reg.register_symbol(0xF2EF253F3504ABE5ULL, "memchr", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestAddr s = ctx.rdi;
+        const GuestSize n = ctx.rdx;
+        const u8* p = (n != 0 && mem.is_valid_address(s, n)) ? mem.to_host_ptr<u8>(s) : nullptr;
+        const void* hit = p ? std::memchr(p, static_cast<int>(ctx.rsi & 0xFF), n) : nullptr;
+        ctx.rax = hit ? s + static_cast<GuestAddr>(static_cast<const u8*>(hit) - p) : 0;
+    });
+    // strlcpy(dst, src, size) -> strlen(src)
+    reg.register_symbol(0x49F40865CAAFBE6BULL, "strlcpy", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const std::string src = guest_cstring(mem, ctx.rsi, 1 << 20);
+        const GuestSize size = ctx.rdx;
+        if (size != 0) {
+            const usize n = std::min<usize>(src.size(), size - 1);
+            mem.write_bytes(ctx.rdi, src.data(), n);
+            mem.write_value(ctx.rdi + n, static_cast<u8>(0));
+        }
+        ctx.rax = src.size();
+    });
+    // strncat(dst, src, n) -> dst
+    reg.register_symbol(0x907838E6A3C2E9FDULL, "strncat", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const std::string dst = guest_cstring(mem, ctx.rdi, 1 << 20);
+        std::string src = guest_cstring(mem, ctx.rsi, ctx.rdx);
+        mem.write_bytes(ctx.rdi + dst.size(), src.c_str(), src.size() + 1);
+        ctx.rax = ctx.rdi;
+    });
+    // vsprintf(buf, fmt, va_list) -> length
+    reg.register_symbol(0x8DBCFD23DBE4AA49ULL, "vsprintf", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const std::string fmt = guest_cstring(mem, ctx.rsi, 4096);
+        VaListArgs args(mem, ctx.rdx);
+        const std::string out = format_guest(mem, fmt.c_str(), args);
+        mem.write_bytes(ctx.rdi, out.c_str(), out.size() + 1);
+        ctx.rax = out.size();
+    });
+    // fprintf(FILE*, fmt, ...) -> length
+    reg.register_symbol(0x7DF7F010B5CD5450ULL, "fprintf", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const std::string fmt = guest_cstring(mem, ctx.rsi, 4096);
+        CallArgs args(ctx, mem, 2);
+        const std::string out = format_guest(mem, fmt.c_str(), args);
+        FILE* f = host_stream(ctx.rdi);
+        ctx.rax = f ? std::fwrite(out.data(), 1, out.size(), f) : static_cast<u64>(-1);
+    });
+    // fwrite(ptr, size, nmemb, FILE*) -> items written
+    reg.register_symbol(0x329C61321F1016BAULL, "fwrite", "libc", [](CpuContext& ctx, MemoryManager& mem) {
+        const GuestSize total = ctx.rsi * ctx.rdx;
+        FILE* f = host_stream(ctx.rcx);
+        if (!f || total == 0 || !mem.is_valid_address(ctx.rdi, total)) {
+            ctx.rax = 0;
+            return;
+        }
+        ctx.rax = std::fwrite(mem.to_host_ptr<void>(ctx.rdi), ctx.rsi, ctx.rdx, f);
+    });
+
+    // ---- std::locale (one codecvt<char16_t> converter in the game) -----------
+    auto locale_global = [](CpuContext& ctx, MemoryManager& mem) {
+        ensure_global_locale(mem);
+        ctx.rax = g_global_locimp;
+    };
+    reg.register_symbol(0xF6B30C2F4F3A4841ULL, "_ZNSt6locale5_InitEv", "libc", locale_global);
+    reg.register_symbol(0x844436622E0F2570ULL, "_ZNSt6locale16_GetgloballocaleEv", "libc", locale_global);
+    // _Locimp::_Locimp(const _Locimp& right)
+    reg.register_symbol(0x5958B0C6D10AC479ULL, "_ZNSt6locale7_LocimpC1ERKS0_", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            ensure_global_locale(mem);
+            const GuestAddr self = ctx.rdi, right = ctx.rsi;
+            u64 count = 0, vec = 0, name = 0;
+            i32 catmask = 0;
+            mem.read_value(right + 0x18, count);
+            mem.read_value(right + 0x10, vec);
+            mem.read_value(right + 0x20, catmask);
+            mem.read_value(right + 0x28, name);
+            mem.zero_memory(self, kLocimpSize);
+            mem.write_value(self + 0x00, g_locimp_vtable);
+            mem.write_value(self + 0x08, static_cast<u32>(1));
+            GuestAddr copy = 0;
+            if (count != 0 && vec != 0) {
+                copy = alloc_guest_zeroed(mem, count * 8);
+                for (u64 i = 0; i < count; ++i) {
+                    u64 f = 0;
+                    mem.read_value(vec + i * 8, f);
+                    mem.write_value(copy + i * 8, f);
+                    // facet::_Incref is an atomic add on the u32 at +8.
+                    if (auto* refs = f ? mem.to_host_ptr<u32>(f + 8) : nullptr)
+                        __atomic_fetch_add(refs, 1u, __ATOMIC_SEQ_CST);
+                }
+            }
+            mem.write_value(self + 0x10, copy);
+            mem.write_value(self + 0x18, copy ? count : 0);
+            mem.write_value(self + 0x20, catmask);
+            mem.write_value(self + 0x28, name ? name : g_locale_name);
+        });
+    // _Locimp::_Addfac(facet* pf, size_t id)
+    reg.register_symbol(0xBAE81ADD18A908A4ULL, "_ZNSt6locale7_Locimp7_AddfacEPNS_5facetEm", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr self = ctx.rdi, facet = ctx.rsi;
+            const u64 id = ctx.rdx;
+            u64 count = 0, vec = 0;
+            mem.read_value(self + 0x18, count);
+            mem.read_value(self + 0x10, vec);
+            if (id >= count) {
+                const u64 grown = std::max<u64>(id + 1, 40);
+                const GuestAddr nv = alloc_guest_zeroed(mem, grown * 8);
+                for (u64 i = 0; i < count; ++i) {
+                    u64 f = 0;
+                    mem.read_value(vec + i * 8, f);
+                    mem.write_value(nv + i * 8, f);
+                }
+                vec = nv;
+                count = grown;
+                mem.write_value(self + 0x10, vec);
+                mem.write_value(self + 0x18, count);
+            }
+            if (auto* refs = facet ? mem.to_host_ptr<u32>(facet + 8) : nullptr)
+                __atomic_fetch_add(refs, 1u, __ATOMIC_SEQ_CST);
+            mem.write_value(vec + id * 8, facet);
+        });
+    // _Locinfo holds the C library's category data; the game only builds one
+    // to construct a facet and never reads it back.
+    reg.register_symbol(0x86A8BCC8C382986DULL, "_ZNSt8_LocinfoC1EPKc", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = ctx.rdi; });
+    reg.register_symbol(0xA7A2EB1E321031D9ULL, "_ZNSt8_LocinfoD1Ev", "libc", [](CpuContext&, MemoryManager&) {});
+
+    // ---- std::thread ----------------------------------------------------------
+    reg.register_symbol(0x746628F6613C2B60ULL, "_ZNSt4_PadC2Ev", "libc", [](CpuContext& ctx, MemoryManager&) {
+        auto st = pad_state(ctx.rdi, true);
+        std::lock_guard lock(st->mtx);
+        st->released = false;
+    });
+    reg.register_symbol(0x8232D16607DBDE2DULL, "_ZNSt4_PadD2Ev", "libc", [](CpuContext& ctx, MemoryManager&) {
+        std::lock_guard lock(g_pads_mtx);
+        g_pads.erase(ctx.rdi);
+    });
+    // _Pad::_Launch(_Thrd_t* thr)
+    reg.register_symbol(0xC59AA266F99CA7D9ULL, "_ZNSt4_Pad7_LaunchEPP7pthread", "libc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr pad = ctx.rdi, thr = ctx.rsi;
+            if (g_pad_entry == 0) {
+                // mov rax, [rdi]; jmp qword ptr [rax]  -- this->_Go()
+                g_pad_entry = emit_guest_code(mem, {0x48, 0x8B, 0x07, 0xFF, 0x20});
+            }
+            auto st = pad_state(pad, true);
+            ScePthreadAttr attr{};
+            const ScePthreadId tid = get_thread_manager(mem).create_thread(g_pad_entry, pad, &attr, "std::thread");
+            if (thr != 0) mem.write_value(thr, static_cast<u64>(tid));
+            std::unique_lock lock(st->mtx);
+            st->cv.wait(lock, [&] { return st->released; });
+        });
+    reg.register_symbol(0x6BFCFBC31B983B61ULL, "_ZNSt4_Pad8_ReleaseEv", "libc", [](CpuContext& ctx, MemoryManager&) {
+        if (auto st = pad_state(ctx.rdi, false)) {
+            std::lock_guard lock(st->mtx);
+            st->released = true;
+            st->cv.notify_all();
+        }
+    });
+    reg.register_symbol(0x2FB7FBCD8C01BD90ULL, "_Thrd_detach", "libc",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = 0; });
+
+    // ---- libkernel / libSceRtc / libSceVideoOut odds and ends -------------------
+    reg.register_symbol(0x71091EF54B8140E9ULL, "sceKernelMunmap", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+    reg.register_symbol(0x301B88B6F6DAEB3FULL, "sceKernelReleaseDirectMemory", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+    // sceRtcGetCurrentTick(SceRtcTick* tick): microseconds since 0001-01-01 UTC.
+    reg.register_symbol(0xD7C076352D72F545ULL, "sceRtcGetCurrentTick", "libSceRtc",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            constexpr u64 kUnixEpochTicks = 62135596800ULL * 1000000ULL;
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            if (ctx.rdi == 0) {
+                ctx.rax = 0x80B50002ULL; // SCE_RTC_ERROR_INVALID_POINTER
+                return;
+            }
+            mem.write_value(ctx.rdi, kUnixEpochTicks + static_cast<u64>(us));
+            ctx.rax = SCE_OK;
+        });
+    reg.register_symbol(0xBAAB951F8FC3BBBFULL, "sceVideoOutClose", "libSceVideoOut",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+    reg.register_symbol(0xEF7590E098F49C92ULL, "sceScreenShotSetOverlayImageWithOrigin", "libSceScreenShot",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; });
+}
+
+// =============================================================================
+// NP services as an offline console: the user is signed out of PSN, so
+// availability checks, leaderboards (libSceNpScore) and the save-data dialog
+// finish at once with "signed out" / "OK" and the game carries on locally.
+// =============================================================================
+static void register_np_offline(NidRegistry& reg) {
+    constexpr u64 kSignedOut = 0x80550006ULL; // SCE_NP_ERROR_SIGNED_OUT
+    static std::atomic<i32> s_next_request{1};
+    auto new_request = [](CpuContext& ctx, MemoryManager&) { ctx.rax = s_next_request.fetch_add(1); };
+    auto ok = [](CpuContext& ctx, MemoryManager&) { ctx.rax = SCE_OK; };
+    auto signed_out = [kSignedOut](CpuContext& ctx, MemoryManager&) { ctx.rax = kSignedOut; };
+    // Poll(reqId, int* result): finished (0), with the request failing signed out.
+    auto poll_signed_out = [kSignedOut](CpuContext& ctx, MemoryManager& mem) {
+        if (ctx.rsi != 0) mem.write_value(ctx.rsi, static_cast<i32>(kSignedOut));
+        ctx.rax = 0;
+    };
+
+    reg.register_symbol(0x7A2A8C0ADF54B212ULL, "sceNpCreateAsyncRequest", "libSceNpManager", new_request);
+    reg.register_symbol(0x4BB4139FBD8FAC3CULL, "sceNpDeleteRequest", "libSceNpManager", ok);
+    reg.register_symbol(0xF19D897391AF1832ULL, "sceNpCheckNpAvailabilityA", "libSceNpManager", signed_out);
+    reg.register_symbol(0xBAA70F24B58BD3C3ULL, "sceNpPollAsync", "libSceNpManager", poll_signed_out);
+    reg.register_symbol(0x56061CCCF181E6CBULL, "sceNpGetUserIdByAccountId", "libSceNpManager", signed_out);
+    reg.register_symbol(0x036090DE4812A294ULL, "sceNpSetContentRestriction", "libSceNpManager", ok);
+    reg.register_symbol(0x11CEB7CB9F65F6DCULL, "sceNpSetNpTitleId", "libSceNpManager", ok);
+
+    reg.register_symbol(0x1969D640D5D91F93ULL, "sceNpScoreCreateNpTitleCtxA", "libSceNpScore", new_request);
+    reg.register_symbol(0x816F2ACA362B51B9ULL, "sceNpScoreCreateRequest", "libSceNpScore", new_request);
+    reg.register_symbol(0x74AF3F4A061FEABEULL, "sceNpScoreDeleteRequest", "libSceNpScore", ok);
+    reg.register_symbol(0x751B3334DC865A4CULL, "sceNpScoreGetRankingByAccountIdAsync", "libSceNpScore", ok);
+    reg.register_symbol(0xCB98DAED6234E6BBULL, "sceNpScoreGetRankingByRangeAAsync", "libSceNpScore", ok);
+    reg.register_symbol(0x00D26CB0FCF7998DULL, "sceNpScoreRecordScoreAsync", "libSceNpScore", ok);
+    reg.register_symbol(0x9B50DF351B2D9124ULL, "sceNpScorePollAsync", "libSceNpScore", poll_signed_out);
+
+    // Save-data dialog: an opened dialog finishes at once with OK pressed.
+    // SceCommonDialogStatus: NONE 0, INITIALIZED 1, RUNNING 2, FINISHED 3.
+    static std::atomic<i32> s_dialog_status{0};
+    reg.register_symbol(0xB3D7B7F98A519F3CULL, "sceSaveDataDialogInitialize", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager&) {
+            s_dialog_status.store(1);
+            ctx.rax = SCE_OK;
+        });
+    reg.register_symbol(0x62E1F6140EDACEA4ULL, "sceSaveDataDialogTerminate", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager&) {
+            s_dialog_status.store(0);
+            ctx.rax = SCE_OK;
+        });
+    reg.register_symbol(0xE2D3E1B0FE85A432ULL, "sceSaveDataDialogOpen", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager&) {
+            hle_log_once("SaveDataDialog", "sceSaveDataDialogOpen");
+            s_dialog_status.store(3);
+            ctx.rax = SCE_OK;
+        });
+    reg.register_symbol(0x28ADC1760D5158ADULL, "sceSaveDataDialogUpdateStatus", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = static_cast<u64>(s_dialog_status.load()); });
+    // sceSaveDataDialogGetResult(SceSaveDataDialogResult*): result 0, button OK.
+    reg.register_symbol(0xC84889FEAAABE828ULL, "sceSaveDataDialogGetResult", "libSceSaveDataDialog",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (ctx.rdi != 0) {
+                mem.write_value(ctx.rdi + 4, static_cast<i32>(0));
+                mem.write_value(ctx.rdi + 8, static_cast<i32>(1)); // SCE_SAVE_DATA_DIALOG_BUTTON_ID_OK
+            }
+            ctx.rax = SCE_OK;
         });
 }
 

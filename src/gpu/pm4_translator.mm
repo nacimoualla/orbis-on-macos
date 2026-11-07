@@ -1591,7 +1591,12 @@ bool Pm4Translator::submit_frame(bool wait_for_completion) {
     m_impl->metal->end_render_encoder();
     // PS4_GPU_READBACK=1: wait for frames that drew and log the framebuffer
     // centre (diagnostic for comparing the GCN path with the fixed shader).
-    static const bool readback = std::getenv("PS4_GPU_READBACK") != nullptr;
+    static const bool readback_on = std::getenv("PS4_GPU_READBACK") != nullptr;
+    // PS4_READBACK_EVERY=N: only every Nth submitted frame (default every one).
+    static const u64 readback_every = std::getenv("PS4_READBACK_EVERY")
+                                          ? std::max<u64>(1, std::strtoull(std::getenv("PS4_READBACK_EVERY"), nullptr, 0))
+                                          : 1;
+    const bool readback = readback_on && (m_impl->metal->submitted_frame_count() + 1) % readback_every == 0;
     const bool drew = m_impl->frame_draw_encoded;
     const bool submitted = m_impl->metal->submit_frame(wait_for_completion || (readback && drew));
     if (readback && drew && submitted) {

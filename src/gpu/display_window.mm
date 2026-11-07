@@ -1,4 +1,5 @@
 #import <AppKit/AppKit.h>
+#import <GameController/GameController.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include "ps4/display_window.hpp"
@@ -72,6 +73,70 @@ struct DisplayWindow::Impl {
     // down and up arrive in the same event batch would otherwise never be seen.
     mutable u32 pressed_latch{0};
 };
+
+namespace {
+
+// Orbis pad button bits (ScePadButtonDataOffset).
+constexpr u32 kPadL3 = 0x2, kPadR3 = 0x4, kPadOptions = 0x8, kPadUp = 0x10, kPadRight = 0x20,
+              kPadDown = 0x40, kPadLeft = 0x80, kPadL2 = 0x100, kPadR2 = 0x200, kPadL1 = 0x400,
+              kPadR1 = 0x800, kPadTriangle = 0x1000, kPadCircle = 0x2000, kPadCross = 0x4000,
+              kPadSquare = 0x8000, kPadTouchPad = 0x100000;
+
+// Keyboard -> pad. Space and a left click press Cross and the touch pad
+// together: games that say "touch pad to start" read the pad, others Cross.
+u32 key_to_pad(unsigned short code) {
+    switch (code) {
+    case 123: return kPadLeft;                  // arrows
+    case 124: return kPadRight;
+    case 125: return kPadDown;
+    case 126: return kPadUp;
+    case 49: return kPadCross | kPadTouchPad;   // Space
+    case 6: return kPadCross;                   // Z
+    case 7: return kPadCircle;                  // X
+    case 8: return kPadSquare;                  // C
+    case 9: return kPadTriangle;                // V
+    case 36: return kPadOptions;                // Return
+    case 0: return kPadL1;                      // A
+    case 1: return kPadR1;                      // S
+    case 12: return kPadL2;                     // Q
+    case 14: return kPadR2;                     // E
+    case 48: return kPadTouchPad;               // Tab
+    default: return 0;
+    }
+}
+
+// Every connected game controller (DualShock 4, DualSense, Xbox, MFi): D-pad
+// or left stick, face buttons by position, shoulders, triggers, Menu.
+u32 gamepad_buttons() {
+    u32 b = 0;
+    for (GCController* c in [GCController controllers]) {
+        GCExtendedGamepad* g = c.extendedGamepad;
+        if (!g) continue;
+        const float x = g.leftThumbstick.xAxis.value, y = g.leftThumbstick.yAxis.value;
+        if (g.dpad.up.pressed || y > 0.5f) b |= kPadUp;
+        if (g.dpad.down.pressed || y < -0.5f) b |= kPadDown;
+        if (g.dpad.left.pressed || x < -0.5f) b |= kPadLeft;
+        if (g.dpad.right.pressed || x > 0.5f) b |= kPadRight;
+        if (g.buttonA.pressed) b |= kPadCross;
+        if (g.buttonB.pressed) b |= kPadCircle;
+        if (g.buttonX.pressed) b |= kPadSquare;
+        if (g.buttonY.pressed) b |= kPadTriangle;
+        if (g.leftShoulder.pressed) b |= kPadL1;
+        if (g.rightShoulder.pressed) b |= kPadR1;
+        if (g.leftTrigger.pressed) b |= kPadL2;
+        if (g.rightTrigger.pressed) b |= kPadR2;
+        if (g.buttonMenu.pressed) b |= kPadOptions;
+        if (g.leftThumbstickButton.pressed) b |= kPadL3;
+        if (g.rightThumbstickButton.pressed) b |= kPadR3;
+        if ([g isKindOfClass:[GCDualShockGamepad class]] &&
+            ((GCDualShockGamepad*)g).touchpadButton.pressed) b |= kPadTouchPad;
+        if ([g isKindOfClass:[GCDualSenseGamepad class]] &&
+            ((GCDualSenseGamepad*)g).touchpadButton.pressed) b |= kPadTouchPad;
+    }
+    return b;
+}
+
+} // namespace
 
 DisplayWindow::DisplayWindow() : m_impl(std::make_unique<Impl>()) {}
 
@@ -202,26 +267,23 @@ void DisplayWindow::poll_events() {
                 break;
             }
 
-            // Map Space bar (keyCode 49), Enter (keyCode 36), or Left Click / Touch to PS4 Cross
-            // (0x4000) plus a touch-pad press (0x100000): games that say "touch pad to start"
-            // read the touch pad, others read Cross.
-            constexpr u32 PS4_BUTTON_CROSS = 0x4000 | 0x100000;
-            if ([event type] == NSEventTypeKeyDown) {
-                const unsigned short code = [event keyCode];
-                if (code == 49 || code == 36 || code == 126 /* Up */ || code == 124 /* Right */) {
-                    m_impl->buttons |= PS4_BUTTON_CROSS;
-                    m_impl->pressed_latch |= PS4_BUTTON_CROSS;
+            // Keys and clicks are consumed here: passed on, every key press
+            // would also beep (the window has no key-handling responder).
+            if ([event type] == NSEventTypeKeyDown || [event type] == NSEventTypeKeyUp) {
+                const u32 pad = key_to_pad([event keyCode]);
+                if ([event type] == NSEventTypeKeyDown) {
+                    m_impl->buttons |= pad;
+                    m_impl->pressed_latch |= pad;
+                } else {
+                    m_impl->buttons &= ~pad;
                 }
-            } else if ([event type] == NSEventTypeKeyUp) {
-                const unsigned short code = [event keyCode];
-                if (code == 49 || code == 36 || code == 126 || code == 124) {
-                    m_impl->buttons &= ~PS4_BUTTON_CROSS;
-                }
-            } else if ([event type] == NSEventTypeLeftMouseDown) {
-                m_impl->buttons |= PS4_BUTTON_CROSS;
-                m_impl->pressed_latch |= PS4_BUTTON_CROSS;
+                continue;
+            }
+            if ([event type] == NSEventTypeLeftMouseDown) {
+                m_impl->buttons |= kPadCross | kPadTouchPad;
+                m_impl->pressed_latch |= kPadCross | kPadTouchPad;
             } else if ([event type] == NSEventTypeLeftMouseUp) {
-                m_impl->buttons &= ~PS4_BUTTON_CROSS;
+                m_impl->buttons &= ~(kPadCross | kPadTouchPad);
             }
 
             [NSApp sendEvent:event];
@@ -232,7 +294,7 @@ void DisplayWindow::poll_events() {
 
 u32 DisplayWindow::input_buttons() const noexcept {
     if (!m_impl) return 0;
-    const u32 b = m_impl->buttons | m_impl->pressed_latch;
+    const u32 b = m_impl->buttons | m_impl->pressed_latch | gamepad_buttons();
     m_impl->pressed_latch = 0;
     return b;
 }

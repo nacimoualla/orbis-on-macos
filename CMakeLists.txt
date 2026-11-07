@@ -38,6 +38,7 @@ find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
 find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
 find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
+find_library(GAMECONTROLLER_FRAMEWORK GameController REQUIRED)
 
 # Core library
 add_library(ps4_core
@@ -71,6 +72,7 @@ target_link_libraries(ps4_core PUBLIC
     ${APPKIT_FRAMEWORK}
     ${AUDIOTOOLBOX_FRAMEWORK}
     ${COREAUDIO_FRAMEWORK}
+    ${GAMECONTROLLER_FRAMEWORK}
 )
 set_source_files_properties(src/gpu/metal_backend.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/gpu/display_window.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")

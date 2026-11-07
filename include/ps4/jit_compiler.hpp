@@ -23,7 +23,10 @@ namespace ps4 {
 // its instructions unless a memory access fails the bounds check, in which
 // case it side-exits with ctx->rip at the faulting instruction (so the
 // interpreter executes it) and returns the count retired before it.
-using JittedBlockFunc = u64 (*)(CpuContext* ctx, u8* guest_base, u64 guest_size);
+/// A compiled block. `chain_budget` > 0 lets it continue straight into the
+/// next compiled block (through JitCompiler's chain table) until that many
+/// guest instructions have retired; it returns the total it retired.
+using JittedBlockFunc = u64 (*)(CpuContext* ctx, u8* guest_base, u64 guest_size, u64 chain_budget);
 
 struct JitBlockMetrics {
     usize instructions_compiled{0};
@@ -119,6 +122,33 @@ public:
     void str_w_idx(u8 rt, u8 rn, u8 rm);
     void str_x_idx(u8 rt, u8 rn, u8 rm);
 
+    // Variable shifts, conditional select, multiply, rotate, compare-branch
+    void lslv(bool sf, u8 rd, u8 rn, u8 rm);
+    void asrv(bool sf, u8 rd, u8 rn, u8 rm);
+    void csel(bool sf, u8 rd, u8 rn, u8 rm, u8 cond);
+    void cmp_imm(bool sf, u8 rn, u16 imm12);
+    void mul(bool sf, u8 rd, u8 rn, u8 rm);
+    void smull(u8 rd, u8 rn, u8 rm); // xd = sext(wn) * sext(wm)
+    void smulh(u8 rd, u8 rn, u8 rm);
+    void ror_imm(bool sf, u8 rd, u8 rn, u8 shift); // EXTR rd, rn, rn, #shift
+    void cbz(bool sf, u8 rt, i32 offset_words);    // retarget with patch_b_cond
+    void invert_last_cbz() { m_code.back() ^= 0x01000000u; } // CBZ <-> CBNZ
+
+    // SIMD&FP registers v0-v31. size_log2: 2 = S (32), 3 = D (64), 4 = Q (128).
+    void fp_ldr(u8 size_log2, u8 vt, u8 rn, u32 offset_bytes);
+    void fp_str(u8 size_log2, u8 vt, u8 rn, u32 offset_bytes);
+    void fp_ldr_idx(u8 size_log2, u8 vt, u8 rn, u8 rm);
+    void fp_str_idx(u8 size_log2, u8 vt, u8 rn, u8 rm);
+    enum : u8 { FP_MUL = 0, FP_DIV = 1, FP_ADD = 2, FP_SUB = 3 };
+    void fp_arith(bool dbl, u8 op, u8 vd, u8 vn, u8 vm);
+    void fcmp(bool dbl, u8 vn, u8 vm);
+    void fcsel(bool dbl, u8 vd, u8 vn, u8 vm, u8 cond);
+    void scvtf(bool dbl, bool src64, u8 vd, u8 rn);
+    void ins_lane0(bool dbl, u8 vd, u8 vn); // vd.{s,d}[0] = vn.{s,d}[0]
+    void eor_v16(u8 vd, u8 vn, u8 vm);
+    void fmov_to_gpr(bool dbl, u8 rd, u8 vn);
+    void fmov_from_gpr(bool dbl, u8 vd, u8 rn);
+
     /// Current position (in instruction words), e.g. for later patching.
     [[nodiscard]] usize pos() const noexcept { return m_code.size(); }
     /// Re-target a B.cond emitted at `at` to the instruction word `target`.
@@ -156,14 +186,22 @@ public:
     /// retiring any instruction). `retired` receives the number of guest
     /// instructions the block retired.
     /// The block reads and writes guest memory through memory.base_address().
+    /// `chain_budget` > 0 lets compiled code run on into following blocks
+    /// (direct jumps, calls, returns) until about that many instructions have
+    /// retired, without returning here between blocks.
     bool execute_block(CpuContext& ctx, const MemoryManager& memory,
-                       usize* retired = nullptr);
+                       usize* retired = nullptr, usize chain_budget = 0);
 
     /// Check if a guest address has a compiled block in cache
     [[nodiscard]] bool is_block_cached(GuestAddr guest_rip) const;
 
     /// Invalidate cache
     void clear_cache();
+
+    /// Make `rip` always start a block that is entered from the dispatcher
+    /// (never by chaining), so the executor sees every arrival there (used
+    /// by PS4_REG_HOOK). Takes effect for blocks compiled afterwards.
+    void add_chain_barrier(GuestAddr rip);
 
     /// Metrics and stats
     [[nodiscard]] usize cached_block_count() const noexcept;
@@ -182,6 +220,18 @@ private:
     usize m_total_invocations{0};
 
     std::unordered_map<GuestAddr, JittedBlockFunc> m_blocks;
+    // Block chaining: guest RIP -> host address just past a block's
+    // prologue, direct-mapped and read by compiled code itself (an aligned
+    // 16-byte LDP, single-copy atomic on Apple silicon). Empty: rip = ~0.
+    struct alignas(16) ChainSlot {
+        u64 rip;
+        u64 entry;
+    };
+    static constexpr usize kChainSlots = 1u << 16;
+    std::vector<ChainSlot> m_chain;
+    std::unordered_set<GuestAddr> m_barriers;
+    void chain_insert(GuestAddr rip, const void* entry);
+    void chain_clear();
     std::unordered_map<GuestAddr, JitBlockMetrics> m_metrics;
     std::unordered_set<GuestAddr> m_failed; // block starts that compiled to nothing
     Arm64Emitter m_emitter;
