@@ -43,6 +43,7 @@ find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
 
 # Core library
 add_library(ps4_core
+    src/debug/scenario.mm
     src/debug/capture.mm
     src/debug/page_watch.cpp
     src/core/elf_loader.cpp
@@ -181,6 +182,9 @@ add_test(NAME JitStats COMMAND test_jit_stats)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if (Python3_EXECUTABLE)
+    add_test(NAME ScenarioTools
+        COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+            -s "${CMAKE_SOURCE_DIR}/scripts/scenario" -p "test_*.py")
     add_test(NAME GoldenFrameRegression
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/golden_frame_test.py"
             --runner "$<TARGET_FILE:ps4-runner>"
@@ -280,3 +284,5 @@ target_link_libraries(test_input PRIVATE ps4_core)
 add_test(NAME InputState COMMAND test_input)
 
 set_source_files_properties(src/debug/capture.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+set_source_files_properties(src/debug/scenario.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")

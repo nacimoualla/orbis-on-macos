@@ -1,6 +1,7 @@
 #import <Metal/Metal.h>
 #import <AppKit/AppKit.h>
 #include "ps4/debug/capture.hpp"
+#include "ps4/debug/scenario.hpp"
 #include "ps4/gpu_state.hpp"
 #include "ps4/memory.hpp"
 #include <filesystem>
@@ -37,16 +38,18 @@ void save_json(id object, NSString* path) {
 }
 bool capture_active() { return report != nil; }
 void capture_begin(u64 frame, void* device) {
+    scenario_begin_frame(frame);
     const char* trigger=getenv("PS4_AT_FRAME"); char* tail=nullptr;
+    bool requested=scenario_capture_requested();
     bool dump=trigger && strtoull(trigger,&tail,0)==frame && tail && strcmp(tail,":dump")==0;
-    if (!dump && frame != selected("PS4_GPU_CAPTURE_FRAME") && frame != selected("PS4_GPU_CAPTURE_XCODE")) return;
+    if (!requested && !dump && frame != selected("PS4_GPU_CAPTURE_FRAME") && frame != selected("PS4_GPU_CAPTURE_XCODE")) return;
     const char* root = getenv("PS4_DEBUG_DIR");
     directory = [NSString stringWithFormat:@"%s/frame_%llu", root ? root : "debug-captures", (unsigned long long)frame];
     NSError* error = nil;
     if (![[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:&error]) {
         fprintf(stderr, "[debug] mkdir failed: %s\n", error.localizedDescription.UTF8String); return;
     }
-    if (dump || frame == selected("PS4_GPU_CAPTURE_FRAME")) {
+    if (requested || dump || frame == selected("PS4_GPU_CAPTURE_FRAME")) {
         operations = [NSMutableArray array]; passes = [NSMutableArray array];
         report = [@{@"frame":@(frame), @"operations":operations, @"passes":passes,
                     @"hash_algorithm":@"GCN FNV-1a code and fetch code"} mutableCopy];
@@ -118,6 +121,9 @@ void capture_operation(const char* kind, u32 count, const u32* regs, MemoryManag
     }
 }
 void capture_resources(const char* stage, u64 hash, const gcn::ResourceScan& scan, const std::vector<gcn::ImageSlot>& slots) {
+    scenario_shader(stage,hash);
+    for (usize i=0;i<scan.images.size() && i<slots.size();++i)
+        if (scan.ok && slots[i].sampled) scenario_texture(gcn::decode_tsharp(scan.images[i].tsharp).base);
     if (!report || !operation) return;
     NSMutableArray* images = [NSMutableArray array];
     for (usize i=0;i<scan.images.size();++i) {
@@ -180,16 +186,26 @@ void capture_texture(u64 key, void* texture) {
         p[0]=q[bgra?2:0]; p[1]=channels>1?q[1]:q[0]; p[2]=channels==4?q[bgra?0:2]:0; p[3]=channels==4?q[3]:255;
     }
     NSString* path=[directory stringByAppendingPathComponent:[NSString stringWithFormat:@"target_%016llx.png",(unsigned long long)key]];
+    if (scenario_enabled()) {
+        NSString* ppm=[path stringByReplacingOccurrencesOfString:@".png" withString:@".ppm"];
+        if (FILE* file=fopen(ppm.UTF8String,"wb")) {
+            fprintf(file,"P6\n%lu %lu\n255\n",(unsigned long)t.width,(unsigned long)t.height);
+            for (NSUInteger i=0;i<t.width*t.height;++i) fwrite(image.bitmapData+4*i,1,3,file);
+            fclose(file);
+        }
+    }
     if (![[image representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:path atomically:YES])
         fprintf(stderr,"[debug] PNG write failed: %s\n",path.UTF8String);
 }
 void capture_end() {
     if (report) { save_json(report,[directory stringByAppendingPathComponent:@"report.json"]); fprintf(stderr,"[debug] captured %s\n",directory.UTF8String); }
+    if (report) scenario_capture_completed(directory.UTF8String);
     if (xcode) [[MTLCaptureManager sharedCaptureManager] stopCapture];
     report=nil; attachments=nil; operation=nil; operations=nil; passes=nil; xcode=false;
 }
 void set_frame_dump(std::function<void()> callback) { dump_callback=std::move(callback); }
 void at_frame(u64 frame) {
+    scenario_frame(frame);
     const char* spec=getenv("PS4_AT_FRAME"); if (!spec) return;
     char* end=nullptr; u64 n=strtoull(spec,&end,0); if (n!=frame || *end!=':') return;
     static std::atomic<bool> fired{false}; if (fired.exchange(true)) return;

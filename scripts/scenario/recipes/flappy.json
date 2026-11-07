@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "name": "flappy-smoke",
+  "eboot": "games/flappy_bird/ED1633-NPXX51362_00-TER1520000000000/eboot.elf",
+  "timeout": 30,
+  "fast_forward_until": "rendering",
+  "milestones": [
+    {
+      "name": "boot",
+      "source": {
+        "type": "start"
+      }
+    },
+    {
+      "name": "video_open",
+      "after": "boot",
+      "source": {
+        "type": "nid",
+        "name": "sceVideoOutOpen"
+      }
+    },
+    {
+      "name": "rendering",
+      "after": "video_open",
+      "source": {
+        "type": "shader",
+        "stage": "PS",
+        "hash": "0xf52eb6ef71fb996f"
+      },
+      "role": "scene"
+    },
+    {
+      "name": "texture_sampled",
+      "after": "rendering",
+      "source": {
+        "type": "texture",
+        "address": "0x1625b4100"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "id": "cross",
+      "after": "rendering",
+      "delay": 0.2,
+      "action": "press",
+      "buttons": [
+        "cross"
+      ],
+      "duration": 0.15
+    },
+    {
+      "id": "render_capture",
+      "after": "rendering",
+      "delay": 0.5,
+      "action": "capture"
+    },
+    {
+      "id": "done",
+      "after": "rendering",
+      "delay": 3,
+      "action": "stop"
+    }
+  ],
+  "expected": {
+    "milestones": [
+      "boot",
+      "video_open",
+      "rendering",
+      "texture_sampled"
+    ],
+    "max_unsupported_packets": 0
+  }
+}

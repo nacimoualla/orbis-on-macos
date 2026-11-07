@@ -1,3 +1,4 @@
+#include "ps4/debug/scenario.hpp"
 #include "ps4/debug/page_watch.hpp"
 #include "ps4/debug/capture.hpp"
 #include <chrono>
@@ -141,6 +142,8 @@ int main(int argc, char* argv[]) {
     nid_registry.set_vfs(&vfs);
     nid_registry.set_syscall_table(&syscalls);
     nid_registry.register_default_libraries();
+    ps4::debug::scenario_start(nid_registry);
+    struct ScenarioLifetime { ~ScenarioLifetime() { ps4::debug::scenario_stop(); } } scenario_lifetime;
 
     ps4::DynamicLinker linker(memory, syscalls, nid_registry);
     // State up front which module-loading mode this run will use, so a log can
@@ -312,7 +315,7 @@ int main(int argc, char* argv[]) {
                     // priority so it is not scheduled onto efficiency cores.
                     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
                     auto t_report = std::chrono::steady_clock::now();
-                    while (!stop_guest.load() && !syscalls.has_exited() &&
+                    while (!stop_guest.load() && !ps4::debug::scenario_should_stop() && !syscalls.has_exited() &&
                            (instruction_budget == 0 || guest_instructions.load() < instruction_budget)) {
                         const ps4::RunResult r = cpu.run(2000000);
                         guest_instructions.fetch_add(r.instructions_executed);
@@ -363,7 +366,7 @@ int main(int argc, char* argv[]) {
                         const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
                         pad_state.buttons |= std::fmod(t, 3.0) < 2.0 ? 0x20 : 0x80;
                     }
-                    nid_registry.set_pad_state(pad_state);
+                    if (!ps4::debug::scenario_enabled()) nid_registry.set_pad_state(pad_state);
                     // PS4_HLE_HIST_EVERY=N (with PS4_HLE_HIST): per-thread HLE
                     // calls of each N-second window, to see what a running but
                     // stuck game polls.
@@ -436,7 +439,7 @@ int main(int argc, char* argv[]) {
                 return v ? std::atof(v) : 0.0;
             }();
             static const bool s_auto_move = std::getenv("PS4_AUTO_MOVE") != nullptr;
-            while ((max_total == 0 || total_instructions < max_total) && !syscalls.has_exited()) {
+            while ((max_total == 0 || total_instructions < max_total) && !ps4::debug::scenario_should_stop() && !syscalls.has_exited()) {
                 if (s_auto_press > 0.0 || s_auto_move) {
                     const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
                     ps4::u32 buttons = 0;
@@ -550,6 +553,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Join all guest pthreads before local MemoryManager, SyscallTable, and JitCompiler go out of scope
+    ps4::debug::scenario_stop();
     nid_registry.shutdown();
 
     // PS4_JIT_STATS: JIT coverage telemetry (scripts/jit_coverage.py)
