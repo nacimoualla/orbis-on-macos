@@ -43,6 +43,8 @@ find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
 
 # Core library
 add_library(ps4_core
+    src/debug/capture.mm
+    src/debug/page_watch.cpp
     src/core/elf_loader.cpp
     src/core/memory.cpp
     src/core/syscall_table.cpp
@@ -263,3 +265,5 @@ set_tests_properties(SfoParser PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_executable(test_input tests/test_input.cpp)
 target_link_libraries(test_input PRIVATE ps4_core)
 add_test(NAME InputState COMMAND test_input)
+
+set_source_files_properties(src/debug/capture.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")

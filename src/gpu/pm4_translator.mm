@@ -4,6 +4,7 @@
 #include "ps4/pm4_translator.hpp"
 #include "ps4/gcn_pipeline.hpp"
 #include "ps4/gpu_state.hpp"
+#include "ps4/debug/capture.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -1158,6 +1159,7 @@ bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_ad
         }
 
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
+        debug::capture_bound();
         id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
         id<MTLTexture> fb = (__bridge id<MTLTexture>)metal->color_target_texture(0);
         if (!fb) fb = (__bridge id<MTLTexture>)metal->raw_framebuffer();
@@ -1200,12 +1202,15 @@ bool Pm4Translator::Impl::try_gcn_draw(bool indexed, u32 count, GuestAddr idx_ad
 bool Pm4Translator::Impl::try_gcn_dispatch(u32 dim_x, u32 dim_y, u32 dim_z) {
     if (!gcn_enabled || !memory || !metal || cs_shader_addr <= 0x1000) return false;
     if (!ensure_frame()) return false;
+    debug::capture_operation("dispatch", 0, reg_file.data(), memory,
+        metal->width(), metal->height(), dim_x, dim_y, dim_z);
     @autoreleasepool {
         if (!gcn_cache) gcn_cache = std::make_unique<GcnPipelineCache>(metal->raw_device(), memory);
         gcn_cache->set_memory(memory);
         gcn_cache->set_metal_backend(metal);
 
         if (!metal->ensure_compute_encoder()) return false;
+        debug::capture_bound();
         void* compute_enc = metal->active_compute_encoder();
         if (!compute_enc) return false;
 
@@ -1253,6 +1258,7 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         PM4_LOG("[PM4] draw outside frame\n");
         return false;
     }
+    debug::capture_operation("draw_indexed", idx_count, reg_file.data(), memory, metal->width(), metal->height());
     if (cb_special_draw()) return true;
 
     if (try_gcn_draw(true, idx_count, idx_addr, idx_type, prim_type, base_vertex, instance_count)) {
@@ -1379,6 +1385,7 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         // The fixed mesh pipeline has one BGRA colour attachment: draw to the screen.
         metal->reset_color_targets();
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
+        debug::capture_bound();
         id<MTLRenderCommandEncoder> enc =
             (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
         if (!enc) return false;
@@ -1494,6 +1501,7 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         PM4_LOG("[PM4] draw outside frame\n");
         return false;
     }
+    debug::capture_operation("draw", vtx_count, reg_file.data(), memory, metal->width(), metal->height());
     if (cb_special_draw()) return true;
 
     if (try_gcn_draw(false, vtx_count, 0, MTLIndexTypeUInt16, prim_type, base_vertex, instance_count)) {
@@ -1653,6 +1661,7 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         // The fixed mesh pipeline has one BGRA colour attachment: draw to the screen.
         metal->reset_color_targets();
         if (!metal->ensure_render_encoder(!frame_draw_encoded, clear_color)) return false;
+        debug::capture_bound();
         id<MTLRenderCommandEncoder> enc =
             (__bridge id<MTLRenderCommandEncoder>)metal->active_render_encoder();
         if (!enc) return false;

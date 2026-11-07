@@ -1,3 +1,6 @@
+#if defined(__APPLE__)
+#include "ps4/debug/page_watch.hpp"
+#endif
 #include "ps4/jit_compiler.hpp"
 #include "arm64_simd.hpp"
 
@@ -3079,6 +3082,12 @@ JittedBlockFunc JitCompiler::compile_block_locked(GuestAddr guest_rip,
   assert(m_emitter.size_bytes() == kChainEntryOffset);
   BlockTranslator translator(m_emitter);
   for (usize i = 0; i < insns.size(); ++i) {
+    // Debug-only publication: preserve the precise store RIP with JIT chaining.
+    static const bool page_watch = std::getenv("PS4_PAGE_WATCH") != nullptr;
+    if (page_watch) {
+      m_emitter.mov_imm64(0, insns[i].rip);
+      m_emitter.str_reg(0, 19, offsetof(CpuContext, rip));
+    }
     translator.emit(insns[i], flags_needed[i], i);
   }
 
@@ -3250,7 +3259,18 @@ bool JitCompiler::execute_block(CpuContext &ctx, const MemoryManager &memory,
   // Compiled code stores to guest memory: the MemoryManager is only const
   // because compilation does not modify it.
   u8 *guest_base = const_cast<u8 *>(memory.base_address());
+#if defined(__APPLE__)
+  static const bool page_watch = std::getenv("PS4_PAGE_WATCH") != nullptr;
+  const CpuContext* previous_watch_context = nullptr;
+  if (page_watch) {
+    previous_watch_context = debug::watch_context;
+    debug::watch_context = &ctx;
+  }
+#endif
   const u64 n = fn(&ctx, guest_base, memory.total_size(), tc.chain.get(), chain_budget);
+#if defined(__APPLE__)
+  if (page_watch) debug::watch_context = previous_watch_context;
+#endif
   if (retired)
     *retired = static_cast<usize>(n);
   // A block that side-exited on its first instruction made no progress: the

@@ -1,3 +1,4 @@
+#include "ps4/debug/capture.hpp"
 #import <Metal/Metal.h>
 
 #include "ps4/gcn_pipeline.hpp"
@@ -604,6 +605,8 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
                                                     read, max_index);
     gcn::ResourceScan ps_scan = gcn::scan_resources(ps, pe.tp.ps_images, req.ps_user, std::min<u32>(ps_user_count, 16),
                                                     read, 0);
+    debug::capture_resources("VS", vs.hash, vs_scan, pe.tp.vs_images);
+    debug::capture_resources("PS", ps.hash, ps_scan, pe.tp.ps_images);
     if (!vs_scan.ok || !ps_scan.ok) {
         const std::string e = !vs_scan.ok ? "VS " + vs_scan.error : "PS " + ps_scan.error;
         im.log_once("resource scan: " + e);
@@ -840,6 +843,7 @@ bool GcnPipelineCache::encode_dispatch(void* compute_encoder, const GcnComputeRe
     // Always scanned: it also evaluates the scalar loads (uniform_loads).
     gcn::ResourceScan scan =
         gcn::scan_resources(cs, pe->tp.images, req.cs_user, std::min<u32>(cs_user_count, 16), read, 0);
+    if (!pe->tp.images.empty()) debug::capture_resources("CS", cs.hash, scan, pe->tp.images);
     if (!scan.ok && !pe->tp.images.empty()) {
         im.log_once("CS resource scan: " + scan.error);
         return fail("CS resource scan: " + scan.error);
