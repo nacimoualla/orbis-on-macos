@@ -278,6 +278,23 @@ static i64 fios_open_file_handle(const char* tag, MemoryManager& mem, GuestAddr 
     return SCE_OK;
 }
 
+static std::mutex g_guest_stdio_mtx;
+static std::unordered_set<uintptr_t> g_guest_open_files;
+
+inline FILE* resolve_guest_stream(GuestAddr addr) {
+    if (addr == 0) return nullptr;
+    if (addr == 1 || (addr >= 0x3FF2200ULL && addr < 0x3FF2400ULL)) return stdout;
+    if (addr == 2 || (addr >= 0x3FF2400ULL && addr < 0x3FF2600ULL)) return stderr;
+    if (addr >= 0x3FF2000ULL && addr < 0x3FF2200ULL) return stdin;
+
+    std::lock_guard<std::mutex> lock(g_guest_stdio_mtx);
+    if (g_guest_open_files.contains(static_cast<uintptr_t>(addr))) {
+        return reinterpret_cast<FILE*>(addr);
+    }
+    // Safe fallback for unmapped streams or trampolines: write to stderr rather than crashing host flockfile
+    return stderr;
+}
+
 // PS4_LOG_SEMA=1: log every sceKernelWaitSema/SignalSema (FMOD hits these
 // hundreds of times a second, so they are off by default).
 static bool sema_log_enabled() {
