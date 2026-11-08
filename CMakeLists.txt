@@ -41,6 +41,7 @@ find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
 find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
 find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
 find_library(GAMECONTROLLER_FRAMEWORK GameController REQUIRED)
+find_package(ZLIB REQUIRED)
 
 # Core library
 add_library(ps4_core
@@ -70,6 +71,7 @@ add_library(ps4_core
     src/hle/thread.cpp
     src/gui/game_import.cpp
     src/core/sfo.cpp
+    src/core/psarc.cpp
 )
 target_include_directories(ps4_core PUBLIC include)
 target_link_libraries(ps4_core PUBLIC
@@ -80,6 +82,7 @@ target_link_libraries(ps4_core PUBLIC
     ${AUDIOTOOLBOX_FRAMEWORK}
     ${COREAUDIO_FRAMEWORK}
     ${GAMECONTROLLER_FRAMEWORK}
+    ZLIB::ZLIB
 )
 set_source_files_properties(src/gpu/metal_backend.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 set_source_files_properties(src/gpu/display_window.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
@@ -160,6 +163,10 @@ add_test(NAME Phase15_JitExecutorIntegration COMMAND test_phase15)
 add_executable(test_fios2_async tests/test_fios2_async.cpp)
 target_link_libraries(test_fios2_async PRIVATE ps4_core)
 add_test(NAME Fios2_AsyncOpHandle COMMAND test_fios2_async)
+
+add_executable(test_psarc tests/test_psarc.cpp)
+target_link_libraries(test_psarc PRIVATE ps4_core)
+add_test(NAME Psarc_Reader COMMAND test_psarc)
 
 add_executable(test_flappy_gpu tests/test_flappy_gpu.cpp)
 target_link_libraries(test_flappy_gpu PRIVATE ps4_core)

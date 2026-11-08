@@ -6,6 +6,7 @@
 #include "ps4/np_trophy.hpp"
 #include "ps4/guest_libc_blob.hpp"
 #include "ps4/pm4_translator.hpp"
+#include "ps4/psarc.hpp"
 #include "ps4/save_data.hpp"
 #include "ps4/syscall_table.hpp"
 #include "ps4/thread.hpp"
@@ -36,6 +37,7 @@ static bool pm4_verbose() {
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -221,13 +223,70 @@ inline VirtualFileSystem& get_vfs() {
 
 // Fios2 file handle tracking
 struct FiosFile {
-    std::unique_ptr<std::ifstream> stream;
+    std::unique_ptr<std::istream> stream;  // host file, or an entry inside a mounted archive
     u64 size{0};
     u64 offset{0};
     std::string path;
 };
 static std::unordered_map<i32, FiosFile> s_fios_files;
 static i32 s_next_fios_fd = 200;
+
+// Archives mounted with sceFiosArchiveMount. Paths under a mount point are
+// served from the archive before the host file system, newest mount first.
+struct FiosMount {
+    std::string point;  // guest path, no trailing '/'
+    std::shared_ptr<PsarcArchive> archive;
+    i32 fh{0};
+};
+static std::mutex s_fios_mount_mtx;
+static std::vector<FiosMount> s_fios_mounts;
+static i32 s_next_fios_archive_fh = 0x4000;
+// Error reported for a failed archive op. The exact SCE_FIOS_ERROR_* code is
+// unverified; the callers seen so far only test it against zero.
+constexpr i32 kFiosArchiveError = static_cast<i32>(0x80820002);
+
+// Visit, newest first, each mounted archive whose mount point contains
+// `path`, with `path` relative to it ("/x/y"), until `fn` returns true.
+// Several archives can share one mount point (inFAMOUS mounts all of its
+// psarcs at /in_archive), so callers must not stop at the first cover.
+template <typename Fn>
+static bool fios_for_each_mount(const char* path, Fn&& fn) {
+    if (path == nullptr) return false;
+    const std::string_view p(path);
+    std::vector<std::pair<std::shared_ptr<PsarcArchive>, std::string>> hits;
+    {
+        std::lock_guard<std::mutex> lock(s_fios_mount_mtx);
+        for (auto it = s_fios_mounts.rbegin(); it != s_fios_mounts.rend(); ++it) {
+            const std::string& m = it->point;
+            if (p.size() < m.size() || strncasecmp(p.data(), m.data(), m.size()) != 0) continue;
+            if (p.size() > m.size() && p[m.size()] != '/' && !m.empty()) continue;
+            std::string inner(p.substr(m.size()));
+            hits.emplace_back(it->archive, inner.empty() ? std::string("/") : std::move(inner));
+        }
+    }
+    for (auto& [ar, inner] : hits) {
+        if (fn(ar, inner)) return true;
+    }
+    return false;
+}
+
+// A file inside a mounted archive, if `path` names one.
+static std::shared_ptr<PsarcArchive> fios_archive_file(const char* path, const PsarcArchive::Entry*& entry) {
+    std::shared_ptr<PsarcArchive> found;
+    entry = nullptr;
+    fios_for_each_mount(path, [&](const std::shared_ptr<PsarcArchive>& ar, const std::string& inner) {
+        entry = ar->find(inner);
+        if (entry) found = ar;
+        return entry != nullptr;
+    });
+    return found;
+}
+
+static bool fios_archive_dir(const char* path) {
+    return fios_for_each_mount(path, [](const std::shared_ptr<PsarcArchive>& ar, const std::string& inner) {
+        return ar->is_directory(inner);
+    });
+}
 
 // Async FIOS2 operations. sceFiosFHOpen returns an SceFiosOp id (never SCE_OK)
 // so the engine's async layer can track it. The open completes inside the call,
@@ -246,6 +305,22 @@ static i64 fios_open_file_handle(const char* tag, MemoryManager& mem, GuestAddr 
                            ? mem.to_host_ptr<char>(path_addr) : nullptr;
     if (!path) {
         return -1;
+    }
+    const PsarcArchive::Entry* entry = nullptr;
+    if (auto ar = fios_archive_file(path, entry)) {
+        const i32 fd = s_next_fios_fd++;
+        s_fios_files[fd] = FiosFile{
+            .stream = ar->open_entry(*entry),
+            .size = entry->size,
+            .offset = 0,
+            .path = path
+        };
+        if (pfh_addr != 0 && mem.is_valid_address(pfh_addr, sizeof(i32))) {
+            mem.write_value(pfh_addr, fd);
+        }
+        std::fprintf(stderr, "[FIOS2] %s('%s' in archive %s) -> handle %d (size=%llu)\n",
+                     tag, path, ar->path().filename().c_str(), fd, (unsigned long long)entry->size);
+        return SCE_OK;
     }
     auto& vfs = get_vfs();
     auto resolved = vfs.resolve_path(path);
@@ -5846,9 +5921,10 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = 0;
             return;
         }
+        const PsarcArchive::Entry* entry = nullptr;
+        bool exists = fios_archive_file(path, entry) != nullptr;
         auto& vfs = get_vfs();
-        auto resolved = vfs.resolve_path(path);
-        bool exists = false;
+        auto resolved = exists ? std::nullopt : vfs.resolve_path(path);
         if (resolved) {
             std::error_code ec;
             exists = std::filesystem::is_regular_file(*resolved, ec);
@@ -5873,9 +5949,9 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = 0;
             return;
         }
+        bool exists = fios_archive_dir(path);
         auto& vfs = get_vfs();
-        auto resolved = vfs.resolve_path(path);
-        bool exists = false;
+        auto resolved = exists ? std::nullopt : vfs.resolve_path(path);
         if (resolved) {
             std::error_code ec;
             exists = std::filesystem::is_directory(*resolved, ec);
@@ -5895,6 +5971,19 @@ void NidRegistry::register_default_libraries() {
                                ? mem.to_host_ptr<char>(path_addr) : nullptr;
         if (!path || stat_ptr == 0 || !mem.is_valid_address(stat_ptr, 0x40)) {
             ctx.rax = static_cast<u64>(-1);
+            return;
+        }
+        const PsarcArchive::Entry* entry = nullptr;
+        const bool arc_file = fios_archive_file(path, entry) != nullptr;
+        if (arc_file || fios_archive_dir(path)) {
+            mem.zero_memory(stat_ptr, 0x40);
+            const u64 file_sz = arc_file ? entry->size : 0;
+            const u32 stat_flags = arc_file ? 0x0 : 0x1;
+            mem.write_value(stat_ptr + 0x00, file_sz);
+            mem.write_value(stat_ptr + 0x20, stat_flags);
+            std::fprintf(stderr, "[FIOS2] sceFiosStat('%s', archive) -> size=%llu, flags=0x%x\n",
+                         path, (unsigned long long)file_sz, stat_flags);
+            ctx.rax = SCE_OK;
             return;
         }
         auto& vfs = get_vfs();
@@ -5936,6 +6025,13 @@ void NidRegistry::register_default_libraries() {
                                    ? mem.to_host_ptr<char>(path_addr) : nullptr;
             if (!path) {
                 ctx.rax = static_cast<u64>(-1);
+                return;
+            }
+            const PsarcArchive::Entry* entry = nullptr;
+            if (fios_archive_file(path, entry)) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFileGetSizeSync('%s', archive) -> size=%llu\n",
+                             path, (unsigned long long)entry->size);
+                ctx.rax = entry->size;
                 return;
             }
             auto& vfs = get_vfs();
@@ -6047,7 +6143,7 @@ void NidRegistry::register_default_libraries() {
             const GuestSize size = ctx.rdx;
             const GuestAddr buf_addr = ctx.rcx;
             auto it = s_fios_files.find(fd);
-            if (it == s_fios_files.end() || !it->second.stream || !it->second.stream->is_open()) {
+            if (it == s_fios_files.end() || !it->second.stream) {
                 std::fprintf(stderr, "[FIOS2] sceFiosFHRead: invalid handle %d\n", fd);
                 ctx.rax = static_cast<u64>(-1);
                 return;
@@ -6079,7 +6175,7 @@ void NidRegistry::register_default_libraries() {
             const GuestSize size = ctx.rcx;
             const u64 offset = ctx.r8;
             auto it = s_fios_files.find(fd);
-            if (it == s_fios_files.end() || !it->second.stream || !it->second.stream->is_open()) {
+            if (it == s_fios_files.end() || !it->second.stream) {
                 std::fprintf(stderr, "[FIOS2] sceFiosFHPread: invalid handle %d\n", fd);
                 ctx.rax = static_cast<u64>(-1);
                 return;
@@ -6108,7 +6204,7 @@ void NidRegistry::register_default_libraries() {
             const GuestSize size = ctx.rcx;
             const u64 offset = ctx.r8;
             auto it = s_fios_files.find(fd);
-            if (it == s_fios_files.end() || !it->second.stream || !it->second.stream->is_open()) {
+            if (it == s_fios_files.end() || !it->second.stream) {
                 std::fprintf(stderr, "[FIOS2] sceFiosFHPreadSync: invalid handle %d\n", fd);
                 ctx.rax = static_cast<u64>(-1);
                 return;
@@ -6142,7 +6238,7 @@ void NidRegistry::register_default_libraries() {
             i32 error = SCE_OK;
             i64 bytes_read = 0;
             auto it = s_fios_files.find(fd);
-            if (it == s_fios_files.end() || !it->second.stream || !it->second.stream->is_open()) {
+            if (it == s_fios_files.end() || !it->second.stream) {
                 std::fprintf(stderr, "[FIOS2] sceFiosFHPread: invalid handle %d\n", fd);
                 error = -1;
             } else if (size != 0 && (buf_addr == 0 || !mem.is_valid_address(buf_addr, size))) {
@@ -6175,7 +6271,7 @@ void NidRegistry::register_default_libraries() {
             const GuestAddr buf_addr = ctx.rdx;
             const GuestSize size = ctx.rcx;
             auto it = s_fios_files.find(fd);
-            if (it == s_fios_files.end() || !it->second.stream || !it->second.stream->is_open()) {
+            if (it == s_fios_files.end() || !it->second.stream) {
                 std::fprintf(stderr, "[FIOS2] sceFiosFHReadSync: invalid handle %d\n", fd);
                 ctx.rax = static_cast<u64>(-1);
                 return;
@@ -6314,11 +6410,111 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = ec ? static_cast<u64>(-1) : sz;
         });
 
-    // sceFiosArchiveMountSync(int profile, const char* path, ...)
+    // SceFiosOp sceFiosArchiveGetMountBufferSize(const SceFiosOpAttr* pAttr,
+    //     const char* pArchivePath, const SceFiosOpenParams* pOpenParams)
+    // NID: 0x1119A238AF554F48. The size is the op's actual count. Archives are
+    // read straight from the host file, so the game's buffer only needs to
+    // exist; 64 KiB is plenty for any real FIOS TOC cache.
+    register_symbol(0x1119A238AF554F48ULL, "sceFiosArchiveGetMountBufferSize", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr attr = ctx.rdi;
+            const char* path = (ctx.rsi > 0x1000 && mem.is_valid_address(ctx.rsi, 1))
+                                   ? mem.to_host_ptr<char>(ctx.rsi) : nullptr;
+            auto resolved = path ? get_vfs().resolve_path(path) : std::nullopt;
+            std::error_code ec;
+            const bool found = resolved && std::filesystem::is_regular_file(*resolved, ec);
+            constexpr i64 kMountBufferSize = 0x10000;
+            const i32 err = found ? SCE_OK : kFiosArchiveError;
+            const u64 op = s_next_fios_op++;
+            s_fios_ops[op] = FiosOp{ .error = err, .actual = found ? kMountBufferSize : 0 };
+            std::fprintf(stderr, "[FIOS2] sceFiosArchiveGetMountBufferSize('%s') -> op=0x%llx size=0x%llx err=0x%x\n",
+                         path ? path : "(null)", (unsigned long long)op,
+                         (unsigned long long)s_fios_ops[op].actual, static_cast<u32>(err));
+            fios_complete_op(mem, "sceFiosArchiveGetMountBufferSize", attr, op, err);
+            ctx.rax = op;
+        });
+
+    // Shared body of sceFiosArchiveMount{,Sync}(attr, SceFiosFH* pFH,
+    // const char* pArchivePath, const char* pMountPoint, SceFiosBuffer buf,
+    // const SceFiosOpenParams*): parse the PSARC, add it to the mount table
+    // and write its handle to *pFH. Returns SCE_OK or a FIOS error.
+    static auto fios_archive_mount = [](MemoryManager& mem, const char* tag, GuestAddr pfh,
+                                        GuestAddr path_addr, GuestAddr point_addr) -> i32 {
+        auto guest_str = [&mem](GuestAddr a) -> const char* {
+            return (a > 0x1000 && mem.is_valid_address(a, 1)) ? mem.to_host_ptr<char>(a) : nullptr;
+        };
+        const char* path = guest_str(path_addr);
+        const char* point = guest_str(point_addr);
+        if (!path || !point) return kFiosArchiveError;
+        auto resolved = get_vfs().resolve_path(path);
+        if (!resolved) {
+            std::fprintf(stderr, "[FIOS2] %s('%s') -> not found\n", tag, path);
+            return kFiosArchiveError;
+        }
+        auto ar = PsarcArchive::open(*resolved);
+        if (!ar) {
+            std::fprintf(stderr, "[FIOS2] %s('%s' -> '%s') -> not a PSARC\n", tag, path, resolved->c_str());
+            return kFiosArchiveError;
+        }
+        std::string mp(point);
+        while (!mp.empty() && mp.back() == '/') mp.pop_back();
+        i32 fh = 0;
+        {
+            std::lock_guard<std::mutex> lock(s_fios_mount_mtx);
+            fh = s_next_fios_archive_fh++;
+            s_fios_mounts.push_back(FiosMount{ .point = mp, .archive = ar, .fh = fh });
+        }
+        if (pfh != 0 && mem.is_valid_address(pfh, sizeof(i32))) mem.write_value(pfh, fh);
+        std::fprintf(stderr, "[FIOS2] %s('%s' at '%s') -> fh=%d, %zu files\n",
+                     tag, path, mp.empty() ? "/" : mp.c_str(), fh, ar->file_count());
+        return SCE_OK;
+    };
+
+    // int sceFiosArchiveMountSync(attr, pFH, path, mountPoint, SceFiosBuffer, params)
     // NID: 0xC6EB4B6D076AC9BEULL ("xutLbQdqyb4")
     register_symbol(0xC6EB4B6D076AC9BEULL, "sceFiosArchiveMountSync", "libSceFios2",
-        [](CpuContext& ctx, MemoryManager& /*mem*/) {
-            ctx.rax = static_cast<u64>(-1);
+        [](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = static_cast<u64>(static_cast<i64>(
+                fios_archive_mount(mem, "sceFiosArchiveMountSync", ctx.rsi, ctx.rdx, ctx.rcx)));
+        });
+
+    // SceFiosOp sceFiosArchiveMount(attr, pFH, path, mountPoint, SceFiosBuffer, params)
+    // NID: 0xA4853CBBA56C2CCF. The buffer arrives by value in r8/r9; unused.
+    register_symbol(0xA4853CBBA56C2CCFULL, "sceFiosArchiveMount", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr attr = ctx.rdi;
+            const i32 err = fios_archive_mount(mem, "sceFiosArchiveMount", ctx.rsi, ctx.rdx, ctx.rcx);
+            const u64 op = s_next_fios_op++;
+            s_fios_ops[op] = FiosOp{ .error = err };
+            fios_complete_op(mem, "sceFiosArchiveMount", attr, op, err);
+            ctx.rax = op;
+        });
+
+    static auto fios_archive_unmount = [](const char* tag, i32 fh) -> i32 {
+        std::lock_guard<std::mutex> lock(s_fios_mount_mtx);
+        const auto it = std::find_if(s_fios_mounts.begin(), s_fios_mounts.end(),
+                                     [fh](const FiosMount& m) { return m.fh == fh; });
+        const bool found = it != s_fios_mounts.end();
+        if (found) s_fios_mounts.erase(it);
+        std::fprintf(stderr, "[FIOS2] %s(fh=%d) -> %s\n", tag, fh, found ? "OK" : "unknown handle");
+        return found ? SCE_OK : kFiosArchiveError;
+    };
+
+    // int sceFiosArchiveUnmountSync(attr, SceFiosFH fh). NID: 0xCB2E82EE4EC53D96.
+    register_symbol(0xCB2E82EE4EC53D96ULL, "sceFiosArchiveUnmountSync", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = static_cast<u64>(static_cast<i64>(
+                fios_archive_unmount("sceFiosArchiveUnmountSync", static_cast<i32>(ctx.rsi))));
+        });
+
+    // SceFiosOp sceFiosArchiveUnmount(attr, SceFiosFH fh). NID: 0x61F4C1054E6738D4.
+    register_symbol(0x61F4C1054E6738D4ULL, "sceFiosArchiveUnmount", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const i32 err = fios_archive_unmount("sceFiosArchiveUnmount", static_cast<i32>(ctx.rsi));
+            const u64 op = s_next_fios_op++;
+            s_fios_ops[op] = FiosOp{ .error = err };
+            fios_complete_op(mem, "sceFiosArchiveUnmount", ctx.rdi, op, err);
+            ctx.rax = op;
         });
 
     // sceFiosFileRead(int profile, const char* path, void* buf, size_t size, ...)
