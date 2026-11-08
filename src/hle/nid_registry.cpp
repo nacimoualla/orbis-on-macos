@@ -221,6 +221,22 @@ inline VirtualFileSystem& get_vfs() {
     return *g_vfs;
 }
 
+// ScePthreadMutexattr is an opaque pointer-sized object. scePthreadMutexattrInit
+// stores this tag plus the mutex type in it, so scePthreadMutexInit can create
+// the right kind of mutex. Types: 1 error-check, 2 recursive, 3 normal,
+// 4 adaptive. Untagged or 0 keeps the old default, recursive.
+constexpr u64 kMutexAttrTag = 0x4D41545452000000ULL;
+static bool sce_mutex_attr_recursive(MemoryManager& mem, GuestAddr attr_ptr) {
+    u64 v = 0;
+    if (attr_ptr == 0 || !mem.is_valid_address(attr_ptr, sizeof(u64)) || !mem.read_value(attr_ptr, v)) return true;
+    if ((v & ~0xFFULL) != kMutexAttrTag) return true;
+    const u32 type = static_cast<u32>(v & 0xFF);
+    return !(type == 1 || type == 3 || type == 4);
+}
+static u64 sce_kernel_errno(int e) {
+    return e == 0 ? 0 : (0x80020000ULL | static_cast<u64>(e));
+}
+
 // Fios2 file handle tracking
 struct FiosFile {
     std::unique_ptr<std::istream> stream;  // host file, or an entry inside a mounted archive
@@ -2315,7 +2331,7 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr mtx_ptr = ctx.rdi;
             auto& tm = get_thread_manager(mem);
-            const u32 mid = tm.mutex_create();
+            const u32 mid = tm.mutex_create("mutex", sce_mutex_attr_recursive(mem, ctx.rsi));
             if (mtx_ptr != 0 && mem.is_valid_address(mtx_ptr, sizeof(u32))) {
                 mem.write_value(mtx_ptr, mid);
                 ctx.rax = SCE_OK;
@@ -2352,25 +2368,20 @@ void NidRegistry::register_default_libraries() {
     // scePthreadMutexLock(ScePthreadMutex* mutex)
     register_symbol(0xE86895318FDC64A0ULL, "scePthreadMutexLock", "libkernel",
         [resolve_mutex_id](CpuContext& ctx, MemoryManager& mem) {
-            ctx.rax = get_thread_manager(mem).mutex_lock(resolve_mutex_id(ctx, mem)) ? SCE_OK
-                                                                                      : static_cast<u64>(-22);
+            ctx.rax = sce_kernel_errno(get_thread_manager(mem).mutex_lock_errno(resolve_mutex_id(ctx, mem)));
         });
 
     // scePthreadMutexTrylock(ScePthreadMutex* mutex)
     // NID: 0xBA9A15AF330715E1ULL ("upoVrzMHFeE")
     register_symbol(0xBA9A15AF330715E1ULL, "scePthreadMutexTrylock", "libkernel",
         [resolve_mutex_id](CpuContext& ctx, MemoryManager& mem) {
-            ctx.rax = get_thread_manager(mem).mutex_trylock(resolve_mutex_id(ctx, mem))
-                          ? SCE_OK
-                          : static_cast<u64>(-16); // EBUSY
+            ctx.rax = sce_kernel_errno(get_thread_manager(mem).mutex_trylock_errno(resolve_mutex_id(ctx, mem)));
         });
 
     // scePthreadMutexUnlock(ScePthreadMutex* mutex)
     register_symbol(0xEFB2023594895C85ULL, "scePthreadMutexUnlock", "libkernel",
         [resolve_mutex_id](CpuContext& ctx, MemoryManager& mem) {
-            ctx.rax = get_thread_manager(mem).mutex_unlock(resolve_mutex_id(ctx, mem))
-                          ? SCE_OK
-                          : static_cast<u64>(-22);
+            ctx.rax = sce_kernel_errno(get_thread_manager(mem).mutex_unlock_errno(resolve_mutex_id(ctx, mem)));
         });
 
     // scePthreadMutexLock (alternate NID: 0xF542B5BCB6507EDEULL / "9UK1vLZQft4")
@@ -5086,7 +5097,7 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr mtx_ptr = ctx.rdi;
             auto& tm = get_thread_manager(mem);
-            const u32 mid = tm.mutex_create();
+            const u32 mid = tm.mutex_create("mutex", sce_mutex_attr_recursive(mem, ctx.rsi));
             if (mtx_ptr != 0 && mem.is_valid_address(mtx_ptr, sizeof(u32))) {
                 mem.write_value(mtx_ptr, mid);
             }
@@ -5095,13 +5106,24 @@ void NidRegistry::register_default_libraries() {
 
     // scePthreadMutexattrInit NID: 0x17C6D41F0006DBCEULL ("F8bUHwAG284")
     register_symbol(0x17C6D41F0006DBCEULL, "scePthreadMutexattrInit", "libkernel",
-        [](CpuContext& ctx, MemoryManager&) {
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (ctx.rdi != 0 && mem.is_valid_address(ctx.rdi, sizeof(u64))) {
+                mem.write_value(ctx.rdi, kMutexAttrTag);
+            }
             ctx.rax = SCE_OK;
         });
 
     // scePthreadMutexattrSettype NID: 0x88CA7C42913E5CEEULL ("iMp8QpE+XO4")
     register_symbol(0x88CA7C42913E5CEEULL, "scePthreadMutexattrSettype", "libkernel",
-        [](CpuContext& ctx, MemoryManager&) {
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const u32 type = static_cast<u32>(ctx.rsi);
+            if (type < 1 || type > 4) {
+                ctx.rax = sce_kernel_errno(ThreadManager::kMutexEinval);
+                return;
+            }
+            if (ctx.rdi != 0 && mem.is_valid_address(ctx.rdi, sizeof(u64))) {
+                mem.write_value(ctx.rdi, kMutexAttrTag | type);
+            }
             ctx.rax = SCE_OK;
         });
 

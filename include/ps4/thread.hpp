@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ps4 {
@@ -104,6 +105,9 @@ struct GuestThread {
     // Host QoS class wanted for this thread (from its name), applied by the
     // thread itself at its next quantum boundary; 0 = nothing pending.
     std::atomic<unsigned> pending_qos{0};
+    // Guest mutex id this thread is blocked locking (0 = none), for the
+    // stall dump's "held by" line.
+    std::atomic<u32> waiting_mutex{0};
 };
 
 class CpuExecutor;
@@ -210,11 +214,18 @@ public:
     [[nodiscard]] u64 threads_executed_instructions() const noexcept { return m_threads_executed_instructions.load(); }
 
     // Mutex management
-    u32 mutex_create(std::string_view name = "mutex");
+    // recursive=false gives FreeBSD error-check semantics (also used for the
+    // normal and adaptive types): a re-lock by the owner fails with EDEADLK.
+    u32 mutex_create(std::string_view name = "mutex", bool recursive = true);
     bool mutex_exists(u32 mutex_id);
     bool mutex_lock(u32 mutex_id);
     bool mutex_trylock(u32 mutex_id);
     bool mutex_unlock(u32 mutex_id);
+    // Same operations, returning 0 or a positive errno.
+    static constexpr int kMutexEperm = 1, kMutexEdeadlk = 11, kMutexEbusy = 16, kMutexEinval = 22;
+    int mutex_lock_errno(u32 mutex_id);
+    int mutex_trylock_errno(u32 mutex_id);
+    int mutex_unlock_errno(u32 mutex_id);
     bool mutex_destroy(u32 mutex_id);
 
     // Condition variable management
@@ -252,9 +263,19 @@ private:
     GuestAddr m_next_stack_top{0x1D0000000ULL};
 
     // Synchronization tables
-    std::mutex m_sync_mutex;
+    mutable std::mutex m_sync_mutex;
     u32 m_next_mutex_id{1};
     std::unordered_map<u32, std::shared_ptr<std::recursive_mutex>> m_mutexes;
+    // Who holds each locked guest mutex (guarded by m_sync_mutex), so a
+    // stall dump can name the owner of a mutex another thread is stuck on.
+    // Ownership is checked by host thread (what actually holds the host
+    // mutex); tid is the guest thread id, for logs and dumps only.
+    struct MutexOwner { std::thread::id host{}; ScePthreadId tid{0}; u32 depth{0}; GuestAddr rip{0}; };
+    std::unordered_map<u32, MutexOwner> m_mutex_owners;
+    void note_mutex_acquired(u32 mutex_id);
+    std::unordered_set<u32> m_mutex_kinds;  // ids of non-recursive mutexes
+    MutexOwner cond_wait_release(u32 mutex_id, std::recursive_mutex& mtx);
+    void cond_wait_restore(u32 mutex_id, std::recursive_mutex& mtx, const MutexOwner& saved);
 
     u32 m_next_cond_id{1};
     std::unordered_map<u32, std::shared_ptr<std::condition_variable_any>> m_conds;

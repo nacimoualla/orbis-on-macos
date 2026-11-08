@@ -168,6 +168,10 @@ add_executable(test_psarc tests/test_psarc.cpp)
 target_link_libraries(test_psarc PRIVATE ps4_core)
 add_test(NAME Psarc_Reader COMMAND test_psarc)
 
+add_executable(test_mutex_semantics tests/test_mutex_semantics.cpp)
+target_link_libraries(test_mutex_semantics PRIVATE ps4_core)
+add_test(NAME Mutex_Semantics COMMAND test_mutex_semantics)
+
 add_executable(test_flappy_gpu tests/test_flappy_gpu.cpp)
 target_link_libraries(test_flappy_gpu PRIVATE ps4_core)
 target_compile_definitions(test_flappy_gpu PRIVATE CMAKE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

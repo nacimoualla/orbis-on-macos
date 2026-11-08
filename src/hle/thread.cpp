@@ -658,6 +658,16 @@ void ThreadManager::dump_stall_snapshot(const char* tag) const {
         // entry point. That made a thread which ran ~1,400 instructions and then
         // parked in sem_wait look identical to one that never ran at all. Report
         // the HLE it is actually parked in so the two are distinguishable.
+        if (const u32 wm = th->waiting_mutex.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> lock(m_sync_mutex);
+            auto it = m_mutex_owners.find(wm);
+            if (it == m_mutex_owners.end()) {
+                std::fprintf(stderr, "  [Thread %u] waiting for mutex %u (no recorded owner)\n", th->id, wm);
+            } else {
+                std::fprintf(stderr, "  [Thread %u] waiting for mutex %u held by T%u (depth %u, locked at caller 0x%llx)\n",
+                             th->id, wm, it->second.tid, it->second.depth, (unsigned long long)it->second.rip);
+            }
+        }
         const bool blocked_in_hle = th->in_hle.load(std::memory_order_relaxed);
         if (blocked_in_hle && !live) {
             std::fprintf(stderr,
@@ -734,11 +744,21 @@ void ThreadManager::dump_stall_snapshot(const char* tag) const {
     std::fprintf(stderr, "========================================\n");
 }
 
-u32 ThreadManager::mutex_create(std::string_view) {
+u32 ThreadManager::mutex_create(std::string_view, bool recursive) {
     std::lock_guard<std::mutex> lock(m_sync_mutex);
     const u32 id = m_next_mutex_id++;
     m_mutexes[id] = std::make_shared<std::recursive_mutex>();
+    if (!recursive) m_mutex_kinds.insert(id);
     return id;
+}
+
+void ThreadManager::note_mutex_acquired(u32 mutex_id) {
+    GuestThread* th = current_thread();
+    std::lock_guard<std::mutex> lock(m_sync_mutex);
+    MutexOwner& o = m_mutex_owners[mutex_id];
+    o.host = std::this_thread::get_id();
+    o.tid = th ? th->id : current_hle_thread_id();
+    if (o.depth++ == 0) o.rip = th ? th->hle_caller_rip.load(std::memory_order_relaxed) : 0;
 }
 
 bool ThreadManager::mutex_exists(u32 mutex_id) {
@@ -746,59 +766,115 @@ bool ThreadManager::mutex_exists(u32 mutex_id) {
     return m_mutexes.find(mutex_id) != m_mutexes.end();
 }
 
-bool ThreadManager::mutex_lock(u32 mutex_id) {
+static ScePthreadId self_tid(GuestThread* th) {
+    return th ? th->id : current_hle_thread_id();
+}
+
+// First few EDEADLK/EPERM answers, which only the non-recursive and
+// owner-checked paths produce; they show a game leaning on those semantics.
+static void log_mutex_refusal(const char* what, u32 mutex_id, ScePthreadId self, ScePthreadId owner,
+                              GuestThread* th) {
+    static std::atomic<int> s_logged{0};
+    if (s_logged.fetch_add(1, std::memory_order_relaxed) >= 64) return;
+    std::fprintf(stderr, "[MUTEX] %s: mutex %u T%u (owner T%u) caller=0x%llx\n", what, mutex_id, self, owner,
+                 th ? (unsigned long long)th->hle_caller_rip.load(std::memory_order_relaxed) : 0ULL);
+}
+
+int ThreadManager::mutex_lock_errno(u32 mutex_id) {
     std::shared_ptr<std::recursive_mutex> mtx;
+    GuestThread* cur_th = current_thread();
     {
         std::lock_guard<std::mutex> lock(m_sync_mutex);
         auto it = m_mutexes.find(mutex_id);
-        if (it == m_mutexes.end()) return false;
+        if (it == m_mutexes.end()) return kMutexEinval;
         mtx = it->second;
+        // Error-check, normal and adaptive mutexes are not recursive: FreeBSD
+        // libthr answers a re-lock by the owner with EDEADLK and leaves the
+        // count alone. inFAMOUS relies on it (lock; if (!depth) unlock); a
+        // recursive re-lock leaked one level per frame and starved its
+        // MovieDecoder thread forever.
+        if (m_mutex_kinds.contains(mutex_id)) {
+            auto ow = m_mutex_owners.find(mutex_id);
+            if (ow != m_mutex_owners.end() && ow->second.host == std::this_thread::get_id()) {
+                log_mutex_refusal("lock EDEADLK", mutex_id, self_tid(cur_th), ow->second.tid, cur_th);
+                return kMutexEdeadlk;
+            }
+        }
     }
-    GuestThread* cur_th = current_thread();
-    if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
+    if (cur_th) {
+        cur_th->state.store(ThreadState::WaitingSync);
+        cur_th->waiting_mutex.store(mutex_id, std::memory_order_relaxed);
+    }
+    bool ok = true;
     try {
         mtx->lock();
     } catch (...) {
-        if (cur_th) cur_th->state.store(ThreadState::Running);
-        return false;
+        ok = false;
     }
-    if (cur_th) cur_th->state.store(ThreadState::Running);
-    return true;
+    if (cur_th) {
+        cur_th->waiting_mutex.store(0, std::memory_order_relaxed);
+        cur_th->state.store(ThreadState::Running);
+    }
+    if (!ok) return kMutexEinval;
+    note_mutex_acquired(mutex_id);
+    return 0;
 }
 
-bool ThreadManager::mutex_trylock(u32 mutex_id) {
+int ThreadManager::mutex_trylock_errno(u32 mutex_id) {
     std::shared_ptr<std::recursive_mutex> mtx;
     {
         std::lock_guard<std::mutex> lock(m_sync_mutex);
         auto it = m_mutexes.find(mutex_id);
-        if (it == m_mutexes.end()) return false;
+        if (it == m_mutexes.end()) return kMutexEinval;
         mtx = it->second;
+        if (m_mutex_kinds.contains(mutex_id)) {
+            auto ow = m_mutex_owners.find(mutex_id);
+            if (ow != m_mutex_owners.end() && ow->second.host == std::this_thread::get_id()) return kMutexEbusy;
+        }
     }
     try {
-        return mtx->try_lock();
+        if (!mtx->try_lock()) return kMutexEbusy;
     } catch (...) {
-        return false;
+        return kMutexEinval;
     }
+    note_mutex_acquired(mutex_id);
+    return 0;
 }
 
-bool ThreadManager::mutex_unlock(u32 mutex_id) {
+int ThreadManager::mutex_unlock_errno(u32 mutex_id) {
     std::shared_ptr<std::recursive_mutex> mtx;
+    const ScePthreadId self = self_tid(current_thread());
     {
         std::lock_guard<std::mutex> lock(m_sync_mutex);
         auto it = m_mutexes.find(mutex_id);
-        if (it == m_mutexes.end()) return false;
+        if (it == m_mutexes.end()) return kMutexEinval;
         mtx = it->second;
+        // Unlocking a mutex this thread does not hold is EPERM in libthr
+        // (and undefined behaviour for the host mutex), so refuse it.
+        auto ow = m_mutex_owners.find(mutex_id);
+        if (ow == m_mutex_owners.end() || ow->second.host != std::this_thread::get_id()) {
+            log_mutex_refusal("unlock EPERM", mutex_id, self, ow == m_mutex_owners.end() ? 0 : ow->second.tid,
+                              current_thread());
+            return kMutexEperm;
+        }
+        if (--ow->second.depth == 0) m_mutex_owners.erase(ow);
     }
     try {
         mtx->unlock();
     } catch (...) {
-        return false;
+        return kMutexEinval;
     }
-    return true;
+    return 0;
 }
+
+bool ThreadManager::mutex_lock(u32 mutex_id) { return mutex_lock_errno(mutex_id) == 0; }
+bool ThreadManager::mutex_trylock(u32 mutex_id) { return mutex_trylock_errno(mutex_id) == 0; }
+bool ThreadManager::mutex_unlock(u32 mutex_id) { return mutex_unlock_errno(mutex_id) == 0; }
 
 bool ThreadManager::mutex_destroy(u32 mutex_id) {
     std::lock_guard<std::mutex> lock(m_sync_mutex);
+    m_mutex_owners.erase(mutex_id);
+    m_mutex_kinds.erase(mutex_id);
     return m_mutexes.erase(mutex_id) > 0;
 }
 
@@ -807,6 +883,36 @@ u32 ThreadManager::cond_create(std::string_view) {
     const u32 id = m_next_cond_id++;
     m_conds[id] = std::make_shared<std::condition_variable_any>();
     return id;
+}
+
+// pthread_cond_wait on a recursive mutex: FreeBSD libthr (the PS4's libc)
+// saves the lock count, releases the mutex completely for the wait and
+// restores the count after. condition_variable_any only unlocks once, so a
+// mutex locked twice stayed held while its owner slept. Drop the extra
+// levels (and the owner record) here; cond_wait_restore puts them back.
+ThreadManager::MutexOwner ThreadManager::cond_wait_release(u32 mutex_id, std::recursive_mutex& mtx) {
+    MutexOwner saved{};
+    {
+        std::lock_guard<std::mutex> lock(m_sync_mutex);
+        auto it = m_mutex_owners.find(mutex_id);
+        if (it == m_mutex_owners.end() || it->second.host != std::this_thread::get_id()) return MutexOwner{};
+        saved = it->second;
+        m_mutex_owners.erase(it);
+    }
+    for (u32 i = 1; i < saved.depth; ++i) mtx.unlock();
+    return saved;
+}
+
+void ThreadManager::cond_wait_restore(u32 mutex_id, std::recursive_mutex& mtx, const MutexOwner& saved) {
+    for (u32 i = 1; i < saved.depth; ++i) mtx.lock();
+    if (saved.depth == 0) {
+        // No recorded hold before the wait (the guest waited without owning
+        // the mutex); the wait still re-acquired it once, so record that.
+        note_mutex_acquired(mutex_id);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_sync_mutex);
+    m_mutex_owners[mutex_id] = saved;
 }
 
 bool ThreadManager::cond_wait(u32 cond_id, u32 mutex_id) {
@@ -822,14 +928,16 @@ bool ThreadManager::cond_wait(u32 cond_id, u32 mutex_id) {
     }
     GuestThread* cur_th = current_thread();
     if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
+    const MutexOwner saved = cond_wait_release(mutex_id, *mtx);
+    bool ok = true;
     try {
         cv->wait(*mtx);
     } catch (...) {
-        if (cur_th) cur_th->state.store(ThreadState::Running);
-        return false;
+        ok = false;
     }
+    cond_wait_restore(mutex_id, *mtx, saved);
     if (cur_th) cur_th->state.store(ThreadState::Running);
-    return true;
+    return ok;
 }
 
 bool ThreadManager::cond_timedwait(u32 cond_id, u32 mutex_id, u64 timeout_usec) {
@@ -846,13 +954,16 @@ bool ThreadManager::cond_timedwait(u32 cond_id, u32 mutex_id, u64 timeout_usec) 
     GuestThread* cur_th = current_thread();
     if (cur_th) cur_th->state.store(ThreadState::WaitingSync);
     std::cv_status status = std::cv_status::timeout;
+    const MutexOwner saved = cond_wait_release(mutex_id, *mtx);
+    bool ok = true;
     try {
         status = cv->wait_for(*mtx, std::chrono::microseconds(timeout_usec));
     } catch (...) {
-        if (cur_th) cur_th->state.store(ThreadState::Running);
-        return false;
+        ok = false;
     }
+    cond_wait_restore(mutex_id, *mtx, saved);
     if (cur_th) cur_th->state.store(ThreadState::Running);
+    if (!ok) return false;
     return status == std::cv_status::no_timeout;
 }
 
