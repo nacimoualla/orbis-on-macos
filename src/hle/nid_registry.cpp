@@ -234,6 +234,7 @@ static i32 s_next_fios_fd = 200;
 // so each op is recorded as done with the error it finished with.
 struct FiosOp {
     i32 error{0};
+    i64 actual{0};  // bytes transferred, for sceFiosOpGetActualCount
 };
 static std::unordered_map<u64, FiosOp> s_fios_ops;
 static u64 s_next_fios_op = 0x10000;
@@ -276,6 +277,71 @@ static i64 fios_open_file_handle(const char* tag, MemoryManager& mem, GuestAddr 
     std::fprintf(stderr, "[FIOS2] %s('%s' -> '%s') -> handle %d (size=%llu) written to 0x%llx\n",
                  tag, path, resolved->c_str(), fd, (unsigned long long)sz, (unsigned long long)pfh_addr);
     return SCE_OK;
+}
+
+// Call guest code at `entry` (SysV: rdi, rsi, rdx, rcx) to completion on the
+// calling thread's executor, nested inside the current HLE call, as exception
+// delivery does. It returns through a HLT sentinel; the caller's context is
+// restored afterwards. False when no executor is active or the code stopped
+// before returning.
+static bool call_guest_sysv(MemoryManager& mem, GuestAddr entry, u64 a0, u64 a1, u64 a2, u64 a3, u64& ret) {
+    CpuExecutor* ex = current_executor();
+    if (ex == nullptr || entry == 0) return false;
+    static const GuestAddr s_sentinel = [&mem] {
+        const GuestAddr p = bump_alloc(16, 16);
+        const u8 hlt = 0xF4;
+        if (p != 0) mem.write_bytes(p, &hlt, 1);
+        return p;
+    }();
+    if (s_sentinel == 0) return false;
+    const CpuContext saved = ex->context();
+    CpuContext& c = ex->context();
+    const GuestAddr sp = ((saved.rsp - 512) & ~GuestAddr{0xF}) - 8;  // below the red zone
+    mem.write_value(sp, s_sentinel);
+    c.rsp = sp;
+    c.rip = entry;
+    c.rdi = a0;
+    c.rsi = a1;
+    c.rdx = a2;
+    c.rcx = a3;
+    bool returned = false;
+    for (int i = 0; i < 100000; ++i) {
+        const RunResult rr = ex->run(200000);
+        if (c.rip == s_sentinel || c.rip == s_sentinel + 1) {
+            returned = true;
+            break;
+        }
+        if (rr.status != StepResult::Ok && rr.status != StepResult::Syscall) {
+            std::fprintf(stderr, "[HLE] guest call 0x%llx stopped at RIP=0x%llx (%s)\n",
+                         (unsigned long long)entry, (unsigned long long)c.rip,
+                         step_result_to_string(rr.status).data());
+            break;
+        }
+    }
+    ret = c.rax;
+    ex->context() = saved;
+    return returned;
+}
+
+// Async FIOS2 completion. Every async call takes a SceFiosOpAttr* first:
+//   +0x00 deadline, +0x08 SceFiosOpCallback, +0x10 callback context.
+// The callback is int cb(void* ctx, SceFiosOp op, SceFiosOpEvent event, int err),
+// and SCE_FIOS_OPEVENT_COMPLETE is 1. Games that pass a callback wait for it
+// instead of polling the op (inFAMOUS Second Son's loader queue never drains
+// otherwise), so call it once the work is done.
+static void fios_complete_op(MemoryManager& mem, const char* tag, GuestAddr attr, u64 op, i64 status) {
+    if (attr < 0x1000 || !mem.is_valid_address(attr, 0x18)) return;
+    GuestAddr cb = 0, cb_ctx = 0;
+    mem.read_value(attr + 0x08, cb);
+    mem.read_value(attr + 0x10, cb_ctx);
+    if (cb == 0 || !mem.is_valid_address(cb, 1)) return;
+    constexpr u64 kOpEventComplete = 1;
+    u64 rv = 0;
+    const bool ok = call_guest_sysv(mem, cb, cb_ctx, op, kOpEventComplete,
+                                    static_cast<u64>(static_cast<i64>(static_cast<i32>(status))), rv);
+    std::fprintf(stderr, "[FIOS2] %s op=0x%llx: callback 0x%llx(ctx=0x%llx, COMPLETE, err=%lld) -> %s %d\n",
+                 tag, (unsigned long long)op, (unsigned long long)cb, (unsigned long long)cb_ctx,
+                 (long long)status, ok ? "returned" : "did not return", static_cast<i32>(rv));
 }
 
 static std::mutex g_guest_stdio_mtx;
@@ -1703,44 +1769,9 @@ void NidRegistry::register_default_libraries() {
     // is restored afterwards. False when no executor is active or the code
     // stopped before returning.
     static auto call_guest = [](MemoryManager& mem, GuestAddr entry, u64 a0, u64 a1, u64& ret) -> bool {
-        CpuExecutor* ex = current_executor();
-        if (ex == nullptr || entry == 0) return false;
-        static const GuestAddr s_sentinel = [&mem] {
-            const GuestAddr p = bump_alloc(16, 16);
-            const u8 hlt = 0xF4;
-            if (p != 0) mem.write_bytes(p, &hlt, 1);
-            return p;
-        }();
-        if (s_sentinel == 0) return false;
-        const CpuContext saved = ex->context();
-        CpuContext& c = ex->context();
-        const GuestAddr sp = ((saved.rsp - 512) & ~GuestAddr{0xF}) - 8;  // below the red zone
-        mem.write_value(sp, s_sentinel);
-        c.rsp = sp;
-        c.rip = entry;
-        c.rdi = a0;
-        c.rsi = a1;
         // A PRX start stub tail-calls a non-null third argument instead of
-        // the module's own module_start.
-        c.rdx = 0;
-        c.rcx = 0;
-        bool returned = false;
-        for (int i = 0; i < 100000; ++i) {
-            const RunResult rr = ex->run(200000);
-            if (c.rip == s_sentinel || c.rip == s_sentinel + 1) {
-                returned = true;
-                break;
-            }
-            if (rr.status != StepResult::Ok && rr.status != StepResult::Syscall) {
-                std::fprintf(stderr, "[HLE] guest call 0x%llx stopped at RIP=0x%llx (%s)\n",
-                             (unsigned long long)entry, (unsigned long long)c.rip,
-                             step_result_to_string(rr.status).data());
-                break;
-            }
-        }
-        ret = c.rax;
-        ex->context() = saved;
-        return returned;
+        // the module's own module_start, so rdx and rcx stay 0.
+        return call_guest_sysv(mem, entry, a0, a1, 0, 0, ret);
     };
     register_symbol(0xC33BEA4F852A297FULL, "sceKernelLoadStartModule", "libkernel",
         [](CpuContext& ctx, MemoryManager& mem) {
@@ -3665,6 +3696,14 @@ void NidRegistry::register_default_libraries() {
     };
     register_symbol(0xE19F218ECFDE29A6ULL, "sinf", "libc", sinf_handler);
 
+    // int __isfinitef(float x). NID: 0x43CA6F2629945A2BULL ("Q8pvJimUWis").
+    // Unregistered it returned 0, so every float read as NaN/inf to its
+    // caller (inFAMOUS Second Son calls it on every frame).
+    register_symbol(0x43CA6F2629945A2BULL, "__isfinitef", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            ctx.rax = std::isfinite(ctx.ymm[0].f[0]) ? 1 : 0;
+        });
+
     // _FSin(float x, unsigned int idx)
     // Dinkumware C runtime: idx=0 -> sin(x), idx=1 -> cos(x), idx=2 -> -sin(x), idx=3 -> -cos(x)
     auto fsin_handler = [](CpuContext& ctx, MemoryManager&) {
@@ -5374,6 +5413,32 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = 0;
         });
 
+    // sceLibcMspaceReallocalign(mspace msp, void* ptr, size_t alignment, size_t size)
+    // NID: 0xA7A96B456F3F30B6ULL ("p6lrRW8-MLY"). Argument order checked against
+    // inFAMOUS Second Son's wrapper at 0x2ff6b0. Unregistered, it returned NULL:
+    // the game grew a hash table to address 0, and the memset and bucket stores
+    // overwrote its own code at 0x52c0..0x5340, so the next call into that code
+    // died on a garbage instruction. The new block comes from the mspace arena
+    // like sceLibcMspaceMemalign. Arena blocks carry no size, so when the old
+    // size is unknown `size` bytes are copied (bytes past the old end are
+    // indeterminate after a realloc anyway).
+    register_symbol(0xA7A96B456F3F30B6ULL, "sceLibcMspaceReallocalign", "libSceLibcInternal",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr old_ptr = ctx.rsi;
+            const GuestSize alignment = ctx.rdx > 0 ? ctx.rdx : 16;
+            const GuestSize size = ctx.rcx;
+            const GuestAddr p = mspace_alloc(size, alignment);
+            if (old_ptr != 0 && p != 0) {
+                GuestSize n = bump_size_of(old_ptr);
+                if (n == 0 || n > size) n = size;
+                if (n != 0 && mem.is_valid_address(old_ptr, n) && mem.is_valid_address(p, n)) {
+                    std::memmove(mem.to_host_ptr<u8>(p), mem.to_host_ptr<u8>(old_ptr), n);
+                }
+                heap_free(old_ptr);
+            }
+            ctx.rax = p;
+        });
+
     // memcpy(void* dest, const void* src, size_t n)
     // NID: 0x437541C425E1507BULL ("Q3VBxCXhUHs")
     register_symbol(0x437541C425E1507BULL, "memcpy", "libc",
@@ -5903,17 +5968,29 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = static_cast<u64>(fios_open_file_handle("sceFiosFHOpenSync", mem, ctx.rsi, ctx.rdx));
         });
 
-    // sceFiosFHOpen(int profile, SceFiosFH* pFH, const char* path, const SceFiosOpenParams* pParams) -> SceFiosOp
-    // NID: 0x7ABE93910154BE9DULL. Same arguments as the Sync variant, but it
-    // returns an op id instead of SCE_OK. Without a registration the call fell
-    // through to the unimplemented-stub path and returned 0, which the
-    // caller's async layer treats as "no operation" and polls forever.
+    // sceFiosFHOpen(const SceFiosOpAttr* pAttr, SceFiosFH* pFH, const char* path,
+    //               const SceFiosOpenParams* pParams) -> SceFiosOp
+    // NID: 0x7ABE93910154BE9DULL. Returns an op id instead of SCE_OK. The open
+    // completes inside the call; then the attr's completion callback, if any,
+    // is invoked (see fios_complete_op).
     register_symbol(0x7ABE93910154BE9DULL, "sceFiosFHOpen", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr attr = ctx.rdi;
             const i64 status = fios_open_file_handle("sceFiosFHOpen", mem, ctx.rsi, ctx.rdx);
             const u64 op = s_next_fios_op++;
             s_fios_ops[op] = FiosOp{ .error = static_cast<i32>(status) };
+            fios_complete_op(mem, "sceFiosFHOpen", attr, op, status);
             ctx.rax = op;
+        });
+
+    // SceFiosSize sceFiosFHGetSize(SceFiosFH fh). NID: 0x15D8E8A8540E96DDULL.
+    register_symbol(0x15D8E8A8540E96DDULL, "sceFiosFHGetSize", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager&) {
+            const i32 fd = static_cast<i32>(ctx.rdi);
+            const auto it = s_fios_files.find(fd);
+            const i64 sz = (it == s_fios_files.end()) ? -1 : static_cast<i64>(it->second.size);
+            std::fprintf(stderr, "[FIOS2] sceFiosFHGetSize(fd=%d) -> %lld\n", fd, (long long)sz);
+            ctx.rax = static_cast<u64>(sz);
         });
 
     // int sceFiosOpIsDone(SceFiosOp op). NID: 0x6DF828D8EB66AB3DULL.
@@ -6051,6 +6128,44 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = static_cast<u64>(bytes_read);
         });
 
+    // sceFiosFHPread(const SceFiosOpAttr* pAttr, SceFiosFH fh, void* pBuf,
+    //                SceFiosSize length, SceFiosOffset offset) -> SceFiosOp
+    // NID: 0xAD1F30ABB605459BULL. The read happens inside the call; the op
+    // records the byte count, then the attr's completion callback runs.
+    register_symbol(0xAD1F30ABB605459BULL, "sceFiosFHPread", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr attr = ctx.rdi;
+            const i32 fd = static_cast<i32>(ctx.rsi);
+            const GuestAddr buf_addr = ctx.rdx;
+            const GuestSize size = ctx.rcx;
+            const u64 offset = ctx.r8;
+            i32 error = SCE_OK;
+            i64 bytes_read = 0;
+            auto it = s_fios_files.find(fd);
+            if (it == s_fios_files.end() || !it->second.stream || !it->second.stream->is_open()) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHPread: invalid handle %d\n", fd);
+                error = -1;
+            } else if (size != 0 && (buf_addr == 0 || !mem.is_valid_address(buf_addr, size))) {
+                std::fprintf(stderr, "[FIOS2] sceFiosFHPread: invalid buffer 0x%llx (size=%llu)\n",
+                             (unsigned long long)buf_addr, (unsigned long long)size);
+                error = -1;
+            } else if (size != 0) {
+                auto& stream = *it->second.stream;
+                stream.clear();  // a previous read may have hit EOF
+                stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+                stream.read(reinterpret_cast<char*>(mem.to_host_ptr<u8>(buf_addr)),
+                            static_cast<std::streamsize>(size));
+                bytes_read = static_cast<i64>(stream.gcount());
+            }
+            const u64 op = s_next_fios_op++;
+            s_fios_ops[op] = FiosOp{ .error = error, .actual = bytes_read };
+            std::fprintf(stderr, "[FIOS2] sceFiosFHPread(fd=%d, offset=%llu, size=%llu) -> op 0x%llx, read %lld bytes\n",
+                         fd, (unsigned long long)offset, (unsigned long long)size,
+                         (unsigned long long)op, (long long)bytes_read);
+            fios_complete_op(mem, "sceFiosFHPread", attr, op, error);
+            ctx.rax = op;
+        });
+
     // sceFiosFHReadSync(int profile, int fh, void* buf, size_t size)
     // NID: 0x067D991786637AE4ULL — the real blocking read; consumes the live offset.
     // Arg positions mirror FHPreadSync (fd=rsi, buf=rdx, size=rcx).
@@ -6124,11 +6239,24 @@ void NidRegistry::register_default_libraries() {
     auto fios_fh_close_handler = [](CpuContext& ctx, MemoryManager& /*mem*/) {
         const i32 fd = static_cast<i32>(ctx.rsi);
         s_fios_files.erase(fd);
-        std::fprintf(stderr, "[FIOS2] sceFiosFHClose(fd=%d) -> closed\n", fd);
+        std::fprintf(stderr, "[FIOS2] sceFiosFHCloseSync(fd=%d) -> closed\n", fd);
         ctx.rax = SCE_OK;
     };
-    register_symbol(0xE6C60D04D2BE5B78ULL, "sceFiosFHClose", "libSceFios2", fios_fh_close_handler);
     register_symbol(0x00EBA3486A94FA6BULL, "sceFiosFHCloseSync", "libSceFios2", fios_fh_close_handler);
+    // sceFiosFHClose(const SceFiosOpAttr* pAttr, SceFiosFH fh) -> SceFiosOp.
+    // Async: returns an op id and runs the attr's completion callback.
+    register_symbol(0xE6C60D04D2BE5B78ULL, "sceFiosFHClose", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const GuestAddr attr = ctx.rdi;
+            const i32 fd = static_cast<i32>(ctx.rsi);
+            const i32 error = s_fios_files.erase(fd) != 0 ? SCE_OK : -1;
+            const u64 op = s_next_fios_op++;
+            s_fios_ops[op] = FiosOp{ .error = error };
+            std::fprintf(stderr, "[FIOS2] sceFiosFHClose(fd=%d) -> op 0x%llx (%s)\n",
+                         fd, (unsigned long long)op, error == SCE_OK ? "closed" : "unknown handle");
+            fios_complete_op(mem, "sceFiosFHClose", attr, op, error);
+            ctx.rax = op;
+        });
 
     // sceFiosDirectoryCreateSync(int profile, const char* path)
     // NID: 0x9D6BB36B465D7EA0ULL ("nWuza0ZdfqA")
@@ -6234,9 +6362,15 @@ void NidRegistry::register_default_libraries() {
     //   0xF8546F2A49D48F52 -> sceFiosOpGetActualCount   (returns -1: no ops)
     //   0x186AAE70BF45F982 -> sceFiosDHOpenSync         (returns -1)
     //   0xB8292024EAD850BE -> sceFiosDHOpen             (returns buffer size)
+    // SceFiosSize sceFiosOpGetActualCount(SceFiosOp op): bytes the op
+    // transferred, or -1 for an op this runtime never issued.
     register_symbol(0xF8546F2A49D48F52ULL, "sceFiosOpGetActualCount", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& /*mem*/) {
-            ctx.rax = static_cast<u64>(-1);
+            const auto it = s_fios_ops.find(ctx.rdi);
+            const i64 n = (it == s_fios_ops.end()) ? -1 : it->second.actual;
+            std::fprintf(stderr, "[FIOS2] sceFiosOpGetActualCount(op=0x%llx) -> %lld\n",
+                         (unsigned long long)ctx.rdi, (long long)n);
+            ctx.rax = static_cast<u64>(n);
         });
     register_symbol(0x186AAE70BF45F982ULL, "sceFiosDHOpenSync", "libSceFios2",
         [](CpuContext& ctx, MemoryManager& /*mem*/) {
@@ -8231,15 +8365,108 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = SCE_OK;
         });
 
-    // sceGnmMapComputeQueue(uint32_t* vqueue, uint32_t pipe, uint32_t queue, ...) — tag 29oKvKXzEZo.
-    // NID: 0xDBDA0ABCA5F3119AULL
+    // Compute queues. A game maps a ring of PM4 packets (usually INDIRECT_BUFFER
+    // packets pointing at its compute command buffers), writes packets into it
+    // and rings the doorbell with the new write offset. The doorbell runs the
+    // packets between the read and write offsets on the PM4 translator, like a
+    // graphics submit, so RELEASE_MEM / WRITE_DATA labels the game polls get
+    // written. inFAMOUS Second Son waits on such a label right after its first
+    // sceGnmDingDong (`while (label < target) delay_us(50)` at 0x1695b0).
+    struct ComputeQueue {
+        GuestAddr ring{0};
+        u32 size_dw{0};
+        GuestAddr read_ptr{0};
+        u32 rptr_dw{0};
+    };
+    static std::mutex s_compute_q_mtx;
+    static std::vector<ComputeQueue> s_compute_queues;
+
+    // int sceGnmMapComputeQueue(u32 pipeId, u32 queueId, void* ringBase,
+    //                           u32 ringSizeInDw, void* readPtrAddr) -> vqueue id
+    // NID: 0xDBDA0ABCA5F3119AULL (tag 29oKvKXzEZo). Signature checked against
+    // inFAMOUS Second Son's wrapper at 0x63b830, which stores a non-negative
+    // result as the queue id and treats a negative one as an error.
     register_symbol(0xDBDA0ABCA5F3119AULL, "sceGnmMapComputeQueue", "libSceGnmDriver",
         [](CpuContext& ctx, MemoryManager& mem) {
-            const GuestAddr vqueue_ptr = ctx.rdi;
-            if (vqueue_ptr > 0x1000 && mem.is_valid_address(vqueue_ptr, sizeof(u32))) {
-                mem.write_value(vqueue_ptr, static_cast<u32>(1));
+            // The old stub took rdi as a vqueue out-pointer; keep answering a
+            // caller that really passes one. Pipe ids are 0..6.
+            if (ctx.rdi > 0x1000 && mem.is_valid_address(ctx.rdi, sizeof(u32))) {
+                mem.write_value(ctx.rdi, static_cast<u32>(1));
+                ctx.rax = SCE_OK;
+                return;
             }
-            ctx.rax = SCE_OK;
+            ComputeQueue q;
+            q.ring = ctx.rdx;
+            q.size_dw = static_cast<u32>(ctx.rcx);
+            q.read_ptr = ctx.r8;
+            if (q.read_ptr > 0x1000 && mem.is_valid_address(q.read_ptr, sizeof(u32))) {
+                mem.write_value(q.read_ptr, static_cast<u32>(0));
+            }
+            u32 id = 0;
+            {
+                std::lock_guard<std::mutex> lock(s_compute_q_mtx);
+                s_compute_queues.push_back(q);
+                id = static_cast<u32>(s_compute_queues.size());  // 1-based
+            }
+            std::fprintf(stderr, "[Gnm] sceGnmMapComputeQueue(pipe=%u, queue=%u, ring=0x%llx, size=%u dw, rptr=0x%llx) -> vqueue %u\n",
+                         static_cast<u32>(ctx.rdi), static_cast<u32>(ctx.rsi),
+                         (unsigned long long)q.ring, q.size_dw, (unsigned long long)q.read_ptr, id);
+            ctx.rax = id;
+        });
+
+    // void sceGnmDingDong(u32 vqueueId, u32 nextStartOffsetInDw)
+    // NID: 0x6D7E486D1BC40979ULL ("bX5IbRvECXk")
+    register_symbol(0x6D7E486D1BC40979ULL, "sceGnmDingDong", "libSceGnmDriver",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const u32 id = static_cast<u32>(ctx.rdi);
+            const u32 next_dw = static_cast<u32>(ctx.rsi);
+            ComputeQueue q;
+            {
+                std::lock_guard<std::mutex> lock(s_compute_q_mtx);
+                if (id == 0 || id > s_compute_queues.size()) {
+                    std::fprintf(stderr, "[Gnm] sceGnmDingDong: unknown vqueue %u\n", id);
+                    ctx.rax = 0;
+                    return;
+                }
+                q = s_compute_queues[id - 1];
+            }
+            if (q.size_dw == 0 || next_dw > q.size_dw) {
+                std::fprintf(stderr, "[Gnm] sceGnmDingDong(vqueue=%u): offset %u outside ring of %u dw\n",
+                             id, next_dw, q.size_dw);
+                ctx.rax = 0;
+                return;
+            }
+            // Packets between the read and write offsets; the write offset may
+            // have wrapped past the end of the ring.
+            auto run = [&](u32 from_dw, u32 to_dw) {
+                if (to_dw <= from_dw || !g_pm4_translator) return;
+                const GuestAddr addr = q.ring + GuestAddr{from_dw} * 4;
+                const usize bytes = usize{to_dw - from_dw} * 4;
+                if (!mem.is_valid_address(addr, bytes)) return;
+                g_pm4_translator->set_memory_manager(&mem);
+                const usize pkts = g_pm4_translator->execute_command_buffer(addr, bytes);
+                PM4_LOG("[Gnm] DingDong vqueue %u: ran %zu packets at 0x%llx (%zu bytes)\n",
+                        id, pkts, (unsigned long long)addr, bytes);
+            };
+            if (next_dw >= q.rptr_dw) {
+                run(q.rptr_dw, next_dw);
+            } else {
+                run(q.rptr_dw, q.size_dw);
+                run(0, next_dw);
+            }
+            {
+                std::lock_guard<std::mutex> lock(s_compute_q_mtx);
+                s_compute_queues[id - 1].rptr_dw = next_dw;
+            }
+            if (q.read_ptr > 0x1000 && mem.is_valid_address(q.read_ptr, sizeof(u32))) {
+                mem.write_value(q.read_ptr, next_dw);
+            }
+            static std::atomic<u32> s_logged{0};
+            if (s_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::fprintf(stderr, "[Gnm] sceGnmDingDong(vqueue=%u, next=%u dw)%s\n", id, next_dw,
+                             g_pm4_translator ? "" : " (no PM4 translator: packets not run)");
+            }
+            ctx.rax = 0;
         });
 
     // =========================================================================
