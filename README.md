@@ -15,7 +15,7 @@
 |---|---|---|
 | **Flappy Bird** (Unity, `NPXX51362`) | 🟢 Playable | Real Mono runtime (`mono-ps4.prx`), full game loop at a steady 60 fps. |
 | **Dragon Ball Xenoverse 2** (`CUSA05350`) | 🟡 Menus | Boots, logos, opening movie at 50–60 fps, save-data dialog, precautions and EULA screens. Main menu not reached yet. |
-| **Sonic Mania Plus** (`CUSA07010`) | 🟡 In game, slow | Runs, at about 5–30 fps. |
+| **Sonic Mania Plus** (`CUSA07010`) | 🟢 Playable | Runs, at about 60 fps. |
 
 🟢 playable · 🟡 partly working · 🔴 doesn't boot. This is an early project: expect most other titles not to boot yet. Reports are welcome as [issues](https://github.com/nacimoualla/orbis-on-macos/issues).
 
