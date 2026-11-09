@@ -55,108 +55,128 @@ namespace {
 
 // Compact 8GB PS4 Memory Map for 16GB MacBook Air M4:
 // 0x000000000 - 0x004000000 (0 - 64 MB)    : ELF segments + trampolines
-// 0x004000000 - 0x020000000 (64 - 512 MB)  : Main stack (0x1ffffff00)
+// 0x004000000 - 0x020000000 (64 - 512 MB)  : Modules, mmap arena
 // 0x020000000 - 0x040000000 (512 MB - 1 GB): Guest libc heap (malloc/memalign)
-// 0x040000000 - 0x1C0000000 (1 GB - 7 GB)  : Direct Memory (ALLOC_GFX / ONION / GARLIC)
-// 0x1C0000000 - 0x200000000 (7 GB - 8 GB)  : Worker thread stacks (downward from 0x1d0000000)
-std::atomic<GuestAddr> g_guest_heap_current{0x20000000ULL};   // 512 MB mark
+// 0x040000000 - 0x17C000000 (1 GB - ~6 GB) : Direct memory (kDirectMemorySize, mapped 1:1)
+// 0x180000000 - 0x1C0000000 (6 GB - 7 GB)  : mspace heap (sceLibcMspaceMemalign/Reallocalign)
+// 0x1C0000000 - 0x1D0000000                : Worker thread stacks (downward from 0x1d0000000)
+// 0x1FFF00000 - 0x200000000                : Main thread stack + TLS
 std::atomic<GuestAddr> g_direct_phys_current{0x40000000ULL};  // 1 GB mark
 
-// The libc heap: a bump pointer plus size-keyed free lists. There are no block
-// headers (realloc and free look sizes up here instead), and freed blocks are
-// reused best-fit: with free() a no-op a long session walked the bump pointer
-// into the 1 GB ceiling and every later malloc returned NULL.
+// What sceKernelGetDirectMemorySize reports: the 5056 MB a retail PS4 gives a
+// game. inFAMOUS Second Son allocates "total - used - 64 KB" as its last pool;
+// with the stub's 0 that came out negative and wrapped the allocator.
+constexpr GuestSize kDirectMemorySize = 0x13C000000ULL;
+constexpr GuestAddr kDirectMemoryBase = 0x40000000ULL;
+constexpr GuestAddr kDirectMemoryEnd = kDirectMemoryBase + kDirectMemorySize;  // 0x17C000000
+
+// A guest heap: a bump pointer under a ceiling plus size-keyed free lists.
+// There are no block headers (realloc and free look sizes up here instead),
+// and freed blocks are reused best-fit: with free() a no-op a long session
+// walked the bump pointer into the ceiling and every later malloc returned
+// NULL. One mutex guards everything; guest threads allocate concurrently.
 //
-// All three are leaked on purpose: guest threads keep allocating while the host
-// tears down at exit, and a destroyed mutex throws "mutex lock failed: Invalid
-// argument" out of bump_alloc (Flappy's Unity workers do this through the
+// Instances are leaked on purpose: guest threads keep allocating while the
+// host tears down at exit, and a destroyed mutex throws "mutex lock failed:
+// Invalid argument" out of alloc (Flappy's Unity workers do this through the
 // sceLibcMspace* handlers).
-static std::mutex& s_heap_sizes_mtx = *new std::mutex;                                   // guards everything below
-static auto& s_heap_sizes = *new std::unordered_map<GuestAddr, GuestSize>;              // live block -> size
-static auto& s_heap_free = *new std::multimap<GuestSize, GuestAddr>;                    // size -> free block
+struct GuestHeap {
+    const char* name;
+    GuestAddr cur;
+    GuestAddr end;
+    std::mutex mtx;
+    std::unordered_map<GuestAddr, GuestSize> sizes;  // live block -> size
+    std::multimap<GuestSize, GuestAddr> free_blocks; // size -> free block
 
-// Hard ceiling for the CPU heap. The memory map reserves 0x20000000-0x40000000
-// for the guest libc heap and 0x40000000-0x1C0000000 for direct (Garlic/ONION)
-// memory; an unbounded bump allocator walks straight through that boundary and
-// silently overwrites GPU buffers with heap contents. See mspace_alloc below.
-static constexpr GuestAddr kCpuHeapEnd = 0x40000000ULL;
+    GuestHeap(const char* n, GuestAddr base, GuestAddr limit) : name(n), cur(base), end(limit) {}
 
-// Round to 16 bytes up to 4 KB, then to eighths of the size's power of two,
-// so a freed block fits later requests of about the same size.
-inline GuestSize heap_round(GuestSize size) {
-    if (size <= 4096) return (std::max<GuestSize>(size, 1) + 15) & ~GuestSize{15};
-    const unsigned shift = 63u - static_cast<unsigned>(__builtin_clzll(size)) - 3u;
-    const GuestSize gran = GuestSize{1} << shift;
-    return (size + gran - 1) & ~(gran - 1);
-}
+    // Round to 16 bytes up to 4 KB, then to eighths of the size's power of
+    // two, so a freed block fits later requests of about the same size.
+    static GuestSize round(GuestSize size) {
+        if (size <= 4096) return (std::max<GuestSize>(size, 1) + 15) & ~GuestSize{15};
+        const unsigned shift = 63u - static_cast<unsigned>(__builtin_clzll(size)) - 3u;
+        const GuestSize gran = GuestSize{1} << shift;
+        return (size + gran - 1) & ~(gran - 1);
+    }
 
-inline GuestAddr bump_alloc(GuestSize size, GuestSize align = 16) {
-    if (align < 16) align = 16;
-    const GuestSize rs = heap_round(size);
-    std::lock_guard<std::mutex> lock(s_heap_sizes_mtx);
-    // Reuse a free block of this size class (up to 25% larger) if one is
-    // suitably aligned.
-    int tries = 0;
-    for (auto it = s_heap_free.lower_bound(rs); it != s_heap_free.end() && it->first <= rs + rs / 4 && tries < 64;
-         ++it, ++tries) {
-        if ((it->second & (align - 1)) != 0) continue;
-        const GuestAddr p = it->second;
-        s_heap_sizes[p] = it->first;
-        s_heap_free.erase(it);
+    GuestAddr alloc(GuestSize size, GuestSize align) {
+        if (align < 16) align = 16;
+        if (size > end) return 0;
+        const GuestSize rs = round(size);
+        std::lock_guard<std::mutex> lock(mtx);
+        // Reuse a free block of this size class (up to 25% larger) if one is
+        // suitably aligned.
+        int tries = 0;
+        for (auto it = free_blocks.lower_bound(rs); it != free_blocks.end() && it->first <= rs + rs / 4 && tries < 64;
+             ++it, ++tries) {
+            if ((it->second & (align - 1)) != 0) continue;
+            const GuestAddr p = it->second;
+            sizes[p] = it->first;
+            free_blocks.erase(it);
+            return p;
+        }
+        const GuestAddr p = (cur + align - 1) & ~(align - 1);
+        if (p > end || rs > end - p) {
+            std::fprintf(stderr, "[heap] %s heap exhausted: need %llu at 0x%llx, ceiling 0x%llx\n", name,
+                         (unsigned long long)size, (unsigned long long)p, (unsigned long long)end);
+            return 0;
+        }
+        cur = p + rs;
+        sizes[p] = rs;
         return p;
     }
-    const GuestAddr cur = g_guest_heap_current.load();
-    const GuestAddr p = (cur + align - 1) & ~(align - 1);
-    if (p + rs > kCpuHeapEnd) {
-        std::fprintf(stderr, "[heap] CPU heap exhausted: need %llu at 0x%llx, ceiling 0x%llx\n",
-                     (unsigned long long)size, (unsigned long long)p,
-                     (unsigned long long)kCpuHeapEnd);
-        return 0;
+
+    // 0 if this heap did not hand out `ptr` (or it was freed).
+    GuestSize size_of(GuestAddr ptr) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = sizes.find(ptr);
+        return it == sizes.end() ? 0 : it->second;
     }
-    g_guest_heap_current.store(p + rs);
-    s_heap_sizes[p] = rs;
-    return p;
-}
 
-inline GuestSize bump_size_of(GuestAddr ptr) {
-    std::lock_guard<std::mutex> lock(s_heap_sizes_mtx);
-    auto it = s_heap_sizes.find(ptr);
-    return it == s_heap_sizes.end() ? 0 : it->second;
-}
+    // Return a block to the free lists; false if it is not a live block here.
+    bool release(GuestAddr ptr) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = sizes.find(ptr);
+        if (it == sizes.end()) return false;
+        free_blocks.emplace(it->second, ptr);
+        sizes.erase(it);
+        return true;
+    }
+};
 
-// Return a block to the free lists. Pointers this heap did not hand out
-// (mspace, mmap, module data) and double frees are ignored.
-inline void heap_free(GuestAddr ptr) {
-    if (ptr == 0) return;
-    std::lock_guard<std::mutex> lock(s_heap_sizes_mtx);
-    auto it = s_heap_sizes.find(ptr);
-    if (it == s_heap_sizes.end()) return;
-    s_heap_free.emplace(it->second, ptr);
-    s_heap_sizes.erase(it);
-}
+// The libc heap (malloc, memalign, sceLibcMspaceMalloc/Calloc). The memory map
+// reserves 0x20000000-0x40000000 for it and 0x40000000 up for direct memory;
+// an unbounded bump allocator walks straight through that boundary and
+// silently overwrites GPU buffers with heap contents.
+static GuestHeap& s_cpu_heap = *new GuestHeap("CPU", 0x20000000ULL, 0x40000000ULL);
 
 // Unity's PS4 resource allocator (sceLibcMspaceMemalign) asks for hundreds of
 // megabytes of Garlic/ONION memory and treats the result as a GPU buffer: it
-// copies shader binaries there and parses their headers. Served from the shared
-// CPU bump pointer it walked from 0x20100000 to 0x5A7A8C20 -- straight through
-// 0x40000000 -- so ~1.6 GB of heap landed on top of the direct-memory window,
-// first block inside it at 0x40770000. Unity then parsed a header full of heap
-// pointers ("shaderBinarySize %u is not equal to Program size %ld", sizes that
-// were really 0x5E020D58 and a sum of 16-byte entry counts read from pointers),
-// fell into a table walk with a 1.5-billion trip count and never presented a
-// frame. Give these allocations their own arena above the direct-memory region
-// so CPU heap and GPU memory can never alias.
-// Direct memory runs 0x40000000..0x15B800000 in a 60 s run (one 4.5 GB
-// allocation plus a 128 KB one), so the arena starts just above it and has the
-// 0x160000000..0x200000000 remainder of the 8 GB space to itself.
-static std::atomic<GuestAddr> g_mspace_current{0x160000000ULL};
+// copies shader binaries there and parses their headers. Served from the CPU
+// heap it walked through 0x40000000 into the direct-memory window, and Unity
+// parsed a header full of heap pointers and never presented a frame. So these
+// blocks have their own heap above direct memory and below the thread stacks.
+// It used to be a bare bump pointer starting inside direct memory
+// (0x160000000), updated with a separate load and store (two threads could get
+// the same block) and never reusing freed blocks: inFAMOUS Second Son makes
+// ~80k aligned allocations and corrupted its own objects and thread stacks.
+static GuestHeap& s_mspace_heap = *new GuestHeap("mspace", 0x180000000ULL, 0x1C0000000ULL);
 
-inline GuestAddr mspace_alloc(GuestSize size, GuestSize align) {
-    if (size == 0) size = 1;
-    if (align == 0) align = 16;
-    const GuestAddr p = (g_mspace_current.load() + align - 1) & ~(align - 1);
-    g_mspace_current.store(p + size);
-    return p;
+inline GuestAddr bump_alloc(GuestSize size, GuestSize align = 16) { return s_cpu_heap.alloc(size, align); }
+
+inline GuestAddr mspace_alloc(GuestSize size, GuestSize align) { return s_mspace_heap.alloc(size, align); }
+
+// Size of a live block from either heap, 0 if unknown.
+inline GuestSize bump_size_of(GuestAddr ptr) {
+    if (const GuestSize n = s_cpu_heap.size_of(ptr)) return n;
+    return s_mspace_heap.size_of(ptr);
+}
+
+// Return a block to whichever heap handed it out. Pointers neither heap gave
+// out (mmap, module data) and double frees are ignored.
+inline void heap_free(GuestAddr ptr) {
+    if (ptr == 0) return;
+    if (!s_cpu_heap.release(ptr)) s_mspace_heap.release(ptr);
 }
 
 // Anonymous/file mmap arena for loaded modules (mono-ps4.prx's GC maps its heap
@@ -577,16 +597,14 @@ static constexpr GuestSize kMonoSlotSize = 256;
 // so untouched pages stay unbacked. Returns 0 when exhausted.
 static GuestAddr mono_arena_alloc(MemoryManager& mem) {
     if (s_mono_arena.base == 0) {
-        std::lock_guard<std::mutex> heap_lock(s_heap_sizes_mtx);
-        GuestAddr cur = (g_guest_heap_current.load() + 15) & ~15ULL;
-        if (!mem.is_valid_address(cur, kMonoArenaSize)) {
+        const GuestAddr cur = bump_alloc(kMonoArenaSize, 16);
+        if (cur == 0 || !mem.is_valid_address(cur, kMonoArenaSize)) {
             std::fprintf(stderr, "[Mono] arena carve failed: heap exhausted\n");
             return 0;
         }
         s_mono_arena.base = cur;
         s_mono_arena.next = cur;
         s_mono_arena.end = cur + kMonoArenaSize;
-        g_guest_heap_current.store(cur + kMonoArenaSize);
     }
     if (s_mono_arena.next + kMonoSlotSize > s_mono_arena.end) {
         std::fprintf(stderr, "\n[FATAL] Mono arena exhausted! Hit ceiling of 4096 slots (1 MB). "
@@ -1986,17 +2004,24 @@ void NidRegistry::register_default_libraries() {
         const GuestSize align  = ctx.rcx > 0 ? ctx.rcx : GUEST_PAGE_SIZE;
         const GuestAddr out_ptr = ctx.r9;
 
-        GuestAddr cur = g_direct_phys_current.load();
-        cur = (cur + align - 1) & ~(align - 1);
-
-        // Keep all direct memory allocations strictly below the 7GB thread-stack boundary (0x1C0000000)
-        constexpr GuestAddr kDirectMemCeiling = 0x1C0000000ULL;
-        GuestSize effective_advance = requested_len;
-        if (cur + effective_advance > kDirectMemCeiling) {
-            // Reserve virtual sub-range without overflowing into the 7GB..8GB stack region
-            effective_advance = (cur < kDirectMemCeiling) ? std::min<GuestSize>(requested_len, 0x40000000ULL) : 0;
+        // Direct memory is mapped 1:1 into [kDirectMemoryBase, kDirectMemoryEnd).
+        // A request that does not fit fails as on the console (EAGAIN). The old
+        // check computed cur + len, which wrapped for a huge (negative) length
+        // and moved the bump pointer below the region.
+        GuestAddr cur = 0;
+        {
+            static std::mutex s_direct_mtx;
+            std::lock_guard<std::mutex> lock(s_direct_mtx);
+            cur = (g_direct_phys_current.load() + align - 1) & ~(align - 1);
+            if (requested_len == 0 || cur > kDirectMemoryEnd || requested_len > kDirectMemoryEnd - cur) {
+                std::fprintf(stderr, "[DirectMem] cannot allocate 0x%llx bytes at 0x%llx (end 0x%llx)\n",
+                             (unsigned long long)requested_len, (unsigned long long)cur,
+                             (unsigned long long)kDirectMemoryEnd);
+                ctx.rax = 0x80020023ULL;  // SCE_KERNEL_ERROR_EAGAIN
+                return;
+            }
+            g_direct_phys_current.store(cur + requested_len);
         }
-        g_direct_phys_current.store(cur + effective_advance);
 
         std::fprintf(stderr, "[DirectMem] Allocated 0x%llx bytes at phys 0x%llx (next=0x%llx)\n",
                      (unsigned long long)requested_len,
@@ -2010,6 +2035,11 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = static_cast<u64>(-14); // -EFAULT
         }
     };
+    // sceKernelGetDirectMemorySize() -> total direct memory for the game. It was
+    // a sync stub returning 0.
+    // NID: 0xA4EF7A4F0CCE9B91ULL
+    register_symbol(0xA4EF7A4F0CCE9B91ULL, "sceKernelGetDirectMemorySize", "libkernel",
+        [](CpuContext& ctx, MemoryManager&) { ctx.rax = kDirectMemorySize; });
     register_symbol(0x51EAECE91C9A12B0ULL, "sceKernelAllocateDirectMemory", "libkernel", alloc_direct_handler);
     register_symbol(0xAD35F0EB9C662C80ULL, "sceKernelAllocateDirectMemory", "libkernel", alloc_direct_handler);
 
@@ -5648,30 +5678,84 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = static_cast<u64>(static_cast<i64>(diff));
         });
 
-    // __cxa_guard_acquire(int64_t* guard)
+    // Thread-safe function-local statics (Itanium C++ ABI guards).
+    //
+    // Byte 0 of the guard is the "initialized" flag that compiled code tests
+    // inline before calling __cxa_guard_acquire, so it may only be set once the
+    // object is constructed (by release). Setting it in acquire let a second
+    // thread skip the construction and use a half-built object while the first
+    // was still running the constructor. A thread that finds the guard being
+    // initialized by another thread waits for release or abort.
+    struct GuardTable {
+        std::mutex m;
+        std::condition_variable cv;
+        std::unordered_map<GuestAddr, std::thread::id> in_progress;
+    };
+    static GuardTable s_guards;
+
+    // __cxa_guard_acquire(int64_t* guard) -> 1 if the caller must construct
     // NID: 0xDC63E98D0740313CULL ("3GPpjQdAMTw")
     register_symbol(0xDC63E98D0740313CULL, "__cxa_guard_acquire", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr guard_ptr = ctx.rdi;
-            u8 val = 0;
-            if (guard_ptr != 0 && mem.read_value(guard_ptr, val)) {
-                if (val == 0) {
-                    mem.write_value(guard_ptr, static_cast<u8>(1));
-                    ctx.rax = 1; // Needs initialization
+            u8 done = 0;
+            if (guard_ptr == 0 || !mem.read_value(guard_ptr, done)) {
+                ctx.rax = 0;
+                return;
+            }
+            const auto me = std::this_thread::get_id();
+            std::unique_lock<std::mutex> lock(s_guards.m);
+            for (;;) {
+                mem.read_value(guard_ptr, done);
+                if (done != 0) {
+                    ctx.rax = 0;  // constructed (possibly while we waited)
                     return;
                 }
+                auto it = s_guards.in_progress.find(guard_ptr);
+                if (it == s_guards.in_progress.end()) {
+                    s_guards.in_progress.emplace(guard_ptr, me);
+                    ctx.rax = 1;
+                    return;
+                }
+                if (it->second == me) {
+                    // Recursive initialization of the same static: undefined
+                    // behaviour in C++. Don't deadlock; let the caller see it
+                    // as constructed.
+                    std::fprintf(stderr, "[cxa_guard] recursive acquire of guard 0x%llx\n",
+                                 static_cast<unsigned long long>(guard_ptr));
+                    ctx.rax = 0;
+                    return;
+                }
+                s_guards.cv.wait_for(lock, std::chrono::milliseconds(10));
             }
-            ctx.rax = 0; // Already initialized
         });
 
-    // __cxa_guard_release(int64_t* guard)
+    // __cxa_guard_release(int64_t* guard): construction finished.
     // NID: 0xF6B01E00D4F6B721ULL ("9rAeANT2tyE")
     register_symbol(0xF6B01E00D4F6B721ULL, "__cxa_guard_release", "libc",
         [](CpuContext& ctx, MemoryManager& mem) {
             const GuestAddr guard_ptr = ctx.rdi;
-            if (guard_ptr != 0 && mem.is_valid_address(guard_ptr, 1)) {
-                mem.write_value(guard_ptr, static_cast<u8>(1));
+            {
+                std::lock_guard<std::mutex> lock(s_guards.m);
+                if (guard_ptr != 0 && mem.is_valid_address(guard_ptr, 1)) {
+                    mem.write_value(guard_ptr, static_cast<u8>(1));
+                }
+                s_guards.in_progress.erase(guard_ptr);
             }
+            s_guards.cv.notify_all();
+            ctx.rax = 0;
+        });
+
+    // __cxa_guard_abort(int64_t* guard): the constructor threw; another thread
+    // may try again.
+    // NID: 0xD9E99A6A5B96CD4CULL ("2emaaluWzUw")
+    register_symbol(0xD9E99A6A5B96CD4CULL, "__cxa_guard_abort", "libc",
+        [](CpuContext& ctx, MemoryManager&) {
+            {
+                std::lock_guard<std::mutex> lock(s_guards.m);
+                s_guards.in_progress.erase(ctx.rdi);
+            }
+            s_guards.cv.notify_all();
             ctx.rax = 0;
         });
 
@@ -7950,7 +8034,6 @@ void NidRegistry::register_default_libraries() {
     };
     static constexpr SyncStub kSyncStubs[] = {
         {0x2AE3AE0F9F21AA7EULL, "malloc_stats_fast", "libSceLibcInternal"},
-        {0xA4EF7A4F0CCE9B91ULL, "sceKernelGetDirectMemorySize", "libkernel"},
         // sceKernelGetProcessTimeCounterFrequency has a real handler: as a
         // sync stub it returned 0, and Unity divides by it to get seconds.
         {0xFE99E3DFFEDAE900ULL, "sceKernelSyncStub", "libkernel"}, // FMOD / pad init helper
