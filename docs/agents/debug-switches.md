@@ -88,7 +88,8 @@ Do not watch pages the guest will unmap or change permissions on during the run.
 | `PS4_WATCH_ADDR=addr` | Interpreter/MemoryManager-path store ring with old/new values, caller RIP and thread context; direct JIT stores bypass it. |
 | `PS4_WATCH_SIZE=N` | Byte length for `PS4_WATCH_ADDR`; default 8. |
 | `PS4_WATCH_FILTER=addr` | Filter the watch ring printed at normal exit to this address; defaults to the watched address. |
-| `PS4_DUMP_CODE=addr:len` | Dump loaded guest bytes to `dump_code_<addr>.bin` at normal exit; both fields hexadecimal, length strictly below 4 MiB. |
+| `PS4_DUMP_CODE=addr:len[,addr:len...]` | Dump loaded guest bytes to `dump_code_<addr>.bin` at normal exit, one file per comma-separated range; both fields hexadecimal, length below 32 MiB. |
+| `PS4_TSO=1` | Give guest memory x86 (TSO) ordering across threads: the JIT emits `dmb ishld` after and `dmb ishst` before each non-stack guest load/store, and the interpreter fences its accesses. Slower; use it to rule memory ordering in or out when a multithreaded hang or corruption varies between runs. |
 | `PS4_LOG_PM4=1` | Log PM4 packets, draw/shader state and GNM calls. High output volume can stall execution. |
 | `PS4_LOG_HLE=1` | Log HLE calls, rate-limiting hot non-GNM calls. |
 | `PS4_LOG_HLE=all` | Request unthrottled HLE logging. This build's outer enable check accepts only literal `1`, so `all` alone does not enable the outer call logger. |

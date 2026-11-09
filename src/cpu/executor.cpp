@@ -1674,6 +1674,18 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
+        // VLDDQU (VEX.F2.0F F0 /r): unaligned 128/256-bit load, memory source only.
+        if (vex_map == 1 && vex_op == 0xF0 && vex_pp == 3) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
+            if (!m.valid || m.is_reg) return StepResult::IllegalInstruction;
+            const u8 dest = m.reg_id & 15;
+            CpuContext::YmmReg v{};
+            if (!m_memory.read_bytes(m.mem_addr, &v, vex_l ? 32 : 16)) return StepResult::MemoryFault;
+            m_context.ymm[dest] = v;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+
         // VMOVDQA / VMOVDQU (0x6F load, 0x7F store)
         if (vex_op == 0x6F) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
@@ -5326,7 +5338,15 @@ StepResult CpuExecutor::step() {
             m_context.rip = start_rip + cursor + m.bytes_consumed;
             return StepResult::Ok;
         }
-                // 0x0F 0x6F (MOVDQA/MOVDQU load), 0x0F 0x7F (MOVDQA/MOVDQU store)
+        // F2 0F F0: LDDQU xmm, m128 (unaligned load; bits 255:128 untouched).
+        if (op1 == 0xF0 && rep_prefix == 0xF2) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid || m.is_reg) return StepResult::IllegalInstruction;
+            if (!m_memory.read_bytes(m.mem_addr, &m_context.ymm[m.reg_id & 15], 16)) return StepResult::MemoryFault;
+            m_context.rip = start_rip + cursor + m.bytes_consumed;
+            return StepResult::Ok;
+        }
+        // 0x0F 0x6F (MOVDQA/MOVDQU load), 0x0F 0x7F (MOVDQA/MOVDQU store)
         if (op1 == 0x6F) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
             if (!m.valid) return StepResult::IllegalInstruction;

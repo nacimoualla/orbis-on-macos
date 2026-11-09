@@ -841,6 +841,7 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
         const usize count = static_cast<usize>(table_size / sizeof(Elf64_Rela));
         usize applied = 0, unread = 0;
         GuestAddr first_failure = 0;
+        std::map<u32, usize> unhandled_types;  // relocation type -> count
         auto read_failed = [&](GuestAddr address) {
             ++unread;
             if (first_failure == 0) first_failure = address;
@@ -863,6 +864,9 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
             const u32 type = ELF64_R_TYPE(rela.r_info);
             const u32 sym_idx = ELF64_R_SYM(rela.r_info);
             const GuestAddr patch_location = base_load_addr + rela.r_offset;
+            if (type != R_X86_64_RELATIVE && type != R_X86_64_64 && type != R_X86_64_JUMP_SLOT &&
+                type != R_X86_64_GLOB_DAT)
+                ++unhandled_types[type];
 
             if (type == R_X86_64_RELATIVE) {
                 const GuestAddr value = base_load_addr + rela.r_addend;
@@ -953,6 +957,8 @@ bool DynamicLinker::resolve_relocations(std::span<const u8> file_data, const Elf
             std::fprintf(stderr, "[module] %s: %zu relocs, %zu read, %zu unread\n",
                          what, count, applied, unread);
         }
+        for (const auto& [t, n] : unhandled_types)
+            std::fprintf(stderr, "[module] %s: %zu relocations of unhandled type %u left unapplied\n", what, n, t);
         if (unread != 0) {
             char detail[256];
             std::snprintf(detail, sizeof(detail),

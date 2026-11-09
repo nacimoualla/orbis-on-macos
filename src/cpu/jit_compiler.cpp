@@ -1874,8 +1874,26 @@ private:
     }
   }
 
+  // PS4_TSO=1: x86 ordering for guest memory shared between threads. A load
+  // is followed by DMB ISHLD (orders it before later loads and stores), and a
+  // store is preceded by DMB ISHST (orders earlier stores before it).
+  static bool tso() {
+    static const bool on = std::getenv("PS4_TSO") != nullptr;
+    return on;
+  }
+  void tso_after_load() {
+    if (tso()) m_e.emit(0xD50339BFu); // dmb ishld
+  }
+  void tso_before_store() {
+    if (tso()) m_e.emit(0xD5033ABFu); // dmb ishst
+  }
+
   // Guest memory at x9 (already bounds-checked)
   void load_mem(u8 rd, u8 width, bool sign_extend = false) {
+    load_mem_raw(rd, width, sign_extend);
+    tso_after_load();
+  }
+  void load_mem_raw(u8 rd, u8 width, bool sign_extend) {
     switch (width) {
     case 64:
       m_e.ldr_x_idx(rd, R_GBASE, R_EA);
@@ -1902,6 +1920,7 @@ private:
   }
 
   void store_mem(u8 rs, u8 width) {
+    tso_before_store();
     switch (width) {
     case 64:
       m_e.str_x_idx(rs, R_GBASE, R_EA);
@@ -1992,13 +2011,21 @@ private:
     m_e.add_imm(10, R_EA, off);
     return 10;
   }
-  void mld_q(u8 vt, u32 off = 0) { m_e.emit(a64::ldr_q_x(vt, R_GBASE, ea_plus(off))); }
-  void mst_q(u8 vt, u32 off = 0) { m_e.emit(a64::str_q_x(vt, R_GBASE, ea_plus(off))); }
+  void mld_q(u8 vt, u32 off = 0) {
+    m_e.emit(a64::ldr_q_x(vt, R_GBASE, ea_plus(off)));
+    tso_after_load();
+  }
+  void mst_q(u8 vt, u32 off = 0) {
+    tso_before_store();
+    m_e.emit(a64::str_q_x(vt, R_GBASE, ea_plus(off)));
+  }
   // Scalar load/store of lane 0 (4 or 8 bytes); a load zeroes the rest of vt.
   void mld_lane(bool dbl, u8 vt) {
     m_e.emit(dbl ? a64::ldr_d_x(vt, R_GBASE, R_EA) : a64::ldr_s_x(vt, R_GBASE, R_EA));
+    tso_after_load();
   }
   void mst_lane(bool dbl, u8 vt) {
+    tso_before_store();
     m_e.emit(dbl ? a64::str_d_x(vt, R_GBASE, R_EA) : a64::str_s_x(vt, R_GBASE, R_EA));
   }
   void ctx_ld_lane(bool dbl, u8 vt, u8 r, u32 byte = 0) {
@@ -2444,7 +2471,10 @@ private:
       else if (d.vsteps == 2)
         mld_lane(false, 1);
       else
+      {
         m_e.emit(a64::ldr_h_x(1, R_GBASE, R_EA));
+        tso_after_load();
+      }
       for (u32 k = 0, esize = d.vlane; k < d.vsteps; ++k, esize *= 2)
         m_e.emit(dbl ? a64::sxtl(esize, 1, 1) : a64::uxtl(esize, 1, 1));
       vst(1, dst, 0);

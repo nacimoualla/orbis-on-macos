@@ -249,6 +249,12 @@ void MemoryManager::dump_mappings() const {
     }
 }
 
+// PS4_TSO=1: give interpreter accesses to guest memory x86 (TSO) ordering.
+static bool guest_tso() {
+    static const bool on = std::getenv("PS4_TSO") != nullptr;
+    return on;
+}
+
 bool MemoryManager::write_bytes(GuestAddr addr, const void* src, usize size) {
     if (!is_valid_address(addr, size)) {
         m_last_error = MemoryError::OutOfBounds;
@@ -297,6 +303,7 @@ bool MemoryManager::write_bytes(GuestAddr addr, const void* src, usize size) {
         }
     }
 
+    if (guest_tso()) std::atomic_thread_fence(std::memory_order_release);
     std::memcpy(m_base + addr, src, size);
     m_last_error = MemoryError::None;
     return true;
@@ -308,6 +315,7 @@ bool MemoryManager::read_bytes(GuestAddr addr, void* dest, usize size) const {
     }
 
     std::memcpy(dest, m_base + addr, size);
+    if (guest_tso()) std::atomic_thread_fence(std::memory_order_acquire);
     return true;
 }
 

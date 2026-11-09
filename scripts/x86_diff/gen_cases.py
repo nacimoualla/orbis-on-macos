@@ -580,6 +580,9 @@ for imm in (0x7F, 0xFF, 0x71, 0x31, 0xF1, 0x55):
     add(f"vdpps x5,x4,x2,{imm:02x}", vex(0x40, 1, 3, 5, 4, 2, imm=imm))
 add("vdpps y5,y4,y2,7f", vex(0x40, 1, 3, 5, 4, 2, L=1, imm=0x7F))
 add("vdpps x2,x2,x2,7f", vex(0x40, 1, 3, 2, 2, 2, imm=0x7F))
+add("vlddqu x5,[mem]", vex(0xF0, 3, 1, 5, 0, 0, mod_rm=0x84 | (5 << 3)) + M, mem=1)
+add("vlddqu y5,[mem]", vex(0xF0, 3, 1, 5, 0, 0, L=1, mod_rm=0x84 | (5 << 3)) + M, mem=1)
+add("lddqu x0,[mem]", [0xF2, 0x0F, 0xF0, 0x84] + M, mem=1)
 for op, nm in ((0x39, "vpminsd"), (0x3B, "vpminud"), (0x3D, "vpmaxsd"), (0x3F, "vpmaxud")):
     add(f"{nm} x5,x4,x2", vex(op, 1, 2, 5, 4, 2)); add(f"{nm} y5,y4,y2", vex(op, 1, 2, 5, 4, 2, L=1))
 
