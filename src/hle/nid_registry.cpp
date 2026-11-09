@@ -5938,16 +5938,16 @@ void NidRegistry::register_default_libraries() {
             ctx.rax = static_cast<u64>(us);
         });
 
-    // sceFiosFileExistsSync / sceFiosFileExists(int profile, const char* path, ...)
-    // Canonical Sync NID: 0x3703873113363E9CULL ("NwOHMRM2Ppw"), Non-sync alias NID: 0x398F2FF160F39F7BULL ("OY8v8WDzn3s")
-    auto fios_file_exists_handler = [](CpuContext& ctx, MemoryManager& mem) {
-        const GuestAddr path_addr = ctx.rsi;
+    // bool sceFiosFileExistsSync(const SceFiosOpAttr*, const char* path)
+    // SceFiosOp sceFiosFileExists(const SceFiosOpAttr*, const char* path, bool* pOutExists)
+    // Sync NID: 0x3703873113363E9CULL ("NwOHMRM2Ppw"), async NID: 0x398F2FF160F39F7BULL ("OY8v8WDzn3s").
+    // The async forms here and below (Stat, DirectoryExists, FileDelete,
+    // DHOpen) complete inside the call and then run the attr's callback, like
+    // sceFiosFHOpen: inFAMOUS's I/O jobs wait for that callback.
+    static auto fios_file_exists = [](MemoryManager& mem, GuestAddr path_addr) -> bool {
         const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
                                ? mem.to_host_ptr<char>(path_addr) : nullptr;
-        if (!path) {
-            ctx.rax = 0;
-            return;
-        }
+        if (!path) return false;
         const PsarcArchive::Entry* entry = nullptr;
         bool exists = fios_archive_file(path, entry) != nullptr;
         auto& vfs = get_vfs();
@@ -5957,25 +5957,35 @@ void NidRegistry::register_default_libraries() {
             exists = std::filesystem::is_regular_file(*resolved, ec);
         }
         std::fprintf(stderr, "[FIOS2] sceFiosFileExists('%s') -> %d\n", path, exists ? 1 : 0);
-        ctx.rax = exists ? 1 : 0;
+        return exists;
     };
-    register_symbol(0x398F2FF160F39F7BULL, "sceFiosFileExists", "libSceFios2", fios_file_exists_handler);
-    register_symbol(0x3703873113363E9CULL, "sceFiosFileExistsSync", "libSceFios2", fios_file_exists_handler);
+    // Async op whose only result is an error code (and side effects already done).
+    static auto fios_finish_async = [](CpuContext& ctx, MemoryManager& mem, const char* tag, i64 status) {
+        const u64 op = s_next_fios_op++;
+        s_fios_ops[op] = FiosOp{ .error = static_cast<i32>(status) };
+        fios_complete_op(mem, tag, ctx.rdi, op, status);
+        ctx.rax = op;
+    };
+    register_symbol(0x398F2FF160F39F7BULL, "sceFiosFileExists", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const bool exists = fios_file_exists(mem, ctx.rsi);
+            if (ctx.rdx != 0) mem.write_value(ctx.rdx, static_cast<u8>(exists));
+            fios_finish_async(ctx, mem, "sceFiosFileExists", SCE_OK);
+        });
+    register_symbol(0x3703873113363E9CULL, "sceFiosFileExistsSync", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) { ctx.rax = fios_file_exists(mem, ctx.rsi) ? 1 : 0; });
 
     // sceFiosFHRead / sceFiosFHReadSync(int profile, int fh, void* buf, size_t size)
     // NID: 0x2A5FD36EB0D4F583ULL ("Kl-TbrDU9YM")
     // Registered below, after sceFiosFHOpenSync, using the handle-based
     // s_fios_files read implementation (see the sceFiosFHOpenSync handler above it).
-    // sceFiosDirectoryExistsSync / sceFiosDirectoryExists(int profile, const char* path, ...)
-    // Canonical Sync NID: 0x38EBAF1CA4EEE0E7ULL ("OOuvHKTu4Oc"), Non-sync alias NID: 0xBED1DDD347F43B9DULL ("vtHd00f0O50")
-    auto fios_dir_exists_handler = [](CpuContext& ctx, MemoryManager& mem) {
-        const GuestAddr path_addr = ctx.rsi;
+    // bool sceFiosDirectoryExistsSync(const SceFiosOpAttr*, const char* path)
+    // SceFiosOp sceFiosDirectoryExists(const SceFiosOpAttr*, const char* path, bool* pOutExists)
+    // Sync NID: 0x38EBAF1CA4EEE0E7ULL ("OOuvHKTu4Oc"), async NID: 0xBED1DDD347F43B9DULL ("vtHd00f0O50")
+    static auto fios_dir_exists = [](MemoryManager& mem, GuestAddr path_addr) -> bool {
         const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
                                ? mem.to_host_ptr<char>(path_addr) : nullptr;
-        if (!path) {
-            ctx.rax = 0;
-            return;
-        }
+        if (!path) return false;
         bool exists = fios_archive_dir(path);
         auto& vfs = get_vfs();
         auto resolved = exists ? std::nullopt : vfs.resolve_path(path);
@@ -5984,21 +5994,25 @@ void NidRegistry::register_default_libraries() {
             exists = std::filesystem::is_directory(*resolved, ec);
         }
         std::fprintf(stderr, "[FIOS2] sceFiosDirectoryExists('%s') -> %d\n", path, exists ? 1 : 0);
-        ctx.rax = exists ? 1 : 0;
+        return exists;
     };
-    register_symbol(0xBED1DDD347F43B9DULL, "sceFiosDirectoryExists", "libSceFios2", fios_dir_exists_handler);
-    register_symbol(0x38EBAF1CA4EEE0E7ULL, "sceFiosDirectoryExistsSync", "libSceFios2", fios_dir_exists_handler);
+    register_symbol(0xBED1DDD347F43B9DULL, "sceFiosDirectoryExists", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            const bool exists = fios_dir_exists(mem, ctx.rsi);
+            if (ctx.rdx != 0) mem.write_value(ctx.rdx, static_cast<u8>(exists));
+            fios_finish_async(ctx, mem, "sceFiosDirectoryExists", SCE_OK);
+        });
+    register_symbol(0x38EBAF1CA4EEE0E7ULL, "sceFiosDirectoryExistsSync", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) { ctx.rax = fios_dir_exists(mem, ctx.rsi) ? 1 : 0; });
 
-    // sceFiosStatSync / sceFiosStat(int profile, const char* path, SceFiosStat* stat)
-    // Canonical Sync NID: 0x8DACAF634EC2E5D9ULL ("jayvY07C5dk"), Non-sync alias NID: 0x40AB08F4DECAD731ULL ("QKsI9N7K1zE")
-    auto fios_stat_handler = [](CpuContext& ctx, MemoryManager& mem) {
-        const GuestAddr path_addr = ctx.rsi;
-        const GuestAddr stat_ptr  = ctx.rdx;
+    // int sceFiosStatSync(const SceFiosOpAttr*, const char* path, SceFiosStat* stat)
+    // SceFiosOp sceFiosStat(const SceFiosOpAttr*, const char* path, SceFiosStat* stat)
+    // Sync NID: 0x8DACAF634EC2E5D9ULL ("jayvY07C5dk"), async NID: 0x40AB08F4DECAD731ULL ("QKsI9N7K1zE")
+    static auto fios_stat = [](MemoryManager& mem, GuestAddr path_addr, GuestAddr stat_ptr) -> i64 {
         const char* path = (path_addr > 0x1000 && mem.is_valid_address(path_addr, 1))
                                ? mem.to_host_ptr<char>(path_addr) : nullptr;
         if (!path || stat_ptr == 0 || !mem.is_valid_address(stat_ptr, 0x40)) {
-            ctx.rax = static_cast<u64>(-1);
-            return;
+            return -1;
         }
         const PsarcArchive::Entry* entry = nullptr;
         const bool arc_file = fios_archive_file(path, entry) != nullptr;
@@ -6010,22 +6024,19 @@ void NidRegistry::register_default_libraries() {
             mem.write_value(stat_ptr + 0x20, stat_flags);
             std::fprintf(stderr, "[FIOS2] sceFiosStat('%s', archive) -> size=%llu, flags=0x%x\n",
                          path, (unsigned long long)file_sz, stat_flags);
-            ctx.rax = SCE_OK;
-            return;
+            return SCE_OK;
         }
         auto& vfs = get_vfs();
         auto resolved = vfs.resolve_path(path);
         if (!resolved) {
             std::fprintf(stderr, "[FIOS2] sceFiosStat('%s') -> not found\n", path);
-            ctx.rax = static_cast<u64>(-1);
-            return;
+            return -1;
         }
         std::error_code ec;
         const auto st = std::filesystem::status(*resolved, ec);
         if (!std::filesystem::exists(st)) {
             std::fprintf(stderr, "[FIOS2] sceFiosStat('%s' -> '%s') -> not found\n", path, resolved->c_str());
-            ctx.rax = static_cast<u64>(-1);
-            return;
+            return -1;
         }
 
         mem.zero_memory(stat_ptr, 0x40);
@@ -6038,10 +6049,16 @@ void NidRegistry::register_default_libraries() {
 
         std::fprintf(stderr, "[FIOS2] sceFiosStat('%s') -> size=%llu, flags=0x%x\n",
                      path, (unsigned long long)file_sz, stat_flags);
-        ctx.rax = SCE_OK;
+        return SCE_OK;
     };
-    register_symbol(0x40AB08F4DECAD731ULL, "sceFiosStat", "libSceFios2", fios_stat_handler);
-    register_symbol(0x8DACAF634EC2E5D9ULL, "sceFiosStatSync", "libSceFios2", fios_stat_handler);
+    register_symbol(0x40AB08F4DECAD731ULL, "sceFiosStat", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            fios_finish_async(ctx, mem, "sceFiosStat", fios_stat(mem, ctx.rsi, ctx.rdx));
+        });
+    register_symbol(0x8DACAF634EC2E5D9ULL, "sceFiosStatSync", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            ctx.rax = static_cast<u64>(fios_stat(mem, ctx.rsi, ctx.rdx));
+        });
 
     // sceFiosFileGetSizeSync / sceFiosGetSize(int profile, const char* path, ...)
     // NID: 0xCC5F3F091BD15E73ULL ("zF8-CRvRXnM")
@@ -6410,7 +6427,8 @@ void NidRegistry::register_default_libraries() {
     auto fios_file_delete_handler = [](CpuContext& ctx, MemoryManager& /*mem*/) {
         ctx.rax = SCE_OK;
     };
-    register_symbol(0x550F1EE6DF2FB588ULL, "sceFiosFileDelete", "libSceFios2", fios_file_delete_handler);
+    register_symbol(0x550F1EE6DF2FB588ULL, "sceFiosFileDelete", "libSceFios2",
+        [](CpuContext& ctx, MemoryManager& mem) { fios_finish_async(ctx, mem, "sceFiosFileDelete", SCE_OK); });
     register_symbol(0x6C3BA91206D0E859ULL, "sceFiosFileDeleteSync", "libSceFios2", fios_file_delete_handler);
     register_symbol(0x2AC553734E2437D9ULL, "sceFiosDeleteSync", "libSceFios2", fios_file_delete_handler);
 
@@ -6599,10 +6617,10 @@ void NidRegistry::register_default_libraries() {
         [](CpuContext& ctx, MemoryManager& /*mem*/) {
             ctx.rax = static_cast<u64>(-1);
         });
+    // SceFiosOp sceFiosDHOpen(attr, SceFiosDH*, path, SceFiosBuffer): directory
+    // handles are not supported, so it fails like sceFiosDHOpenSync, via an op.
     register_symbol(0xB8292024EAD850BEULL, "sceFiosDHOpen", "libSceFios2",
-        [](CpuContext& ctx, MemoryManager& /*mem*/) {
-            ctx.rax = 0x10000;
-        });
+        [](CpuContext& ctx, MemoryManager& mem) { fios_finish_async(ctx, mem, "sceFiosDHOpen", -1); });
 
     // =========================================================================
     // =========================================================================
