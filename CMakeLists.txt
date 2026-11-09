@@ -41,6 +41,9 @@ find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
 find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
 find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
 find_library(GAMECONTROLLER_FRAMEWORK GameController REQUIRED)
+find_library(VIDEOTOOLBOX_FRAMEWORK VideoToolbox REQUIRED)
+find_library(COREMEDIA_FRAMEWORK CoreMedia REQUIRED)
+find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
 find_package(ZLIB REQUIRED)
 
 # Core library
@@ -72,6 +75,7 @@ add_library(ps4_core
     src/gui/game_import.cpp
     src/core/sfo.cpp
     src/core/psarc.cpp
+    src/media/h264_decoder.cpp
 )
 target_include_directories(ps4_core PUBLIC include)
 target_link_libraries(ps4_core PUBLIC
@@ -82,6 +86,9 @@ target_link_libraries(ps4_core PUBLIC
     ${AUDIOTOOLBOX_FRAMEWORK}
     ${COREAUDIO_FRAMEWORK}
     ${GAMECONTROLLER_FRAMEWORK}
+    ${VIDEOTOOLBOX_FRAMEWORK}
+    ${COREMEDIA_FRAMEWORK}
+    ${COREVIDEO_FRAMEWORK}
     ZLIB::ZLIB
 )
 set_source_files_properties(src/gpu/metal_backend.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
@@ -171,6 +178,10 @@ add_test(NAME Psarc_Reader COMMAND test_psarc)
 add_executable(test_mutex_semantics tests/test_mutex_semantics.cpp)
 target_link_libraries(test_mutex_semantics PRIVATE ps4_core)
 add_test(NAME Mutex_Semantics COMMAND test_mutex_semantics)
+
+add_executable(test_h264_decoder tests/test_h264_decoder.cpp)
+target_link_libraries(test_h264_decoder PRIVATE ps4_core)
+add_test(NAME H264_Decoder COMMAND test_h264_decoder)
 
 add_executable(test_flappy_gpu tests/test_flappy_gpu.cpp)
 target_link_libraries(test_flappy_gpu PRIVATE ps4_core)

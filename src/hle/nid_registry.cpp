@@ -5,6 +5,7 @@
 #include "ps4/nid_registry.hpp"
 #include "ps4/np_trophy.hpp"
 #include "ps4/guest_libc_blob.hpp"
+#include "ps4/h264_decoder.hpp"
 #include "ps4/pm4_translator.hpp"
 #include "ps4/psarc.hpp"
 #include "ps4/save_data.hpp"
@@ -1770,6 +1771,7 @@ static u64 guest_inet_ntop(MemoryManager& mem, u64 af, GuestAddr src, GuestAddr 
 static void register_save_data_and_trophy(NidRegistry& reg);
 static void register_libc_cxx_runtime(NidRegistry& reg);
 static void register_np_offline(NidRegistry& reg);
+static void register_videodec(NidRegistry& reg);
 
 void NidRegistry::register_default_libraries() {
     // A new registry is a new emulation session. request_semaphore_shutdown()
@@ -5840,6 +5842,9 @@ void NidRegistry::register_default_libraries() {
     // services it polls, served as an offline console.
     register_libc_cxx_runtime(*this);
     register_np_offline(*this);
+
+    // libSceVideodec: H.264 through VideoToolbox (see register_videodec).
+    register_videodec(*this);
 
     // =========================================================================
     // libSceVideoOut / libSceSocialScreen entries that were falling through to
@@ -12019,6 +12024,189 @@ static void register_np_offline(NidRegistry& reg) {
                 mem.write_value(ctx.rdi + 4, static_cast<i32>(0));
                 mem.write_value(ctx.rdi + 8, static_cast<i32>(1)); // SCE_SAVE_DATA_DIALOG_BUTTON_ID_OK
             }
+            ctx.rax = SCE_OK;
+        });
+}
+
+// libSceVideodec: the PS4's hardware H.264 decoder, served by H264Decoder
+// (VideoToolbox). Structures, as the game fills them:
+//   SceVideodecConfigInfo (0x28): thisSize, codecType u32 (0 = AVC), profile,
+//     maxLevel, maxFrameWidth +0x14, maxFrameHeight +0x18, maxDpbFrameCount,
+//     flags u64 +0x20.
+//   SceVideodecResourceInfo (0x38): thisSize, cpuMemorySize +0x08, pCpuMemory,
+//     cpuGpuMemorySize +0x18, pCpuGpuMemory, maxFrameBufferSize +0x28,
+//     frameBufferAlignment u32 +0x30.
+//   SceVideodecCtrl (0x18): thisSize, handle +0x08, version +0x10.
+//   SceVideodecInputData (0x30): thisSize, pAuData +0x08, auSize +0x10,
+//     ptsData +0x18, dtsData +0x20, attachedData +0x28.
+//   SceVideodecFrameBuffer (0x18): thisSize, pFrameBuffer +0x08, frameBufferSize.
+//   SceVideodecPictureInfo (0x70 for AVC): thisSize, isValid u32 +0x08,
+//     codecType +0x0c, frameWidth +0x10, framePitch +0x14, frameHeight +0x18,
+//     isErrorPic +0x1c, ptsData u64 +0x20, attachedData +0x28, codec info.
+// Frames are written as NV12, pitch == width, chroma right after luma.
+// inFAMOUS Second Son sizes each buffer as width * height * 3 / 2 and reads
+// frameWidth/frameHeight back; it ends a movie with Flush until !isValid.
+static void register_videodec(NidRegistry& reg) {
+    // Error codes are not verified against firmware; the game only tests != 0.
+    constexpr u64 kVideodecErrorArg = 0x80C10000ULL;
+    constexpr u64 kVideodecErrorHandle = 0x80C10003ULL;
+    static std::mutex s_mtx;
+    static std::unordered_map<u64, std::unique_ptr<H264Decoder>> s_decoders;
+    static u64 s_next_handle = 0x7DEC0001ULL;
+    static std::atomic<u32> s_log_budget{24};
+
+    auto lookup = [](MemoryManager& mem, GuestAddr ctrl) -> H264Decoder* {
+        u64 handle = 0;
+        if (ctrl == 0 || !mem.read_value(ctrl + 0x08, handle)) return nullptr;
+        auto it = s_decoders.find(handle);
+        return it == s_decoders.end() ? nullptr : it->second.get();
+    };
+
+    // Write the next display-order frame (if any) to the game's buffer.
+    auto emit = [](MemoryManager& mem, H264Decoder& dec, GuestAddr fb, GuestAddr pic, const char* tag) {
+        u64 pic_size = 0;
+        mem.read_value(pic, pic_size);
+        const usize clear = std::clamp<u64>(pic_size, 0x30, 0x70) - 8;
+        mem.zero_memory(pic + 8, clear);
+        H264Frame f;
+        if (!dec.pop(f)) return;
+        GuestAddr buf = 0;
+        u64 buf_size = 0;
+        mem.read_value(fb + 0x08, buf);
+        mem.read_value(fb + 0x10, buf_size);
+        const usize n = std::min<usize>(f.nv12.size(), buf_size);
+        if (buf == 0 || n == 0 || !mem.write_bytes(buf, f.nv12.data(), n)) {
+            std::fprintf(stderr, "[Videodec] %s: frame buffer 0x%llx (size 0x%llx) not writable\n", tag,
+                         (unsigned long long)buf, (unsigned long long)buf_size);
+            return;
+        }
+        mem.write_value(pic + 0x08, static_cast<u32>(1));  // isValid
+        mem.write_value(pic + 0x0c, static_cast<u32>(0));  // codecType AVC
+        mem.write_value(pic + 0x10, f.width);
+        mem.write_value(pic + 0x14, f.width);              // framePitch
+        mem.write_value(pic + 0x18, f.height);
+        mem.write_value(pic + 0x1c, static_cast<u32>(n < f.nv12.size()));  // isErrorPic if clipped
+        mem.write_value(pic + 0x20, f.pts);
+        mem.write_value(pic + 0x28, f.attached);
+        if (s_log_budget.load() > 0) {
+            --s_log_budget;
+            std::fprintf(stderr, "[Videodec] %s: frame %ux%u pts=%llu -> 0x%llx (0x%zx of 0x%llx bytes)\n", tag,
+                         f.width, f.height, (unsigned long long)f.pts, (unsigned long long)buf, n,
+                         (unsigned long long)buf_size);
+        }
+    };
+
+    // int sceVideodecQueryResourceInfo(const SceVideodecConfigInfo*, SceVideodecResourceInfo*)
+    reg.register_symbol(0x95E080B1C8A97C56ULL, "sceVideodecQueryResourceInfo", "libSceVideodec",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            u32 codec = 0, w = 0, h = 0;
+            if (ctx.rdi == 0 || ctx.rsi == 0 || !mem.read_value(ctx.rdi + 0x08, codec) ||
+                !mem.read_value(ctx.rdi + 0x14, w) || !mem.read_value(ctx.rdi + 0x18, h) || codec != 0) {
+                ctx.rax = kVideodecErrorArg;
+                return;
+            }
+            // The decoding happens on the host, so the game's memory only has
+            // to exist. The frame size is what the hardware would need.
+            const u64 frame = ((static_cast<u64>(w) * ((h + 15) & ~15u) * 3 / 2) + 0xffff) & ~0xffffULL;
+            mem.write_value(ctx.rsi + 0x08, static_cast<u64>(0x10000));  // cpuMemorySize
+            mem.write_value(ctx.rsi + 0x10, static_cast<u64>(0));
+            mem.write_value(ctx.rsi + 0x18, static_cast<u64>(0x10000));  // cpuGpuMemorySize
+            mem.write_value(ctx.rsi + 0x20, static_cast<u64>(0));
+            mem.write_value(ctx.rsi + 0x28, frame);                       // maxFrameBufferSize
+            mem.write_value(ctx.rsi + 0x30, static_cast<u32>(0x100));     // frameBufferAlignment
+            std::fprintf(stderr, "[Videodec] sceVideodecQueryResourceInfo(%ux%u) -> frame 0x%llx\n", w, h,
+                         (unsigned long long)frame);
+            ctx.rax = SCE_OK;
+        });
+
+    // int sceVideodecCreateDecoder(const SceVideodecConfigInfo*, const SceVideodecResourceInfo*, SceVideodecCtrl*)
+    reg.register_symbol(0xAA48118B01F285E5ULL, "sceVideodecCreateDecoder", "libSceVideodec",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            if (ctx.rdx == 0) {
+                ctx.rax = kVideodecErrorArg;
+                return;
+            }
+            std::lock_guard lk(s_mtx);
+            const u64 handle = s_next_handle++;
+            s_decoders[handle] = std::make_unique<H264Decoder>();
+            mem.write_value(ctx.rdx + 0x08, handle);
+            mem.write_value(ctx.rdx + 0x10, static_cast<u64>(0x00010000));  // version
+            std::fprintf(stderr, "[Videodec] sceVideodecCreateDecoder -> handle 0x%llx\n",
+                         (unsigned long long)handle);
+            ctx.rax = SCE_OK;
+        });
+
+    // int sceVideodecDecode(SceVideodecCtrl*, const SceVideodecInputData*,
+    //                       SceVideodecFrameBuffer*, SceVideodecPictureInfo*)
+    reg.register_symbol(0xAB45B9189328BCCBULL, "sceVideodecDecode", "libSceVideodec",
+        [lookup, emit](CpuContext& ctx, MemoryManager& mem) {
+            std::lock_guard lk(s_mtx);
+            H264Decoder* dec = lookup(mem, ctx.rdi);
+            if (!dec) {
+                ctx.rax = kVideodecErrorHandle;
+                return;
+            }
+            GuestAddr au = 0;
+            u64 au_size = 0, pts = 0, attached = 0;
+            if (ctx.rsi == 0 || ctx.rdx == 0 || ctx.rcx == 0 || !mem.read_value(ctx.rsi + 0x08, au) ||
+                !mem.read_value(ctx.rsi + 0x10, au_size) || !mem.read_value(ctx.rsi + 0x18, pts) ||
+                !mem.read_value(ctx.rsi + 0x28, attached)) {
+                ctx.rax = kVideodecErrorArg;
+                return;
+            }
+            const u8* data = au_size && mem.is_valid_address(au, au_size)
+                                 ? static_cast<const u8*>(mem.to_host_ptr(au, au_size)) : nullptr;
+            if (au_size && !data) {
+                ctx.rax = kVideodecErrorArg;
+                return;
+            }
+            dec->feed(data, au_size, pts, attached);
+            emit(mem, *dec, ctx.rdx, ctx.rcx, "decode");
+            ctx.rax = SCE_OK;
+        });
+
+    // int sceVideodecFlush(SceVideodecCtrl*, SceVideodecFrameBuffer*, SceVideodecPictureInfo*)
+    // Called until it returns a picture with isValid == 0.
+    reg.register_symbol(0x8DE8A02E529DA792ULL, "sceVideodecFlush", "libSceVideodec",
+        [lookup, emit](CpuContext& ctx, MemoryManager& mem) {
+            std::lock_guard lk(s_mtx);
+            H264Decoder* dec = lookup(mem, ctx.rdi);
+            if (!dec) {
+                ctx.rax = kVideodecErrorHandle;
+                return;
+            }
+            if (ctx.rsi == 0 || ctx.rdx == 0) {
+                ctx.rax = kVideodecErrorArg;
+                return;
+            }
+            dec->flush();
+            emit(mem, *dec, ctx.rsi, ctx.rdx, "flush");
+            ctx.rax = SCE_OK;
+        });
+
+    // int sceVideodecReset(SceVideodecCtrl*)
+    reg.register_symbol(0x7FC0200EFFF55FC0ULL, "sceVideodecReset", "libSceVideodec",
+        [lookup](CpuContext& ctx, MemoryManager& mem) {
+            std::lock_guard lk(s_mtx);
+            H264Decoder* dec = lookup(mem, ctx.rdi);
+            if (!dec) {
+                ctx.rax = kVideodecErrorHandle;
+                return;
+            }
+            dec->reset();
+            ctx.rax = SCE_OK;
+        });
+
+    // int sceVideodecDeleteDecoder(SceVideodecCtrl*)
+    reg.register_symbol(0x534929185D5C97DDULL, "sceVideodecDeleteDecoder", "libSceVideodec",
+        [](CpuContext& ctx, MemoryManager& mem) {
+            std::lock_guard lk(s_mtx);
+            u64 handle = 0;
+            if (ctx.rdi == 0 || !mem.read_value(ctx.rdi + 0x08, handle) || s_decoders.erase(handle) == 0) {
+                ctx.rax = kVideodecErrorHandle;
+                return;
+            }
+            std::fprintf(stderr, "[Videodec] sceVideodecDeleteDecoder(0x%llx)\n", (unsigned long long)handle);
             ctx.rax = SCE_OK;
         });
 }
