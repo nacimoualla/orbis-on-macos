@@ -14,7 +14,9 @@ OUT="$(mktemp -d)"
 clang -arch x86_64 -O1 -I"$HERE" "$HERE/native.c" -o "$OUT/native"
 clang++ -std=c++20 -O0 -I"$ROOT/include" -I"$HERE" "$HERE/emu.cpp" "$ROOT/build/libps4_core.a" \
     -framework Metal -framework Foundation -framework AppKit -framework QuartzCore \
-    -framework CoreAudio -framework AudioToolbox -framework GameController -o "$OUT/emu"
+    -framework CoreAudio -framework AudioToolbox -framework GameController \
+    -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreFoundation -lz \
+    -o "$OUT/emu"
 arch -x86_64 "$OUT/native" > "$OUT/native.txt"
 "$OUT/emu" 2>/dev/null | grep -v '^#' | grep '^[0-9]' > "$OUT/interp.txt"
 "$OUT/emu" jit 2>/dev/null > "$OUT/jit_full.txt"

@@ -445,7 +445,14 @@ bool CpuExecutor::setup_default_stack(GuestAddr stack_base, GuestSize stack_size
     m_context.rsi = 0;
     m_context.rdx = 0;
 
-    m_context.rsp = sp;
+    // The PS4 entry point is an ordinary function, entry(params, exit_fn), that
+    // the system calls: on entry RSP is 16n - 8, with the return address at
+    // [RSP]. Entering with RSP 16-aligned put every main-thread frame 8 bytes off;
+    // compiled code relies on the alignment (inFAMOUS Second Son's BVH builder
+    // picks a child list with `or reg, 8` on an rbp-relative address, so it
+    // always picked the left one and built a corrupt tree it then looped on).
+    m_context.rsp = sp - 8;
+    m_memory.write_value(m_context.rsp, 0ULL);
     m_context.rbp = sp;
 
     // Standard x86_64 ELF TLS / TCB initial layout:
@@ -2173,12 +2180,25 @@ StepResult CpuExecutor::step() {
             const usize lanes = vex_l ? 2 : 1;
             for (usize lane = 0; lane < lanes; ++lane) {
                 const usize base = lane * 4;
-                float sum = 0.0f;
-                for (usize i = 0; i < 4; ++i) {
-                    if (imm8 & (0x10u << i)) {
-                        sum += m_context.ymm[src1].f[base + i] * src2.f[base + i];
+                // Hardware adds the products pairwise: (p0 + p1) + (p2 + p3),
+                // with masked-out products as +0.0. A NaN made from non-NaN
+                // inputs (inf - inf, 0 * inf) is x86's negative default NaN,
+                // not the host's positive one.
+                const auto x86 = [](float r, float a, float b) {
+                    if (r != r && a == a && b == b) {
+                        const u32 qnan = 0xFFC00000u;
+                        std::memcpy(&r, &qnan, sizeof r);
                     }
+                    return r;
+                };
+                float p[4];
+                for (usize i = 0; i < 4; ++i) {
+                    const float a = m_context.ymm[src1].f[base + i], b = src2.f[base + i];
+                    p[i] = (imm8 & (0x10u << i)) ? x86(a * b, a, b) : 0.0f;
                 }
+                const float lo = x86(p[0] + p[1], p[0], p[1]);
+                const float hi = x86(p[2] + p[3], p[2], p[3]);
+                const float sum = x86(lo + hi, lo, hi);
                 for (usize i = 0; i < 4; ++i) {
                     res.f[base + i] = (imm8 & (1u << i)) ? sum : 0.0f;
                 }

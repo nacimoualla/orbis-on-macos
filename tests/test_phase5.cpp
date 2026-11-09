@@ -97,6 +97,42 @@ int main() {
         std::cout << "  ✓ VZEROUPPER / VZEROALL verified\n";
     }
 
+    // VDPPS adds the products pairwise, (p0 + p1) + (p2 + p3). With products
+    // 1e8, 1, -1e8, 1 that is 1e8 + -1e8 = 0; adding left to right gives 1.
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x403300ULL;
+        const ps4::u8 code[] = {0xC4, 0xE3, 0x71, 0x40, 0xC2, 0xF1, 0xF4};  // vdpps xmm0, xmm1, xmm2, 0xf1
+        assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        const float a[4] = {1e8f, 1.0f, -1e8f, 1.0f};
+        for (int i = 0; i < 4; ++i) {
+            cpu.context().ymm[1].f[i] = a[i];
+            cpu.context().ymm[2].f[i] = 1.0f;
+        }
+        cpu.set_entry_point(code_addr);
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().ymm[0].f[0] == 0.0f);
+        assert(cpu.context().ymm[0].f[1] == 0.0f && cpu.context().ymm[0].q[1] == 0);
+        std::cout << "  ✓ VDPPS pairwise sum verified\n";
+    }
+
+    // The main thread enters the eboot as if called: RSP = 16n - 8 with a return
+    // address at [RSP], and RDI pointing at {argc, argv[]} just above it. The
+    // entry's `push rbp; mov rbp, rsp` then leaves every frame 16-byte aligned,
+    // which compiled code relies on.
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        assert(cpu.setup_default_stack());
+        const auto& c = cpu.context();
+        assert(c.rsp % 16 == 8);
+        ps4::u64 ret = 1, argc = 0, argv0 = 0;
+        assert(memory.read_value(c.rsp, ret) && ret == 0);
+        assert(c.rdi == c.rsp + 8);
+        assert(memory.read_value(c.rdi, argc) && argc == 1);
+        assert(memory.read_value(c.rdi + 8, argv0) && argv0 != 0);
+        std::cout << "  ✓ entry stack alignment verified\n";
+    }
+
     // Test 1: Stack initialization
     {
         ps4::CpuExecutor cpu(memory, syscalls);

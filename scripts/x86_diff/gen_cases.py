@@ -575,6 +575,14 @@ add("vmaskmovps y5,y4,[mem]", vex(0x2C, 1, 2, 5, 4, 0, L=1, mod_rm=0x84 | (5 << 
 add("vmaskmovps [mem],y4,y5", vex(0x2E, 1, 2, 5, 4, 0, L=1, mod_rm=0x84 | (5 << 3) & 0x38) + M, mem=1)
 add("vpcmpgtd x5,x4,x2", vex(0x66, 1, 1, 5, 4, 2))
 
+# inFAMOUS Second Son's BVH builder: dot products (surface areas) and dword max.
+for imm in (0x7F, 0xFF, 0x71, 0x31, 0xF1, 0x55):
+    add(f"vdpps x5,x4,x2,{imm:02x}", vex(0x40, 1, 3, 5, 4, 2, imm=imm))
+add("vdpps y5,y4,y2,7f", vex(0x40, 1, 3, 5, 4, 2, L=1, imm=0x7F))
+add("vdpps x2,x2,x2,7f", vex(0x40, 1, 3, 2, 2, 2, imm=0x7F))
+for op, nm in ((0x39, "vpminsd"), (0x3B, "vpminud"), (0x3D, "vpmaxsd"), (0x3F, "vpmaxud")):
+    add(f"{nm} x5,x4,x2", vex(op, 1, 2, 5, 4, 2)); add(f"{nm} y5,y4,y2", vex(op, 1, 2, 5, 4, 2, L=1))
+
 if "--from-stats" in sys.argv:
     idx = sys.argv.index("--from-stats")
     stats_arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else None

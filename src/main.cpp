@@ -595,7 +595,9 @@ int main(int argc, char* argv[]) {
     // on the extracted inner ELF maps addresses differently from the runtime.
     // Dumping what the emulator actually mapped is the only way to disassemble
     // the image the guest really executed.
-    if (const char* dc = std::getenv("PS4_DUMP_CODE")) {
+    // Several ranges can be given, separated by commas.
+    for (const char* dc = std::getenv("PS4_DUMP_CODE"); dc && *dc;
+         dc = std::strchr(dc, ',') ? std::strchr(dc, ',') + 1 : nullptr) {
         unsigned long long base = 0, len = 0;
         if (std::sscanf(dc, "%llx:%llx", &base, &len) == 2 && len > 0 && len < (1u << 25)) {
             std::vector<ps4::u8> buf(static_cast<size_t>(len));
