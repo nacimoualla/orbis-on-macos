@@ -73,6 +73,30 @@ int main() {
         std::cout << "  ✓ VMOVLPS VEX map=1 opcode 0x13 128-bit store and 256-bit rejection verified\n";
     }
 
+    // VZEROUPPER (C5 F8 77) clears bits 255:128 of every ymm and keeps the low
+    // halves; VZEROALL (C5 FC 77) clears everything. Neither has a ModRM byte.
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x403200ULL;
+        const ps4::u8 code[] = {0xC5, 0xF8, 0x77, 0xC5, 0xFC, 0x77, 0xF4};
+        assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        for (int r = 0; r < 16; ++r)
+            for (int q = 0; q < 4; ++q) cpu.context().ymm[r].q[q] = 0x1111111111111111ULL * (r + 1) + q;
+        cpu.set_entry_point(code_addr);
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().rip == code_addr + 3);
+        for (int r = 0; r < 16; ++r) {
+            assert(cpu.context().ymm[r].q[0] == 0x1111111111111111ULL * (r + 1));
+            assert(cpu.context().ymm[r].q[1] == 0x1111111111111111ULL * (r + 1) + 1);
+            assert(cpu.context().ymm[r].q[2] == 0 && cpu.context().ymm[r].q[3] == 0);
+        }
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(cpu.context().rip == code_addr + 6);
+        for (int r = 0; r < 16; ++r)
+            for (int q = 0; q < 4; ++q) assert(cpu.context().ymm[r].q[q] == 0);
+        std::cout << "  ✓ VZEROUPPER / VZEROALL verified\n";
+    }
+
     // Test 1: Stack initialization
     {
         ps4::CpuExecutor cpu(memory, syscalls);

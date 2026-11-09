@@ -1753,6 +1753,23 @@ StepResult CpuExecutor::step() {
         }
 
         // VLDMXCSR / VSTMXCSR m32 (map 1, op 0xAE /2 /3)
+        // VZEROUPPER (VEX.128.0F 77) / VZEROALL (VEX.256.0F 77): no ModRM.
+        // Clears bits 255:128 (or all bits) of ymm0-15. Compilers emit it on
+        // the way out of AVX code; inFAMOUS's job workers hit it at 0x894882
+        // and died with "illegal instruction" mid-job, hanging the world load.
+        if (vex_map == 1 && vex_op == 0x77 && vex_pp == 0) {
+            for (auto& y : m_context.ymm) {
+                if (vex_l) {
+                    y = CpuContext::YmmReg{};
+                } else {
+                    y.q[2] = 0;
+                    y.q[3] = 0;
+                }
+            }
+            m_context.rip = start_rip + cursor;
+            return StepResult::Ok;
+        }
+
         if (vex_map == 1 && vex_op == 0xAE) {
             auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_vex, vex_r, vex_x, vex_b, seg_override, m_context);
             if (m.valid && !m.is_reg && ((m.reg_id & 7) == 2 || (m.reg_id & 7) == 3)) {
