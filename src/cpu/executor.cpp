@@ -5667,6 +5667,54 @@ StepResult CpuExecutor::step() {
             return StepResult::Ok;
         }
 
+        // AMD SSE4a bit-field extract/insert (the PS4's Jaguar CPU has them):
+        //   66 0F 79 /r        EXTRQ   xmm1, xmm2         len = xmm2[5:0],  idx = xmm2[13:8]
+        //   66 0F 78 /0 ib ib  EXTRQ   xmm1, len, idx     (xmm1 in ModRM.rm)
+        //   F2 0F 79 /r        INSERTQ xmm1, xmm2         len = xmm2[69:64], idx = xmm2[77:72]
+        //   F2 0F 78 /r ib ib  INSERTQ xmm1, xmm2, len, idx
+        // A length of 0 means 64. Only the low quadword is defined; bits 127:64
+        // of the destination are left as they were. They used to fall into the
+        // generic "skip as NOP" path below: inFAMOUS Second Son unpacks its
+        // compressed animation keys with EXTRQ, every bone matrix came out NaN,
+        // and a NaN-driven light-probe walk in the vertex shader kept the GPU
+        // busy for ~15 s per draw (the whole Mac stalled).
+        if ((op1 == 0x78 || op1 == 0x79) && (rep_prefix == 0xF2 || operand_size_16)) {
+            auto m = decode_modrm(raw_code + cursor, 15 - cursor, next_ip_base_0f, rex_r, rex_x, rex_b, seg_override, m_context);
+            if (!m.valid || !m.is_reg) return StepResult::IllegalInstruction;
+            const bool insert = rep_prefix == 0xF2;
+            usize imm_bytes = 0;
+            u32 len = 0, idx = 0;
+            CpuContext::YmmReg* dst = nullptr;
+            const CpuContext::YmmReg* src = nullptr;
+            if (op1 == 0x78) {
+                if (!insert && (m.reg_id & 7) != 0) return StepResult::IllegalInstruction;
+                imm_bytes = 2;
+                len = raw_code[cursor + m.bytes_consumed] & 63u;
+                idx = raw_code[cursor + m.bytes_consumed + 1] & 63u;
+                if (insert) {
+                    dst = &m_context.ymm[m.reg_id & 15];
+                    src = &m_context.ymm[m.rm_id & 15];
+                } else {
+                    dst = &m_context.ymm[m.rm_id & 15];
+                }
+            } else {
+                dst = &m_context.ymm[m.reg_id & 15];
+                src = &m_context.ymm[m.rm_id & 15];
+                const u64 ctl = insert ? src->q[1] : src->q[0];
+                len = static_cast<u32>(ctl & 63u);
+                idx = static_cast<u32>((ctl >> 8) & 63u);
+            }
+            const u64 mask = len == 0 ? ~0ULL : ((1ULL << len) - 1);
+            const u64 field_src = insert ? src->q[0] : 0;   // read before dst may alias src
+            if (insert) {
+                dst->q[0] = (dst->q[0] & ~(mask << idx)) | ((field_src & mask) << idx);
+            } else {
+                dst->q[0] = (dst->q[0] >> idx) & mask;
+            }
+            m_context.rip = start_rip + cursor + m.bytes_consumed + imm_bytes;
+            return StepResult::Ok;
+        }
+
         // Generic fallback for any other 0x0F opcode with ModR/M: skipped as a
         // NOP (correct for hints such as 0F 18-1F / 0F 0D). Anything else
         // skipped here is unimplemented and silently wrong, so name each

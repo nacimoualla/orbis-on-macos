@@ -116,6 +116,47 @@ int main() {
         std::cout << "  ✓ VDPPS pairwise sum verified\n";
     }
 
+    // AMD SSE4a EXTRQ / INSERTQ (the PS4's Jaguar has them; inFAMOUS Second
+    // Son unpacks animation keys with EXTRQ). Bits 127:64 stay untouched.
+    {
+        ps4::CpuExecutor cpu(memory, syscalls);
+        const ps4::GuestAddr code_addr = 0x403400ULL;
+        const ps4::u8 code[] = {
+            0x66, 0x0F, 0x79, 0xE7,                   // extrq   xmm4, xmm7
+            0x66, 0x0F, 0x78, 0xC0, 0x10, 0x04,       // extrq   xmm0, 16, 4
+            0xF2, 0x0F, 0x79, 0xCA,                   // insertq xmm1, xmm2
+            0xF2, 0x0F, 0x78, 0xDA, 0x04, 0x20,       // insertq xmm3, xmm2, 4, 32
+            0x66, 0x41, 0x0F, 0x79, 0xFE,             // extrq   xmm7, xmm14
+            0x66, 0x0F, 0x78, 0xC5, 0x00, 0x00,       // extrq   xmm5, 0, 0 (length 0 = 64)
+            0xF4};
+        assert(memory.write_bytes(code_addr, code, sizeof(code)));
+        auto& c = cpu.context();
+        c.ymm[4].q[0] = 0x0123456789ABCDEFULL; c.ymm[4].q[1] = 0x1111111111111111ULL;
+        c.ymm[7].q[0] = 0x080C;                                      // idx 8, len 12
+        c.ymm[0].q[0] = 0x0123456789ABCDEFULL; c.ymm[0].q[1] = 0x2222222222222222ULL;
+        c.ymm[1].q[0] = 0xFFFFFFFFFFFFFFFFULL; c.ymm[1].q[1] = 0x3333333333333333ULL;
+        c.ymm[2].q[0] = 0x00000000000ABCD5ULL; c.ymm[2].q[1] = 0x1008; // idx 16, len 8
+        c.ymm[3].q[0] = 0;
+        c.ymm[14].q[0] = 0x2004;                                     // idx 32, len 4
+        c.ymm[5].q[0] = 0xDEADBEEFCAFEF00DULL;
+        cpu.set_entry_point(code_addr);
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(c.ymm[4].q[0] == 0xBCD && c.ymm[4].q[1] == 0x1111111111111111ULL);
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(c.ymm[0].q[0] == 0xBCDE && c.ymm[0].q[1] == 0x2222222222222222ULL);
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(c.ymm[1].q[0] == 0xFFFFFFFFFFD5FFFFULL && c.ymm[1].q[1] == 0x3333333333333333ULL);
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(c.ymm[3].q[0] == 0x0000000500000000ULL);
+        c.ymm[7].q[0] = 0x0123456789ABCDEFULL;
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(c.ymm[7].q[0] == 0x7);                                // bits 35:32 of xmm7
+        assert(cpu.step() == ps4::StepResult::Ok);
+        assert(c.ymm[5].q[0] == 0xDEADBEEFCAFEF00DULL);
+        assert(c.rip == code_addr + sizeof(code) - 1);
+        std::cout << "  ✓ SSE4a EXTRQ / INSERTQ verified\n";
+    }
+
     // The main thread enters the eboot as if called: RSP = 16n - 8 with a return
     // address at [RSP], and RDI pointing at {argc, argv[]} just above it. The
     // entry's `push rbp; mov rbp, rsp` then leaves every frame 16-byte aligned,
