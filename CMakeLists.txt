@@ -51,6 +51,7 @@ add_library(ps4_core
     src/debug/scenario.mm
     src/debug/capture.mm
     src/debug/page_watch.cpp
+    src/debug/mem_limit.cpp
     src/core/elf_loader.cpp
     src/core/memory.cpp
     src/core/syscall_table.cpp

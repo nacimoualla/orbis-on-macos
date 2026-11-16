@@ -12,6 +12,7 @@
 #include <cstring>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <map>
 #include <set>
@@ -94,6 +95,70 @@ MTLSamplerAddressMode address_mode(u32 c) {
 
 } // namespace
 
+// PS4_GCN_PROBE_VS=<vs hash, hex>: debug probe for one vertex shader. Its
+// translated source gets a writable buffer(3) of 32 words per vertex; vertex
+// `vid` < 1024 records word 0 = dispatch steps of its branch loop, then the
+// VGPRs listed in PS4_GCN_PROBE_REGS (comma separated, default
+// 31,32,33,4,83,84,85). They are recorded when the loop ends, or just before
+// the first line of the VS body that contains PS4_GCN_PROBE_BEFORE.
+// With PS4_GPU_DRAW_TIMING the draw is waited for and the results printed.
+static std::vector<u32> probe_regs() {
+    std::vector<u32> r;
+    const char* v = std::getenv("PS4_GCN_PROBE_REGS");
+    std::string list = v ? v : "31,32,33,4,83,84,85";
+    for (size_t at = 0; at < list.size();) {
+        r.push_back(static_cast<u32>(std::strtoul(list.c_str() + at, nullptr, 10)));
+        const size_t c = list.find(',', at);
+        if (c == std::string::npos || r.size() == 31) break;
+        at = c + 1;
+    }
+    return r;
+}
+static u64 probe_vs_hash() {
+    static const u64 h = [] {
+        const char* v = std::getenv("PS4_GCN_PROBE_VS");
+        return v ? std::strtoull(v, nullptr, 16) : 0ull;
+    }();
+    return h;
+}
+static bool add_vs_probe(std::string& msl) {
+    auto swap = [&](const std::string& from, const std::string& to, bool all) {
+        size_t at = msl.find(from), n = 0;
+        while (at != std::string::npos) {
+            msl.replace(at, from.size(), to);
+            ++n;
+            if (!all) break;
+            at = msl.find(from, at + to.size());
+        }
+        return n;
+    };
+    const std::string sig = "static void gcn_vs_body(uint vid, uint iid, constant GcnDrawConsts& dc, device const uchar* mem, constant uint* ul";
+    if (!swap(sig, sig + ", device uint* probe_", false)) return false;
+    swap("gcn_vs_body(vid, iid, dc, mem, ul", "gcn_vs_body(vid, iid, dc, mem, ul, probe_", true);
+    swap("constant uint* ul [[buffer(2)]]", "constant uint* ul [[buffer(2)]], device uint* probe_ [[buffer(3)]]", false);
+    // The VS body is emitted first; instrument its dispatch loop.
+    const size_t body = msl.find(sig);
+    const std::string loop = "  for (uint guard_ = 0u; running && guard_ < 100000u; ++guard_) {";
+    const size_t at = msl.find(loop, body);
+    if (at == std::string::npos) return false;
+    msl.replace(at, loop.size(), "  uint gsteps_ = 0u;\n" + loop + " gsteps_ = guard_ + 1u;");
+    std::string rec = "  if (vid < 1024u) { device uint* q_ = probe_ + vid * 32u; q_[0] = max(gsteps_, 1u);";
+    const std::vector<u32> regs = probe_regs();
+    for (size_t k = 0; k < regs.size(); ++k) rec += " q_[" + std::to_string(k + 1) + "] = v[" + std::to_string(regs[k]) + "];";
+    rec += " }\n";
+    if (const char* before = std::getenv("PS4_GCN_PROBE_BEFORE"); before && *before) {
+        const size_t b = msl.find(before, at);
+        if (b == std::string::npos) return false;
+        msl.insert(msl.rfind('\n', b) + 1, rec);
+        return true;
+    }
+    const std::string end = "  running = false;\n  }\n";
+    const size_t e = msl.find(end, at);
+    if (e == std::string::npos) return false;
+    msl.insert(e + end.size(), rec);
+    return true;
+}
+
 struct GcnPipelineCache::Impl {
     id<MTLDevice> device{nil};
     MemoryManager* memory{nullptr};
@@ -132,8 +197,10 @@ struct GcnPipelineCache::Impl {
         id<MTLRenderPipelineState> pso{nil};
         gcn::TranslatedPipeline tp;
         std::string error;
+        bool probed{false};   // PS4_GCN_PROBE_VS instrumented this VS
     };
     std::map<PipeKey, PipeEntry> pipes;
+    id<MTLBuffer> probe_buffer{nil};
 
     struct ComputeKey {
         u64 cs_hash{0};
@@ -158,8 +225,30 @@ struct GcnPipelineCache::Impl {
         id<MTLTexture> tex{nil};
         u64 content_hash{0};
         u64 last_used{0};
+        u64 bytes{0};
     };
     std::map<std::vector<u32>, TexEntry> textures;
+    u64 texture_bytes{0};
+    // Host memory the texture cache may hold. It used to be emptied whenever it
+    // passed 256 entries: a scene with more textures than that re-decoded all
+    // of them every frame, and 256 decoded 4K textures is 16 GB. Now the least
+    // recently used entries go once the budget is passed.
+    static constexpr u64 kTextureBudgetBytes = 768ull << 20;
+    void store_texture(const std::vector<u32>& key, id<MTLTexture> tex, u64 hash, u64 bytes) {
+        if (auto it = textures.find(key); it != textures.end()) {
+            texture_bytes -= it->second.bytes;
+            textures.erase(it);
+        }
+        while (!textures.empty() && (texture_bytes + bytes > kTextureBudgetBytes || textures.size() >= 4096)) {
+            auto lru = textures.begin();
+            for (auto it = textures.begin(); it != textures.end(); ++it)
+                if (it->second.last_used < lru->second.last_used) lru = it;
+            texture_bytes -= lru->second.bytes;
+            textures.erase(lru);
+        }
+        textures[key] = TexEntry{tex, hash, ++clock, bytes};
+        texture_bytes += bytes;
+    }
     std::map<u64, id<MTLSamplerState>> samplers;
     std::map<std::array<u32, 3>, id<MTLDepthStencilState>> depth_states;
 
@@ -355,8 +444,7 @@ struct GcnPipelineCache::Impl {
             if (!tex) return white_texture();
             [tex replaceRegion:MTLRegionMake2D(0, 0, td.width, td.height) mipmapLevel:0 withBytes:src
                    bytesPerRow:std::max(td.pitch, td.width)];
-            if (textures.size() > 256) textures.clear();
-            textures[key] = TexEntry{tex, h, ++clock};
+            store_texture(key, tex, h, u64(td.width) * td.height);
             ++stats.textures_uploaded;
             return tex;
         }
@@ -364,8 +452,7 @@ struct GcnPipelineCache::Impl {
         // frames): Metal reads the guest bytes as they are, with the T#'s
         // channel selects as the texture swizzle -- no CPU conversion.
         if (id<MTLTexture> direct = direct_texture(td, src)) {
-            if (textures.size() > 256) textures.clear();
-            textures[key] = TexEntry{direct, h, ++clock};
+            store_texture(key, direct, h, u64(td.width) * td.height * (td.dfmt == 16 ? 2 : 4));
             ++stats.textures_uploaded;
             return direct;
         }
@@ -384,8 +471,7 @@ struct GcnPipelineCache::Impl {
         if (!tex) return white_texture();
         [tex replaceRegion:MTLRegionMake2D(0, 0, td.width, td.height) mipmapLevel:0 withBytes:rgba.data()
                bytesPerRow:td.width * 4];
-        if (textures.size() > 256) textures.clear();
-        textures[key] = TexEntry{tex, h, ++clock};
+        store_texture(key, tex, h, u64(td.width) * td.height * 4);
         ++stats.textures_uploaded;
         return tex;
     }
@@ -478,6 +564,8 @@ struct GcnPipelineCache::Impl {
         PipeEntry e;
         const auto t_compile = std::chrono::steady_clock::now();
         e.tp = gcn::translate_pipeline(vs, ps, cntl, opts);
+        e.probed = e.tp.ok && probe_vs_hash() != 0 && vs.hash == probe_vs_hash() && add_vs_probe(e.tp.msl);
+        if (e.probed) std::fprintf(stderr, "[probe] instrumented VS#%016llx\n", (unsigned long long)vs.hash);
         dump(key, vs, ps, e.tp);
         if (!e.tp.ok) {
             e.error = "translate: " + e.tp.error;
@@ -685,11 +773,29 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
     if (!pe.pso) return fail(pe.error);
 
     // Resources.
-    const u32 max_index = req.indexed ? 0xFFFFFu : req.count + (req.base_vertex > 0 ? req.base_vertex : 0);
+    // The highest vertex the draw fetches bounds how much of each vertex
+    // stream is copied for it. For an indexed draw that is the largest index
+    // (all-ones is primitive restart), not a blanket 1M vertices.
+    u32 max_index = req.count;
+    if (req.indexed) {
+        const usize isz = static_cast<usize>(req.count) * (req.index32 ? 4 : 2);
+        if (!im.memory->is_valid_address(req.index_addr, isz)) return fail("index buffer out of range");
+        const u8* idx = im.memory->to_host_ptr<u8>(req.index_addr);
+        max_index = 0;
+        for (u32 k = 0; k < req.count; ++k) {
+            u32 v = 0;
+            if (req.index32) { std::memcpy(&v, idx + usize(k) * 4, 4); if (v == 0xFFFFFFFFu) continue; }
+            else { u16 h; std::memcpy(&h, idx + usize(k) * 2, 2); if (h == 0xFFFFu) continue; v = h; }
+            max_index = std::max(max_index, v);
+        }
+    }
+    if (req.base_vertex > 0) max_index += static_cast<u32>(req.base_vertex);
+    max_index = std::max(max_index, req.instances);   // per-instance streams are indexed by instance
+    if (max_index == gcn::kNoVertexLimit) --max_index;
     gcn::ResourceScan vs_scan = gcn::scan_resources(vs, pe.tp.vs_images, req.vs_user, std::min<u32>(vs_user_count, 16),
                                                     read, max_index);
     gcn::ResourceScan ps_scan = gcn::scan_resources(ps, pe.tp.ps_images, req.ps_user, std::min<u32>(ps_user_count, 16),
-                                                    read, 0);
+                                                    read, gcn::kNoVertexLimit);
     debug::capture_resources("VS", vs.hash, vs_scan, pe.tp.vs_images);
     debug::capture_resources("PS", ps.hash, ps_scan, pe.tp.ps_images);
     if (!vs_scan.ok || !ps_scan.ok) {
@@ -772,6 +878,12 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
             }
             if (!idx_buf) return fail("index allocation");
         }
+        // Each Metal buffer occupies whole 16 KB pages until the command
+        // buffer that uses it completes.
+        if (im.metal) {
+            auto pages = [](NSUInteger n) { return (static_cast<u64>(n) + 16383) & ~u64{16383}; };
+            im.metal->note_transient_bytes(pages(mem.length) + (idx_buf ? pages(idx_buf.length) : 0));
+        }
 
         [enc setRenderPipelineState:pe.pso];
         [enc setCullMode:rs.raster.cull == CullMode::Front  ? MTLCullModeFront
@@ -813,6 +925,12 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
             if (pe.tp.ps_images[k].sampled) [enc setFragmentSamplerState:im.sampler_for(ps_scan.images[k]) atIndex:k];
         }
 
+        if (pe.probed) {
+            if (!im.probe_buffer)
+                im.probe_buffer = [im.device newBufferWithLength:1024 * 32 * 4 options:MTLResourceStorageModeShared];
+            std::memset(im.probe_buffer.contents, 0, im.probe_buffer.length);
+            [enc setVertexBuffer:im.probe_buffer offset:0 atIndex:3];
+        }
         const u32 instances = std::max<u32>(1, req.instances);
         if (req.indexed) {
             [enc drawIndexedPrimitives:mtl_prim
@@ -831,6 +949,57 @@ bool GcnPipelineCache::encode_draw(void* render_encoder, u32 color_format, const
                   instanceCount:instances];
         } else {
             [enc drawPrimitives:mtl_prim vertexStart:dc.base_vertex vertexCount:req.count instanceCount:instances];
+        }
+    }
+    if (im.metal && MetalBackend::draw_timing_enabled()) {
+        char label[256];
+        std::snprintf(label, sizeof(label),
+                      "VS#%016llx PS#%016llx count=%u instances=%u indexed=%d prim=%u ranges=%zu arena=%zuKB fb=%ux%u",
+                      (unsigned long long)vs.hash, (unsigned long long)ps.hash, req.count, std::max<u32>(1, req.instances),
+                      req.indexed ? 1 : 0, static_cast<u32>(req.prim), ranges.size(), arena.size() >> 10,
+                      req.fb_width, req.fb_height);
+        std::string full = label;
+        char w[16];
+        full += " vs_user=";
+        for (u32 k = 0; k < 16; ++k) { std::snprintf(w, sizeof(w), "%s%08x", k ? "," : "", req.vs_user[k]); full += w; }
+        const double ms = im.metal->time_draw(full.c_str());
+        if (pe.probed && im.probe_buffer) {
+            const u32* q = static_cast<const u32*>(im.probe_buffer.contents);
+            const std::vector<u32> regs = probe_regs();
+            u32 seen = 0;
+            u64 steps = 0;
+            for (u32 k = 0; k < 1024; ++k) if (q[k * 32]) { ++seen; steps += q[k * 32]; }
+            std::fprintf(stderr, "[probe] %.0f ms: %u vertices, avg %.0f loop steps\n", ms, seen, seen ? double(steps) / seen : 0.0);
+            for (u32 k = 0, shown = 0; k < 1024 && shown < 4; ++k) {
+                const u32* r = q + k * 32;
+                if (!r[0]) continue;
+                std::string line = "[probe]   vid " + std::to_string(k) + " steps " + std::to_string(r[0]) + ":";
+                for (size_t j = 0; j < regs.size(); ++j) {
+                    float f;
+                    std::memcpy(&f, &r[j + 1], 4);
+                    char b[64];
+                    std::snprintf(b, sizeof(b), " v%u=%08x(%g)", regs[j], r[j + 1], f);
+                    line += b;
+                }
+                std::fprintf(stderr, "%s\n", line.c_str());
+                ++shown;
+            }
+        }
+        // PS4_GPU_DRAW_DUMP=<dir>: write what the GPU saw for a slow draw
+        // (snapshot of guest memory, its range table, user SGPRs) to replay it.
+        static int dumped = 0;
+        const char* dd = std::getenv("PS4_GPU_DRAW_DUMP");
+        if (dd && *dd && ms >= 100.0 && dumped < 2) {
+            const std::string base = std::string(dd) + "/draw" + std::to_string(dumped++);
+            std::ofstream(base + ".arena", std::ios::binary).write(reinterpret_cast<const char*>(arena.data()),
+                                                                   static_cast<std::streamsize>(arena.size()));
+            std::ofstream t(base + ".txt");
+            t << full << "\n";
+            for (u32 k = 0; k < dc.range_count; ++k)
+                t << "range " << std::hex << dc.range_base[k] << " " << dc.range_size[k] << " " << dc.range_off[k] << std::dec << "\n";
+            t << "ps_user";
+            for (u32 k = 0; k < 16; ++k) t << " " << std::hex << req.ps_user[k];
+            t << std::dec << "\nbase_vertex " << req.base_vertex << " index_addr " << std::hex << req.index_addr << "\n";
         }
     }
     ++im.stats.translated_draws;
@@ -927,7 +1096,8 @@ bool GcnPipelineCache::encode_dispatch(void* compute_encoder, const GcnComputeRe
 
     // Always scanned: it also evaluates the scalar loads (uniform_loads).
     gcn::ResourceScan scan =
-        gcn::scan_resources(cs, pe->tp.images, req.cs_user, std::min<u32>(cs_user_count, 16), read, 0);
+        gcn::scan_resources(cs, pe->tp.images, req.cs_user, std::min<u32>(cs_user_count, 16), read,
+                            gcn::kNoVertexLimit);
     if (!pe->tp.images.empty()) debug::capture_resources("CS", cs.hash, scan, pe->tp.images);
     if (!scan.ok && !pe->tp.images.empty()) {
         im.log_once("CS resource scan: " + scan.error);

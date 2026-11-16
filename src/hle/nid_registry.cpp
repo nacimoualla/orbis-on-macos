@@ -1492,7 +1492,16 @@ static u32 count_dcb_eop_interrupts(MemoryManager& mem, GuestAddr dcb, u32 size_
 // sceGnmSubmitAndFlipCommandBuffers.
 static void execute_submitted_dcbs(MemoryManager& mem, u32 count, GuestAddr dcb_addrs_ptr,
                                    GuestAddr dcb_sizes_ptr, std::vector<PrepareFlip>* flips = nullptr) {
-    if (dcb_addrs_ptr == 0 || dcb_sizes_ptr == 0 || count > 64) return;
+    // The cap only rejects a garbage count. It was 64, and inFAMOUS Second Son
+    // submits 74 command buffers for a busy frame (from 512-entry arrays): the
+    // whole submit was dropped, its end-of-pipe label never written, and the
+    // render loop waited on that label forever.
+    constexpr u32 kMaxSubmitDcbs = 4096;
+    if (dcb_addrs_ptr == 0 || dcb_sizes_ptr == 0 || count > kMaxSubmitDcbs) {
+        std::fprintf(stderr, "[Gnm] submit of %u DCBs (addrs=0x%llx sizes=0x%llx) ignored\n", count,
+                     (unsigned long long)dcb_addrs_ptr, (unsigned long long)dcb_sizes_ptr);
+        return;
+    }
     static std::atomic<u32> s_submits_logged{0};
     const bool log = s_submits_logged.fetch_add(1, std::memory_order_relaxed) < 4;
     if (g_pm4_translator) g_pm4_translator->set_memory_manager(&mem);
@@ -1508,6 +1517,8 @@ static void execute_submitted_dcbs(MemoryManager& mem, u32 count, GuestAddr dcb_
         }
         if (dcb_gpu_addr <= 0x1000 || dcb_size_bytes < sizeof(u32) ||
             !mem.is_valid_address(dcb_gpu_addr, dcb_size_bytes)) {
+            std::fprintf(stderr, "[Gnm] DCB #%u of %u skipped (addr=0x%llx size=%u)\n", i, count,
+                         (unsigned long long)dcb_gpu_addr, dcb_size_bytes);
             continue;
         }
         interrupts += count_dcb_eop_interrupts(mem, dcb_gpu_addr, dcb_size_bytes, log, flips);

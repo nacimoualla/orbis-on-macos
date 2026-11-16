@@ -88,7 +88,11 @@ Do not watch pages the guest will unmap or change permissions on during the run.
 | `PS4_WATCH_ADDR=addr` | Interpreter/MemoryManager-path store ring with old/new values, caller RIP and thread context; direct JIT stores bypass it. |
 | `PS4_WATCH_SIZE=N` | Byte length for `PS4_WATCH_ADDR`; default 8. |
 | `PS4_WATCH_FILTER=addr` | Filter the watch ring printed at normal exit to this address; defaults to the watched address. |
-| `PS4_DUMP_CODE=addr:len[,addr:len...]` | Dump loaded guest bytes to `dump_code_<addr>.bin` at normal exit, one file per comma-separated range; both fields hexadecimal, length below 32 MiB. |
+| `PS4_DUMP_CODE=addr:len[,addr:len...]` | Dump loaded guest bytes to `dump_code_<addr>.bin` at normal exit, one file per comma-separated range; both fields hexadecimal, length below 32 MiB. `*addr:len` dumps from the 64-bit pointer stored at `addr`. |
+| `PS4_MEM_LIMIT_MB=n` | Exit (code 99, with a message) when the runner's physical footprint passes n MB. Default: half of physical RAM; `0` turns the limit off. |
+| `PS4_GPU_DRAW_TIMING=1` | Submit each translated draw on its own, wait for it, and log `[gpu-draw] <ms> VS#… PS#… count=… vs_user=…` for draws slower than `PS4_GPU_DRAW_TIMING_MS` (default 20). Very slow; for finding the draw that holds the GPU. |
+| `PS4_GPU_DRAW_DUMP=dir` | With `PS4_GPU_DRAW_TIMING`: for the first two draws over 100 ms, write the memory snapshot the GPU read (`drawN.arena`) and its range table and user SGPRs (`drawN.txt`), to replay shader logic on the CPU. |
+| `PS4_GCN_PROBE_VS=<hash>` | Instrument one vertex shader (hex hash from `[gpu-draw]` or `PS4_GCN_DUMP_DIR`): vertices 0-1023 record their branch-loop step count and the VGPRs in `PS4_GCN_PROBE_REGS` (comma list, default `31,32,33,4,83,84,85`), when the loop ends or just before the first VS line containing `PS4_GCN_PROBE_BEFORE`. Printed as `[probe]` lines; needs `PS4_GPU_DRAW_TIMING`. |
 | `PS4_TSO=1` | Give guest memory x86 (TSO) ordering across threads: the JIT emits `dmb ishld` after and `dmb ishst` before each non-stack guest load/store, and the interpreter fences its accesses. Slower; use it to rule memory ordering in or out when a multithreaded hang or corruption varies between runs. |
 | `PS4_LOG_PM4=1` | Log PM4 packets, draw/shader state and GNM calls. High output volume can stall execution. |
 | `PS4_LOG_HLE=1` | Log HLE calls, rate-limiting hot non-GNM calls. |

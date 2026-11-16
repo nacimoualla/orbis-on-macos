@@ -1426,6 +1426,7 @@ bool Pm4Translator::Impl::render_indexed_mesh(GuestAddr idx_addr, u32 idx_count,
         }];
 
         id<MTLBuffer> uniform_buf = [device newBufferWithBytes:&uniforms length:sizeof(uniforms) options:MTLResourceStorageModeShared];
+        if (metal) metal->note_transient_bytes(16384 + ((static_cast<u64>(vtx_buf.length) + 16383) & ~u64{16383}));
         [enc setVertexBuffer:vtx_buf offset:0 atIndex:0];
         [enc setVertexBuffer:uniform_buf offset:0 atIndex:1];
         [enc setFragmentBuffer:uniform_buf offset:0 atIndex:1];
@@ -1702,6 +1703,7 @@ bool Pm4Translator::Impl::render_auto_mesh(u32 vtx_count, PrimitiveType prim_typ
         }];
 
         id<MTLBuffer> uniform_buf = [device newBufferWithBytes:&uniforms length:sizeof(uniforms) options:MTLResourceStorageModeShared];
+        if (metal) metal->note_transient_bytes(16384 + ((static_cast<u64>(vtx_buf.length) + 16383) & ~u64{16383}));
         [enc setVertexBuffer:vtx_buf offset:0 atIndex:0];
         [enc setVertexBuffer:uniform_buf offset:0 atIndex:1];
         [enc setFragmentBuffer:uniform_buf offset:0 atIndex:1];

@@ -224,6 +224,17 @@ struct ResourceScan {
     std::vector<u32> uniform_loads;         // bound as binding::kUniformLoads
 };
 
+// max_vertex_index for a shader whose buffer loads are not indexed by vertex
+// (pixel and compute shaders): buffers are scanned at their full size.
+inline constexpr u32 kNoVertexLimit = 0xFFFFFFFFu;
+// Buffers up to this size are always scanned whole, whatever max_vertex_index
+// says: constant buffers and bone palettes are indexed by something else.
+inline constexpr u64 kWholeBufferBytes = 64 * 1024;
+
+/// max_vertex_index: the highest vertex index the draw can fetch. A buffer
+/// larger than kWholeBufferBytes is taken to be a vertex stream and scanned
+/// only up to that index, so a draw of a small mesh does not pull in the whole
+/// vertex pool it lives in.
 ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& slots,
                             const u32* user_sgprs, u32 user_count,
                             const MemReader& read, u32 max_vertex_index);

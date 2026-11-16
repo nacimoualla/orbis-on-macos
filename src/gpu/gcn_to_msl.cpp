@@ -1463,14 +1463,41 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
             }
         return true;
     };
-    auto buffer_extent = [&](u32 w1, u32 w2) -> u64 {
+    // v0 holds the vertex index when a vertex shader starts. A buffer the
+    // shader indexes with it (idxen, vaddr v0, before v0 is overwritten) is a
+    // vertex stream; any other buffer is indexed by something else (a loop
+    // counter, a bone or light index) and must be scanned whole.
+    bool v0_is_vertex_index = max_vertex_index != kNoVertexLimit;
+    auto buffer_extent = [&](u32 w1, u32 w2, bool vertex_indexed) -> u64 {
         const u32 stride = (w1 >> 16) & 0x3FFF;
         if (stride == 0) return w2;
-        const u64 recs = std::min<u64>(w2, static_cast<u64>(max_vertex_index) + 1 > w2 ? w2 : w2);
-        return recs * stride + 16;
+        // The index limit used to be compared and then ignored (both arms
+        // of the conditional were w2), so every draw copied each buffer whole:
+        // up to 16 MB per vertex stream out of a shared vertex pool, thousands
+        // of times a frame (inFAMOUS Second Son's world went past 40 GB).
+        const u64 whole = static_cast<u64>(w2) * stride;
+        if (!vertex_indexed || whole <= kWholeBufferBytes) return whole + 16;
+        const u64 by_index = (static_cast<u64>(max_vertex_index) + 1) * stride;
+        return std::min<u64>(whole, std::max<u64>(by_index, kWholeBufferBytes)) + 16;
     };
 
     for (const Instruction& i : prog.insts) {
+        // Once an instruction writes v0 it no longer holds the vertex index.
+        // (The write takes effect after this instruction's own operands are read.)
+        struct V0Clobber {
+            bool& flag; const Instruction& in;
+            ~V0Clobber() {
+                bool writes_v0 = false;
+                switch (in.enc) {
+                case Encoding::VOP1: case Encoding::VOP2: case Encoding::VINTRP:
+                case Encoding::MUBUF: case Encoding::MTBUF: case Encoding::MIMG: case Encoding::DS:
+                    writes_v0 = in.dst == 0; break;
+                case Encoding::VOP3: writes_v0 = in.op >= 0x100 && in.dst == 0; break;
+                default: break;
+                }
+                if (writes_v0) flag = false;
+            }
+        } v0_clobber{v0_is_vertex_index, i};
         switch (i.enc) {
         case Encoding::SMRD: {
             if (i.op == 29 || i.op == 31) break;
@@ -1492,7 +1519,7 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
             if (i.op >= 8) {
                 if (need(i.sbase, 4, "s_buffer_load")) {
                     base = static_cast<u64>(val[i.sbase]) | (static_cast<u64>(val[i.sbase + 1] & 0xFFFF) << 32);
-                    const u64 extent = std::max<u64>(buffer_extent(val[i.sbase + 1], val[i.sbase + 2]),
+                    const u64 extent = std::max<u64>(buffer_extent(val[i.sbase + 1], val[i.sbase + 2], false),
                                                      static_cast<u64>(offv) + n * 4);
                     add_range(base, std::max<u64>(extent, 16));
                     ok = off_known;
@@ -1587,7 +1614,7 @@ ResourceScan scan_resources(const Program& prog, const std::vector<ImageSlot>& s
             const u64 base = static_cast<u64>(w0) | (static_cast<u64>(w1 & 0xFFFF) << 32);
             u32 soff = 0;
             get(i.soffset, i, soff);
-            add_range(base, buffer_extent(w1, w2) + soff + i.offset + 16);
+            add_range(base, buffer_extent(w1, w2, v0_is_vertex_index && i.idxen && i.vaddr == 0) + soff + i.offset + 16);
             break;
         }
         case Encoding::MIMG: {

@@ -12,7 +12,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <deque>
 #include <set>
+#include <tuple>
 
 namespace {
 std::atomic<double> g_last_frame_gpu_ms{0.0};
@@ -29,17 +31,73 @@ struct MetalBackend::Impl {
     id<MTLComputeCommandEncoder> active_compute_encoder{nil};
     id<MTLCommandBuffer> last_submitted_command_buffer{nil};
     u64 submitted_frames{0};
+
+    // Transient allocations: bytes the open command buffer keeps alive, and
+    // the command buffers committed early (split) that the GPU has not
+    // finished, with what each keeps alive. Without a split, a stretch of
+    // off-screen work between two flips (inFAMOUS Second Son's loading: mip
+    // chains, cube maps, multi-second frames) held every per-draw buffer of
+    // the stretch at once: ~60,000 Metal buffers, 3.7 GB, and the Mac swapped.
+    static constexpr u64 kSplitBytes = 64ull << 20;
+    static constexpr u64 kMaxInFlightBytes = 256ull << 20;
+    u64 transient_bytes{0};
+    std::deque<std::pair<id<MTLCommandBuffer>, u64>> in_flight;
+    u64 in_flight_bytes{0};
+
+    void retire_in_flight(bool wait_for_budget) {
+        while (!in_flight.empty()) {
+            id<MTLCommandBuffer> cb = in_flight.front().first;
+            const bool done = cb.status == MTLCommandBufferStatusCompleted || cb.status == MTLCommandBufferStatusError;
+            if (!done) {
+                if (!wait_for_budget || in_flight_bytes <= kMaxInFlightBytes) break;
+                [cb waitUntilCompleted];
+            }
+            in_flight_bytes -= in_flight.front().second;
+            in_flight.pop_front();
+        }
+    }
     bool last_frame_completed{true};
     u32 width{0};
     u32 height{0};
 
     // Depth/stencil buffers by guest depth-surface address (0 = none bound
-    // yet). A new buffer is cleared to 0 by the first pass that uses it.
+    // yet) and pass size. A new buffer is cleared to 0 by the first pass that
+    // uses it. The size is part of the key because Metal wants the depth
+    // attachment to match the colour attachments, and a game renders passes of
+    // several sizes against one depth address (mip chains, half and quarter
+    // resolution): keyed by address alone, the buffer was thrown away and
+    // reallocated on every size change -- hundreds of 1080p depth textures a
+    // frame in inFAMOUS Second Son, each kept alive by the frame's command
+    // buffer, which took the process past 40 GB.
     struct DepthBuffer {
         id<MTLTexture> texture{nil};
         bool initialized{false};
     };
-    std::map<u64, DepthBuffer> depth_buffers;
+    using DepthKey = std::tuple<u64, u32, u32>;   // address, width, height
+    std::map<DepthKey, DepthBuffer> depth_buffers;
+    u64 depth_bytes{0};
+    DepthKey encoder_depth_buffer{};
+    // Host memory the surface caches may hold before unused entries go.
+    static constexpr u64 kDepthBudgetBytes = 512ull << 20;
+    static constexpr u64 kColorBudgetBytes = 768ull << 20;
+    static u64 surface_bytes(u32 w, u32 h, MTLPixelFormat fmt) {
+        u64 bpp = 4;
+        switch (fmt) {
+        case MTLPixelFormatDepth32Float_Stencil8:
+        case MTLPixelFormatRGBA16Float: case MTLPixelFormatRGBA16Unorm: bpp = 8; break;
+        case MTLPixelFormatRGBA32Float: bpp = 16; break;
+        case MTLPixelFormatR8Unorm: bpp = 1; break;
+        case MTLPixelFormatRG8Unorm: case MTLPixelFormatR16Float: case MTLPixelFormatR16Unorm: bpp = 2; break;
+        default: break;
+        }
+        return u64(w) * h * bpp;
+    }
+    u64 color_bytes() const {
+        u64 n = 0;
+        for (const auto& [k, cb] : color_buffers)
+            if (cb.texture) n += surface_bytes(cb.width, cb.height, cb.format);
+        return n;
+    }
     u64 depth_key{0};
     u64 encoder_depth_key{0};
 
@@ -90,8 +148,20 @@ struct MetalBackend::Impl {
     // Depth buffers match the colour attachments of the pass they are used
     // with (Metal requires equal attachment sizes).
     DepthBuffer& depth_buffer(u64 key, u32 w, u32 h) {
-        DepthBuffer& db = depth_buffers[key];
-        if (!db.texture || db.texture.width != w || db.texture.height != h) {
+        const DepthKey dk{key, w, h};
+        if (!depth_buffers.count(dk) && depth_bytes + surface_bytes(w, h, MTLPixelFormatDepth32Float_Stencil8) >
+                                            kDepthBudgetBytes) {
+            // Over budget: drop every buffer the open pass does not use.
+            for (auto it = depth_buffers.begin(); it != depth_buffers.end();) {
+                if (active_render_encoder && it->first == encoder_depth_buffer) { ++it; continue; }
+                if (it->second.texture)
+                    depth_bytes -= surface_bytes(std::get<1>(it->first), std::get<2>(it->first),
+                                                 MTLPixelFormatDepth32Float_Stencil8);
+                it = depth_buffers.erase(it);
+            }
+        }
+        DepthBuffer& db = depth_buffers[dk];
+        if (!db.texture) {
             MTLTextureDescriptor* d =
                 [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
                                                                    width:w
@@ -100,6 +170,7 @@ struct MetalBackend::Impl {
             d.usage = MTLTextureUsageRenderTarget;
             d.storageMode = MTLStorageModePrivate;
             db.texture = [device newTextureWithDescriptor:d];
+            if (db.texture) depth_bytes += surface_bytes(w, h, MTLPixelFormatDepth32Float_Stencil8);
             db.initialized = false;
         }
         return db;
@@ -170,6 +241,7 @@ bool MetalBackend::create_framebuffer(u32 width, u32 height) {
         m_impl->width = width;
         m_impl->height = height;
         m_impl->depth_buffers.clear();
+        m_impl->depth_bytes = 0;
         m_impl->color_buffers.clear();
         m_impl->color_keys.fill(0);
         m_impl->encoder_color_keys.fill(0);
@@ -300,6 +372,10 @@ bool MetalBackend::submit_frame(bool wait_for_completion) {
             }];
         }
         [command_buffer commit];
+        m_impl->in_flight.emplace_back(command_buffer, m_impl->transient_bytes);
+        m_impl->in_flight_bytes += m_impl->transient_bytes;
+        m_impl->transient_bytes = 0;
+        m_impl->retire_in_flight(true);
         if (wait_for_completion) {
             [command_buffer waitUntilCompleted];
         }
@@ -328,10 +404,61 @@ bool MetalBackend::submit_frame(bool wait_for_completion) {
     }
 }
 
+void MetalBackend::note_transient_bytes(u64 bytes) noexcept {
+    if (m_impl) m_impl->transient_bytes += bytes;
+}
+
+// Commit the open command buffer and continue the frame in a new one when it
+// holds kSplitBytes of per-draw allocations. Called before a draw opens an
+// encoder, so no draw is split. Render targets keep their contents across the
+// split (they load what the previous passes stored).
+void MetalBackend::split_if_needed() {
+    if (!m_impl || !m_impl->active_command_buffer || m_impl->transient_bytes < Impl::kSplitBytes ||
+        debug::capture_active())
+        return;
+    @autoreleasepool {
+        end_render_encoder();
+        end_compute_encoder();
+        id<MTLCommandBuffer> cb = m_impl->active_command_buffer;
+        [cb commit];
+        m_impl->in_flight.emplace_back(cb, m_impl->transient_bytes);
+        m_impl->in_flight_bytes += m_impl->transient_bytes;
+        m_impl->transient_bytes = 0;
+        m_impl->active_command_buffer = [m_impl->command_queue commandBuffer];
+        m_impl->retire_in_flight(true);
+    }
+}
+
+bool MetalBackend::draw_timing_enabled() noexcept {
+    static const bool on = std::getenv("PS4_GPU_DRAW_TIMING") != nullptr;
+    return on;
+}
+
+double MetalBackend::time_draw(const char* label) {
+    if (!m_impl || !m_impl->active_command_buffer || debug::capture_active()) return 0;
+    static const double threshold_ms = [] {
+        const char* v = std::getenv("PS4_GPU_DRAW_TIMING_MS");
+        return v ? std::atof(v) : 20.0;
+    }();
+    @autoreleasepool {
+        end_render_encoder();
+        end_compute_encoder();
+        id<MTLCommandBuffer> cb = m_impl->active_command_buffer;
+        [cb commit];
+        [cb waitUntilCompleted];
+        const double ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+        if (ms >= threshold_ms) std::fprintf(stderr, "[gpu-draw] %.1f ms  %s\n", ms, label);
+        m_impl->transient_bytes = 0;
+        m_impl->active_command_buffer = [m_impl->command_queue commandBuffer];
+        return ms;
+    }
+}
+
 bool MetalBackend::ensure_render_encoder(bool clear, ColorRGBA color) {
     if (!is_initialized() || !m_impl->active_command_buffer || !m_impl->framebuffer) {
         return false;
     }
+    split_if_needed();
     if (m_impl->active_compute_encoder) {
         end_compute_encoder();
     }
@@ -383,6 +510,7 @@ bool MetalBackend::ensure_render_encoder(bool clear, ColorRGBA color) {
         m_impl->active_render_encoder =
             [m_impl->active_command_buffer renderCommandEncoderWithDescriptor:pass_desc];
         m_impl->encoder_depth_key = m_impl->depth_key;
+        m_impl->encoder_depth_buffer = Impl::DepthKey{m_impl->depth_key, pass_w, pass_h};
         m_impl->encoder_color_keys = m_impl->color_keys;
         return m_impl->active_render_encoder != nil;
     }
@@ -396,6 +524,7 @@ bool MetalBackend::ensure_compute_encoder() {
     if (!is_initialized() || !m_impl->active_command_buffer) {
         return false;
     }
+    split_if_needed();
     if (m_impl->active_render_encoder) {
         end_render_encoder();
     }
@@ -431,13 +560,7 @@ void MetalBackend::set_depth_target(u64 key) {
     if (!m_impl || key == m_impl->depth_key) return;
     m_impl->depth_key = key;
     if (m_impl->active_render_encoder && m_impl->encoder_depth_key != key) end_render_encoder();
-    // Bound the number of host depth buffers a game can make us keep.
-    if (m_impl->depth_buffers.size() > 32) {
-        for (auto it = m_impl->depth_buffers.begin(); it != m_impl->depth_buffers.end();) {
-            if (it->first != key && it->first != m_impl->encoder_depth_key) it = m_impl->depth_buffers.erase(it);
-            else ++it;
-        }
-    }
+    // depth_buffer() bounds the host memory the depth buffers may hold.
 }
 
 void MetalBackend::register_display_buffer(u64 addr) {
@@ -475,7 +598,10 @@ void MetalBackend::set_color_target(u32 slot, u64 key, u32 width, u32 height, u3
         m_impl->color_buffer(key, same_fmt ? std::max(width, cur->width) : width,
                              same_fmt ? std::max(height, cur->height) : height, fmt);
     }
-    if (m_impl->color_buffers.size() > 32) {
+    // Bound the host memory offscreen targets may hold. This was a count (32):
+    // a frame with more targets than that had every unbound one evicted and
+    // recreated, empty, each frame.
+    if (m_impl->color_buffers.size() > 512 || (reshape && m_impl->color_bytes() > Impl::kColorBudgetBytes)) {
         for (auto it = m_impl->color_buffers.begin(); it != m_impl->color_buffers.end();) {
             bool in_use = false;
             for (u32 s = 0; s < 8; ++s) {

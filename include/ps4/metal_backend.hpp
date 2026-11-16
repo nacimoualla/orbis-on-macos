@@ -110,6 +110,19 @@ public:
     /// Run `fn` once the GPU has finished the work encoded so far (on a Metal
     /// completion thread), or now when no frame is open.
     void run_after_gpu(std::function<void()> fn);
+
+    /// Per-draw GPU allocations (vertex/constant snapshots, index and uniform
+    /// buffers) live until the command buffer that uses them completes. Draw
+    /// code reports their size here; once a frame has accumulated enough, the
+    /// next draw commits the work so far and continues in a new command buffer.
+    void note_transient_bytes(u64 bytes) noexcept;
+
+    /// PS4_GPU_DRAW_TIMING=1: submit the draw just encoded on its own, wait
+    /// for it, and log it with `label` if the GPU took longer than
+    /// PS4_GPU_DRAW_TIMING_MS (default 20). Slow; for finding expensive draws.
+    /// Returns the draw's GPU time in milliseconds (0 when not timed).
+    double time_draw(const char* label);
+    [[nodiscard]] static bool draw_timing_enabled() noexcept;
     [[nodiscard]] void* color_target_texture(u32 slot) const noexcept;
 
     /// Read back pixel from a specific color target (or main framebuffer if key == 0)
@@ -142,6 +155,7 @@ public:
     [[nodiscard]] void* raw_framebuffer() const noexcept;
 
 private:
+    void split_if_needed();
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

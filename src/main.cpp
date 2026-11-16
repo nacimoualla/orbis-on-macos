@@ -1,5 +1,6 @@
 #include "ps4/debug/scenario.hpp"
 #include "ps4/debug/page_watch.hpp"
+#include "ps4/debug/mem_limit.hpp"
 #include "ps4/debug/capture.hpp"
 #include <chrono>
 #include <cmath>
@@ -322,6 +323,8 @@ int main(int argc, char* argv[]) {
         nid_registry.thread_manager(memory).dump_thread_states();
     });
     ps4::debug::start_page_watch(memory);
+    if (const std::uint64_t limit = ps4::debug::start_memory_limit())
+        std::fprintf(stderr, "[memory] limit %llu MB (PS4_MEM_LIMIT_MB)\n", static_cast<unsigned long long>(limit >> 20));
     struct PageWatchLifetime { ~PageWatchLifetime() { ps4::debug::stop_page_watch(); ps4::debug::set_frame_dump({}); } } page_watch_lifetime;
     cpu.set_entry_point(loader.entry_point());
     std::cout << "[CPU] RIP set to entry point: 0x" << std::hex << loader.entry_point() << std::dec << "\n";
@@ -595,11 +598,20 @@ int main(int argc, char* argv[]) {
     // on the extracted inner ELF maps addresses differently from the runtime.
     // Dumping what the emulator actually mapped is the only way to disassemble
     // the image the guest really executed.
-    // Several ranges can be given, separated by commas.
+    // Several ranges can be given, separated by commas. A range written
+    // *<ptr_addr>:<len> dumps from the 64-bit pointer stored at ptr_addr (for
+    // heap blocks whose address changes from run to run).
     for (const char* dc = std::getenv("PS4_DUMP_CODE"); dc && *dc;
          dc = std::strchr(dc, ',') ? std::strchr(dc, ',') + 1 : nullptr) {
         unsigned long long base = 0, len = 0;
-        if (std::sscanf(dc, "%llx:%llx", &base, &len) == 2 && len > 0 && len < (1u << 25)) {
+        const bool deref = *dc == '*';
+        if (std::sscanf(dc + (deref ? 1 : 0), "%llx:%llx", &base, &len) == 2 && deref) {
+            ps4::u64 target = 0;
+            memory.read_value(static_cast<ps4::GuestAddr>(base), target);
+            std::fprintf(stderr, "[dumpcode] *0x%llx = 0x%llx\n", base, (unsigned long long)target);
+            base = target;
+        }
+        if (base != 0 && len > 0 && len < (1u << 25)) {
             std::vector<ps4::u8> buf(static_cast<size_t>(len));
             if (memory.read_bytes(static_cast<ps4::GuestAddr>(base), buf.data(), buf.size())) {
                 char path[256];
